@@ -450,6 +450,47 @@
         return re.test(msg);
     }
 
+    function isTransientNetworkError(err) {
+        if (!err) return false;
+        let msg = '';
+        try {
+            msg = String(err?.message ?? err ?? '');
+        } catch (_) {
+            msg = '';
+        }
+        if (!msg) return false;
+        return /network changed|timed out|connection closed|name not resolved|networkerror|failed to fetch|load failed|err_network_changed|err_timed_out|err_connection_closed|err_name_not_resolved/i.test(msg);
+    }
+
+    async function pageFetchWithRetry(pageFetch, url, init, {label = 'request', attempts = 3, transientStatuses = [502, 503, 504]} = {}) {
+        const lt = ensureAckLifetime(`pageFetchWithRetry:${label}`);
+        let lastErr = null;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            if (lt.signal.aborted) throw new Error(`${label} aborted`);
+            try {
+                const resp = await pageFetch(url, init);
+                if (!resp.ok && transientStatuses.includes(resp.status) && attempt < attempts) {
+                    if (!_ackTesting) {
+                        console.warn(`ACKtopus: ${label} got HTTP ${resp.status}, retrying (${attempt}/${attempts})`);
+                    }
+                    const aborted = await ackSleep(400 * attempt, lt);
+                    if (aborted) throw new Error(`${label} aborted`);
+                    continue;
+                }
+                return resp;
+            } catch (e) {
+                lastErr = e;
+                if (attempt >= attempts || !isTransientNetworkError(e)) throw e;
+                if (!_ackTesting) {
+                    console.warn(`ACKtopus: ${label} transient network error, retrying (${attempt}/${attempts}):`, e?.message || e);
+                }
+                const aborted = await ackSleep(400 * attempt, lt);
+                if (aborted) throw e;
+            }
+        }
+        throw lastErr || new Error(`${label} failed`);
+    }
+
     // Extract CSRF token from a GitHub HTML document (string).
     // Used by some session-auth endpoints where we must bootstrap a CSRF token from HTML.
     function extractCsrfFromHtml(html) {
@@ -4057,6 +4098,106 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.join('\n\n');
     }
 
+    async function gatherSingleCommitContext(onProgress = () => {}) {
+        const pr = parsePR();
+        if (!pr) return '';
+        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
+        if (!shaMatch) return '';
+        const sha = shaMatch[1];
+        const shortSha = sha.slice(0, 8);
+        const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
+        const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
+        const parts = [`# Commit from PR: ${commitUrl}`];
+
+        onProgress('Reading PR description...');
+        let prTitle = '';
+        let description = '';
+        try {
+            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+            prTitle = prData.title || '';
+            description = prData.body || '';
+        } catch (_) {
+            prTitle = getPRTitleText() || document.querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')?.textContent?.trim() || '';
+            const bodyEl = document.querySelector('#issue-body, [data-testid="issue-body"]');
+            description = bodyEl?.innerText?.trim() || '';
+        }
+
+        let commitSummary = '';
+        try {
+            const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+            const cur = commits.find(c => c.sha?.startsWith(sha) || sha.startsWith(c.sha || ''));
+            commitSummary = cur?.commit?.message || cur?.msg || '';
+        } catch (_) {
+        }
+        if (!commitSummary) {
+            commitSummary =
+                document.querySelector('.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2')?.textContent?.trim()
+                || '';
+        }
+
+        const meta = [`* PR: ${prUrl}`];
+        if (prTitle) meta.push(`* PR title: ${prTitle}`);
+        if (commitSummary) meta.push(`* Commit: ${shortSha} ${commitSummary.split('\n')[0]}`);
+        parts.push(`## Metadata\n${meta.join('\n')}`);
+
+        if (description) parts.push(`## PR Description\n${description}`);
+
+        onProgress('Fetching commit patch...');
+        try {
+            const patch = await fetchCommitPatch(pr, sha);
+            if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
+        } catch (_) {
+        }
+
+        onProgress('Gathering commit comments...');
+        const comments = gatherVisibleComments().filter(c =>
+            c.commitSha && (sha.startsWith(c.commitSha) || c.commitSha.startsWith(shortSha))
+        );
+        if (comments.length > 0) {
+            const threads = new Map();
+            const general = [];
+            for (const c of comments) {
+                if (c.threadId) {
+                    if (!threads.has(c.threadId)) threads.set(c.threadId, []);
+                    threads.get(c.threadId).push(c);
+                } else {
+                    general.push(c);
+                }
+            }
+            const fmtLoc = (c) => {
+                if (!c.file) return '';
+                let loc = c.file;
+                if (c.line) loc += ':' + c.line;
+                if (c.commitSha) loc += '@' + c.commitSha;
+                return ` [${loc}]`;
+            };
+            const commentParts = [];
+            for (const c of general) {
+                const datePart = c.date ? ` (${c.date})` : '';
+                commentParts.push(`**${c.author}**${datePart}${fmtLoc(c)}:\n${c.markdown}`);
+            }
+            for (const [tid, thread] of threads) {
+                const first = thread[0];
+                let loc = '';
+                if (first.file) {
+                    loc = ` - ${first.file}`;
+                    if (first.line) loc += ':' + first.line;
+                    if (first.commitSha) loc += '@' + first.commitSha;
+                }
+                const resolved = first.isResolved ? ' [resolved]' : '';
+                const threadLines = thread.map(c => {
+                    const datePart = c.date ? ` (${c.date})` : '';
+                    return `> **${c.author}**${datePart}:\n> ${c.markdown.replace(/\n/g, '\n> ')}`;
+                }).join('\n>\n');
+                commentParts.push(`### Thread${loc}${resolved}\n${threadLines}`);
+            }
+            parts.push(`## Visible Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+        }
+
+        onProgress('Done');
+        return parts.join('\n\n');
+    }
+
     function scrollToAndHighlight(el) {
         if (!el) return;
         el.scrollIntoView({behavior: 'smooth', block: 'center'});
@@ -5646,6 +5787,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         throw new Error('no pending review found');
     }
 
+    function isAckOwnedReviewControl(el) {
+        return !!el?.closest?.(
+            '#acktopus-buttons, #acktopus-analysis, #ack-submit-review-popover, ' +
+            '.ack-submit-review-wrap, .ack-config-overlay'
+        );
+    }
+
     function findNativeReviewDialog() {
         const reviewBody =
             document.querySelector('textarea#pull_request_review_body')
@@ -5656,6 +5804,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
         const submitBtn = [...document.querySelectorAll('button, [role="button"]')].find(btn => {
             if (btn.offsetParent === null) return false;
+            if (isAckOwnedReviewControl(btn)) return false;
             const text = (btn.textContent || '').trim();
             return /^(submit\s*review|approve|request changes|comment)$/i.test(text);
         });
@@ -5671,6 +5820,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const matcher = textMatchers[eventValue] || textMatchers.COMMENT;
         const buttons = [...dialog.querySelectorAll('button, [role="button"]')].filter(btn => {
             if (btn.disabled || btn.offsetParent === null) return false;
+            if (isAckOwnedReviewControl(btn)) return false;
             const text = (btn.textContent || '').trim();
             if (!text) return false;
             if (/^(cancel|close)$/i.test(text)) return false;
@@ -5803,12 +5953,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	
 	            const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes`;
 	            const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-	            const resp = await pageFetch(url, {
+	            const resp = await pageFetchWithRetry(pageFetch, url, {
 	                method: 'GET',
 	                credentials: 'same-origin',
 	                cache: 'no-store',
 	                headers: {'Accept': 'text/html'},
-	            });
+	            }, {label: 'fetch /changes meta', attempts: 2});
+                if (!resp.ok) throw new Error(`fetch /changes meta HTTP ${resp.status}`);
 	            const html = await resp.text();
 	            const nonce =
 	                html.match(/name=["']fetch-nonce["'][^>]*content=["']([^"']+)["']/i)?.[1] ||
@@ -5878,18 +6029,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            headers: mkHeaders(n, cv),
 	            body: JSON.stringify(body),
 	        });
+            const doCreateReviewFetch = (init, label) => pageFetchWithRetry(pageFetch, url, init, {
+                label,
+                attempts: 3,
+                transientStatuses: [502, 503, 504],
+            });
 	        // GitHub's verified-fetch calls use credentials:"omit" and rely on
 	        // x-fetch-nonce for auth. Matching that avoids occasional 404s when
 	        // cookies are sent from a userscript context.
 	        const changesReferrer = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes`;
-	        let resp = await pageFetch(url, {
+	        let resp = await doCreateReviewFetch({
 	            ...baseInit(nonce, clientVersion),
 	            credentials: 'omit',
 	            // GitHub's request comes from the Files/Changes app; setting the referrer
 	            // to `/changes` matches that behavior even when we trigger from
 	            // the Conversation tab.
 	            referrer: changesReferrer,
-	        });
+	        }, 'create_review_comment verified-fetch');
 	        // If the nonce/clientVersion were stale (Turbo cached head) or scoped
 	        // to a different surface, refresh from /changes and retry once.
 	        if (!resp.ok && (resp.status === 404 || resp.status === 422)) {
@@ -5897,20 +6053,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            if (meta.nonce && meta.clientVersion && (meta.nonce !== nonce || meta.clientVersion !== clientVersion)) {
 	                nonce = meta.nonce;
 	                clientVersion = meta.clientVersion;
-	                resp = await pageFetch(url, {
+	                resp = await doCreateReviewFetch({
 	                    ...baseInit(nonce, clientVersion),
 	                    credentials: 'omit',
 	                    referrer: changesReferrer,
-	                });
+	                }, 'create_review_comment refreshed verified-fetch');
 	            }
 	        }
 	        // Fallback: some GitHub surfaces/A-B tests behave differently with verified-fetch.
 	        // If we got a 404, try once more with session cookies + current page referrer.
 	        if (!resp.ok && resp.status === 404) {
-	            resp = await pageFetch(url, {
+	            resp = await doCreateReviewFetch({
 	                ...baseInit(nonce, clientVersion),
 	                credentials: 'same-origin',
-	            });
+	            }, 'create_review_comment same-origin fallback');
 	        }
 
         let json = null;
@@ -6293,11 +6449,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             ...document.querySelectorAll('#review-changes-modal summary'),
         ];
         for (const btn of candidates) {
+            if (isAckOwnedReviewControl(btn)) continue;
             btn.click();
             return;
         }
         const allBtns = [...document.querySelectorAll('button')];
-        const found = allBtns.find(b => /finish.*review|review\s*changes|submit\s*review/i.test(b.textContent));
+        const found = allBtns.find(b =>
+            !isAckOwnedReviewControl(b) &&
+            /finish.*review|review\s*changes|submit\s*review/i.test(b.textContent)
+        );
         if (found) {
             found.click();
             return;
@@ -9856,27 +10016,53 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     const FOLD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5.25 4.75 8 2l2.75 2.75"/><path d="M5.25 11.25 8 14l2.75-2.75"/><path d="M2 8h12"/></svg>`;
     const PROOFREAD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5 2.25h4.25L12 5v7.25a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z"/><path d="M9.25 2.25V5H12"/><path d="m5.9 9 1.25 1.25L10.1 7.3"/></svg>`;
 
+	    function getToolbarEditorRoot(toolbar) {
+	        return toolbar?.closest(
+	            'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
+	            '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
+	            '.js-review-body, [data-testid="review-body"], .review-changes-modal, ' +
+	            '.CommentBox, [class*="CommentBox-module__commentBoxContainer__"]'
+	        ) || (toolbar?.tagName === 'MARKDOWN-TOOLBAR' ? toolbar.parentElement : null);
+	    }
+
+	    function getToolbarTextarea(toolbar) {
+	        const editorRoot = getToolbarEditorRoot(toolbar);
+	        if (!editorRoot) return null;
+	        const tryById = (id) => {
+	            if (!id) return null;
+	            try {
+	                if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+	                    return editorRoot?.querySelector?.(`#${CSS.escape(id)}`) || document.getElementById(id);
+	                }
+	            } catch (_) {
+	            }
+	            return editorRoot?.querySelector?.(`#${id}`) || document.getElementById(id);
+	        };
+	        if (toolbar?.tagName === 'MARKDOWN-TOOLBAR') {
+	            const direct = tryById(toolbar.getAttribute('for'));
+	            if (direct) return direct;
+	        }
+	        const md = editorRoot?.querySelector?.('markdown-toolbar[for]');
+	        const byFor = tryById(md?.getAttribute?.('for'));
+	        if (byFor) return byFor;
+	        const candidates = [...(editorRoot?.querySelectorAll?.('textarea') || [])];
+	        return candidates.find(t => document.activeElement === t)
+	            || candidates.find(isVisible)
+	            || candidates[0]
+	            || null;
+	    }
+
 		    function addDetailsButtons(root = document) {
 		        qsa(root, 'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]').forEach(toolbar => {
 		            // GitHub CSS modules can produce unrelated classes like
 		            // `PullRequestFilesToolbar-module__toolbar__...` which still contain the
 		            // substring `Toolbar-module__toolbar`. Only inject into toolbars that are
 		            // part of an actual markdown editor.
-		            const isReactFormattingToolbar = toolbar.matches?.('[class*="Toolbar-module__toolbar"]');
-		            if (isReactFormattingToolbar) {
-		                const editorRoot = toolbar.closest('fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"]');
-		                if (!editorRoot) {
-		                    // Fallback for editor variants that don't use the fieldset/container
-		                    // wrappers, but still have a textarea nearby (eg. review summary).
-			                    const nearbyRoot = toolbar.closest('form') || toolbar.parentElement;
-			                    const hasTextarea = !!nearbyRoot?.querySelector?.('textarea');
-			                    if (!hasTextarea) {
-			                        // Clean up any stale injections from older ACKtopus versions.
-	                    toolbar.querySelectorAll('.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-item, .ack-toolbar-actions').forEach(el => el.remove());
-			                        return;
-			                    }
-			                }
-			            }
+		            const hasAssociatedTextarea = !!getToolbarTextarea(toolbar);
+		            if (!hasAssociatedTextarea) {
+		                toolbar.querySelectorAll('.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-item, .ack-toolbar-actions').forEach(el => el.remove());
+		                return;
+		            }
 
 	            // Avoid double-injecting into React markdown editors where the old
 	            // `markdown-toolbar` element exists but is hidden (display:none).
@@ -9995,37 +10181,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     function wrapSelectionInDetails(toolbar) {
         const summaryLabel = 'Details';
-        const editorRoot =
-            toolbar?.closest(
-                'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
-                '.js-previewable-comment-form, .js-write-bucket, .write-content'
-            )
-            || toolbar?.parentElement;
-        const tryById = (id) => {
-            if (!id) return null;
-            try {
-                if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                    return editorRoot?.querySelector?.(`#${CSS.escape(id)}`) || document.getElementById(id);
-                }
-            } catch (_) {
-            }
-            return editorRoot?.querySelector?.(`#${id}`) || document.getElementById(id);
-        };
-        let ta = null;
-        if (toolbar?.tagName === 'MARKDOWN-TOOLBAR') {
-            ta = tryById(toolbar.getAttribute('for'));
-        }
-        if (!ta) {
-            const md = editorRoot?.querySelector?.('markdown-toolbar[for]');
-            ta = tryById(md?.getAttribute?.('for'));
-        }
-        if (!ta) {
-            const candidates = [...(editorRoot?.querySelectorAll?.('textarea') || [])];
-            ta = candidates.find(t => document.activeElement === t)
-                || candidates.find(isVisible)
-                || candidates[0]
-                || null;
-        }
+        const ta = getToolbarTextarea(toolbar);
         if (!ta) return;
 
         const start = ta.selectionStart;
@@ -12402,10 +12558,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const stopSpin = startBrailleAnimation(frame => {
             btn.textContent = frame;
         });
-        const popup = makeStatusPopup(`Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`);
+        const mode = getAnalysisMode();
+        const isCommitPage = mode === ANALYSIS_MODES.commit;
+        const popup = makeStatusPopup(
+            isCommitPage
+                ? 'Gathering commit context...'
+                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`
+        );
 
         try {
-            const context = await gatherFullPRContext(msg => {
+            const gather = isCommitPage ? gatherSingleCommitContext : gatherFullPRContext;
+            const context = await gather(msg => {
                 popup.textContent = msg;
             });
             if (context) {
@@ -12626,9 +12789,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const llmGroup = document.createElement('div');
         Object.assign(llmGroup.style, {display: 'flex'});
 
+        const contextBtnTitle = getAnalysisMode() === ANALYSIS_MODES.commit
+            ? 'Copy current commit context to clipboard (PR info, current commit patch, visible comments on this commit)'
+            : 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)';
         const contextBtn = createBtn(compact ? '📎' : '📎 Context', function () {
             copyPRContext(this);
-        }, 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)');
+        }, contextBtnTitle);
         contextBtn.style.borderRadius = '6px 0 0 6px';
         contextBtn.style.borderRight = 'none';
         if (compact) contextBtn.style.padding = '4px 8px';
@@ -16262,13 +16428,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    ackTest('addDetailsButtons injects fold/proofread into markdown-toolbar ActionBar', () => {
 	        const root = document.createElement('div');
 	        root.innerHTML = `
-	          <markdown-toolbar class="CommentBox-toolbar">
-	            <action-bar role="toolbar" class="ActionBar overflow-visible">
-	              <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
-	                <div class="ActionBar-item"><button type="button">Bold</button></div>
-	              </div>
-	            </action-bar>
-	          </markdown-toolbar>
+	          <div class="js-previewable-comment-form">
+	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
+	              <action-bar role="toolbar" class="ActionBar overflow-visible">
+	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
+	                  <div class="ActionBar-item"><button type="button">Bold</button></div>
+	                </div>
+	              </action-bar>
+	            </markdown-toolbar>
+	            <textarea id="comment-body"></textarea>
+	          </div>
 	        `;
 	        addDetailsButtons(root);
 	
@@ -16297,14 +16466,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    ackTest('addDetailsButtons repairs stale iconless ACKtopus ActionBar buttons', () => {
 	        const root = document.createElement('div');
 	        root.innerHTML = `
-	          <markdown-toolbar class="CommentBox-toolbar">
-	            <action-bar role="toolbar" class="ActionBar overflow-visible">
-	              <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
-	                <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-details-btn"></button></div>
-	                <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-toolbar-proofread"></button></div>
-	              </div>
-	            </action-bar>
-	          </markdown-toolbar>
+	          <div class="js-previewable-comment-form">
+	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
+	              <action-bar role="toolbar" class="ActionBar overflow-visible">
+	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
+	                  <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-details-btn"></button></div>
+	                  <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-toolbar-proofread"></button></div>
+	                </div>
+	              </action-bar>
+	            </markdown-toolbar>
+	            <textarea id="comment-body"></textarea>
+	          </div>
 	        `;
 	        addDetailsButtons(root);
 	        ackAssert(root.querySelector('.ack-details-btn svg'), 'repairs stale empty details button icon');
@@ -16337,6 +16509,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        addDetailsButtons(root);
 	        ackEq(root.querySelectorAll('.ack-details-btn').length, 0, 'should not inject into PR files toolbar');
 	        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 0, 'should not inject proofread into PR files toolbar');
+	    });
+
+	    ackTest('addDetailsButtons does not inject into PR files toolbar with unrelated textarea nearby', () => {
+	        const root = document.createElement('div');
+	        root.innerHTML = `
+	          <div>
+	            <section class="PullRequestFilesToolbar-module__toolbar__ztHN6">
+	              <button type="button">Submit review</button>
+	            </section>
+	            <textarea></textarea>
+	          </div>
+	        `;
+	        addDetailsButtons(root);
+	        ackEq(root.querySelectorAll('.ack-details-btn').length, 0, 'should not inject details button when textarea is unrelated');
+	        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 0, 'should not inject proofread button when textarea is unrelated');
 	    });
 
 		    ackTest('addDetailsButtons still injects into React formatting toolbar inside markdown editor', () => {
@@ -19085,6 +19272,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(fn.includes('if (!isIssue && includePatch)'), 'guards patch section for PRs only');
     });
 
+    ackTest('gatherSingleCommitContext focuses on current commit only', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherSingleCommitContext'), source.indexOf('function scrollToAndHighlight'));
+        ackAssert(fn.includes('# Commit from PR:'), 'labels copied context as a commit from a PR');
+        ackAssert(fn.includes('## PR Description'), 'includes PR description');
+        ackAssert(fn.includes('## Commit Patch'), 'includes current commit patch');
+        ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
+        ackAssert(!fn.includes('## Commits ('), 'does not include full PR commit list');
+        ackAssert(fn.includes("gatherVisibleComments().filter"), 'filters visible comments for current commit');
+        ackAssert(fn.includes('## Visible Comments ('), 'includes filtered visible comments section');
+    });
+
     ackTest('getCommentLocationInfo extracts file/line/commit from both tabs', () => {
         const source = _ackSource;
         const helper = source.slice(source.indexOf('function getCommentLocationInfo'), source.indexOf('function formatCommentLocation'));
@@ -19401,11 +19600,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // Helper should do the actual work and use userscript clipboard API directly.
         const helper = source.slice(source.indexOf('async function copyPRContext'), source.indexOf('async function loadAsyncPRData'));
         ackAssert(helper.includes('gatherFullPRContext'), 'copyPRContext gathers full PR context');
+        ackAssert(helper.includes('gatherSingleCommitContext'), 'copyPRContext can gather single-commit context');
         ackAssert(helper.includes('GM_setClipboard'), 'copies via GM_setClipboard');
         ackAssert(!helper.includes('navigator.clipboard'), 'does not use navigator.clipboard API');
         ackAssert(helper.includes('startBrailleAnimation'), 'shows loading spinner');
         ackAssert(helper.includes("popup.textContent"), 'updates progress popup');
         ackAssert(helper.includes("Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context"), 'shows page-type-aware initial gathering message');
+        ackAssert(helper.includes('Gathering commit context'), 'shows commit-specific initial gathering message');
     });
 
     ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
@@ -20108,6 +20309,30 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         } finally {
             GM_xmlhttpRequest = origReq;
             readViewerPendingReviewFromSSR = origRead;
+        }
+    });
+
+    ackTest('openReviewDialog ignores ACKtopus Submit review buttons', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div id="acktopus-buttons">
+                <button type="button" class="ack-submit-review-btn">Submit review</button>
+            </div>
+            <button type="button" data-testid="submit-review-button">Submit review</button>
+        `;
+        document.body.appendChild(host);
+        let ackClicks = 0;
+        let nativeClicks = 0;
+        try {
+            host.querySelector('.ack-submit-review-btn').addEventListener('click', () => ackClicks++);
+            host.querySelector('[data-testid="submit-review-button"]').addEventListener('click', () => nativeClicks++);
+            openReviewDialog();
+            ackEq(ackClicks, 0, 'does not click ACKtopus submit review button');
+            ackEq(nativeClicks, 1, 'clicks native submit review button');
+        } finally {
+            host.remove();
         }
     });
 
@@ -21478,16 +21703,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    ackTest('createReviewCommentViaPageData refreshes verified-fetch meta from /changes on 404/422', () => {
 	        ensureSelfSource();
 	        const fn = _ackSource.slice(
-	            _ackSource.indexOf('function fetchVerifiedFetchMetaFromChanges'),
+	            _ackSource.indexOf('function isTransientNetworkError'),
 	            _ackSource.indexOf('function findReviewThreadPathForReplyForm')
 	        );
+	        ackAssert(fn.includes('function pageFetchWithRetry'), 'has transient page fetch retry helper');
+	        ackAssert(fn.includes('network changed'), 'retry helper treats network changes as transient');
+	        ackAssert(fn.includes('timed out'), 'retry helper treats timeouts as transient');
+	        ackAssert(fn.includes('connection closed'), 'retry helper treats connection closes as transient');
+	        ackAssert(fn.includes('502, 503, 504'), 'retry helper retries transient gateway statuses');
 	        ackAssert(fn.includes('fetchVerifiedFetchMetaFromChanges'), 'has /changes meta helper');
 	        ackAssert(fn.includes("cache: 'no-store'") || fn.includes('cache:"no-store"'), 'forces no-store when fetching /changes meta');
+	        ackAssert(fn.includes('pageFetchWithRetry(pageFetch, url'), 'uses retry helper when fetching /changes meta');
 	        const createFn = _ackSource.slice(
 	            _ackSource.indexOf('function createReviewCommentViaPageData'),
 	            _ackSource.indexOf('function findReviewThreadPathForReplyForm')
 	        );
 	        ackAssert(createFn.includes('fetchVerifiedFetchMetaFromChanges'), 'createReviewCommentViaPageData uses /changes meta helper');
+	        ackAssert(createFn.includes('doCreateReviewFetch'), 'createReviewCommentViaPageData uses retry wrapper for writes');
 	        ackAssert(createFn.includes('fetchVerifiedFetchMetaFromChanges(pr, true)') || createFn.includes('fetchVerifiedFetchMetaFromChanges(pr,true)'), 'forces /changes meta refresh for Conversation writes');
 	        ackAssert(createFn.includes('resp.status === 404') || createFn.includes('resp.status===404'), 'retries on 404');
 	        ackAssert(createFn.includes('resp.status === 422') || createFn.includes('resp.status===422'), 'retries on 422');
