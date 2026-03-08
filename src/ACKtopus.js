@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.00
+// @version      1.21
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -59,10 +59,11 @@
         'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item-container{gap:0!important}',
         'markdown-toolbar.ack-compact-md-toolbar [data-target="action-bar.itemContainer"]{justify-content:flex-start!important;column-gap:0!important;row-gap:0!important;flex-wrap:nowrap!important}',
         'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item{margin:0!important}',
-        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item>.Button.Button--iconOnly{min-width:22px!important;min-height:22px!important;padding:0 2px!important}',
-        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item>.Button .Button-visual{width:14px!important;height:14px!important}',
-        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-divider{margin-inline:2px!important}',
+        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item>.Button.Button--iconOnly{min-width:20px!important;min-height:20px!important;padding:0 1px!important}',
+        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-item>.Button .Button-visual{width:13px!important;height:13px!important}',
+        'markdown-toolbar.ack-compact-md-toolbar .ActionBar-divider{margin-inline:1px!important}',
 	        'markdown-toolbar.ack-compact-md-toolbar .ack-toolbar-item--dock-right{margin-inline-start:auto!important}',
+	        'markdown-toolbar.ack-compact-md-toolbar .ack-toolbar-item>.Button.Button--iconOnly{min-width:20px!important;min-height:20px!important;padding:0 1px!important}',
 	        // Diff selection toolbar: keep any overflow chrome hidden
 	        '.ack-diff-selection-btnrow::-webkit-scrollbar{display:none}',
 	        '.ack-diff-selection-btnrow{-ms-overflow-style:none;scrollbar-width:none}',
@@ -71,6 +72,7 @@
 	    ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
+    let lastForcePushSignature = '';
     let userAckSha = null;    // SHA from current user's last ACK (set async)
 	    let prFileCategories = null; // { bench: [], test: [], fuzz: [], functional: [], cpp: [] } -- set async
 
@@ -2169,6 +2171,12 @@
         return [];
     }
 
+    function forcePushSignature(pushes) {
+        return (pushes || []).map(push =>
+            `${push.fromFull || push.from || ''}->${push.toFull || push.to || ''}`
+        ).join('|');
+    }
+
     // --- Force-Push Compare Enhancement ---
 
     // On PR pages, rewrite force-push Compare links:
@@ -3934,20 +3942,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const {includePatch = true, includeComments = true} = opts;
         const pr = parsePageContext();
         if (!pr) return '';
+        const isIssue = pageKind() === 'issue';
+        const itemKind = isIssue ? 'Issue' : 'PR';
+        const itemRoute = isIssue ? 'issues' : 'pull';
         const parts = [];
 
-        // 1. PR URL
-        const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
-        parts.push(`# PR: ${prUrl}`);
+        // 1. Page URL
+        const pageUrl = `https://github.com/${pr.owner}/${pr.repo}/${itemRoute}/${pr.pr}`;
+        parts.push(`# ${itemKind}: ${pageUrl}`);
 
         // 2. Title
         onProgress('Reading title & description...');
         let prTitle = '';
         let description = '';
         try {
-            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
-            prTitle = prData.title || '';
-            description = prData.body || '';
+            const pageData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/${isIssue ? 'issues' : 'pulls'}/${pr.pr}`);
+            prTitle = pageData.title || '';
+            description = pageData.body || '';
         } catch (_) {
             // Fallback to page (title + rendered description)
             if (isPRPage()) prTitle = getPRTitleText();
@@ -3960,28 +3971,30 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // 3. Description (raw markdown from API for full fidelity)
         if (description) parts.push(`## Description\n${description}`);
 
-        // 4. Commits with messages (from API for accurate SHAs + messages)
-        onProgress('Fetching commits...');
-        try {
-            const commits = await gmFetch(
-                `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=100`
-            );
-            if (commits.length > 0) {
-                const commitLines = commits.map(c =>
-                    `### ${c.sha.slice(0, 12)}\n${c.commit?.message || '(no message)'}`
-                ).join('\n\n');
-                parts.push(`## Commits (${commits.length})\n${commitLines}`);
-            }
-        } catch (_) {
-            // Fallback to page
-            const pageCommits = parseCommitsFromPage();
-            if (pageCommits.length) {
-                parts.push(`## Commits (${pageCommits.length})\n${pageCommits.map(c => `- ${c.sha.slice(0, 8)}: ${c.msg}`).join('\n')}`);
+        // 4. Commits with messages (PRs only)
+        if (!isIssue) {
+            onProgress('Fetching commits...');
+            try {
+                const commits = await gmFetch(
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=100`
+                );
+                if (commits.length > 0) {
+                    const commitLines = commits.map(c =>
+                        `### ${c.sha.slice(0, 12)}\n${c.commit?.message || '(no message)'}`
+                    ).join('\n\n');
+                    parts.push(`## Commits (${commits.length})\n${commitLines}`);
+                }
+            } catch (_) {
+                // Fallback to page
+                const pageCommits = parseCommitsFromPage();
+                if (pageCommits.length) {
+                    parts.push(`## Commits (${pageCommits.length})\n${pageCommits.map(c => `- ${c.sha.slice(0, 8)}: ${c.msg}`).join('\n')}`);
+                }
             }
         }
 
-        // 5. Full .patch (optional, for copy context and full-context LLM calls)
-        if (includePatch) {
+        // 5. Full .patch (PRs only; optional for copy context and full-context LLM calls)
+        if (!isIssue && includePatch) {
             onProgress('Fetching patch...');
             try {
                 const patch = await fetchPatch(pr);
@@ -6442,11 +6455,25 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             btn.getAttribute('name') !== 'comment_and_close'
         );
 
+        const setButtonText = (btn, text) => {
+            if (!btn) return;
+            const label = btn.querySelector?.('.Button-label');
+            if (label) label.textContent = text;
+            else btn.textContent = text;
+        };
+
         const restoreCommentBtn = () => {
-            const liveCommentBtn = document.querySelector('#new_comment_form button[data-ack-submit-orig-class], #new_comment_form .ack-submit-review-anchor button[data-ack-submit-orig-class]');
+            const liveCommentBtn =
+                form?.querySelector?.('button[data-ack-submit-orig-class], .ack-submit-review-anchor button[data-ack-submit-orig-class]')
+                || commentBtn
+                || document.querySelector('#new_comment_form button[data-ack-submit-orig-class], #new_comment_form .ack-submit-review-anchor button[data-ack-submit-orig-class]');
             if (liveCommentBtn?.dataset?.ackSubmitOrigClass) {
                 liveCommentBtn.className = liveCommentBtn.dataset.ackSubmitOrigClass;
                 delete liveCommentBtn.dataset.ackSubmitOrigClass;
+            }
+            if (liveCommentBtn) {
+                setButtonText(liveCommentBtn, 'Comment');
+                liveCommentBtn.title = '';
             }
         };
 
@@ -6467,6 +6494,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             commentBtn.dataset.ackSubmitOrigClass = commentBtn.className;
             commentBtn.classList.remove('btn-primary', 'Button--primary');
         }
+        setButtonText(commentBtn, 'Comment');
+        commentBtn.title = '';
 
         const wrap = document.createElement('div');
         wrap.className = 'color-bg-subtle ml-1 ack-submit-review-wrap ack-submit-review-anchor';
@@ -9863,6 +9892,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 }
 	            }
 
+	            const hasRenderedToolbarIcon = (btn) => !!btn?.querySelector?.('svg, img, g-emoji, .Button-visual');
+	            const removeBrokenToolbarButtons = (scope, selector) => {
+	                scope.querySelectorAll(selector).forEach(btn => {
+	                    if (hasRenderedToolbarIcon(btn)) return;
+	                    const item = btn.closest('.ack-toolbar-item');
+	                    if (item && item.parentElement) item.remove();
+	                    else btn.remove();
+	                });
+	            };
+	            removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread');
 	            let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
 	            let hasProofreadBtn = !!toolbar.querySelector('.ack-toolbar-proofread');
 	            if (hasDetailsBtn && hasProofreadBtn) return;
@@ -9884,12 +9923,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	                    const icon = btn.querySelector('svg');
 	                    if (icon) icon.classList.add('Button-visual');
 	                    Object.assign(btn.style, {
-	                        padding: '0 2px',
+	                        padding: '0 1px',
 	                    });
 	                } else {
 	                    Object.assign(btn.style, {
 	                        background: 'none', border: 'none', cursor: 'pointer',
-	                        padding: '2px 6px',
+	                        padding: '2px 5px',
 	                        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
 	                        fontSize: '14px',
 	                        opacity: '0.6', lineHeight: '1', color: 'inherit',
@@ -9955,6 +9994,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    }
 
     function wrapSelectionInDetails(toolbar) {
+        const summaryLabel = 'Details';
         const editorRoot =
             toolbar?.closest(
                 'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
@@ -9995,7 +10035,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         if (!hasSelection) {
             // Insert empty template at cursor with fenced code block
-            const template = '\n<details><summary>Details</summary>\n\n```\n\n```\n\n</details>\n';
+            const template = `\n<details><summary>${summaryLabel}</summary>\n\n\`\`\`bash\n\n\`\`\`\n\n</details>\n`;
             const cursorPos = start + template.indexOf('```\n\n```') + 4; // after opening fence + newline
             setTextareaValue(ta, text.slice(0, start) + template + text.slice(end));
             ta.focus();
@@ -10009,15 +10049,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const inner = '```\n' + selected + '\n```';
 
         // Blank lines around <details> are required for GitHub rendering
-        const wrapped = '\n<details><summary>Details</summary>\n\n' + inner + '\n\n</details>\n';
+        const wrapped = `\n<details><summary>${summaryLabel}</summary>\n\n${inner}\n\n</details>\n`;
         setTextareaValue(ta, text.slice(0, start) + wrapped + text.slice(end));
 
-        // Select the inner content so user sees what was wrapped
-        const innerStart = start + wrapped.indexOf(inner);
-        const innerEnd = innerStart + inner.length;
+        // Reselect the summary label so it is easy to rename immediately.
+        const summaryStart = start + wrapped.indexOf(summaryLabel);
+        const summaryEnd = summaryStart + summaryLabel.length;
         ta.focus();
-        ta.selectionStart = innerStart;
-        ta.selectionEnd = innerEnd;
+        ta.selectionStart = summaryStart;
+        ta.selectionEnd = summaryEnd;
     }
 
     // --- Comment Navigator ---
@@ -12362,7 +12402,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const stopSpin = startBrailleAnimation(frame => {
             btn.textContent = frame;
         });
-        const popup = makeStatusPopup('Gathering PR context...');
+        const popup = makeStatusPopup(`Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`);
 
         try {
             const context = await gatherFullPRContext(msg => {
@@ -12463,6 +12503,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (pushes.length === 0) pushes = await parseForcePushesFromAPI();
         if (!wrapper.isConnected) return;
         console.log('ACKtopus: force-pushes found:', pushes.length);
+        lastForcePushSignature = forcePushSignature(pushes);
         if (pushes.length > 0) {
             lastForcePush = pushes[pushes.length - 1];
             invalidatePRContext();
@@ -13013,6 +13054,36 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return (ctx && kind) ? `${kind}:${ctx.owner}/${ctx.repo}/${ctx.pr}` : null;
     }
 
+    function refreshToolbarForLiveUpdate(reason = 'live-update') {
+        if (!isToolbarPage()) return;
+        console.log(`ACKtopus: refreshing toolbar after ${reason}`);
+        abortAckLifetime(`toolbar-refresh:${reason}`);
+        document.getElementById(BUTTON_CONTAINER_ID)?.remove();
+        lastInjectedPR = null;
+        lastInjectedPath = null;
+        tryInject();
+        if (isPRPage()) {
+            addFloatingCommitNav();
+            hideNativeCommitNav();
+        }
+    }
+
+    function maybeRefreshToolbarForForcePushLiveUpdate() {
+        if (!isPRPage()) return false;
+        const pushes = parseForcePushesFromPage();
+        const sig = forcePushSignature(pushes);
+        if (!sig) return false;
+        if (!lastForcePushSignature) {
+            lastForcePushSignature = sig;
+            return false;
+        }
+        if (sig === lastForcePushSignature) return false;
+        lastForcePushSignature = sig;
+        lastForcePush = pushes[pushes.length - 1] || null;
+        refreshToolbarForLiveUpdate('force-push');
+        return true;
+    }
+
     function tryInject() {
         if (_ackTesting) return;
         ensureAckLifetime('tryInject');
@@ -13045,6 +13116,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 document.querySelector('.ack-submit-review-wrap')?.remove();
                 hideSubmitReviewPopover();
 		                lastForcePush = null;
+		                lastForcePushSignature = '';
 		                userAckSha = null;
 		                prFileCategories = null;
 		                commitListCache.clear();
@@ -13063,6 +13135,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		            document.querySelector('.ack-config-overlay')?.remove();
                     document.querySelector('.ack-submit-review-wrap')?.remove();
                     hideSubmitReviewPopover();
+		            lastForcePushSignature = '';
 		            clearCommitPatchCache();
 		            lastInjectedPR = null;
                     lastInjectedPath = null;
@@ -13139,6 +13212,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         document.querySelectorAll('.ack-changes-link').forEach(el => el.remove());
         _ackPendingReviewActive = false;
+        lastForcePush = null;
+        lastForcePushSignature = '';
+        userAckSha = null;
+        prFileCategories = null;
         lastInjectedPR = null;
         lastInjectedPath = null;
     });
@@ -13276,7 +13353,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.20
+// @version      1.21
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -16217,12 +16294,33 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(fn.includes("toolbar.querySelectorAll('.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-item, .ack-toolbar-actions')"), 'removes duplicates in hidden toolbar');
 	    });
 
+	    ackTest('addDetailsButtons repairs stale iconless ACKtopus ActionBar buttons', () => {
+	        const root = document.createElement('div');
+	        root.innerHTML = `
+	          <markdown-toolbar class="CommentBox-toolbar">
+	            <action-bar role="toolbar" class="ActionBar overflow-visible">
+	              <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
+	                <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-details-btn"></button></div>
+	                <div class="ActionBar-item ack-toolbar-item"><button type="button" class="Button Button--iconOnly Button--invisible Button--medium ack-toolbar-proofread"></button></div>
+	              </div>
+	            </action-bar>
+	          </markdown-toolbar>
+	        `;
+	        addDetailsButtons(root);
+	        ackAssert(root.querySelector('.ack-details-btn svg'), 'repairs stale empty details button icon');
+	        ackAssert(root.querySelector('.ack-toolbar-proofread svg'), 'repairs stale empty proofread button icon');
+	    });
+
 	    ackTest('compact markdown ActionBar CSS is present', () => {
 	        const source = _ackSource;
 	        ackAssert(source.includes('ack-compact-md-toolbar .ActionBar-item-container'),
 	            'injects compact ActionBar item-container spacing rule');
 	        ackAssert(source.includes('ack-compact-md-toolbar .ActionBar-item>.Button.Button--iconOnly'),
 	            'injects compact icon-only button sizing rule');
+	        ackAssert(source.includes("min-width:20px!important;min-height:20px!important;padding:0 1px!important"),
+	            'uses tighter compact icon button sizing');
+	        ackAssert(source.includes("width:13px!important;height:13px!important"),
+	            'uses slightly smaller compact toolbar icons');
 	        ackAssert(source.includes('ack-compact-md-toolbar [data-target="action-bar.itemContainer"]'),
 	            'forces left alignment and no-wrap on item container');
 	        ackAssert(source.includes('ack-compact-md-toolbar .ack-toolbar-item--dock-right{margin-inline-start:auto!important'),
@@ -16418,11 +16516,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(fn.includes('[id^="issue-"]') || fn.includes('issue-\\d+'), 'matches issue-NNN id');
     });
 
-    ackTest('second MutationObserver short-circuits when URL unchanged', () => {
+    ackTest('second MutationObserver only runs on same-URL live updates', () => {
         const source = _ackSource;
-        // The second observer should check location.href === lastUrl before scheduling work
+        // The second observer is for same-URL force-push updates, so it should
+        // return early on actual navigations.
         const secondObserver = source.slice(source.lastIndexOf('new MutationObserver'));
-        ackAssert(secondObserver.includes('location.href === lastUrl'), 'short-circuits on unchanged URL');
+        ackAssert(secondObserver.includes('location.href !== lastUrl'), 'short-circuits on changed URL');
     });
 
     // ============================================================================
@@ -17537,7 +17636,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     ackTest('autoCollapseCompareFiles is called from tryInject', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function tryInject'), source.indexOf('tryInject();'));
+        const start = source.indexOf('function tryInject');
+        const end = source.indexOf('tryInject();', start);
+        const fn = source.slice(start, end);
         ackAssert(fn.includes('autoCollapseCompareFiles()'), 'called from tryInject');
     });
 
@@ -17588,6 +17689,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const proofFn = source.slice(source.indexOf('async function runProofreadOnComment'), source.indexOf('// --- Pending Review'));
         const matches = proofFn.match(/invalidatePRContext/g) || [];
         ackAssert(matches.length >= 2, `invalidated in both proofread submit paths (found ${matches.length})`);
+    });
+
+    ackTest('same-URL force-push live updates trigger toolbar refresh', () => {
+        const source = _ackSource;
+        const helper = source.slice(source.indexOf('function maybeRefreshToolbarForForcePushLiveUpdate'), source.indexOf('function tryInject'));
+        ackAssert(helper.includes('parseForcePushesFromPage()'), 'rechecks force-push timeline items from live DOM');
+        ackAssert(helper.includes('lastForcePushSignature'), 'tracks last seen force-push signature');
+        ackAssert(helper.includes("refreshToolbarForLiveUpdate('force-push')"), 'refreshes toolbar when force-push signature changes');
+
+        const observerStart = source.lastIndexOf("let liveRefreshPending = false");
+        const observerEnd = source.indexOf('})();', observerStart);
+        const observer = source.slice(observerStart, observerEnd);
+        ackAssert(observer.includes('location.href !== lastUrl'), 'same-URL observer ignores actual navigations');
+        ackAssert(observer.includes('maybeRefreshToolbarForForcePushLiveUpdate()'), 'same-URL observer checks for force-push live updates');
     });
 
     ackTest('buildContextBlock is exported and respects char budgets', () => {
@@ -18815,7 +18930,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     ackTest('tryInject uses isToolbarPage for injection gate', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function tryInject'), source.indexOf('tryInject();'));
+        const start = source.indexOf('function tryInject');
+        const end = source.indexOf('tryInject();', start);
+        const fn = source.slice(start, end);
         ackAssert(fn.includes('isToolbarPage()'), 'uses isToolbarPage');
     });
 
@@ -18866,7 +18983,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function wrapSelectionInDetails'), source.indexOf('// --- Commit Explain'));
         ackAssert(fn.includes('!hasSelection'), 'checks for no selection');
-        ackAssert(fn.includes('<details><summary>Details</summary>'), 'inserts details template');
+        ackAssert(fn.includes("const summaryLabel = 'Details';"), 'defines default details summary label');
+        ackAssert(fn.includes('<details><summary>${summaryLabel}</summary>'), 'inserts details template');
         ackAssert(fn.includes("'```\\n\\n```'") || fn.includes('```\\n\\n```'), 'template includes empty code block');
         ackAssert(fn.includes('ta.selectionStart = ta.selectionEnd = cursorPos'), 'positions cursor inside code block');
     });
@@ -18944,7 +19062,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackEq(typeof gatherFullPRContext, 'function', 'gatherFullPRContext exported');
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
-        ackAssert(fn.includes("# PR:"), 'includes PR URL header');
+        ackAssert(fn.includes("const itemKind = isIssue ? 'Issue' : 'PR'"), 'labels page as issue or PR');
+        ackAssert(fn.includes('parts.push(`# ${itemKind}: ${pageUrl}`)'), 'includes issue/PR URL header');
         ackAssert(fn.includes("## Title"), 'includes title section');
         ackAssert(fn.includes("## Description"), 'includes description section');
         ackAssert(fn.includes("## Commits"), 'includes commits section');
@@ -18954,6 +19073,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(fn.includes('fetchPatch(pr)'), 'fetches .patch');
         ackAssert(fn.includes('onProgress'), 'calls progress callback');
         ackAssert(fn.includes('includePatch'), 'respects includePatch option');
+    });
+
+    ackTest('gatherFullPRContext skips PR-only sections on issue pages', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
+        ackAssert(fn.includes("const isIssue = pageKind() === 'issue'"), 'detects issue pages');
+        ackAssert(fn.includes("const itemRoute = isIssue ? 'issues' : 'pull'"), 'uses issue route for copied URL');
+        ackAssert(fn.includes("https://api.github.com/repos/${pr.owner}/${pr.repo}/${isIssue ? 'issues' : 'pulls'}/${pr.pr}"), 'uses issue API endpoint for title/description');
+        ackAssert(fn.includes('if (!isIssue) {'), 'guards commits section for PRs only');
+        ackAssert(fn.includes('if (!isIssue && includePatch)'), 'guards patch section for PRs only');
     });
 
     ackTest('getCommentLocationInfo extracts file/line/commit from both tabs', () => {
@@ -19276,7 +19405,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(!helper.includes('navigator.clipboard'), 'does not use navigator.clipboard API');
         ackAssert(helper.includes('startBrailleAnimation'), 'shows loading spinner');
         ackAssert(helper.includes("popup.textContent"), 'updates progress popup');
-        ackAssert(helper.includes("Gathering PR context"), 'shows initial gathering message');
+        ackAssert(helper.includes("Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context"), 'shows page-type-aware initial gathering message');
     });
 
     ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
@@ -19443,7 +19572,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(fn.includes('_comparePath !== location.pathname'), 'detects pathname change');
         ackAssert(fn.includes("_compareActive = false"), 'resets active state on path change');
         // Also check tryInject resets _comparePath
-        const tryInjectFn = source.slice(source.indexOf('function tryInject()'), source.indexOf('tryInject();'));
+        const start = source.indexOf('function tryInject()');
+        const end = source.indexOf('tryInject();', start);
+        const tryInjectFn = source.slice(start, end);
         ackAssert(tryInjectFn.includes("_comparePath = ''"), 'tryInject resets _comparePath when leaving compare');
     });
 
@@ -19872,7 +20003,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 <form class="js-new-comment-form">
                   <textarea id="new_comment_field">hello</textarea>
                   <div id="partial-new-comment-form-actions">
-                    <div class="color-bg-subtle mt-2"><button type="submit" class="btn-primary btn">Comment</button></div>
+                    <div class="color-bg-subtle mt-2"><button type="submit" class="btn-primary btn">Submit review</button></div>
                   </div>
                 </form>
             `;
@@ -19882,6 +20013,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 ackAssert(!host.querySelector('.ack-submit-review-btn'), 'does not inject Submit review button');
                 ackAssert(!host.querySelector('.ack-submit-review-wrap'), 'does not leave submit review wrapper');
                 ackAssert(host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'keeps main Comment button styling unchanged');
+                ackEq(host.querySelector('button[type="submit"]').textContent.trim(), 'Comment', 'restores main button label to Comment');
+                ackEq(host.querySelector('button[type="submit"]').title || '', '', 'clears submit review wording from main button');
             } finally {
                 host.remove();
             }
@@ -20185,15 +20318,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function wrapSelectionInDetails'), source.indexOf('// --- Commit Explain'));
         // Template and wrapped output should have \n before <details> and after </details>
-        ackAssert(fn.includes("'\\n<details>"), 'newline before <details>');
-        ackAssert(fn.includes("</details>\\n'"), 'newline after </details>');
+        ackAssert(fn.includes("`\\n<details><summary>${summaryLabel}</summary>"), 'newline before <details>');
+        ackAssert(fn.includes('</details>\\n`'), 'newline after </details>');
     });
 
-    ackTest('wrapSelectionInDetails preserves selection on wrapped content', () => {
+    ackTest('wrapSelectionInDetails reselects summary label after wrapping', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function wrapSelectionInDetails'), source.indexOf('// --- Commit Explain'));
-        ackAssert(fn.includes('ta.selectionStart = innerStart'), 'sets selectionStart to inner content');
-        ackAssert(fn.includes('ta.selectionEnd = innerEnd'), 'sets selectionEnd to inner content');
+        ackAssert(fn.includes("const summaryLabel = 'Details';"), 'defines reusable summary label');
+        ackAssert(fn.includes('const summaryStart = start + wrapped.indexOf(summaryLabel)'), 'sets selectionStart to summary content');
+        ackAssert(fn.includes('ta.selectionStart = summaryStart'), 'reselects summary label start');
+        ackAssert(fn.includes('ta.selectionEnd = summaryEnd'), 'reselects summary label end');
     });
 
     ackTest('proofread uses deterministic post-processing for collapsibles and alerts', () => {
@@ -21007,8 +21142,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.20', () => {
-        ackAssert(_ackSource.includes('@version      1.20'), 'version is 1.20');
+    ackTest('version bumped to 1.21', () => {
+        ackAssert(_ackSource.includes('@version      1.21'), 'version is 1.21');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -21875,6 +22010,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // Snapshot mutable global state that live GitHub sessions may have already populated.
         const stateSnapshot = {
             lastForcePush,
+            lastForcePushSignature,
             userAckSha,
             prFileCategories,
             selectedFormat,
@@ -21946,6 +22082,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const resetUnitState = () => {
             // Keep unit tests independent from live session state.
             lastForcePush = null;
+            lastForcePushSignature = '';
             userAckSha = null;
             prFileCategories = null;
             selectedFormat = 'ack';
@@ -21990,6 +22127,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             _ackTesting = false;
             // Restore mutable globals.
             lastForcePush = stateSnapshot.lastForcePush;
+            lastForcePushSignature = stateSnapshot.lastForcePushSignature;
             userAckSha = stateSnapshot.userAckSha;
             prFileCategories = stateSnapshot.prFileCategories;
             selectedFormat = stateSnapshot.selectedFormat;
@@ -22222,6 +22360,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            pending = false;
 	            checkUrlChange();
 	            if (isToolbarPage()) tryInject();
+	        }, 500);
+	    }).observe(document.body, { childList: true, subtree: true });
+
+	    let liveRefreshPending = false;
+	    new MutationObserver(() => {
+	        if (_ackTesting) return;
+	        if (liveRefreshPending || location.href !== lastUrl) return;
+	        liveRefreshPending = true;
+	        ackSetTimeout(() => {
+	            liveRefreshPending = false;
+	            maybeRefreshToolbarForForcePushLiveUpdate();
 	        }, 500);
 	    }).observe(document.body, { childList: true, subtree: true });
 })();
