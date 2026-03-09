@@ -7608,10 +7608,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         {name: 'prefillCommitHash', when: ctx => ctx.onPR, fn: prefillCommitHash},
         {name: 'queueLazyComments', when: ctx => ctx.onToolbar, fn: queueLazyComments},
         {name: 'startReviewButtons', when: ctx => ctx.onPR, fn: addStartReviewButtons},
-        {name: 'detailsButtons', when: ctx => ctx.onToolbar, fn: addDetailsButtons},
-        {name: 'trackEditForms', when: ctx => ctx.onToolbar, fn: trackEditForms},
-        {name: 'prTitleProofread', when: ctx => ctx.onPR, fn: addPRTitleProofreadButton},
-        {name: 'stickyEditToolbar', when: ctx => ctx.onToolbar, fn: makeStickyEditToolbar},
+        {name: 'detailsButtons', when: ctx => ctx.onToolbar || ctx.onCompose, fn: addDetailsButtons},
+        {name: 'trackEditForms', when: ctx => ctx.onToolbar || ctx.onCompose, fn: trackEditForms},
+        {name: 'prTitleProofread', when: ctx => ctx.onPR || ctx.onCompose, fn: addPRTitleProofreadButton},
+        {name: 'stickyEditToolbar', when: ctx => ctx.onToolbar || ctx.onCompose, fn: makeStickyEditToolbar},
         {name: 'quickActions', when: ctx => ctx.onToolbar, fn: addQuickCommentActions},
         {name: 'reactionHover', when: ctx => ctx.onToolbar, fn: autoOpenReactionPopup},
     ];
@@ -7625,7 +7625,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     ];
 
     function currentInjectContext() {
-        return {onPR: isPRPage(), onToolbar: isToolbarPage()};
+        return {onPR: isPRPage(), onToolbar: isToolbarPage(), onCompose: isPRCreationPage()};
+    }
+
+    function shouldRunEditorInjectors() {
+        return isToolbarPage() || isPRCreationPage();
     }
 
     function runRootInjectors(root, ctx = currentInjectContext()) {
@@ -7654,7 +7658,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    let mutationPending = false;
 	    let _domObserverAbortGen = 0;
 	    new MutationObserver((mutations) => {
-	        if (_ackTesting || mutationPending || !isToolbarPage()) return;
+	        if (_ackTesting || mutationPending || !shouldRunEditorInjectors()) return;
 	        const lt = ensureAckLifetime('dom-observer');
 	        if (lt.gen !== _domObserverAbortGen) {
 	            _domObserverAbortGen = lt.gen;
@@ -7686,7 +7690,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             }
             // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
             focusVisibleDeleteCommentConfirmButton();
-            if (prTitleBtnRemoved && ctx.onPR) addPRTitleProofreadButton(document);
+            if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
             runDocInjectors(ctx);
         });
     }).observe(document.body, {childList: true, subtree: true});
@@ -7697,7 +7701,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	    let attrRefreshPending = false;
 	    let _attrObserverAbortGen = 0;
 	    new MutationObserver((mutations) => {
-	        if (_ackTesting || attrRefreshPending || !isToolbarPage()) return;
+	        if (_ackTesting || attrRefreshPending || !shouldRunEditorInjectors()) return;
 	        for (const m of mutations) {
 	            if (!m.target?.closest?.(COMMENT_CONTAINER_SELECTOR)) continue;
 	            const lt = ensureAckLifetime('attr-observer');
@@ -8429,7 +8433,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     // --- PR Title Proofread ---
     function findPRTitleDom() {
-        if (!isPRPage()) return {headerRoot: null, titleHost: null, titleTextEl: null};
+        const draftInput = document.querySelector(
+            'input[name="pull_request[title]"], input#pull_request_title, input[id*="pull_request_title"], ' +
+            'input[aria-label*="title" i], input[data-testid*="title" i]'
+        );
+        if (!isPRPage() && !isPRCreationPage()) return {headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null};
+        if (!isPRPage() && draftInput) {
+            const draftHost =
+                draftInput.closest('.discussion-timeline-actions, .gh-header, form, .subnav, .Box')
+                || draftInput.parentElement
+                || document.body;
+            return {headerRoot: draftHost, titleHost: draftHost, titleTextEl: draftInput, titleInputEl: draftInput};
+        }
         const headerRoot =
             document.getElementById('partial-discussion-header')
             || document.querySelector('[data-testid*="issue-viewer-header" i], [data-testid*="pull-request-header" i], [data-testid*="issue-header" i]')
@@ -8449,9 +8464,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             );
             if (directTitle) {
                 const directHost = directTitle.closest('h1, [data-testid*="issue" i], [data-testid*="pull-request" i]') || directTitle.parentElement || headerRoot;
-                return {headerRoot, titleHost: directHost, titleTextEl: directTitle};
+                return {headerRoot, titleHost: directHost, titleTextEl: directTitle, titleInputEl: null};
             }
-            return {headerRoot, titleHost: null, titleTextEl: null};
+            return {headerRoot, titleHost: null, titleTextEl: null, titleInputEl: null};
         }
 
         const candidates = [];
@@ -8476,12 +8491,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 bestLen = t.length;
             }
         }
-        return {headerRoot, titleHost: host, titleTextEl: best || host};
+        return {headerRoot, titleHost: host, titleTextEl: best || host, titleInputEl: null};
     }
 
     function getPRTitleText() {
-        const {titleHost, titleTextEl} = findPRTitleDom();
-        let text = titleTextEl?.textContent?.trim() || '';
+        const {titleHost, titleTextEl, titleInputEl} = findPRTitleDom();
+        let text = (titleInputEl?.value || titleTextEl?.textContent || '').trim();
         if (titleHost) {
             const numEl = [...titleHost.querySelectorAll('span, bdi')].find(el => /^#\d+$/.test(el.textContent.trim()));
             const numText = numEl?.textContent?.trim();
@@ -8492,10 +8507,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function addPRTitleProofreadButton(root = document) {
-        if (!isPRPage()) return;
+        if (!isPRPage() && !isPRCreationPage()) return;
         // Ignore root parameter: PR header is unique; searching document is more robust
         // across GitHub re-renders and mutation subtrees.
-        const {titleHost, titleTextEl} = findPRTitleDom();
+        const {titleHost, titleTextEl, titleInputEl} = findPRTitleDom();
         if (!titleHost) return;
 
         const existingBtns = [...document.querySelectorAll('.ack-pr-title-proofread')];
@@ -8509,7 +8524,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             || titleHost.closest('[class*="PageHeader"], header')?.querySelector?.('[data-component="PH_Actions"]')
             || document.querySelector('#partial-discussion-header .gh-header-actions, .gh-header-actions');
         const actionsGroup = actions?.querySelector?.('.d-flex.gap-1') || actions;
-        const insertionRoot = actionsGroup || titleHost;
+        const insertionRoot = titleInputEl?.parentElement || actionsGroup || titleHost;
 
         if (existing && existing.isConnected) {
             if (insertionRoot && insertionRoot.contains(existing)) return;
@@ -8551,6 +8566,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             e.stopPropagation();
             runProofreadOnPRTitle(btn).catch(err => console.error('ACKtopus: PR title proofread failed:', err));
         });
+
+        if (titleInputEl?.parentElement) {
+            titleInputEl.parentElement.insertBefore(btn, titleInputEl.nextSibling);
+            return;
+        }
 
         if (actionsGroup) {
             const editBtn = [...actionsGroup.querySelectorAll('button')].find(b => /^edit$/i.test(b.textContent.trim()));
@@ -8623,19 +8643,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             document.body.appendChild(buildConfigPanel());
             return;
         }
-        if (!isPRPage()) return;
+        if (!isPRPage() && !isPRCreationPage()) return;
 
         const provider = active;
         const pr = parsePageContext();
-        if (!pr) return;
 
         // Re-query title right before we start (React may have re-rendered)
-        const {titleHost, headerRoot} = findPRTitleDom();
+        const {titleHost, headerRoot, titleInputEl} = findPRTitleDom();
         const titleInput = (titleHost || headerRoot || document).querySelector?.(
             'input[name="issue[title]"], input[name="pull_request[title]"], ' +
             'input#issue_title, input[id*="issue_title"], input[aria-label*="title" i], ' +
             'input[data-testid*="title" i]'
-        ) || null;
+        ) || titleInputEl || null;
         const original = (titleInput && isVisible(titleInput) ? titleInput.value : getPRTitleText()).trim();
         if (!original) return;
 
@@ -8650,8 +8669,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 if (!body) return '';
                 return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
             };
-            if (ctx.description) parts.push(wrap('PR description', ctx.description.slice(0, 8000)));
-            if (ctx.commitMessages) parts.push(wrap('Commit messages', ctx.commitMessages.slice(0, 12000)));
+            const draftBody = document.querySelector('textarea[name="pull_request[body]"], textarea#pull_request_body')?.value?.trim() || '';
+            const pageCommits = parseCommitsFromPage().map(c => `${c.sha.slice(0, 8)} ${c.msg}`).join('\n');
+            if (ctx.description || draftBody) parts.push(wrap('PR description', (ctx.description || draftBody).slice(0, 8000)));
+            if (ctx.commitMessages || pageCommits) parts.push(wrap('Commit messages', (ctx.commitMessages || pageCommits).slice(0, 12000)));
             const ctxBlock = parts.length
                 ? `\n\nContext (for understanding only; do NOT include in title):\n\n${parts.join('\n\n')}`
                 : '';
@@ -11066,7 +11087,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 			    let _diffSelectionMouseIsDown = false;
 			    let _diffSelectionMouseDownSeq = 0;
 			    let _diffSelectionUiMouseDown = false;
-			    let _diffSelectionMetaHeld = false;
+                let _diffSelectionCopySuppressUntil = 0;
 
 			    function diffSelectionCtxKey(ctx) {
 			        if (!ctx) return '';
@@ -11087,9 +11108,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 			        if (!el) return;
 			        if (mode === 'one-liner') {
 			            Object.assign(el.style, {
-			                overflow: 'hidden',
-			                minHeight: '4.05em',
-			                maxHeight: '4.05em',
+			                overflow: 'auto',
+			                minHeight: '0',
+			                maxHeight: '60vh',
 			                color: '#8b949e',
 			                fontSize: '11px',
 			            });
@@ -11136,18 +11157,28 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
 	        const scheduleUpdate = () => {
 	            if (_ackTesting) return;
+                const selectionDelayMs = 300;
 	            const mouseDownSeqAtSchedule = _diffSelectionMouseDownSeq;
 	            if (_diffSelectionTimer) ackClearTimeout(_diffSelectionTimer);
 	            _diffSelectionTimer = ackSetTimeout(() => {
 	                _diffSelectionTimer = null;
 	                if (_diffSelectionMouseIsDown) return;
 	                if (mouseDownSeqAtSchedule !== _diffSelectionMouseDownSeq) return;
+                    if (Date.now() < _diffSelectionCopySuppressUntil) return;
+                    // If the user deselected before the delay elapsed, do not show the helper
+                    // and do not start the one-line LLM request.
+                    const sel = window.getSelection?.();
+                    if (!sel || sel.isCollapsed || !sel.toString?.().trim()) {
+                        hideDiffSelectionToolbar();
+                        hideDiffSelectionTooltip();
+                        return;
+                    }
 	                try {
 	                    updateDiffSelectionToolbar();
 	                } catch (e) {
 	                    console.warn('ACKtopus: updateDiffSelectionToolbar failed:', e);
 	                }
-	            }, 100);
+	            }, selectionDelayMs);
 	        };
 
 	        // Only show the helper UI after the user completes a selection.
@@ -11160,12 +11191,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	                return;
 	            }
 	            _diffSelectionMouseIsDown = false;
-	            if (_diffSelectionMetaHeld || e.metaKey) {
-	                _diffSelectionMetaHeld = false;
-	                hideDiffSelectionToolbar();
-	                hideDiffSelectionTooltip();
-	                return;
-	            }
 	            scheduleUpdate();
 	        }, true);
 
@@ -11183,7 +11208,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        document.addEventListener('mousedown', (e) => {
 	            if (_ackTesting) return;
 	            const t = e.target;
-	            _diffSelectionMetaHeld = !!e.metaKey;
 	            if (_diffSelectionToolbar && _diffSelectionToolbar.contains(t)) {
 	                _diffSelectionUiMouseDown = true;
 	                return;
@@ -11200,8 +11224,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            hideDiffSelectionTooltip();
 	        }, true);
 
-        document.addEventListener('keydown', (e) => {
+	        document.addEventListener('keydown', (e) => {
             if (_ackTesting) return;
+            if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && String(e.key || '').toLowerCase() === 'c') {
+                const sel = window.getSelection?.();
+                if (sel && !sel.isCollapsed && sel.toString?.().trim() && !isNodeInsideTextInput(sel.anchorNode) && !isNodeInsideTextInput(sel.focusNode)) {
+                    _diffSelectionCopySuppressUntil = Date.now() + 1200;
+                    hideDiffSelectionToolbar();
+                    hideDiffSelectionTooltip();
+                    return;
+                }
+            }
             if (e.key === 'Escape') {
                 hideDiffSelectionToolbar();
                 hideDiffSelectionTooltip();
@@ -11321,6 +11354,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		        return parts.join('\n---\n');
 		    }
 
+    function findSelectionParentText(rootEl) {
+        if (!rootEl) return '';
+        const parentTextEl =
+            rootEl.closest?.(MARKDOWN_BODY_SELECTOR)
+            || rootEl.closest?.('.commit-desc pre, span.text-mono.ws-pre-wrap.f6, [data-testid="commit-title"], .markdown-title')
+            || rootEl.closest?.('td.blob-code, td.diff-text, td.diff-text-cell, .blob-code-inner, .diff-text-cell, code.diff-text')
+            || null;
+        const fallbackText = (!parentTextEl && rootEl?.textContent) ? rootEl.textContent : '';
+        const text = parentTextEl?.innerText || parentTextEl?.textContent || fallbackText;
+        return String(text || '').replace(/\r\n/g, '\n').trim();
+    }
+
     function getDiffSelectionLineMeta(node) {
         const el = node?.nodeType === 1 ? node : node?.parentElement;
         if (!el) return null;
@@ -11386,6 +11431,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            ? range.commonAncestorContainer
 	            : range.commonAncestorContainer?.parentElement;
 	        const commitSha = shaMatch?.[1] || findCommitShaNearSelection(rootEl) || '';
+                const isPRDescription = !!rootEl?.closest?.('#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]');
 
 	        const file = startMeta?.fileName || endMeta?.fileName || '';
 	        const startLabel = ((startMeta?.side || '') + (startMeta?.lineNum || '')).trim();
@@ -11406,6 +11452,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
 		        let source = '';
 		        let threadText = '';
+                const parentText = findSelectionParentText(rootEl);
 		        const container = rootEl?.closest?.(
 		            COMMENT_CONTAINER_SELECTOR +
 		            ', [id^="discussion_"], [id^="issuecomment-"], [id^="pullrequestreview-"]'
@@ -11440,6 +11487,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		            rect,
 		            contextLines: contextLines.slice(0, 6).join('\n'),
 		            source,
+		            parentText,
+                            isPRDescription,
 		            threadText,
 		        };
 		    }
@@ -11726,7 +11775,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		        });
 
 			        try {
-			            const prCtx = mode === 'factcheck' ? await fetchPRContext(ctx.pr) : null;
+			            const prCtx = ctx.pr ? await fetchPRContext(ctx.pr) : null;
 			            const aid = (mode === 'proofread' || mode === 'factcheck') ? null : getCachedCommitReviewAid(ctx.pr, ctx.commitSha);
 			            const aidText = aid ? formatCommitReviewAidForPrompt(aid) : '';
 		            const prOverview = getCachedPRLightbulbOverview(ctx.pr, provider);
@@ -11743,7 +11792,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            ].filter(Boolean).join(' | ');
 
 	            const selectionBlock = (mode === 'factcheck' ? `Claim:\n${ctx.text}` : `Selected text:\n${ctx.text}`);
+	            const parentTextBlock = (ctx.parentText && ctx.parentText !== ctx.text)
+	                ? `Containing text block:\n${ctx.parentText.slice(0, 12000)}`
+	                : '';
 	            const nearby = (mode === 'factcheck' || !ctx.contextLines) ? '' : `Nearby lines:\n${ctx.contextLines}`;
+                const descriptionBlock = (!ctx.isPRDescription && prCtx?.description)
+                    ? `PR description:\n${prCtx.description.slice(0, 8000)}`
+                    : '';
 	            let patchText = patch || '';
 	            if (patchText.length > 260000) {
 	                const headLen = Math.floor(260000 * 0.7);
@@ -11802,6 +11857,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 			                user = [
 			                    loc,
 			                    selectionBlock,
+			                    parentTextBlock,
 			                    threadBlock,
 			                    prOverviewText,
 			                    titleText ? `PR title:\n${titleText}` : '',
@@ -11813,7 +11869,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		                user = [
 		                    loc,
 		                    selectionBlock,
+		                    parentTextBlock,
 		                    nearby,
+		                    descriptionBlock,
 		                    prOverviewText ? `\n---\n\n${prOverviewText}` : '',
 		                    aidText ? `\n---\n\n${aidText}` : '',
 		                    patchBlock ? `\n---\n\n${patchBlock}` : '',
@@ -11978,7 +12036,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		        if (_diffSelectionOutputMode === 'one-liner') updateDiffSelectionOneLiner(ctx);
 			    }
 
-			    function updateDiffSelectionOneLiner(ctx) {
+		    async function updateDiffSelectionOneLiner(ctx) {
 			        const el = _diffSelectionOneLinerEl;
 			        if (!el) return;
 			        const {provider, model} = getTooltipLLMTarget();
@@ -12008,16 +12066,28 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		            ctx.source ? ctx.source : '',
 		        ].filter(Boolean).join(' | ');
 
-			        const sel = (ctx.text || '').trim().replace(/\r\n/g, '\n');
+			        const selectedText = (ctx.text || '').trim().replace(/\r\n/g, '\n');
+                    const parentText = (ctx.parentText || '').trim().replace(/\r\n/g, '\n');
 			        const prOverview = getCachedPRLightbulbOverview(pr, provider);
+                    const prCtx = await fetchPRContext(pr);
 			        const overviewText = prOverview?.text ? prOverview.text.slice(0, 1200) : '';
 			        const maxChars = 4000; // keep high; output scrolls in UI if needed
-			        const snippet = sel.length > maxChars ? sel.slice(0, maxChars) + '\n…' : sel;
+			        const snippet = selectedText.length > maxChars ? selectedText.slice(0, maxChars) + '\n…' : selectedText;
+                    const parentSnippet = (parentText && parentText !== selectedText)
+                        ? (parentText.length > maxChars ? parentText.slice(0, maxChars) + '\n…' : parentText)
+                        : '';
+                    const prDescription = (!ctx.isPRDescription && prCtx?.description) ? prCtx.description.slice(0, 3000) : '';
 			        // Keep this cheap/fast: minimal input, deterministic output, short response.
 			        // Important: the user can already read the selection; we need context ("what role does this play?"),
 			        // not a paraphrase of the selected text.
 			        const system = 'In 1-2 very short lines (max 180 chars total), describe the role/purpose of the selection in the change. Do NOT rephrase/paraphrase the selection. Add missing context, implications, or intent. No markdown, no quotes, no preamble.';
-				        const user = `${loc}${overviewText ? `\n\nPR overview:\n${overviewText}` : ''}\n\nSelection:\n${snippet}`;
+				        const user = [
+                            loc || location.href,
+                            overviewText ? `PR overview:\n${overviewText}` : '',
+                            prDescription ? `PR description:\n${prDescription}` : '',
+                            parentSnippet ? `Containing text block:\n${parentSnippet}` : '',
+                            `Selection:\n${snippet}`,
+                        ].filter(Boolean).join('\n\n');
 			        const key = hashPrompt(provider + '\0' + model + '\0' + system + '\0' + user);
 			        if (key === _diffSelectionOneLinerKey && el.textContent && el.textContent !== '…') return;
 			        _diffSelectionOneLinerKey = key;
@@ -12646,7 +12716,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (panel) {
                 panel.style.display = GM_getValue('ackPanelVisible', false) ? '' : 'none';
                 const tbWidth = toolbar.offsetWidth;
-                if (tbWidth > 0) panel.style.maxWidth = tbWidth + 'px';
+                if (tbWidth > 0) {
+                    panel.style.width = tbWidth + 'px';
+                    panel.style.minWidth = tbWidth + 'px';
+                    panel.style.maxWidth = tbWidth + 'px';
+                }
                 panel.style.boxSizing = 'border-box';
                 const existingPanel = document.getElementById(ACK_PANEL_ID);
                 if (existingPanel) existingPanel.replaceWith(panel);
@@ -13174,6 +13248,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return /\/issues\/\d+/.test(path);
     }
 
+    function isPRCreationPage(path = location.pathname, root = document) {
+        if (!/\/compare\/[^/]+\.\.\.?[^/]+/.test(path)) return false;
+        return !!root?.querySelector?.(
+            'input[name="pull_request[title]"], textarea[name="pull_request[body]"], ' +
+            'input#pull_request_title, textarea#pull_request_body'
+        );
+    }
+
     function isToolbarPage(path = location.pathname) {
         return isPRPage(path) || isIssuePage(path);
     }
@@ -13290,10 +13372,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	                invalidatePRContext();
 	                resetCommentNav();
 	            }
-            inject();
-            normalizeUnreadTimelineUrls();
-            lastInjectedPR = prKey;
-            lastInjectedPath = location.pathname;
+	            inject();
+	            normalizeUnreadTimelineUrls();
+	            lastInjectedPR = prKey;
+	            lastInjectedPath = location.pathname;
+		        } else if (isPRCreationPage()) {
+		            runRootInjectors(document, currentInjectContext());
+		            lastInjectedPR = null;
+		            lastInjectedPath = location.pathname;
 		        } else {
 		            const old = document.getElementById(BUTTON_CONTAINER_ID);
 		            if (old) old.remove();
@@ -15344,6 +15430,22 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(section.includes("querySelectorAll?.('textarea')"), 'fallback scans textareas within editor root');
 	    });
 
+	    ackTest('PR title proofread supports compare-page draft forms', () => {
+	        const source = _ackSource;
+	        const domFn = source.slice(source.indexOf('function findPRTitleDom'), source.indexOf('function getPRTitleText'));
+	        ackAssert(domFn.includes('input[name="pull_request[title]"]'), 'findPRTitleDom looks for draft PR title input');
+	        ackAssert(domFn.includes('!isPRPage() && !isPRCreationPage()'), 'findPRTitleDom allows compare/new-PR pages');
+
+	        const addFn = source.slice(source.indexOf('function addPRTitleProofreadButton'), source.indexOf('async function applyPRTitleEdit'));
+	        ackAssert(addFn.includes('titleInputEl?.parentElement'), 'title proofread button can attach next to visible draft title input');
+
+	        const runFn = source.slice(source.indexOf('async function runProofreadOnPRTitle'), source.indexOf('function addQuickCommentActions'));
+	        ackAssert(runFn.includes('!isPRPage() && !isPRCreationPage()'), 'title proofread runs on compare/new-PR pages too');
+	        ackAssert(!runFn.includes('if (!pr) return;'), 'title proofread does not require an existing PR object');
+	        ackAssert(runFn.includes('parseCommitsFromPage()'), 'draft title proofread can use page commit messages as context');
+	        ackAssert(runFn.includes('textarea[name="pull_request[body]"]'), 'draft title proofread can use current description draft as context');
+	    });
+
     // ============================================================================
     // Delete flow -- no duplicate confirm
     // ============================================================================
@@ -16633,6 +16735,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(obsSection.includes('ackRaf(() => {'), 'uses ackRaf (cancellable) instead of requestAnimationFrame');
 	    });
 
+	    ackTest('DOM observer editor gate includes compare-page compose mode', () => {
+	        const source = _ackSource;
+	        const helper = source.slice(source.indexOf('function shouldRunEditorInjectors'), source.indexOf('function tryInject'));
+	        ackAssert(helper.includes('isPRCreationPage()'), 'editor injector gate includes compare/new-PR page');
+	        const obsSection = source.slice(source.indexOf('new MutationObserver((mutations)'), source.indexOf('// Attribute observer'));
+	        ackAssert(obsSection.includes('shouldRunEditorInjectors()'), 'DOM observer uses editor injector gate');
+	    });
+
     ackTest('observer-called helpers accept root parameter (not always document)', () => {
         const source = _ackSource;
         for (const fn of ['addQuickCommentActions', 'addDetailsButtons', 'addStartReviewButtons', 'makeStickyEditToolbar', 'prefillCommitHash']) {
@@ -17489,6 +17599,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const callIdx = source.indexOf('const panel = buildAckPanel(acks, memberLogins)');
         ackAssert(callIdx > 0, 'buildAckPanel is called with memberLogins');
         const section = source.slice(callIdx, callIdx + 1400);
+        ackAssert(section.includes("panel.style.width = tbWidth + 'px'"), 'ACK panel width is bound to toolbar width');
+        ackAssert(section.includes("panel.style.minWidth = tbWidth + 'px'"), 'ACK panel min-width is bound to toolbar width');
+        ackAssert(section.includes("panel.style.maxWidth = tbWidth + 'px'"), 'ACK panel max-width is bound to toolbar width');
         const appendIdx = section.indexOf('wrapper.appendChild(panel)');
         const replaceIdx = section.indexOf('existingPanel.replaceWith(panel)');
         const attachIdx = Math.max(appendIdx, replaceIdx);
@@ -18265,6 +18378,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
 	    ackTest('selection helper one-line summary uses fixed throttle and high max-chars (no settings)', () => {
 	        const source = _ackSource;
+	        const install = source.slice(source.indexOf('function installDiffSelectionActions'), source.indexOf('function hideDiffSelectionToolbar'));
+	        ackAssert(install.includes('const selectionDelayMs = 300'), 'selection helper waits for a stable 300ms selection before showing');
+	        ackAssert(install.includes('sel.isCollapsed'), 'stable-selection delay aborts if selection was cleared');
 	        const fn = source.slice(source.indexOf('function updateDiffSelectionOneLiner'), source.indexOf('async function fetchBatchCommitExplanations'));
 	        ackAssert(fn.includes('const maxChars = 4000'), 'high max chars constant (4000)');
 	        ackAssert(fn.includes('const throttleMs = 250'), 'fast throttle constant (250ms)');
@@ -18376,7 +18492,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		        ackAssert(!fn.includes("marginLeft: '4px'"), 'no inline one-liner placement');
 		    });
 
-			    ackTest('diff selection one-liner wraps without scrollbars (fixed 3 lines)', () => {
+			    ackTest('diff selection one-liner can expand downward without truncation', () => {
 			        const source = _ackSource;
 			        const ensure = source.slice(source.indexOf('function ensureDiffSelectionToolbar'), source.indexOf('function showDiffSelectionTooltipAt'));
 			        ackAssert(ensure.includes("flexWrap: 'nowrap'"), 'buttons stay in a single row');
@@ -18388,9 +18504,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 			        ackAssert(!ensure.includes('textOverflow'), 'no single-line ellipsis');
 
 			        const helper = source.slice(source.indexOf('function setDiffSelectionOutputPresentation'), source.indexOf('function cancelDiffSelectionOneLiner'));
-			        ackAssert(helper.includes("overflow: 'hidden'"), 'no scrollbars for one-liner');
-			        ackAssert(helper.includes("minHeight: '4.05em'"), 'reserves 3 lines');
-			        ackAssert(helper.includes("maxHeight: '4.05em'"), 'hard-clamps to 3 lines');
+			        ackAssert(helper.includes("overflow: 'auto'"), 'one-liner can grow and scroll if needed');
+			        ackAssert(helper.includes("minHeight: '0'"), 'one-liner is not forced to reserve 3 lines');
+			        ackAssert(helper.includes("maxHeight: '60vh'"), 'one-liner can expand downward up to viewport budget');
 			    });
 
 		    ackTest('diff selection toolbar width is driven by the button row (one-liner cannot expand it)', () => {
@@ -18416,9 +18532,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        const source = _ackSource;
 	        const fn = source.slice(source.indexOf('function installDiffSelectionActions'), source.indexOf('function hideDiffSelectionToolbar'));
 	        ackAssert(fn.includes("addEventListener('mouseup'"), 'uses mouseup');
-	        ackAssert(fn.includes('_diffSelectionMetaHeld'), 'tracks command-key suppression state');
-	        ackAssert(fn.includes('e.metaKey'), 'checks command key on mouse interactions');
-	        ackAssert(fn.includes('hideDiffSelectionToolbar();'), 'suppressed command-key selections dismiss any stale helper UI');
+	        ackAssert(fn.includes('_diffSelectionCopySuppressUntil'), 'tracks copy suppression window');
+	        ackAssert(fn.includes("String(e.key || '').toLowerCase() === 'c'"), 'detects copy shortcut');
+	        ackAssert(fn.includes('Date.now() < _diffSelectionCopySuppressUntil'), 'suppresses tooltip shortly after copy shortcut');
+	        ackAssert(fn.includes('hideDiffSelectionToolbar();'), 'copy gesture dismisses any stale helper UI');
 	        ackAssert(fn.includes('_diffSelectionUiMouseDown'), 'tracks mouse interactions inside the helper UI');
 	        ackAssert(fn.includes('_diffSelectionUiMouseDown = false'), 'clears inside-helper mouse flag on outside interactions');
 	        ackAssert(fn.includes('_diffSelectionMouseIsDown = false'), 'clears mouse-down state on mouseup before showing');
@@ -18477,12 +18594,37 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            ackAssert(ctx, 'expected selection context');
 	            ackEq(ctx.kind, 'text');
 	            ackEq(ctx.text.trim(), 'Selection');
+                ackEq(ctx.parentText.trim(), 'Selection outside diff should still work');
 	        } finally {
 	            try { sel.removeAllRanges(); } catch (_) {
 	            }
 	            host.remove();
 		        }
 		    });
+
+	    ackTest('selection helper prompt includes containing text block and PR description context', () => {
+	        const source = _ackSource;
+	        const ctxFn = source.slice(source.indexOf('function findSelectionParentText'), source.indexOf('function getDiffSelectionLineMeta'));
+	        ackAssert(ctxFn.includes('MARKDOWN_BODY_SELECTOR'), 'parent-text helper prefers full comment body');
+	        ackAssert(ctxFn.includes('commit-title'), 'parent-text helper supports commit titles/messages');
+
+	        const llmFn = source.slice(source.indexOf('async function runDiffSelectionLLM'), source.indexOf('async function openChatWithDiffSelection'));
+	        ackAssert(llmFn.includes('Containing text block:'), 'selection prompt includes parent text block');
+	        ackAssert(llmFn.includes('ctx.parentText'), 'selection prompt uses captured parent text');
+	        ackAssert(llmFn.includes('PR description:'), 'selection prompt can include PR description context');
+	        ackAssert(llmFn.includes('fetchPRContext(ctx.pr)'), 'selection prompt fetches PR context for non-factcheck paths too');
+	        ackAssert(llmFn.includes('!ctx.isPRDescription'), 'selection prompt avoids duplicating PR description when selection is inside it');
+	    });
+
+	    ackTest('selection one-liner prompt also includes parent text and PR description context', () => {
+	        const source = _ackSource;
+	        const oneLiner = source.slice(source.indexOf('function updateDiffSelectionOneLiner'), source.indexOf('async function fetchBatchCommitExplanations'));
+	        ackAssert(oneLiner.includes('Containing text block:'), 'one-liner prompt includes parent text block');
+	        ackAssert(oneLiner.includes('PR description:'), 'one-liner prompt includes PR description context');
+	        ackAssert(oneLiner.includes('fetchPRContext(pr)'), 'one-liner prompt fetches PR context');
+	        ackAssert(oneLiner.includes('ctx.parentText'), 'one-liner prompt uses captured parent text');
+	        ackAssert(oneLiner.includes('!ctx.isPRDescription'), 'one-liner avoids duplicating PR description when selection is inside it');
+	    });
 
 		    ackTest('diff selection context includes thread context for review thread selections', () => {
 		        const host = document.createElement('div');
@@ -19075,6 +19217,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackEq(isToolbarPage('/bitcoin/bitcoin/pulls'), false);
     });
 
+    ackTest('isPRCreationPage detects compare page with PR creation form', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<input name="pull_request[title]"><textarea name="pull_request[body]"></textarea>';
+        ackEq(isPRCreationPage('/bitcoin/bitcoin/compare/master...topic', host), true);
+        ackEq(isPRCreationPage('/bitcoin/bitcoin/compare/master...topic', document.createElement('div')), false);
+        ackEq(isPRCreationPage('/bitcoin/bitcoin/pull/123', host), false);
+    });
+
     ackTest('parseIssue parses issue URLs', () => {
         const r = parseIssue('/bitcoin/bitcoin/issues/34645');
         ackDeepEq(r, {owner: 'bitcoin', repo: 'bitcoin', pr: '34645'});
@@ -19107,6 +19257,19 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // ACK toggle and SHA group only on PR
         const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('function disableBtn'));
         ackAssert(ackSection.includes('if (onPR)'), 'ACK toggle gated behind onPR');
+    });
+
+    ackTest('currentInjectContext exposes compare-page compose mode', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function currentInjectContext'), source.indexOf('function runRootInjectors'));
+        ackAssert(fn.includes('onCompose: isPRCreationPage()'), 'tracks compare/new-PR compose mode');
+    });
+
+    ackTest('tryInject runs root injectors on compare-page compose screens', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function tryInject'), source.indexOf('tryInject();', source.indexOf('function tryInject')));
+        ackAssert(fn.includes('else if (isPRCreationPage())'), 'tryInject has compare/new-PR branch');
+        ackAssert(fn.includes('runRootInjectors(document, currentInjectContext())'), 'tryInject runs root injectors on compare/new-PR page');
     });
 
     ackTest('gatherChatContext uses parsePageContext (works on issues)', () => {
