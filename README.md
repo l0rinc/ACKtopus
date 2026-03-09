@@ -24,6 +24,10 @@ _Clipboard-ready PR, commit, and comment context for sharing or LLM use._
 
 _Pending-review helpers directly from Conversation replies and the main comment box._
 
+<img src="screenshots/pending%20feedback.png" alt="Pending comment feedback">
+
+_Pending-comment feedback that simulates the likely author response before you post._
+
 <img src="screenshots/per%20PR%20clipboard%20commands.png" alt="Per-PR clipboard commands">
 
 _Per-PR clipboard helpers for ACKs, checkout, range-diff, and review commands._

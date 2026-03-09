@@ -8378,7 +8378,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     function findVisibleDeleteCommentConfirmButton() {
         const dialogRoots = [
-            ...document.querySelectorAll('details-dialog[open], dialog[open], [role="dialog"][aria-modal="true"]'),
+            ...document.querySelectorAll(
+                'details-dialog[open], dialog[open], [role="dialog"][aria-modal="true"], ' +
+                '[role="alertdialog"], [popover], [aria-modal="true"]'
+            ),
         ].filter(isVisible);
         const isDisabledBtn = (b) => {
             if (!b) return true;
@@ -8416,6 +8419,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             }
         }
         return true;
+    }
+
+    function scheduleDeleteConfirmDefault() {
+        for (const delay of [0, 120, 300]) {
+            ackSetTimeout(() => {
+                focusVisibleDeleteCommentConfirmButton();
+            }, delay);
+        }
     }
 
     // Make "Delete" the default action in comment deletion dialogs:
@@ -8960,10 +8971,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            header.dataset.ackQuickProcessed = editState;
 
 	            const author = extractAuthorLogin(header);
-
 	            // Detect PR body via permalink anchor: "#issue-..." = main description.
 	            const permalink = header.querySelector('a[id$="-permalink"]');
 	            const isPRBody = isPRBodyFromPermalink(permalink);
+                const isPendingComment = !!(
+                    headerContainer.querySelector('[data-testid="pending-badge"], .js-pending-review-comment, [title="Label: Pending"]')
+                    || header.querySelector('[data-testid="pending-badge"], .js-pending-review-comment, [title="Label: Pending"]')
+                );
+	            // Find the comment container (for edit/delete/proofread to find textarea/body)
+	            const container = headerContainer;
 	            ensureChangesLink(header, permalink);
 	            ensurePendingRelativeTime(permalink);
 
@@ -8975,9 +8991,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 marginLeft: '4px',
 	                verticalAlign: 'middle'
 	            });
-
-	            // Find the comment container (for edit/delete/proofread to find textarea/body)
-	            const container = headerContainer;
 
             const isMine = (
                 (!!currentUser && !!author && author.toLowerCase() === currentUser.toLowerCase())
@@ -9002,7 +9015,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         }, 'cancel edit button');
                     }));
 	                } else {
-	                    // Not editing: edit, delete
+	                    // Not editing: expected reply (pending only), edit, delete
+                        if (isPendingComment && !isPRBody) {
+                            actionContainer.appendChild(makeIconBtn('👤', 'Expected author reply', (btn) => {
+                                runExpectedReplyForComment(container, btn);
+                            }));
+                        }
 	                    actionContainer.appendChild(makeIconBtn('✏️', 'Edit comment', () => {
 	                        // Edit is behind a lazily-rendered kebab menu
 	                        // (<include-fragment>). Open the menu and then click
@@ -9566,6 +9584,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         if (actionRe.test(item.textContent.trim())) {
                             menu.style.opacity = origOpacity;
                             item.click();
+                            if (/delete/i.test(actionName)) scheduleDeleteConfirmDefault();
                             if (/edit/i.test(actionName)) schedulePostEditRefresh(container);
                             return;
                         }
@@ -10073,6 +10092,139 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            || null;
 	    }
 
+        function normalizeExpectedReplyResult(raw) {
+            try {
+                const parsed = parseLLMJsonObject(raw);
+                const verdict = String(parsed.verdict || '').trim().toLowerCase();
+                const feedback = String(parsed.feedback || '').trim();
+                const reply = String(parsed.reply || '').trim();
+                return {
+                    verdict: (verdict === 'accurate' || verdict === 'change' || verdict === 'unclear') ? verdict : 'unclear',
+                    feedback,
+                    reply,
+                };
+            } catch (_) {
+                return {
+                    verdict: 'unclear',
+                    feedback: '',
+                    reply: String(raw || '').trim(),
+                };
+            }
+        }
+
+        function buildExpectedReplyPanel(result, provider) {
+            const provMeta = PROVIDER_META[provider] || {icon: '🤖', label: provider};
+            const panel = document.createElement('div');
+            panel.className = 'ack-expected-reply-panel';
+            Object.assign(panel.style, {
+                marginTop: '8px',
+                padding: '10px 12px',
+                background: '#0d1117',
+                border: '1px solid #30363d',
+                borderRadius: '8px',
+                color: '#c9d1d9',
+                fontSize: '12px',
+                lineHeight: '1.5',
+                maxHeight: '320px',
+                overflow: 'auto',
+            });
+            const header = document.createElement('div');
+            Object.assign(header.style, {
+                fontSize: '11px',
+                color: '#8b949e',
+                marginBottom: '8px',
+                fontWeight: '600',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+            });
+            const verdictMeta = {
+                accurate: {label: 'Looks accurate', color: '#3fb950', border: '#2ea043'},
+                change: {label: 'Should change', color: '#d29922', border: '#bb8009'},
+                unclear: {label: 'Unclear', color: '#8b949e', border: '#6e7681'},
+            }[result?.verdict || 'unclear'];
+            header.innerHTML = `${provMeta.icon} Potential author reply <span style="margin-left:auto;padding:1px 6px;border-radius:999px;border:1px solid ${verdictMeta.border};color:${verdictMeta.color};font-weight:600">${verdictMeta.label}</span>`;
+            const body = document.createElement('div');
+            const parts = [];
+            if (result?.feedback) parts.push(`**Feedback:** ${result.feedback}`);
+            if (result?.reply) parts.push(`**Potential reply:** ${result.reply}`);
+            body.innerHTML = expandTooltipMarkers(renderMarkdown(parts.join('\n\n').trim()));
+            panel.appendChild(header);
+            panel.appendChild(body);
+            return panel;
+        }
+
+        async function runExpectedReplyForComment(container, commentEl) {
+            const provider = getActiveProvider();
+            if (!isProviderAvailable(provider)) {
+                document.body.appendChild(buildConfigPanel());
+                return;
+            }
+
+            const bodyEl = container.querySelector(MARKDOWN_BODY_SELECTOR);
+            const commentText = String(bodyEl?.innerText || bodyEl?.textContent || '').trim();
+            if (!commentText) return;
+
+            const panelHost = bodyEl?.parentElement || container;
+            const existing = panelHost.querySelector('.ack-expected-reply-panel');
+            if (existing) {
+                existing.remove();
+                return;
+            }
+
+            const origText = commentEl.textContent;
+            const stopSpin = startSpin(commentEl);
+            try {
+                const page = parsePageContext();
+                const ctx = await fetchPRContext(page);
+                const threadRoot = container.closest(
+                    '.js-line-comments, [data-testid="review-thread"], .review-thread-component, ' +
+                    '.inline-comments, .js-resolvable-timeline-thread-container, details[data-resolved]'
+                );
+                const threadContext = threadRoot ? buildSelectionThreadContextFromRoot({threadRoot, targetBodyEl: bodyEl}) : '';
+                const locationInfo = container ? getCommentLocationInfo(container, threadRoot) : {file: '', line: '', commitSha: ''};
+                const pageLabel = page ? `${page.owner}/${page.repo}#${page.pr}` : location.href;
+                const loc = [
+                    `Page: ${pageLabel}`,
+                    locationInfo.file ? `File: ${locationInfo.file}` : '',
+                    locationInfo.line ? `Line: ${locationInfo.line}` : '',
+                    locationInfo.commitSha ? `Commit: ${locationInfo.commitSha}` : '',
+                ].filter(Boolean).join('\n');
+
+                const stableContext = [
+                    loc,
+                    ctx?.title ? `PR title:\n${ctx.title}` : '',
+                    ctx?.description ? `PR description:\n${ctx.description.slice(0, 8000)}` : '',
+                    ctx?.commitMessages ? `Commit messages:\n${ctx.commitMessages.slice(0, 15000)}` : '',
+                    ctx?.diff ? `PR diff:\n${ctx.diff.slice(0, 120000)}` : '',
+                    threadContext ? `Thread context:\n${threadContext}` : '',
+                ].filter(Boolean).join('\n\n');
+
+                const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer sanity-check a pending GitHub comment by estimating how the PR author would respond.\n\nReturn ONLY valid JSON with this schema:\n{"verdict":"accurate|change|unclear","feedback":"...","reply":"..."}\n\nRULES:\n- \`verdict\` means whether the pending comment looks accurate enough to post as-is, should be changed before posting, or is unclear from context.\n- \`feedback\` is the important part. Keep it short, blunt, and factual. Say what is factually wrong, missing, or already correct.\n- If \`verdict\` is \`accurate\`, start \`feedback\` with a brief acknowledgment that this is a real catch.\n- If \`verdict\` is \`change\`, start \`feedback\` with a blunt corrective sentence that makes clear the premise is wrong.\n- \`reply\` is a short potential author response. Do not restate the pending comment. Do not repeat the question unless needed for clarity.\n- Keep \`reply\` shorter than \`feedback\` whenever possible.\n- Answer from the PR author's perspective.\n- If the pending comment contains an incorrect factual assumption, point that out in \`feedback\` and correct it in \`reply\`.\n- Be technically accurate, concise, and grounded in the provided context.\n- Do not critique tone/style unless it affects correctness.\n- No markdown fences, no preamble.`;
+                // Keep the changing part last to maximize any provider-side prefix caching.
+                const user = [
+                    'Stable context (most of this should remain reusable across retries/edits):',
+                    stableContext,
+                    'Current pending comment to answer as the author:',
+                    commentText,
+                ].filter(Boolean).join('\n\n');
+
+                const raw = await callLLM(provider, system, user);
+                stopSpin();
+                commentEl.textContent = origText;
+
+                const panel = buildExpectedReplyPanel(normalizeExpectedReplyResult(raw), provider);
+                if (bodyEl?.parentElement) bodyEl.parentElement.insertBefore(panel, bodyEl.nextSibling);
+                else panelHost.appendChild(panel);
+            } catch (e) {
+                stopSpin('❌');
+                setTimeout(() => {
+                    try { commentEl.textContent = origText; } catch (_) {}
+                }, 1500);
+                console.error('ACKtopus: expected reply failed:', e?.message || e);
+            }
+        }
+
 		    function addDetailsButtons(root = document) {
 		        qsa(root, 'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]').forEach(toolbar => {
 		            // GitHub CSS modules can produce unrelated classes like
@@ -10109,12 +10261,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	                });
 	            };
 	            removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread');
-	            let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
-	            let hasProofreadBtn = !!toolbar.querySelector('.ack-toolbar-proofread');
-	            if (hasDetailsBtn && hasProofreadBtn) return;
 	            const isEditToolbar = !!toolbar.closest(
 	                'form.js-comment-update, [data-testid="edit-comment-form"], .is-comment-editing, .edit-comment-hide'
 	            );
+	            let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
+	            let hasProofreadBtn = !!toolbar.querySelector('.ack-toolbar-proofread');
+	            if (hasDetailsBtn && hasProofreadBtn) return;
 
 	            const isActionBarToolbar = toolbar.tagName === 'MARKDOWN-TOOLBAR';
 	            if (isActionBarToolbar) toolbar.classList.add('ack-compact-md-toolbar');
@@ -16177,6 +16329,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(!fn.includes('[container,'), 'does not search container for menu items');
     });
 
+    ackTest('triggerMenuAction schedules Delete as the default popup action', () => {
+        const source = _ackSource;
+        const fnStart = source.indexOf('function triggerMenuAction');
+        const fnEnd = source.indexOf('\n    function ', fnStart + 1);
+        const fn = source.slice(fnStart, fnEnd);
+        ackAssert(fn.includes('scheduleDeleteConfirmDefault()'), 'delete action schedules default Delete focus');
+    });
+
 	    ackTest('edit button uses clickWithRetry via triggerMenuEdit', () => {
 	        const source = _ackSource;
 	        ackAssert(source.includes('async function triggerMenuEdit'), 'has triggerMenuEdit helper');
@@ -16628,10 +16788,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 0, 'should not inject proofread button when textarea is unrelated');
 	    });
 
-		    ackTest('addDetailsButtons still injects into React formatting toolbar inside markdown editor', () => {
-		        const root = document.createElement('div');
-		        root.innerHTML = `
-		          <fieldset class="MarkdownEditor-module__fieldSet__RU0NL">
+	    ackTest('addDetailsButtons still injects into React formatting toolbar inside markdown editor', () => {
+	        const root = document.createElement('div');
+	        root.innerHTML = `
+	          <fieldset class="MarkdownEditor-module__fieldSet__RU0NL">
 	            <div class="Toolbar-module__toolbar__oK14P"></div>
 	            <textarea></textarea>
 	          </fieldset>
@@ -16639,11 +16799,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        const toolbar = root.querySelector('[class*="Toolbar-module__toolbar"]');
 	        ackAssert(toolbar, 'expected test toolbar');
 	        addDetailsButtons(root);
-		        ackAssert(!!toolbar.querySelector('.ack-details-btn'), 'should inject details button');
-		        ackAssert(!!toolbar.querySelector('.ack-toolbar-proofread'), 'should inject proofread button');
-		    });
+	        ackAssert(!!toolbar.querySelector('.ack-details-btn'), 'should inject details button');
+	        ackAssert(!!toolbar.querySelector('.ack-toolbar-proofread'), 'should inject proofread button');
+	    });
 
-		    ackTest('addDetailsButtons uses shared SVG proofread icon for edit-mode toolbars', () => {
+	    ackTest('addDetailsButtons uses shared SVG proofread icon for edit-mode toolbars', () => {
 		        const root = document.createElement('div');
 		        root.innerHTML = `
 		          <form class="js-comment-update">
@@ -16660,10 +16820,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		        addDetailsButtons(root);
 		        const proofread = root.querySelector('.ack-toolbar-proofread');
 		        ackAssert(!!proofread, 'proofread button injected');
-		        const html = (proofread.innerHTML || '');
-		        ackAssert(html.includes('<svg'), 'edit-mode proofread uses shared SVG icon');
-		        ackAssert(!html.includes('📝'), 'edit-mode proofread does not use emoji icon');
-		    });
+	        const html = (proofread.innerHTML || '');
+	        ackAssert(html.includes('<svg'), 'edit-mode proofread uses shared SVG icon');
+	        ackAssert(!html.includes('📝'), 'edit-mode proofread does not use emoji icon');
+	    });
 
     ackTest('addCommitListExplainButtons guard checks c.el, inserts inside c.el subtree', () => {
         // Guard: c.el.querySelector('.ack-commit-explain')
@@ -16924,6 +17084,56 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            const qa = header.querySelector('.ack-quick-actions');
 	            ackAssert(qa, 'missing .ack-quick-actions');
 	            // View mode: proofread is edit-only
+	            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+	            ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
+	        } finally {
+	            root.remove();
+	        }
+	    });
+
+	    ackTest('addQuickCommentActions injects expected-author-reply button for pending closed comments', () => {
+	        const root = document.createElement('div');
+	        root.id = 'acktest-qactions-pending-reply';
+	        Object.assign(root.style, {position: 'absolute', left: '-10000px', top: '0', width: '400px'});
+
+	        const container = document.createElement('div');
+	        container.className = 'timeline-comment current-user';
+
+	        const header = document.createElement('div');
+	        header.className = 'timeline-comment-header';
+
+	        const flex = document.createElement('div');
+	        flex.className = 'd-flex flex-row-reverse';
+	        const actions = document.createElement('div');
+	        actions.className = 'timeline-comment-actions';
+	        const badges = document.createElement('div');
+	        badges.className = 'd-none d-sm-flex';
+	        const pending = document.createElement('span');
+	        pending.setAttribute('data-testid', 'pending-badge');
+	        pending.textContent = 'Pending';
+	        badges.appendChild(pending);
+	        flex.appendChild(actions);
+	        flex.appendChild(badges);
+	        header.appendChild(flex);
+
+	        const author = document.createElement('a');
+	        author.className = 'author';
+	        author.textContent = 'me';
+	        header.appendChild(author);
+
+	        const body = document.createElement('div');
+	        body.className = 'comment-body markdown-body';
+	        body.textContent = 'Is this actually thread-safe?';
+
+	        container.appendChild(header);
+	        container.appendChild(body);
+	        root.appendChild(container);
+	        document.body.appendChild(root);
+	        try {
+	            addQuickCommentActions(root);
+	            const qa = header.querySelector('.ack-quick-actions');
+	            ackAssert(qa, 'missing .ack-quick-actions');
+	            ackAssert(qa.querySelector('button[title="Expected author reply"]'), 'missing expected-author-reply button on pending comment');
 	            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
 	            ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
 	        } finally {
@@ -18616,15 +18826,29 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(llmFn.includes('!ctx.isPRDescription'), 'selection prompt avoids duplicating PR description when selection is inside it');
 	    });
 
-	    ackTest('selection one-liner prompt also includes parent text and PR description context', () => {
-	        const source = _ackSource;
-	        const oneLiner = source.slice(source.indexOf('function updateDiffSelectionOneLiner'), source.indexOf('async function fetchBatchCommitExplanations'));
-	        ackAssert(oneLiner.includes('Containing text block:'), 'one-liner prompt includes parent text block');
-	        ackAssert(oneLiner.includes('PR description:'), 'one-liner prompt includes PR description context');
+    ackTest('selection one-liner prompt also includes parent text and PR description context', () => {
+        const source = _ackSource;
+        const oneLiner = source.slice(source.indexOf('function updateDiffSelectionOneLiner'), source.indexOf('async function fetchBatchCommitExplanations'));
+        ackAssert(oneLiner.includes('Containing text block:'), 'one-liner prompt includes parent text block');
+        ackAssert(oneLiner.includes('PR description:'), 'one-liner prompt includes PR description context');
 	        ackAssert(oneLiner.includes('fetchPRContext(pr)'), 'one-liner prompt fetches PR context');
 	        ackAssert(oneLiner.includes('ctx.parentText'), 'one-liner prompt uses captured parent text');
-	        ackAssert(oneLiner.includes('!ctx.isPRDescription'), 'one-liner avoids duplicating PR description when selection is inside it');
-	    });
+        ackAssert(oneLiner.includes('!ctx.isPRDescription'), 'one-liner avoids duplicating PR description when selection is inside it');
+    });
+
+    ackTest('expected author reply helper uses stable context first and comment text last', () => {
+        const source = _ackSource;
+        const panelFn = source.slice(source.indexOf('function buildExpectedReplyPanel'), source.indexOf('async function runExpectedReplyForComment'));
+        ackAssert(panelFn.includes('Potential author reply'), 'renders expected-author-reply panel');
+        const fn = source.slice(source.indexOf('async function runExpectedReplyForComment'), source.indexOf('function addDetailsButtons'));
+        ackAssert(fn.includes('Current pending comment to answer as the author:'), 'places changing comment text in a dedicated final section');
+        ackAssert(fn.includes('Stable context (most of this should remain reusable across retries/edits):'), 'keeps stable context in a fixed prefix block');
+        ackAssert(fn.includes('ctx?.diff ? `PR diff:'), 'includes full PR diff context');
+        ackAssert(fn.includes('Thread context:'), 'includes thread context when available');
+        ackAssert(fn.includes('brief acknowledgment that this is a real catch'), 'accurate verdict feedback starts with clear acknowledgment');
+        ackAssert(fn.includes('blunt corrective sentence that makes clear the premise is wrong'), 'incorrect verdict feedback starts with blunt correction');
+        ackAssert(fn.includes('shorter than'), 'reply is intentionally shorter than feedback');
+    });
 
 		    ackTest('diff selection context includes thread context for review thread selections', () => {
 		        const host = document.createElement('div');
@@ -20518,6 +20742,31 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         try {
             const found = findVisibleDeleteCommentConfirmButton();
             ackEq(found, btn, 'finds the confirm delete button');
+	        } finally {
+	            host.remove();
+	        }
+	    });
+
+	    ackTest('findVisibleDeleteCommentConfirmButton also supports visible popover dialogs', () => {
+	        const host = document.createElement('div');
+	        host.setAttribute('popover', 'auto');
+	        host.style.position = 'absolute';
+	        host.style.left = '-99999px';
+	        host.style.top = '0';
+	        host.style.width = '10px';
+	        host.style.height = '10px';
+	        host.style.display = 'block';
+	        host.textContent = 'Delete this comment?';
+	        const btn = document.createElement('button');
+	        btn.className = 'Button--danger';
+	        btn.textContent = 'Delete comment';
+	        btn.style.width = '10px';
+	        btn.style.height = '10px';
+	        host.appendChild(btn);
+	        document.body.appendChild(host);
+	        try {
+	            const found = findVisibleDeleteCommentConfirmButton();
+	            ackEq(found, btn, 'finds delete button inside visible popover');
 	        } finally {
 	            host.remove();
 	        }
