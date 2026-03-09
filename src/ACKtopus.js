@@ -4992,7 +4992,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         // Start spinner IMMEDIATELY so user sees feedback before API calls
         const origText = commentEl.textContent;
+        const origHTML = commentEl.innerHTML;
         const origTitle = commentEl.title || '';
+        const restoreButton = () => {
+            try {
+                commentEl.innerHTML = origHTML;
+                commentEl.title = origTitle;
+            } catch (_) {
+            }
+        };
 
         // Prevent double-click re-entrancy (React can re-render and duplicate handlers).
         if (commentEl.dataset.ackProofreadBusy === '1') {
@@ -5413,7 +5421,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
         if (!container) {
             console.warn('ACKtopus: proofread container not found from', commentEl);
-            stopSpin(origText);
+            stopSpin();
             return;
         }
 
@@ -5469,11 +5477,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	                    || candidates[0]
 	                    || null;
 	            }
-	            if (!ta) {
-	                console.warn('ACKtopus: proofread: toolbar textarea not found');
-	                stopSpin(origText);
-	                return;
-	            }
+		            if (!ta) {
+		                console.warn('ACKtopus: proofread: toolbar textarea not found');
+		                stopSpin();
+		                return;
+		            }
 	            // Tighten container + selector so we don't accidentally update a
 	            // different textarea elsewhere on the page.
 	            container = ta.closest(
@@ -5490,15 +5498,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 		            // Quick-action proofread for existing comments is EDIT-MODE ONLY.
 		            // It's too risky to proofread on the closed/view state.
 		            ta = container.querySelector(EDIT_TA_SELECTOR);
-	            if (!ta) {
-	                console.log('ACKtopus: proofread: not in edit mode (edit textarea not found)');
-	                stopSpin(origText);
-	                commentEl.title = 'Edit the comment first to proofread';
-	                setTimeout(() => {
-	                    try { commentEl.title = origTitle; } catch (_) {}
-	                }, 2000);
-	                return;
-		            }
+		            if (!ta) {
+		                console.log('ACKtopus: proofread: not in edit mode (edit textarea not found)');
+		                stopSpin();
+		                commentEl.title = 'Edit the comment first to proofread';
+		                setTimeout(() => {
+		                    restoreButton();
+		                }, 2000);
+		                return;
+			            }
 		            taContainer = ta.closest('form') || container;
 		            // Tighten container + selector so we don't accidentally update a
 		            // different textarea elsewhere in the thread after async awaits.
@@ -5521,7 +5529,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const textToProofread = hasSelection ? ta.value.slice(selStart, selEnd) : ta.value;
             if (!textToProofread.trim()) {
                 console.log('ACKtopus: proofread: nothing to proofread (empty textarea/selection)');
-                stopSpin(origText);
+                stopSpin();
                 return;
             }
             console.log('ACKtopus: proofread: textarea ready', {
@@ -5583,14 +5591,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     commentEl.textContent = '✅';
                     commentEl.title = NO_CHANGES_MSG;
                     setTimeout(() => {
-                        commentEl.textContent = origText;
-                        commentEl.title = origTitle;
+                        restoreButton();
                     }, 2000);
                     return;
                 }
                 if (accepted === false) {
                     setTimeout(() => {
-                        commentEl.textContent = origText;
+                        restoreButton();
                     }, 500);
                     return;
                 }
@@ -5612,7 +5619,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 }
 
                 // Restore button text, keep the textarea open for user to review.
-                commentEl.textContent = origText;
+                restoreButton();
                 // Refresh quick-action icons (soft rescan: no global clear needed).
                 scheduleQuickActionsSoftRescan(1500);
             } catch (e) {
@@ -5628,8 +5635,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 }
                 setTimeout(() => {
                     try {
-                        commentEl.textContent = origText;
-                        commentEl.title = origTitle;
+                        restoreButton();
                     } catch (_) {
                     }
                     // Restore icons even on failure (soft rescan is enough).
@@ -5637,16 +5643,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 }, 2000);
                 console.error('ACKtopus: EDIT MODE proofread failed:', e?.message, e?.stack);
             }
-	        } else {
-	            // Could not enter edit mode.
-	            stopSpin(origText);
-	        }
+		        } else {
+		            // Could not enter edit mode.
+		            stopSpin();
+		        }
         } catch (e) {
             try { stopSpin('❌'); } catch (_) {}
             setTimeout(() => {
                 try {
-                    commentEl.textContent = origText;
-                    commentEl.title = origTitle;
+                    restoreButton();
                 } catch (_) {
                 }
             }, 2000);
@@ -15412,6 +15417,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const proofFn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
         ackAssert(proofFn.includes("accepted === 'unchanged'"), 'edit mode checks for unchanged');
         ackAssert(proofFn.includes('NO_CHANGES_MSG'), 'edit mode uses NO_CHANGES_MSG constant');
+    });
+
+    ackTest('proofread restores original button HTML after temporary status icons', () => {
+        const source = _ackSource;
+        const proofFn = source.slice(source.indexOf('async function runProofreadOnComment'), source.indexOf('// --- Start a review'));
+        ackAssert(proofFn.includes('const origHTML = commentEl.innerHTML'), 'captures original button HTML');
+        ackAssert(proofFn.includes('const restoreButton = () =>'), 'uses dedicated restore helper');
+        ackAssert(proofFn.includes('commentEl.innerHTML = origHTML'), 'restores original button HTML');
     });
 
     ackTest('showDiffDialog diff spans are clickable (click-to-revert)', () => {
