@@ -1,42 +1,4 @@
-<h1>
-  <svg width="28" height="28" viewBox="0 0 64 64" style="vertical-align:middle">
-    <path d="M22 16Q27 5 32 7Q37 5 42 16" fill="#505870" stroke="#7080a0" stroke-width="1.2"/>
-    <rect x="28" y="5" width="8" height="6" rx="2" fill="#607090" stroke="#8090b0" stroke-width=".6"/>
-    <circle cx="32" cy="5" r="2.8" fill="#e30" opacity=".8"/><circle cx="32" cy="5" r="1.4" fill="#fa0"/>
-    <ellipse cx="32" cy="27" rx="18" ry="15" fill="#454d65"/>
-    <ellipse cx="32" cy="26" rx="16" ry="13" fill="#556080"/>
-    <ellipse cx="32" cy="24" rx="13" ry="8" fill="#6070a0" opacity=".3"/>
-    <circle cx="14" cy="23" r="5.5" fill="#454d65" stroke="#6070a0" stroke-width=".6"/>
-    <circle cx="14" cy="23" r="3.2" fill="#607090"/><circle cx="14" cy="23" r="1.2" fill="#f40" opacity=".3"/>
-    <circle cx="50" cy="23" r="5.5" fill="#454d65" stroke="#6070a0" stroke-width=".6"/>
-    <circle cx="50" cy="23" r="3.2" fill="#607090"/><circle cx="50" cy="23" r="1.2" fill="#f40" opacity=".3"/>
-    <rect x="17" y="21" rx="4" width="30" height="11" fill="#1a1a2a" stroke="#7080a0" stroke-width=".8"/>
-    <circle cx="26" cy="26" r="4" fill="#300"/><circle cx="26" cy="26" r="3" fill="#c00"/>
-    <circle cx="26" cy="26" r="1.6" fill="#f40"/><circle cx="26" cy="26" r=".8" fill="#fe0"/>
-    <circle cx="38" cy="26" r="4" fill="#300"/><circle cx="38" cy="26" r="3" fill="#c00"/>
-    <circle cx="38" cy="26" r="1.6" fill="#f40"/><circle cx="38" cy="26" r=".8" fill="#fe0"/>
-    <circle cx="26" cy="26" r="6" fill="#f40" opacity=".1"/>
-    <circle cx="38" cy="26" r="6" fill="#f40" opacity=".1"/>
-    <line x1="22" y1="26" x2="-4" y2="15" stroke="#f40" stroke-width="2.2" stroke-linecap="round" opacity=".9"/>
-    <line x1="22" y1="26" x2="-1" y2="9" stroke="#f60" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
-    <line x1="42" y1="26" x2="68" y2="15" stroke="#f40" stroke-width="2.2" stroke-linecap="round" opacity=".9"/>
-    <line x1="42" y1="26" x2="65" y2="9" stroke="#f60" stroke-width="1.2" stroke-linecap="round" opacity=".5"/>
-    <circle cx="-4" cy="13" r="1.2" fill="#f60" opacity=".7"/><circle cx="68" cy="13" r="1.2" fill="#f60" opacity=".7"/>
-    <ellipse cx="32" cy="34" rx="8" ry="5.5" fill="#7080a0"/>
-    <circle cx="29" cy="33" r="1.3" fill="#454d65"/><circle cx="35" cy="33" r="1.3" fill="#454d65"/>
-    <path d="M27 37Q32 41 37 37" fill="none" stroke="#2a2a3a" stroke-width="1.5" stroke-linecap="round"/>
-    <path d="M16 36L10 40L8 38" fill="none" stroke="#6080a0" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M48 36L54 40L56 38" fill="none" stroke="#6080a0" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M20 38L16 46L18 48" fill="none" stroke="#5a7090" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M44 38L48 46L46 48" fill="none" stroke="#5a7090" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M27 40L24 48L26 50" fill="none" stroke="#507080" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M37 40L40 48L38 50" fill="none" stroke="#507080" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-    <circle cx="10" cy="40" r="1.2" fill="#7080a0"/><circle cx="54" cy="40" r="1.2" fill="#7080a0"/>
-    <circle cx="16" cy="46" r="1" fill="#7080a0"/><circle cx="48" cy="46" r="1" fill="#7080a0"/>
-    <circle cx="22" cy="19" r="1.2" fill="#8090b0"/><circle cx="42" cy="19" r="1.2" fill="#8090b0"/>
-  </svg>
-  ACKtopus
-</h1>
+<h1><img src="screenshots/acktopus-logo.svg" alt="ACKtopus" width="28" height="28"> ACKtopus</h1>
 
 ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a small floating toolbar and a handful of review helpers on pull requests and issues (optimized for Bitcoin Core-style review).
 
