@@ -8,69 +8,103 @@ ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/
 
 _Floating toolbar with ACK/NACK parsing and jumpable review signals._
 
+----
+
 <img src="screenshots/tooltip%20on%20selection.png" alt="Selection helper tooltip">
 
 _Selection helper with quick explain/fact-check/simplify/proofread actions._
+
+----
 
 <img src="screenshots/pr%20lightbulb.png" alt="PR lightbulb overview">
 
 _PR lightbulb overview with high-level context and reviewer-oriented guidance._
 
+----
+
 <img src="screenshots/copy%20context.png" alt="Context copy actions">
 
 _Clipboard-ready PR, commit, and comment context for sharing or LLM use._
+
+----
 
 <img src="screenshots/start%20review%20from%20reply.png" alt="Start review from reply">
 
 _Pending-review helpers directly from Conversation replies and the main comment box._
 
-<img src="screenshots/pending%20feedback.png" alt="Pending comment feedback">
+----
+
+<img src="screenshots/comment%20feedback.png" alt="Comment feedback">
 
 _Pending-comment feedback that simulates the likely author response before you post._
+
+----
 
 <img src="screenshots/per%20PR%20clipboard%20commands.png" alt="Per-PR clipboard commands">
 
 _Per-PR clipboard helpers for ACKs, checkout, range-diff, and review commands._
 
+----
+
 <img src="screenshots/commit%20lightbulb.png" alt="Single commit lightbulb">
 
 _Single-commit lightbulb with summary, why-it-matters, pseudocode, and concerns._
+
+----
 
 <img src="screenshots/commits%20lightbulb.png" alt="Commits page lightbulb">
 
 _Commits-page lightbulbs showing how each commit fits into the stacked PR._
 
+----
+
 <img src="screenshots/comment%20lightbulb.png" alt="Comment lightbulb">
 
 _Comment explanation in context for understanding review remarks quickly._
+
+----
 
 <img src="screenshots/chat%20with%20navigation.png" alt="Chat panel with navigation">
 
 _LLM chat panel with page context and navigation-aware review assistance._
 
+----
+
 <img src="screenshots/proofread.png" alt="Proofread flow">
 
 _Proofread flow with diff-style review before applying text changes._
+
+----
 
 <img src="screenshots/commit%20review%20prefix.png" alt="Commit review prefix">
 
 _Automatic commit prefix on single-commit views so inline comments stay revision-specific._
 
+----
+
 <img src="screenshots/compare%20closing%20unrelated.png" alt="Compare page focusing unrelated files">
 
 _Compare-page cleanup that collapses unrelated files and keeps focus on the PR-relevant diff._
+
+----
 
 <img src="screenshots/expand%20closed%20sections.png" alt="Expand closed sections">
 
 _Bulk expansion of hidden, minimized, outdated, or otherwise collapsed review content._
 
+----
+
 <img src="screenshots/navigate%20to%20comment.png" alt="Comment navigation">
 
 _Chronological comment navigation for quickly walking long review discussions._
 
+----
+
 <img src="screenshots/queue.png" alt="Queue panel">
 
 _Personal review queue for pull requests you want to revisit later._
+
+----
 
 <img src="screenshots/settings.png" alt="Settings panel">
 

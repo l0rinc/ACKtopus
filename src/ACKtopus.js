@@ -8979,10 +8979,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            // Detect PR body via permalink anchor: "#issue-..." = main description.
 	            const permalink = header.querySelector('a[id$="-permalink"]');
 	            const isPRBody = isPRBodyFromPermalink(permalink);
-                const isPendingComment = !!(
-                    headerContainer.querySelector('[data-testid="pending-badge"], .js-pending-review-comment, [title="Label: Pending"]')
-                    || header.querySelector('[data-testid="pending-badge"], .js-pending-review-comment, [title="Label: Pending"]')
-                );
 	            // Find the comment container (for edit/delete/proofread to find textarea/body)
 	            const container = headerContainer;
 	            ensureChangesLink(header, permalink);
@@ -9019,12 +9015,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                             );
                         }, 'cancel edit button');
                     }));
-	                } else {
-	                    // Not editing: expected reply (pending only), edit, delete
-                        if (isPendingComment && !isPRBody) {
-                            actionContainer.appendChild(makeIconBtn('👤', 'Expected author reply', (btn) => {
-                                runExpectedReplyForComment(container, btn);
-                            }));
+		                } else {
+		                    // Not editing: expected reply, edit, delete
+	                        if (!isPRBody) {
+	                            actionContainer.appendChild(makeIconBtn('👤', 'Expected author reply', (btn) => {
+	                                runExpectedReplyForComment(container, btn);
+	                            }));
                         }
 	                    actionContainer.appendChild(makeIconBtn('✏️', 'Edit comment', () => {
 	                        // Edit is behind a lazily-rendered kebab menu
@@ -17096,10 +17092,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            addQuickCommentActions(root);
 	            const qa = header.querySelector('.ack-quick-actions');
 	            ackAssert(qa, 'missing .ack-quick-actions');
-	            // View mode: proofread is edit-only
-	            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
-	            ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
-	        } finally {
+		            // View mode: proofread is edit-only
+		            ackAssert(qa.querySelector('button[title="Expected author reply"]'), 'missing expected-author-reply button');
+		            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+		            ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
+		        } finally {
 	            root.remove();
 	        }
 	    });
