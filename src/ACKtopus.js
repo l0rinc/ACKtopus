@@ -5751,6 +5751,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
     }
 
+    function getCsrfToken() {
+        return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
+            || document.querySelector('input[name="authenticity_token"]')?.value
+            || extractCsrfFromHtml(document.documentElement?.innerHTML || '')
+            || '';
+    }
+
     // Create a pending review using the official GitHub GraphQL API with PAT.
     // This avoids the CSRF dance entirely — no cookies, no interceptor needed.
     async function createPendingReviewViaPatGraphQL(prNodeId) {
@@ -5800,20 +5807,25 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function findNativeReviewDialog() {
-        const reviewBody =
-            document.querySelector('textarea#pull_request_review_body')
-            || document.querySelector('textarea[name="pull_request_review[body]"]')
-            || document.querySelector('.js-review-body textarea, [data-testid="review-body"] textarea, .review-changes-modal textarea');
-        if (reviewBody) {
-            return reviewBody.closest('details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]') || reviewBody.parentElement;
+        const dialogRoots = [
+            ...document.querySelectorAll('details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]'),
+        ].filter(isVisible);
+        for (const root of dialogRoots) {
+            if (isAckOwnedReviewControl(root)) continue;
+            const hasReviewTextarea = !![...root.querySelectorAll('textarea')].find(isVisible);
+            const hasReviewSubmit = !![...root.querySelectorAll('button, [role="button"]')].find(btn => {
+                if (!isVisible(btn)) return false;
+                const text = (btn.textContent || '').trim();
+                return /^(submit\s*review|approve|request changes|comment)$/i.test(text);
+            });
+            const hasReviewChoices = !!root.querySelector(
+                'input[name="reviewEvent"], input[name="pull_request_review[event]"], input[type="radio"][value="comment"], input[type="radio"][value="approve"], input[type="radio"][value="request changes"]'
+            );
+            if (hasReviewTextarea || hasReviewSubmit || hasReviewChoices) {
+                return root;
+            }
         }
-        const submitBtn = [...document.querySelectorAll('button, [role="button"]')].find(btn => {
-            if (btn.offsetParent === null) return false;
-            if (isAckOwnedReviewControl(btn)) return false;
-            const text = (btn.textContent || '').trim();
-            return /^(submit\s*review|approve|request changes|comment)$/i.test(text);
-        });
-        return submitBtn?.closest('details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]') || null;
+        return null;
     }
 
     function findNativeReviewSubmitButton(dialog, eventValue) {
@@ -5837,9 +5849,72 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             || null;
     }
 
+    function findNativeReviewTrigger() {
+        const candidates = [
+            ...document.querySelectorAll('button[data-testid="submit-review-button"]'),
+            ...document.querySelectorAll('button.js-reviews-toggle'),
+            ...document.querySelectorAll('#review-changes-modal summary'),
+        ];
+        for (const btn of candidates) {
+            if (isAckOwnedReviewControl(btn)) continue;
+            if (btn.offsetParent === null) continue;
+            return btn;
+        }
+        const allBtns = [...document.querySelectorAll('button')];
+        return allBtns.find(b =>
+            !isAckOwnedReviewControl(b) &&
+            b.offsetParent !== null &&
+            /finish.*review|review\s*changes|submit\s*review/i.test(b.textContent)
+        ) || null;
+    }
+
+    function getNativeReviewMenuRoots(trigger) {
+        const roots = [];
+        const push = (el) => {
+            if (!el || el.nodeType !== 1) return;
+            if (!roots.includes(el) && isVisible(el)) roots.push(el);
+        };
+        const controlsId = trigger?.getAttribute?.('aria-controls') || '';
+        const popoverTargetId = trigger?.getAttribute?.('popovertarget') || '';
+        const triggerId = trigger?.id || '';
+        if (controlsId) push(document.getElementById(controlsId));
+        if (popoverTargetId) push(document.getElementById(popoverTargetId));
+        if (triggerId) {
+            for (const el of document.querySelectorAll(`[role="menu"][aria-labelledby="${triggerId}"], [popover][aria-labelledby="${triggerId}"]`)) {
+                push(el);
+            }
+        }
+        for (const el of document.querySelectorAll('[role="menu"], [popover], .Overlay, .ActionListWrap, details-menu, action-menu, action-list')) {
+            push(el);
+        }
+        return roots;
+    }
+
+    function findNativeReviewMenuItem(trigger, eventValue) {
+        const textMatchers = {
+            COMMENT: /^(comment|comment review)$/i,
+            APPROVE: /^(approve)$/i,
+            REQUEST_CHANGES: /^(request changes)$/i,
+        };
+        const matcher = textMatchers[String(eventValue || 'COMMENT').toUpperCase()] || textMatchers.COMMENT;
+        for (const root of getNativeReviewMenuRoots(trigger)) {
+            const items = [...root.querySelectorAll('button, [role="menuitem"], a[role="menuitem"], .ActionListContent')].filter(el => {
+                if (!isVisible(el)) return false;
+                if (isAckOwnedReviewControl(el)) return false;
+                const text =
+                    el.querySelector?.('.ActionListItem-label')?.textContent?.trim?.()
+                    || (el.textContent || '').trim();
+                if (!text) return false;
+                return matcher.test(text);
+            });
+            if (items[0]) return items[0];
+        }
+        return null;
+    }
+
     async function submitPendingReviewViaNativeDialog(pr, {event, body} = {}) {
         if (!pr) throw new Error('not on a PR page');
-        openReviewDialog();
+        await openReviewDialog(String(event || 'COMMENT').toUpperCase());
         const dialog = await waitForElement(
             document,
             () => findNativeReviewDialog(),
@@ -5852,9 +5927,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         dialog.style.visibility = 'hidden';
         try {
             const eventValue = String(event || 'COMMENT').toUpperCase();
+            const nativeEventValue = ({
+                COMMENT: 'comment',
+                APPROVE: 'approve',
+                REQUEST_CHANGES: 'request changes',
+            })[eventValue] || 'comment';
             const radio =
                 dialog.querySelector(`input[name="pull_request_review[event]"][value="${eventValue}"]`)
-                || dialog.querySelector(`input[type="radio"][value="${eventValue}"]`);
+                || dialog.querySelector(`input[name="reviewEvent"][value="${nativeEventValue}"]`)
+                || dialog.querySelector(`input[type="radio"][value="${eventValue}"]`)
+                || dialog.querySelector(`input[type="radio"][value="${nativeEventValue}"]`);
             if (radio && !radio.checked) {
                 radio.click();
                 try {
@@ -5868,7 +5950,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const reviewBody =
                 dialog.querySelector('textarea#pull_request_review_body')
                 || dialog.querySelector('textarea[name="pull_request_review[body]"]')
-                || dialog.querySelector('.js-review-body textarea, [data-testid="review-body"] textarea, .review-changes-modal textarea');
+                || dialog.querySelector('.js-review-body textarea, [data-testid="review-body"] textarea, .review-changes-modal textarea')
+                || [...dialog.querySelectorAll('textarea')].find(isVisible)
+                || null;
             if (reviewBody) {
                 setTextareaValue(reviewBody, String(body || ''));
                 await ackSleep(50);
@@ -5883,6 +5967,56 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             dialog.style.visibility = '';
             throw err;
         }
+    }
+
+    async function submitPendingReviewViaWebEvents(pr, {event, body} = {}) {
+        if (!pr) throw new Error('not on a PR page');
+        const pendingRefs = await findPendingReviewRefs(pr);
+        const reviewId = Number(pendingRefs?.apiId);
+        if (!Number.isFinite(reviewId) || reviewId <= 0) throw new Error('no pending review id found');
+        const csrf = getCsrfToken();
+        if (!csrf) throw new Error('missing csrf token');
+        const eventValue = String(event || 'COMMENT').toUpperCase();
+        const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
+        const baseUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${Number(pr.pr)}/reviews/${reviewId}`;
+        const bodyText = String(body || '');
+        const params = new URLSearchParams();
+        params.set('authenticity_token', csrf);
+        params.set('event', eventValue);
+        params.set('body', bodyText);
+        params.set('pull_request_review[event]', eventValue);
+        params.set('pull_request_review[body]', bodyText);
+
+        const initFor = (url) => ({
+            method: 'POST',
+            credentials: 'same-origin',
+            referrer: `https://github.com/${pr.owner}/${pr.repo}/pull/${Number(pr.pr)}`,
+            headers: {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-CSRF-Token': csrf,
+                'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: params.toString(),
+        });
+
+        const tried = [];
+        for (const url of [`${baseUrl}/events`, `${baseUrl}/event`]) {
+            tried.push(url);
+            const resp = await pageFetchWithRetry(pageFetch, url, initFor(url), {
+                label: `submit review web ${url.split('/').pop()}`,
+                attempts: 2,
+                transientStatuses: [502, 503, 504],
+            });
+            if (resp.ok) {
+                return {id: reviewId, state: eventValue, method: 'web-events'};
+            }
+            if (![404, 405, 422].includes(resp.status)) {
+                const text = await resp.text().catch(() => '');
+                throw new Error(`web submit HTTP ${resp.status}: ${text.slice(0, 200)}`);
+            }
+        }
+        throw new Error(`web submit endpoint not found (${tried.map(u => u.split('/').pop()).join(', ')})`);
     }
 
     async function submitPendingReviewViaPatGraphQL(pr, {event, body} = {}) {
@@ -5927,7 +6061,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             return review;
         } catch (graphErr) {
             if (!_ackTesting) {
-                console.warn('ACKtopus: GraphQL submit review failed, falling back to native dialog:', graphErr?.message || graphErr);
+                console.warn('ACKtopus: GraphQL submit review failed, falling back to same-origin web submit:', graphErr?.message || graphErr);
+            }
+        }
+
+        try {
+            return await submitPendingReviewViaWebEvents(pr, {event, body});
+        } catch (webErr) {
+            if (!_ackTesting) {
+                console.warn('ACKtopus: same-origin web submit failed, falling back to native dialog:', webErr?.message || webErr);
             }
         }
 
@@ -6134,12 +6276,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	
 	        const ta = form.querySelector(`${COMMENT_TA_SELECTOR}, textarea`);
 	        const text = ta?.value || '';
-	        const inReplyTo = form.querySelector('input[name="in_reply_to"]')?.value || '';
+	        const inReplyTo =
+	            form.querySelector('input[name="in_reply_to"], input[name="inReplyTo"]')?.value || '';
 	        const path = findReviewThreadPathForReplyForm(form) || '';
 	        // Conversation tab forms carry comparison OIDs in hidden inputs.
-	        const comparisonStartOid = form.querySelector('input[name="comparison_start_oid"]')?.value || '';
-	        const comparisonEndOid = form.querySelector('input[name="comparison_end_oid"]')?.value || '';
-	        const comparisonBaseOid = form.querySelector('input[name="comparison_base_oid"]')?.value || '';
+	        const comparisonStartOid =
+	            form.querySelector('input[name="comparison_start_oid"], input[name="comparisonStartOid"]')?.value || '';
+	        const comparisonEndOid =
+	            form.querySelector('input[name="comparison_end_oid"], input[name="comparisonEndOid"]')?.value || '';
+	        const comparisonBaseOid =
+	            form.querySelector('input[name="comparison_base_oid"], input[name="comparisonBaseOid"]')?.value || '';
 	
 	        return createReviewCommentViaPageData(pr, {
 	            text,
@@ -6243,6 +6389,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (root?.querySelector?.('.js-pending-review-comment')) return true;
         // Conversation tab fallback: "started a review" timeline item carries a Pending label
         if (root?.querySelector?.('[id^="pullrequestreview-"] .Label--warning, [id^="pullrequestreview-"] [title="Label: Pending"]')) return true;
+        if (hasPendingCommentMarkers(root)) return true;
         // React UI fallback: Submit review button with ButtonCounter
         const submitReviewBtn = findSubmitReviewButton(root);
         const counterText = submitReviewBtn?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
@@ -6251,10 +6398,24 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return false;
     }
 
+    function hasPendingCommentMarkers(root = document) {
+        const labels = root?.querySelectorAll?.('.Label--warning, [title="Label: Pending"]') || [];
+        return [...labels].some(el => {
+            const text = `${el.textContent || ''} ${el.getAttribute?.('title') || ''}`.trim();
+            if (!/pending/i.test(text)) return false;
+            if (el.closest?.('[id^="pullrequestreview-"]')) return false;
+            return !!el.closest?.(
+                `${COMMENT_CONTAINER_SELECTOR}, ${COMMENT_THREAD_SELECTOR}, ` +
+                '[id^="discussion_r"], [id^="pullrequestreviewcomment-"]'
+            );
+        });
+    }
+
     function hasPendingReviewChanges(root = document) {
         const pending = root === document ? readViewerPendingReviewFromSSR() : null;
         if (Array.isArray(pending?.comments) && pending.comments.length > 0) return true;
         if (root?.querySelector?.('.js-pending-review-comment')) return true;
+        if (hasPendingCommentMarkers(root)) return true;
         const submitReviewBtn = findSubmitReviewButton(root);
         const counterText = submitReviewBtn?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
         const counter = parseInt(counterText, 10);
@@ -6267,13 +6428,81 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             .trim();
     }
 
+    function findReplyCommentButton(container) {
+        return [...container.querySelectorAll?.('button[type="submit"], button') || []].find(btn => {
+            const label = buttonBaseLabel(btn);
+            if (/^close with comment$/i.test(label)) return false;
+            return /^(comment|reply)$/i.test(label);
+        }) || null;
+    }
+
+    function getReplyReviewForms(root = document) {
+        return qsa(root, 'form').filter(form =>
+            form.querySelector?.('input[name="in_reply_to"], input[name="inReplyTo"]')
+            && form.querySelector?.('button[type="submit"], button')
+        );
+    }
+
+    function getReplyActionContainers(root = document) {
+        const containers = [];
+        const seen = new Set();
+        const push = (container) => {
+            if (!container || seen.has(container)) return;
+            seen.add(container);
+            containers.push(container);
+        };
+
+        for (const form of getReplyReviewForms(root)) push(form);
+
+        for (const btn of root.querySelectorAll?.('button[name="comment_and_close"], button') || []) {
+            const label = buttonBaseLabel(btn);
+            if (!/^close with comment$/i.test(label)) continue;
+            const container =
+                btn.closest?.(
+                    'form, .js-inline-comment-form, .inline-comment-form, [data-testid="review-thread-reply"], ' +
+                    '.CommentBox-module__commentBoxContainer__fVeTk, .review-thread-component, .inline-comments, ' +
+                    '.js-resolvable-timeline-thread-container'
+                )
+                || btn.parentElement;
+            if (!container?.querySelector?.('textarea')) continue;
+            if (!findReplyCommentButton(container)) continue;
+            push(container);
+        }
+        return containers;
+    }
+
+    function syncPendingReviewState(root = document) {
+        if (!isPRPage()) {
+            _ackPendingReviewActive = false;
+            return false;
+        }
+        const activeInRoot = detectPendingReview(root) && hasPendingReviewChanges(root);
+        const activeInDocument = root === document ? activeInRoot : (detectPendingReview() && hasPendingReviewChanges());
+        _ackPendingReviewActive = !!(activeInRoot || activeInDocument);
+        return _ackPendingReviewActive;
+    }
+
+    function resyncPendingReviewUi(root = document) {
+        const active = syncPendingReviewState(root);
+        if (!active) {
+            unmarkCommentButtonsPending();
+            return false;
+        }
+        markCommentButtonsPending(document);
+        addSubmitReviewButtonToConversation(document);
+        return true;
+    }
+
     // Mark inline review comment/reply submit buttons with ⏳ to signal pending mode.
     function markCommentButtonsPending(root = document) {
-        for (const form of qsa(root, 'form[action*="review_comment/create"]')) {
-            const isReply = !!form.querySelector('input[name="in_reply_to"], input[name="inReplyTo"]');
-            const btn = [...form.querySelectorAll('button[type="submit"], button')].find(b =>
-                /^(comment|reply)$/i.test(buttonBaseLabel(b))
+        for (const container of getReplyActionContainers(root)) {
+            const isReply = !!(
+                container.querySelector?.('input[name="in_reply_to"], input[name="inReplyTo"]')
+                || [...container.querySelectorAll?.('button[name="comment_and_close"], button') || []].some(btn =>
+                    /^close with comment$/i.test(buttonBaseLabel(btn))
+                )
             );
+            const btn = findReplyCommentButton(container);
             if (isReply && /^comment$/i.test(buttonBaseLabel(btn))) {
                 btn.textContent = 'Reply';
             }
@@ -6285,7 +6514,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 btn.title = `${btn.dataset.ackOrigLabel} will be added to your pending review`;
             }
             // Remove "Start a review" button if present
-            form.querySelector('.ack-start-review-btn')?.remove();
+            container.querySelector?.('.ack-start-review-btn')?.remove();
         }
     }
 
@@ -6346,19 +6575,28 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
     }
 
+    function clearCommentFormText(form) {
+        if (!form) return;
+        try {
+            form.reset?.();
+        } catch (_) {
+        }
+        for (const ta of form.querySelectorAll?.('textarea') || []) {
+            setTextareaValue(ta, '');
+        }
+    }
+
     function addStartReviewButtons(root = document) {
         if (!isPRPage()) return;
 
-        if (_ackPendingReviewActive) {
+        if (syncPendingReviewState(root)) {
             markCommentButtonsPending(root);
             addSubmitReviewButtonToConversation(document);
             return;
         }
 
-        for (const form of qsa(root, 'form[action*="review_comment/create"]')) {
-            if (form.dataset.ackStartReviewInjected) continue;
-            // Replies only (not new inline comments, and not the main PR comment box).
-            if (!form.querySelector('input[name="in_reply_to"]')) continue;
+	        for (const form of getReplyReviewForms(root)) {
+	            if (form.dataset.ackStartReviewInjected) continue;
 
             // If GitHub already shows review actions, don't add anything.
             const hasReviewAction = [...form.querySelectorAll('button')].some(b => {
@@ -6416,8 +6654,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     stopSpin();
                     _ackPendingReviewActive = true;
                     // Refresh the thread to show the new pending comment.
-                    await refreshThreadAfterPendingComment(form);
+                    const refreshed = await refreshThreadAfterPendingComment(form);
                     addSubmitReviewButtonToConversation(document);
+                    if (!refreshed) {
+                        if (_ackTesting) return;
+                        clearCommentFormText(form);
+                        suppressUnsavedCommentWarningOnce();
+                        ackSetTimeout(() => location.reload(), 50);
+                        return;
+                    }
                 } catch (e) {
                     stopSpin('❌');
                     startBtn.textContent = 'Start a review';
@@ -6447,26 +6692,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
     }, true);
 
-    function openReviewDialog() {
-        const candidates = [
-            ...document.querySelectorAll('button[data-testid="submit-review-button"]'),
-            ...document.querySelectorAll('button.js-reviews-toggle'),
-            ...document.querySelectorAll('#review-changes-modal summary'),
-        ];
-        for (const btn of candidates) {
-            if (isAckOwnedReviewControl(btn)) continue;
-            btn.click();
-            return;
+    async function openReviewDialog(eventValue = 'COMMENT') {
+        const trigger = findNativeReviewTrigger();
+        if (!trigger) return false;
+        trigger.click();
+        for (let i = 0; i < 4; i++) {
+            const dialog = findNativeReviewDialog();
+            if (dialog) return true;
+            const item = findNativeReviewMenuItem(trigger, eventValue);
+            if (item) {
+                item.click();
+                return true;
+            }
+            await ackSleep(75);
         }
-        const allBtns = [...document.querySelectorAll('button')];
-        const found = allBtns.find(b =>
-            !isAckOwnedReviewControl(b) &&
-            /finish.*review|review\s*changes|submit\s*review/i.test(b.textContent)
-        );
-        if (found) {
-            found.click();
-            return;
-        }
+        return false;
     }
 
     const SUBMIT_REVIEW_POPOVER_ID = 'ack-submit-review-popover';
@@ -6609,6 +6849,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function addSubmitReviewButtonToConversation(root = document) {
+        syncPendingReviewState(root);
         const existing = document.querySelector('.ack-submit-review-wrap');
         const form =
             root.querySelector?.('form#new_comment_form.js-new-comment-form, form.js-new-comment-form')
@@ -7688,7 +7929,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     }
                 }
             }
-            if (roots.length === 0 && !prTitleBtnRemoved) return;
+            const hadRemovals = mutations.some(m => [...m.removedNodes].some(n => n.nodeType === 1));
+            if (roots.length === 0 && !prTitleBtnRemoved && !hadRemovals) return;
             const ctx = currentInjectContext();
             for (const root of roots) {
                 runRootInjectors(root, ctx);
@@ -7697,6 +7939,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             focusVisibleDeleteCommentConfirmButton();
             if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
             runDocInjectors(ctx);
+            if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
         });
     }).observe(document.body, {childList: true, subtree: true});
 
@@ -9047,15 +9290,22 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             // Skip insertion if no buttons were added
             if (actionContainer.children.length === 0) continue;
 
-            // Insertion point: after badges (React BadgesGroupContainer) or
-            // between badges and kebab (Classic -- parent has flex-row-reverse,
-            // so DOM order is reversed visually: insert BEFORE badges in DOM
-            // to appear AFTER badges visually).
-            const badgesGroup = header.querySelector('[class*="BadgesGroupContainer"], [class*="__BadgesGroup"]');
-            if (badgesGroup) {
-                badgesGroup.after(actionContainer);
-            } else {
-                const badgesDiv = header.querySelector('.d-none.d-sm-flex');
+	            // Insertion point: after badges (React BadgesGroupContainer) or
+	            // between badges and kebab (Classic -- parent has flex-row-reverse,
+	            // so DOM order is reversed visually: insert BEFORE badges in DOM
+	            // to appear AFTER badges visually).
+                const badgesGroup = header.querySelector('[class*="BadgesGroupContainer"], [class*="__BadgesGroup"]');
+                const classicActions = header.querySelector('.timeline-comment-actions');
+                if (editState === 'e' && classicActions && !badgesGroup) {
+                    actionContainer.style.marginLeft = '0';
+                    actionContainer.style.marginRight = '4px';
+                    const menuTrigger = classicActions.querySelector('details.details-overlay, summary, button, [role="button"]');
+                    if (menuTrigger) classicActions.insertBefore(actionContainer, menuTrigger);
+                    else classicActions.appendChild(actionContainer);
+                } else if (badgesGroup) {
+	                badgesGroup.after(actionContainer);
+	            } else {
+	                const badgesDiv = header.querySelector('.d-none.d-sm-flex');
                 if (badgesDiv) {
                     // flex-row-reverse: DOM-before = visually-after
                     badgesDiv.before(actionContainer);
@@ -16055,12 +16305,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     ackTest('hasUnsavedCommentText returns false when no textareas exist', () => {
         // Deterministic even on live GitHub pages (which usually *do* have comment textareas).
-        const orig = Document.prototype.querySelectorAll;
-        Document.prototype.querySelectorAll = () => [];
+        const orig = document.querySelectorAll;
+        document.querySelectorAll = () => [];
         try {
             ackEq(hasUnsavedCommentText(), false);
         } finally {
-            Document.prototype.querySelectorAll = orig;
+            document.querySelectorAll = orig;
         }
     });
 
@@ -17215,9 +17465,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
     });
 
-    ackTest('addQuickCommentActions cleans up stale cancel icon after edit mode', () => {
-        const root = document.createElement('div');
-        root.id = 'acktest-qactions-stale-cancel';
+	    ackTest('addQuickCommentActions cleans up stale cancel icon after edit mode', () => {
+	        const root = document.createElement('div');
+	        root.id = 'acktest-qactions-stale-cancel';
         Object.assign(root.style, {position: 'absolute', left: '-10000px', top: '0', width: '400px'});
 
         const container = document.createElement('div');
@@ -17249,10 +17499,59 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             ackAssert(qa, 'missing rebuilt .ack-quick-actions');
             ackAssert(!qa.querySelector('button[title*="Cancel"]'), 'stale cancel button still present');
             ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button after rebuild');
-        } finally {
-            root.remove();
-        }
-    });
+	        } finally {
+	            root.remove();
+	        }
+	    });
+
+	    ackTest('classic edit-mode quick actions stay inside timeline-comment-actions', () => {
+	        const root = document.createElement('div');
+	        root.id = 'acktest-qactions-classic-edit-placement';
+	        Object.assign(root.style, {position: 'absolute', left: '-10000px', top: '0', width: '400px'});
+
+	        const container = document.createElement('div');
+	        container.className = 'timeline-comment current-user';
+
+	        const header = document.createElement('div');
+	        header.className = 'timeline-comment-header';
+
+	        const flex = document.createElement('div');
+	        flex.className = 'd-flex flex-row-reverse';
+	        const actions = document.createElement('div');
+	        actions.className = 'timeline-comment-actions d-flex flex-items-center';
+	        const details = document.createElement('details');
+	        details.className = 'details-overlay';
+	        actions.appendChild(details);
+	        const badges = document.createElement('div');
+	        badges.className = 'd-none d-sm-flex';
+	        flex.appendChild(actions);
+	        flex.appendChild(badges);
+	        header.appendChild(flex);
+
+	        const author = document.createElement('a');
+	        author.className = 'author';
+	        author.textContent = 'me';
+	        header.appendChild(author);
+
+	        const form = document.createElement('form');
+	        form.className = 'js-comment-update';
+	        const ta = document.createElement('textarea');
+	        form.appendChild(ta);
+	        container.appendChild(header);
+	        container.appendChild(form);
+	        root.appendChild(container);
+	        document.body.appendChild(root);
+	        try {
+	            addQuickCommentActions(root);
+	            const qa = actions.querySelector('.ack-quick-actions');
+	            ackAssert(qa, 'missing .ack-quick-actions inside timeline-comment-actions');
+	            ackAssert(qa.querySelector('button[title="Proofread comment"]'), 'missing proofread button');
+	            ackAssert(qa.querySelector('button[title="Cancel edit"]'), 'missing cancel edit button');
+	            ackEq(qa.nextElementSibling, details, 'quick-actions stay grouped with the native action menu');
+	        } finally {
+	            root.remove();
+	        }
+	    });
 
     ackTest('addQuickCommentActions injects icons for React comment headers', () => {
         const root = document.createElement('div');
@@ -20396,6 +20695,46 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
     });
 
+    ackTest('startReviewFromReplyForm supports React camelCase reply and comparison fields', async () => {
+        const origParsePR = parsePR;
+        const origCreate = createReviewCommentViaPageData;
+        try {
+            parsePR = () => ({owner: 'bitcoin', repo: 'bitcoin', pr: '1'});
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <form id="f" action="/x/review_comment/create">
+                    <input type="hidden" name="inReplyTo" value="123">
+                    <input type="hidden" name="comparisonStartOid" value="aaa">
+                    <input type="hidden" name="comparisonEndOid" value="bbb">
+                    <input type="hidden" name="comparisonBaseOid" value="ccc">
+                    <textarea>reply text</textarea>
+                </form>
+            `;
+            document.body.appendChild(host);
+            let call = null;
+            createReviewCommentViaPageData = async (_pr, args) => {
+                call = {pr: _pr, args};
+                return {ok: true};
+            };
+            try {
+                await startReviewFromReplyForm(host.querySelector('#f'));
+                ackEq(call?.pr?.owner, 'bitcoin', 'passes parsed PR');
+                ackEq(call?.args?.inReplyTo, '123', 'reads camelCase inReplyTo');
+                ackEq(call?.args?.comparisonStartOid, 'aaa', 'reads camelCase comparisonStartOid');
+                ackEq(call?.args?.comparisonEndOid, 'bbb', 'reads camelCase comparisonEndOid');
+                ackEq(call?.args?.comparisonBaseOid, 'ccc', 'reads camelCase comparisonBaseOid');
+                ackEq(call?.args?.text, 'reply text', 'passes textarea text');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            parsePR = origParsePR;
+            createReviewCommentViaPageData = origCreate;
+        }
+    });
+
     ackTest('addStartReviewButtons injects button only on review_comment/create reply forms', () => {
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
@@ -20434,6 +20773,77 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             isPRPage = origIsPRPage;
             _ackPendingReviewActive = origPending;
         }
+    });
+
+    ackTest('addStartReviewButtons injects into React reply forms using inReplyTo', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = false;
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <form id="reply" action="/x/review_comment/create">
+                    <input type="hidden" name="inReplyTo" value="123">
+                    <div class="actions"><button type="submit">Comment</button></div>
+                </form>
+            `;
+            document.body.appendChild(host);
+            try {
+                addStartReviewButtons(host);
+                const replyForm = host.querySelector('#reply');
+                ackAssert(replyForm.querySelector('.ack-start-review-btn'), 'injects into React reply form');
+                ackEq(replyForm.querySelector('button[type="submit"]').textContent, 'Reply', 'renames Comment to Reply on React reply forms');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+        }
+    });
+
+    ackTest('addStartReviewButtons injects into reply forms without review_comment/create action', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = false;
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <form id="reply">
+                    <input type="hidden" name="in_reply_to" value="123">
+                    <div class="actions">
+                        <button type="submit" name="comment_and_close">Close with comment</button>
+                        <button type="submit">Comment</button>
+                    </div>
+                </form>
+            `;
+            document.body.appendChild(host);
+            try {
+                addStartReviewButtons(host);
+                const replyForm = host.querySelector('#reply');
+                ackAssert(replyForm.querySelector('.ack-start-review-btn'), 'injects into reply form without action attribute');
+                ackEq(replyForm.querySelectorAll('button[type="submit"]')[1].textContent, 'Reply', 'renames plain Comment button to Reply');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+        }
+    });
+
+    ackTest('addStartReviewButtons reloads when pending comment posts but partial refresh fails', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function addStartReviewButtons'), source.indexOf('// Detect review submission'));
+        ackAssert(fn.includes('const refreshed = await refreshThreadAfterPendingComment(form);'), 'captures partial refresh result');
+        ackAssert(fn.includes('if (!refreshed)'), 'checks for failed partial refresh');
+        ackAssert(fn.includes('location.reload()'), 'falls back to page reload when thread refresh fails');
     });
 
     ackTest('addStartReviewButtons marks pending comment and reply actions with hourglass', () => {
@@ -20541,6 +20951,156 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             _ackPendingReviewActive = origPending;
             readViewerPendingReviewFromSSR = origReadPending;
             unmarkCommentButtonsPending();
+        }
+    });
+
+    ackTest('pending review mode marks reply forms without review_comment/create action', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = false;
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <div id="discussion_r123" class="timeline-comment">
+                    <div class="timeline-comment-header">
+                        <span title="Label: Pending" class="Label Label--warning">Pending</span>
+                    </div>
+                </div>
+                <form id="reply">
+                    <input type="hidden" name="in_reply_to" value="123">
+                    <div class="actions">
+                        <button type="submit" name="comment_and_close">Close with comment</button>
+                        <button type="submit">Comment</button>
+                    </div>
+                </form>
+            `;
+            document.body.appendChild(host);
+            try {
+                addStartReviewButtons(host);
+                ackEq(_ackPendingReviewActive, true, 'syncs pending state from live DOM markers');
+                ackEq(host.querySelectorAll('#reply button[type="submit"]')[1].textContent, 'Reply ⏳', 'marks plain Comment button as pending reply');
+                ackAssert(!host.querySelector('.ack-start-review-btn'), 'does not inject Start a review while pending');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+            unmarkCommentButtonsPending();
+        }
+    });
+
+    ackTest('pending review mode marks generic close-with-comment reply editors', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = false;
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <div id="discussion_r123" class="timeline-comment">
+                    <div class="timeline-comment-header">
+                        <span title="Label: Pending" class="Label Label--warning">Pending</span>
+                    </div>
+                </div>
+                <div id="reply-box" class="CommentBox-module__commentBoxContainer__fVeTk">
+                    <textarea></textarea>
+                    <div class="actions">
+                        <button type="button" name="comment_and_close">Close with comment</button>
+                        <button type="button">Comment</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(host);
+            try {
+                addStartReviewButtons(host);
+                ackEq(_ackPendingReviewActive, true, 'syncs pending state from DOM for generic reply editor');
+                ackEq(host.querySelectorAll('#reply-box button')[1].textContent, 'Reply ⏳', 'marks generic reply editor comment button as pending reply');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+            unmarkCommentButtonsPending();
+        }
+    });
+
+    ackTest('resyncPendingReviewUi drops stale pending mode when live DOM has no pending changes', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        const origHasPending = hasPendingReviewChanges;
+        const origDetectPending = detectPendingReview;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = true;
+            hasPendingReviewChanges = (root = document) => root !== document ? origHasPending(root) : false;
+            detectPendingReview = (root = document) => root !== document ? origDetectPending(root) : false;
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <form id="reply">
+                    <input type="hidden" name="in_reply_to" value="123">
+                    <div class="actions"><button type="submit">Comment</button></div>
+                </form>
+            `;
+            document.body.appendChild(host);
+            try {
+                ackEq(resyncPendingReviewUi(host), false, 'returns non-pending when live document has no pending changes');
+                ackEq(_ackPendingReviewActive, false, 'clears stale pending state');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+            hasPendingReviewChanges = origHasPending;
+            detectPendingReview = origDetectPending;
+        }
+    });
+
+    ackTest('pending comment labels count as pending review changes', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div id="discussion_r123" class="timeline-comment">
+                <div class="timeline-comment-header">
+                    <span title="Label: Pending" class="Label Label--warning">Pending</span>
+                </div>
+                <div class="comment-body">draft</div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            ackEq(detectPendingReview(host), true, 'pending comment marker implies pending review');
+            ackEq(hasPendingReviewChanges(host), true, 'pending comment marker implies pending changes');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('started-review pending label without comments does not count as pending changes', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div id="pullrequestreview-1">
+                <span title="Label: Pending" class="Label Label--warning">Pending</span>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            ackEq(detectPendingReview(host), true, 'started review still counts as pending review');
+            ackEq(hasPendingReviewChanges(host), false, 'started review alone does not imply pending changes');
+        } finally {
+            host.remove();
         }
     });
 
@@ -20709,6 +21269,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
     });
 
+    ackTest('submitPendingReviewViaPatGraphQL tries same-origin web submit before native dialog', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function submitPendingReviewViaPatGraphQL'), source.indexOf('function getGitHubVerifiedFetchNonce'));
+        ackAssert(fn.includes('submitPendingReviewViaWebEvents(pr, {event, body})'), 'tries same-origin web submit fallback');
+        const webIdx = fn.indexOf('submitPendingReviewViaWebEvents(pr, {event, body})');
+        const nativeIdx = fn.indexOf('submitPendingReviewViaNativeDialog(pr, {event, body})');
+        ackAssert(webIdx >= 0 && nativeIdx >= 0 && webIdx < nativeIdx, 'same-origin web submit happens before native dialog fallback');
+    });
+
     ackTest('openReviewDialog ignores ACKtopus Submit review buttons', () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -20731,6 +21300,34 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         } finally {
             host.remove();
         }
+    });
+
+    ackTest('findNativeReviewDialog prefers the actual review overlay over the sticky toolbar trigger', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <button type="button">Submit review</button>
+            <div role="dialog" style="display:block;width:320px;height:200px">
+                <textarea style="display:block;width:200px;height:60px"></textarea>
+                <button type="button">Submit review</button>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const dialog = host.querySelector('[role="dialog"]');
+            ackEq(findNativeReviewDialog(), dialog, 'returns the actual dialog, not the toolbar trigger');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('submitPendingReviewViaNativeDialog supports reviewEvent radios and generic dialog textarea', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function submitPendingReviewViaNativeDialog'), source.indexOf('async function submitPendingReviewViaWebEvents'));
+        ackAssert(fn.includes('input[name="reviewEvent"]'), 'supports current reviewEvent radios');
+        ackAssert(fn.includes("REQUEST_CHANGES: 'request changes'"), 'supports request changes lowercase radio value');
+        ackAssert(fn.includes("[...dialog.querySelectorAll('textarea')].find(isVisible)"), 'falls back to generic visible textarea inside dialog');
     });
 
 	    ackTest('findVisibleDeleteCommentConfirmButton finds danger Delete button in open dialog', () => {
@@ -22157,6 +22754,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(!fn.includes('location.href ='), 'does not assign location.href');
     });
 
+    ackTest('startReviewFromReplyForm clears draft before reload fallback', () => {
+        ensureSelfSource();
+        const fn = _ackSource.slice(
+            _ackSource.indexOf('function addStartReviewButtons'),
+            _ackSource.indexOf("document.addEventListener('click', (e) => {")
+        );
+        ackAssert(fn.includes('clearCommentFormText(form);'), 'clears reply draft before forced reload fallback');
+    });
+
     // --- prefillCommitHash: inline-only + empty-only ---
 
     ackTest('prefillCommitHash only prefills empty inline code comment boxes', () => {
@@ -22360,6 +22966,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     });
     ackTest('extractCsrfFromHtml returns empty for missing CSRF', () => {
         ackEq(extractCsrfFromHtml('<html><body>no csrf here</body></html>'), '');
+    });
+    ackTest('getCsrfToken falls back to authenticity_token input', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = '<input type="hidden" name="authenticity_token" value="formtoken123">';
+        document.body.appendChild(host);
+        try {
+            ackEq(getCsrfToken(), 'formtoken123');
+        } finally {
+            host.remove();
+        }
     });
 
     // --- WIDE_COMMENT_CONTAINER_SELECTOR structural tests ---
