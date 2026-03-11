@@ -392,7 +392,7 @@
 
     const COPY_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-copy" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>`;
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
-    const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"], textarea.comment-form-textarea';
+    const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_SELECTOR = '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
     const EXTENDED_COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_SELECTOR + ', [data-testid="comment-body-content"], .js-comment, .js-line-comments, .inline-comment-form-container';
     const WIDE_COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_SELECTOR + ', .js-discussion, .timeline-comment-group, .js-timeline-item, [id^="issue-"]';
@@ -8709,7 +8709,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             || document.querySelector('[data-testid*="issue-viewer-header" i], [data-testid*="pull-request-header" i], [data-testid*="issue-header" i]')
             || document;
 
-        const hostSel = '[data-component="PH_Title"], h1.gh-header-title, h1[data-testid*="title" i], h1[class*="Title" i], h1, h2[class*="Title" i], h2';
+        const hostSel = 'h1.gh-header-title, h1[data-testid*="title" i], h1[class*="Title" i], h1, h2[class*="Title" i], h2';
         const scopedHostSel = hostSel.split(',').map(s => `#partial-discussion-header ${s.trim()}`).join(', ');
         const host = (headerRoot !== document ? headerRoot.querySelector(hostSel) : null)
             || document.querySelector(scopedHostSel)
@@ -10654,7 +10654,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const seenContainers = new Set();
         const isPR = !!parsePR();
         const postedContainerSelector =
-            '.timeline-comment, .review-comment, [data-marker-navigation-comment-id], ' +
+            '.timeline-comment, .review-comment, ' +
             '[data-testid="issue-body"], [data-testid^="issue-comment"], ' +
             'div[id^="issuecomment-"], div[id^="discussion_r"], div[id^="pullrequestreview-"], div[id^="r"]';
         const findPostedCommentContainer = (body) => {
@@ -13191,16 +13191,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         wrapper.id = BUTTON_CONTAINER_ID;
         Object.assign(wrapper.style, {
             position: 'fixed', top: '8px', right: '8px', zIndex: '99999',
+            display: 'flex', flexDirection: 'column', alignItems: 'flex-end',
         });
 
         const compact = GM_getValue('compactToolbar', false);
 
         const toolbar = document.createElement('div');
         Object.assign(toolbar.style, {
-            display: 'flex', gap: compact ? '2px' : '6px', padding: compact ? '4px 6px' : '6px 10px',
+            display: 'inline-flex', gap: compact ? '2px' : '6px', padding: compact ? '4px 6px' : '6px 10px',
             background: '#161b22', border: '1px solid #30363d',
             borderRadius: '8px', boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
-            alignItems: 'center',
+            alignItems: 'center', width: 'max-content',
         });
 
         // --- ACK toggle button (PR only) ---
@@ -18127,6 +18128,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const overlayIdx = section.indexOf('updateAckPanelPGPOverlays');
         ackAssert(attachIdx >= 0, 'ACK panel is appended/replaced');
         ackAssert(overlayIdx > attachIdx, 'overlay update called after panel insertion');
+        const injectSection = source.slice(
+            source.indexOf('const wrapper = document.createElement(\'div\');'),
+            source.indexOf('// --- ACK toggle button (PR only) ---')
+        );
+        ackAssert(injectSection.includes("alignItems: 'flex-end'"), 'wrapper does not stretch toolbar to panel width');
+        ackAssert(injectSection.includes("display: 'inline-flex'"), 'toolbar shrink-wraps its buttons');
     });
 
     ackTest('buildCommitPrefix includes italic commit message from page header', () => {
@@ -23248,8 +23255,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const allTas = document.querySelectorAll('textarea');
         const commentTas = [...allTas].filter(ta =>
             ta.classList.contains('js-comment-field') ||
-            ta.name === 'comment[body]' ||
-            ta.classList.contains('comment-form-textarea')
+            ta.name === 'comment[body]'
         );
         if (commentTas.length === 0) return;
         ackAssert(tas.length >= commentTas.length,
@@ -23264,6 +23270,139 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!scriptText) return;
         ackAssert(!scriptText.includes('addQuickCommentActions(container)'),
             'found stale addQuickCommentActions(container) call in source');
+    });
+
+    // --- Selector constant validation (cross-referenced against saved GitHub HTML snapshots) ---
+
+    ackTest('selector constants: EXTENDED_COMMENT_CONTAINER_SELECTOR is superset of COMMENT_CONTAINER_SELECTOR', () => {
+        const base = COMMENT_CONTAINER_SELECTOR.split(',').map(s => s.trim());
+        const extended = EXTENDED_COMMENT_CONTAINER_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of base) {
+            ackAssert(extended.includes(sel),
+                `COMMENT_CONTAINER_SELECTOR part "${sel}" missing from EXTENDED_COMMENT_CONTAINER_SELECTOR`);
+        }
+    });
+
+    ackTest('selector constants: WIDE_COMMENT_CONTAINER_SELECTOR is superset of COMMENT_CONTAINER_SELECTOR', () => {
+        const base = COMMENT_CONTAINER_SELECTOR.split(',').map(s => s.trim());
+        const wide = WIDE_COMMENT_CONTAINER_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of base) {
+            ackAssert(wide.includes(sel),
+                `COMMENT_CONTAINER_SELECTOR part "${sel}" missing from WIDE_COMMENT_CONTAINER_SELECTOR`);
+        }
+    });
+
+    ackTest('selector constants: each multi-selector chain has server-HTML-confirmed selectors', () => {
+        // React-only class fragments only exist after hydration — chains must not consist
+        // exclusively of them, or initial page load would fail to match anything.
+        const reactOnlyPatterns = [
+            'ActivityThread', 'ReviewThreadContainer', 'MarkdownEditor-module',
+            'BadgesGroupContainer', '__BadgesGroup', 'PullRequestFilesToolbar-module',
+        ];
+        const isReactOnly = (sel) => reactOnlyPatterns.some(p => sel.includes(p));
+        const chains = {
+            COMMENT_CONTAINER_SELECTOR,
+            EXTENDED_COMMENT_CONTAINER_SELECTOR,
+            WIDE_COMMENT_CONTAINER_SELECTOR,
+            MARKDOWN_BODY_SELECTOR,
+            COMMENT_THREAD_SELECTOR,
+            COMMENT_MENU_TRIGGER_SELECTOR,
+            COMMENT_TA_SELECTOR,
+        };
+        for (const [name, chain] of Object.entries(chains)) {
+            const parts = chain.split(',').map(s => s.trim());
+            const serverParts = parts.filter(s => !isReactOnly(s));
+            ackAssert(serverParts.length > 0,
+                `${name} has only React-only selectors — would fail before hydration`);
+        }
+    });
+
+    ackTest('selector constants: no stale data-marker-navigation-comment-id', () => {
+        const source = _ackSource;
+        // Split string to avoid self-matching in _ackSource
+        const needle = 'data-marker-navigation-comment' + '-id';
+        // Only flag if used as an attribute selector (inside brackets), not in test assertions
+        const usagePattern = new RegExp('\\[' + needle + '\\]');
+        ackAssert(!usagePattern.test(source),
+            needle + ' is stale — not found in any GitHub HTML sample');
+    });
+
+    ackTest('selector constants: no stale textarea.comment-form-textarea', () => {
+        const source = _ackSource;
+        const needle = 'comment-form' + '-textarea';
+        // Flag if used as a CSS class selector
+        const usagePattern = new RegExp('textarea\\.' + needle + '|\\.' + needle);
+        ackAssert(!usagePattern.test(source),
+            needle + ' is a legacy GitHub class — not found in any HTML sample');
+    });
+
+    ackTest('selector constants: no stale data-component="PH_Title"', () => {
+        const source = _ackSource;
+        const needle = 'data-component="PH' + '_Title"';
+        // Flag if used as an attribute selector
+        const usagePattern = new RegExp('\\[data-component="PH' + '_Title"\\]');
+        ackAssert(!usagePattern.test(source),
+            needle + ' not found in any GitHub HTML sample');
+    });
+
+    ackDomTest('DOM: COMMENT_CONTAINER_SELECTOR individual parts each valid CSS', () => {
+        const parts = COMMENT_CONTAINER_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of parts) {
+            try {
+                document.querySelector(sel);
+            } catch (e) {
+                ackAssert(false, `invalid CSS selector in COMMENT_CONTAINER_SELECTOR: "${sel}" — ${e.message}`);
+            }
+        }
+    });
+
+    ackDomTest('DOM: MARKDOWN_BODY_SELECTOR individual parts each valid CSS', () => {
+        const parts = MARKDOWN_BODY_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of parts) {
+            try {
+                document.querySelector(sel);
+            } catch (e) {
+                ackAssert(false, `invalid CSS selector in MARKDOWN_BODY_SELECTOR: "${sel}" — ${e.message}`);
+            }
+        }
+    });
+
+    ackDomTest('DOM: COMMENT_THREAD_SELECTOR individual parts each valid CSS', () => {
+        const parts = COMMENT_THREAD_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of parts) {
+            try {
+                document.querySelector(sel);
+            } catch (e) {
+                ackAssert(false, `invalid CSS selector in COMMENT_THREAD_SELECTOR: "${sel}" — ${e.message}`);
+            }
+        }
+    });
+
+    ackDomTest('DOM: COMMENT_MENU_ROOT_SELECTOR individual parts each valid CSS', () => {
+        const parts = COMMENT_MENU_ROOT_SELECTOR.split(',').map(s => s.trim());
+        for (const sel of parts) {
+            try {
+                document.querySelector(sel);
+            } catch (e) {
+                ackAssert(false, `invalid CSS selector in COMMENT_MENU_ROOT_SELECTOR: "${sel}" — ${e.message}`);
+            }
+        }
+    });
+
+    ackDomTest('DOM: gatherCommentElements postedContainerSelector parts each valid CSS', () => {
+        // Mirror the local selector from gatherCommentElements
+        const postedContainerSelector =
+            '.timeline-comment, .review-comment, ' +
+            '[data-testid="issue-body"], [data-testid^="issue-comment"], ' +
+            'div[id^="issuecomment-"], div[id^="discussion_r"], div[id^="pullrequestreview-"], div[id^="r"]';
+        const parts = postedContainerSelector.split(',').map(s => s.trim());
+        for (const sel of parts) {
+            try {
+                document.querySelector(sel);
+            } catch (e) {
+                ackAssert(false, `invalid CSS selector in postedContainerSelector: "${sel}" — ${e.message}`);
+            }
+        }
     });
 
 
