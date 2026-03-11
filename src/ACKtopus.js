@@ -230,6 +230,36 @@
         return files.length ? files.map(shellQuote).join(' ') : '';
     }
 
+    function readBaseBranchFromSSR() {
+        try {
+            const scriptEl = document.querySelector(
+                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
+            );
+            if (!scriptEl?.textContent) return '';
+            const data = JSON.parse(scriptEl.textContent);
+            return data?.payload?.pullRequestsChangesRoute?.pullRequest?.baseBranch
+                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.baseBranch
+                || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function readBaseBranchFromSummaryDom() {
+        const summary =
+            document.querySelector('.PullRequestHeaderSummary-module__summaryContainer__dA7dP')
+            || document.querySelector('#partial-discussion-header')
+            || document;
+        const branchLink = [...summary.querySelectorAll?.('a[href*="/tree/"]') || []][0];
+        const href = branchLink?.getAttribute?.('href') || '';
+        const m = href.match(/\/tree\/([^?#]+)/);
+        return m?.[1] ? decodeURIComponent(m[1]) : '';
+    }
+
+    function getReviewBaseBranch() {
+        return readBaseBranchFromSSR() || readBaseBranchFromSummaryDom() || 'master';
+    }
+
     const CLANG_TOOLING_CONFIGURE_CMD =
         'cmake -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON';
 
@@ -259,12 +289,15 @@
             fmt: (sha, pr) => `git fetch origin ${sha} && git switch --detach FETCH_HEAD`
         },
         {
-            key: 'ghco', // upstream master
+            key: 'ghco',
             hotkey: 'g',
             emoji: '⬇️',
             label: 'gh pr co',
-            tip: 'Copy gh CLI command to checkout this PR and rebase on master',
-            fmt: (sha, pr) => `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase upstream master`
+            tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
+            fmt: (sha, pr) => {
+                const base = getReviewBaseBranch();
+                return `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase upstream ${shellQuote(base)}`;
+            }
         },
         {
             key: 'rdiff',
@@ -287,15 +320,18 @@
             hotkey: 'e',
             emoji: '📊',
             label: 'rebase + diff',
-            tip: 'Rebase both versions on master and diff (cleanest comparison)',
+            tip: 'Rebase both versions on the base branch and diff (cleanest comparison)',
             fmt: (sha) => {
+                const base = getReviewBaseBranch();
+                const upstreamBase = shellQuote(`upstream/${base}`);
+                const fetchBase = shellQuote(base);
                 if (userAckSha && sha) {
-                    return `B=${userAckSha} A=${sha} && git fetch upstream master $B $A && git checkout --detach $B && git rebase upstream/master && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase upstream/master && git diff $OLD`;
+                    return `B=${userAckSha} A=${sha} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
                 }
                 if (!lastForcePush) return null;
                 const f = lastForcePush.fromFull || lastForcePush.from;
                 const t = lastForcePush.toFull || lastForcePush.to;
-                return `B=${f} A=${t} && git fetch upstream master $B $A && git checkout --detach $B && git rebase upstream/master && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase upstream/master && git diff $OLD`;
+                return `B=${f} A=${t} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
             }
         },
         {
@@ -354,12 +390,13 @@
 	            hotkey: 'm',
 	            emoji: '🧹',
 	            label: 'clang-format-diff',
-	            tip: 'Apply clang-format only to changed lines in this PR (uses merge-base vs upstream/master)',
+	            tip: 'Apply clang-format only to changed lines in this PR (uses merge-base vs the upstream base branch)',
 	            cond: 'cpp',
 	            fmt: () => {
                     const files = getChangedCppPathArgs();
                     if (!files) return null;
-	                return `git diff -U0 $(git merge-base HEAD upstream/master) -- ${files} | contrib/devtools/clang-format-diff.py -p1 -i -v`;
+                    const upstreamBase = shellQuote(`upstream/${getReviewBaseBranch()}`);
+	                return `git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | contrib/devtools/clang-format-diff.py -p1 -i -v`;
 	            }
 	        },
 	        {
@@ -372,7 +409,8 @@
 	            fmt: () => {
                     const files = getChangedCppPathArgs();
                     if (!files) return null;
-	                return `TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 $(git merge-base HEAD upstream/master) -- ${files} | "$TIDY_DIFF" -p1 -path build -j $(nproc)`;
+                    const upstreamBase = shellQuote(`upstream/${getReviewBaseBranch()}`);
+	                return `TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | "$TIDY_DIFF" -p1 -path build -j $(nproc)`;
 	            }
 	        },
 	        {
@@ -6872,9 +6910,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const actions =
             form?.querySelector?.('#partial-new-comment-form-actions')
             || form?.querySelector?.('[data-url*="/partials/form_actions"]');
-        const commentBtn = [...(actions?.querySelectorAll?.('button[type="submit"]') || [])].find(btn =>
-            btn.getAttribute('name') !== 'comment_and_close'
+        const findMainCommentButton = (scope) => [...(scope?.querySelectorAll?.('button[type="submit"]') || [])].find(btn =>
+            !/^comment_and_/i.test(btn.getAttribute('name') || '')
         );
+        const commentBtn = findMainCommentButton(actions);
 
         const setButtonText = (btn, text) => {
             if (!btn) return;
@@ -6887,7 +6926,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const liveCommentBtn =
                 form?.querySelector?.('button[data-ack-submit-orig-class], .ack-submit-review-anchor button[data-ack-submit-orig-class]')
                 || commentBtn
-                || document.querySelector('#new_comment_form button[data-ack-submit-orig-class], #new_comment_form .ack-submit-review-anchor button[data-ack-submit-orig-class]');
+                || findMainCommentButton(actions)
+                || findMainCommentButton(document.querySelector('#new_comment_form'));
             if (liveCommentBtn?.dataset?.ackSubmitOrigClass) {
                 liveCommentBtn.className = liveCommentBtn.dataset.ackSubmitOrigClass;
                 delete liveCommentBtn.dataset.ackSubmitOrigClass;
@@ -14288,10 +14328,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     ackTest('ghco format includes PR URL and rebase', () => {
         const ghco = SHA_FORMATS.find(f => f.key === 'ghco');
         const pr = {owner: 'bitcoin', repo: 'bitcoin', pr: '123'};
-        const result = ghco.fmt('abc', pr);
-        ackAssert(result.includes('github.com/bitcoin/bitcoin/pull/123'));
-        ackAssert(result.includes('--force'));
-        ackAssert(result.includes('git pull --rebase upstream master'));
+        const origBase = getReviewBaseBranch;
+        getReviewBaseBranch = () => 'main';
+        try {
+            const result = ghco.fmt('abc', pr);
+            ackAssert(result.includes('github.com/bitcoin/bitcoin/pull/123'));
+            ackAssert(result.includes('--force'));
+            ackAssert(result.includes('git pull --rebase upstream main'));
+        } finally {
+            getReviewBaseBranch = origBase;
+        }
     });
 
     ackTest('rdiff format returns null when no force-push', () => {
@@ -14641,17 +14687,39 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        }
 	    });
 
-	    ackTest('formatdiff command uses clang-format-diff.py and merge-base vs upstream/master', () => {
+	    ackTest('formatdiff command uses clang-format-diff.py and merge-base vs upstream base branch', () => {
 	        const f = SHA_FORMATS.find(f => f.key === 'formatdiff');
             const prev = prFileCategories;
-            prFileCategories = {cpp: ['src/validation.cpp', 'src/validation.h']};
-	        const cmd = f.fmt();
-            prFileCategories = prev;
-	        ackAssert(cmd.includes('git merge-base HEAD upstream/master'), 'uses merge-base vs upstream/master');
-	        ackAssert(cmd.includes('clang-format-diff.py'), 'invokes clang-format-diff.py');
-            ackAssert(cmd.includes('src/validation.cpp'), 'includes exact changed file path(s)');
-            ackAssert(cmd.includes('src/validation.h'), 'includes exact changed file path(s)');
+            const origBase = getReviewBaseBranch;
+            try {
+                getReviewBaseBranch = () => 'main';
+                prFileCategories = {cpp: ['src/validation.cpp', 'src/validation.h']};
+	            const cmd = f.fmt();
+	            ackAssert(cmd.includes('git merge-base HEAD upstream/main'), 'uses merge-base vs upstream/main');
+	            ackAssert(cmd.includes('clang-format-diff.py'), 'invokes clang-format-diff.py');
+                ackAssert(cmd.includes('src/validation.cpp'), 'includes exact changed file path(s)');
+                ackAssert(cmd.includes('src/validation.h'), 'includes exact changed file path(s)');
+            } finally {
+                prFileCategories = prev;
+                getReviewBaseBranch = origBase;
+            }
 	    });
+
+    ackTest('rebasediff command rebases against the review base branch', () => {
+        const f = SHA_FORMATS.find(f => f.key === 'rebasediff');
+        const origBase = getReviewBaseBranch;
+        const origAck = userAckSha;
+        try {
+            getReviewBaseBranch = () => 'main';
+            userAckSha = 'abc123';
+            const cmd = f.fmt('def456');
+            ackAssert(cmd.includes('git fetch upstream main $B $A'), 'fetches the dynamic base branch');
+            ackAssert(cmd.includes('git rebase upstream/main'), 'rebases against the dynamic base branch');
+        } finally {
+            getReviewBaseBranch = origBase;
+            userAckSha = origAck;
+        }
+    });
 
 	    ackTest('tidydiff command uses clang-tidy-diff with repo-root diff and build path', () => {
 	        const f = SHA_FORMATS.find(f => f.key === 'tidydiff');
@@ -15440,11 +15508,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     ackTest('ghco format produces gh pr co command with rebase', () => {
         const f = SHA_FORMATS.find(f => f.key === 'ghco');
-        const result = f.fmt('abc', {owner: 'bitcoin', repo: 'bitcoin', pr: '42'});
-        ackAssert(result.includes('gh pr co'), 'has gh pr co');
-        ackAssert(result.includes('https://github.com/bitcoin/bitcoin/pull/42'), 'has full PR URL');
-        ackAssert(result.includes('--force'), 'has --force flag');
-        ackAssert(result.includes('&& git pull --rebase upstream master'), 'has rebase');
+        const origBase = getReviewBaseBranch;
+        getReviewBaseBranch = () => 'main';
+        try {
+            const result = f.fmt('abc', {owner: 'bitcoin', repo: 'bitcoin', pr: '42'});
+            ackAssert(result.includes('gh pr co'), 'has gh pr co');
+            ackAssert(result.includes('https://github.com/bitcoin/bitcoin/pull/42'), 'has full PR URL');
+            ackAssert(result.includes('--force'), 'has --force flag');
+            ackAssert(result.includes('&& git pull --rebase upstream main'), 'has rebase');
+        } finally {
+            getReviewBaseBranch = origBase;
+        }
     });
 
     ackTest('ack format is plain ACK + SHA', () => {
@@ -18241,12 +18315,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(cfg.includes('setTimeout(runSelfTests, 50)'), 'auto-runs tests shortly after panel opens');
 	    });
 
-    ackTest('ghco format uses upstream master, not origin master', () => {
+    ackTest('ghco format uses review base branch via upstream remote', () => {
         const source = _ackSource;
-        const ghcoLine = source.split('\n').find(l => l.includes("key: 'ghco'"));
-        ackAssert(ghcoLine, 'ghco format exists');
-        ackAssert(ghcoLine.includes('upstream master'), 'uses upstream master');
-        ackAssert(!ghcoLine.includes('origin master'), 'no origin master');
+        const section = source.slice(source.indexOf("key: 'ghco'"), source.indexOf("key: 'rdiff'"));
+        ackAssert(section.includes('getReviewBaseBranch()'), 'reads the review base branch dynamically');
+        ackAssert(section.includes('git pull --rebase upstream ${shellQuote(base)}'), 'uses upstream remote with the dynamic base branch');
+        ackAssert(!section.includes('origin master'), 'does not hardcode origin/master');
     });
 
     // --- Force-Push Compare Enhancement ---
@@ -21187,6 +21261,46 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 ackAssert(host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'keeps main Comment button styling unchanged');
                 ackEq(host.querySelector('button[type="submit"]').textContent.trim(), 'Comment', 'restores main button label to Comment');
                 ackEq(host.querySelector('button[type="submit"]').title || '', '', 'clears submit review wording from main button');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRConversationPage = origIsConv;
+            _ackPendingReviewActive = origPending;
+            addSubmitReviewButtonToConversation(document);
+        }
+    });
+
+    ackTest('addSubmitReviewButtonToConversation does not relabel comment_and_open reopen action', () => {
+        const origIsConv = isPRConversationPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRConversationPage = () => true;
+            _ackPendingReviewActive = false;
+
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <form id="new_comment_form" class="js-new-comment-form">
+                  <textarea id="new_comment_field">hello</textarea>
+                  <div id="partial-new-comment-form-actions">
+                    <div class="color-bg-subtle">
+                      <button type="submit" name="comment_and_open" class="btn">Reopen pull request</button>
+                    </div>
+                    <div class="color-bg-subtle mt-sm-0 ml-sm-1 mt-2">
+                      <button type="submit" class="btn-primary btn width-full">Comment</button>
+                    </div>
+                  </div>
+                </form>
+            `;
+            document.body.appendChild(host);
+            try {
+                addSubmitReviewButtonToConversation(host);
+                const buttons = host.querySelectorAll('#partial-new-comment-form-actions button[type="submit"]');
+                ackEq(buttons[0].textContent.trim(), 'Reopen pull request', 'keeps reopen action label unchanged');
+                ackEq(buttons[1].textContent.trim(), 'Comment', 'keeps main comment button label unchanged');
+                ackAssert(!host.querySelector('.ack-submit-review-btn'), 'does not inject Submit review button');
             } finally {
                 host.remove();
             }
