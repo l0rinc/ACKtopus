@@ -9388,7 +9388,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         btn.type = 'button';
         btn.role = 'menuitem';
         btn.className = 'dropdown-item btn-link ack-copy-comment-context-item';
-        btn.textContent = 'Copy comment context 📎';
+        btn.textContent = 'Copy comment 📎';
         return bindCopyCommentContextAction(btn, container);
     }
 
@@ -9401,7 +9401,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         btn.role = 'menuitem';
         btn.className = 'ActionListContent';
         btn.innerHTML = `
-            <span class="ActionListItem-label">Copy comment context 📎</span>
+            <span class="ActionListItem-label">Copy comment 📎</span>
         `;
         bindCopyCommentContextAction(btn, container);
         li.appendChild(btn);
@@ -9411,16 +9411,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     function insertCommentContextMenuItem(host, item, itemSelector) {
         const items = [...host.querySelectorAll(itemSelector)];
         const copyLinkItem = items.find(el => /^copy link(\s|$)/i.test((el.textContent || '').trim()));
-        if (copyLinkItem) {
-            copyLinkItem.insertAdjacentElement('afterend', item);
-            return;
-        }
-        const fallbackItem = items.find(el => /^(quote reply|reference in new issue)(\s|$)/i.test((el.textContent || '').trim()));
-        if (fallbackItem) {
-            fallbackItem.insertAdjacentElement('beforebegin', item);
-            return;
-        }
-        host.appendChild(item);
+        if (!copyLinkItem) return false;
+        copyLinkItem.insertAdjacentElement('afterend', item);
+        return true;
     }
 
     function injectCommentContextMenuItem(menuRoot, container) {
@@ -9437,14 +9430,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             || menuRoot.querySelector('ul, ol');
         const hasActionList = !!(actionHost && (menuRoot.querySelector('.ActionListItem, .ActionListContent') || menuRoot.matches('action-list, action-menu')));
         if (hasActionList) {
-            insertCommentContextMenuItem(actionHost, buildActionListCommentContextMenuItem(container), '.ActionListItem');
-            return true;
+            return insertCommentContextMenuItem(actionHost, buildActionListCommentContextMenuItem(container), '.ActionListItem');
         }
 
         const hasClassicItems = !!menuRoot.querySelector('.dropdown-item, .js-comment-quote-reply, button[role="menuitem"], a[role="menuitem"]');
         if (hasClassicItems || menuRoot.matches('details-menu, [role="menu"]')) {
-            insertCommentContextMenuItem(menuRoot, buildClassicCommentContextMenuItem(container), '.dropdown-item, .js-comment-quote-reply, button[role="menuitem"], a[role="menuitem"]');
-            return true;
+            return insertCommentContextMenuItem(menuRoot, buildClassicCommentContextMenuItem(container), '.dropdown-item, .js-comment-quote-reply, button[role="menuitem"], a[role="menuitem"]');
         }
         return false;
     }
@@ -20189,25 +20180,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         actionMenu.innerHTML = '<ul data-targets="action-list.items"><li class="ActionListItem"><button type="button" class="ActionListContent"><span class="ActionListItem-label">Copy link</span></button></li></ul>';
         document.body.appendChild(actionMenu);
         try {
-            ackEq(injectCommentContextMenuItem(classic, host.querySelector('#comment-a')), true, 'injects into classic menu');
-            const classicEntry = classic.querySelector('.ack-copy-comment-context-item');
-            ackAssert(classicEntry, 'classic menu gets copy entry');
-            ackEq(classicEntry.textContent.trim(), 'Copy comment context 📎', 'classic entry carries ACKtopus marker');
-            const classicFallbackItems = [...classic.querySelectorAll('.dropdown-item')].map(el => el.textContent.trim());
-            ackDeepEq(classicFallbackItems, ['Copy comment context 📎', 'Quote reply'], 'classic entry stays near the copy/reply actions when Copy link is absent');
+            ackEq(injectCommentContextMenuItem(classic, host.querySelector('#comment-a')), false, 'does not inject into classic menu without Copy link');
+            ackAssert(!classic.querySelector('.ack-copy-comment-context-item'), 'classic menu stays untouched without Copy link');
 
             classic.innerHTML = '<button type="button" class="dropdown-item">Copy link</button><button type="button" class="dropdown-item">Quote reply</button>';
-            injectCommentContextMenuItem(classic, host.querySelector('#comment-a'));
+            ackEq(injectCommentContextMenuItem(classic, host.querySelector('#comment-a')), true, 'injects into classic menu with Copy link');
             const classicItems = [...classic.querySelectorAll('.dropdown-item')].map(el => el.textContent.trim());
-            ackDeepEq(classicItems, ['Copy link', 'Copy comment context 📎', 'Quote reply'], 'classic entry is inserted right after Copy link');
+            ackDeepEq(classicItems, ['Copy link', 'Copy comment 📎', 'Quote reply'], 'classic entry is inserted right after Copy link');
 
             ackEq(injectCommentContextMenuItem(actionMenu, host.querySelector('#comment-b')), true, 'injects into action-list menu');
             const injectedBtn = actionMenu.querySelector('.ack-copy-comment-context-item button');
             ackAssert(injectedBtn, 'action-list menu gets copy entry');
-            ackEq(injectedBtn.textContent.trim(), 'Copy comment context 📎', 'action-list entry carries ACKtopus marker');
+            ackEq(injectedBtn.textContent.trim(), 'Copy comment 📎', 'action-list entry carries ACKtopus marker');
             ackEq(injectedBtn._ackCommentContextContainer, host.querySelector('#comment-b'), 'stores current comment container on injected action');
             const labels = [...actionMenu.querySelectorAll('.ActionListItem-label')].map(el => el.textContent.trim());
-            ackDeepEq(labels, ['Copy link', 'Copy comment context 📎'], 'action-list entry is inserted right after Copy link');
+            ackDeepEq(labels, ['Copy link', 'Copy comment 📎'], 'action-list entry is inserted right after Copy link');
         } finally {
             classic.remove();
             actionMenu.remove();
@@ -20338,7 +20325,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(copyFn.includes('GM_setClipboard'), 'copyCommentContext writes to clipboard');
 
         const menuFns = source.slice(source.indexOf('function getCommentMenuRoots'), source.indexOf('async function waitForEditTextarea'));
-        ackAssert(menuFns.includes('Copy comment context'), 'injects copy action into menu');
+        ackAssert(menuFns.includes('Copy comment'), 'injects copy action into menu');
         ackAssert(menuFns.includes('installCommentMenuAugmenter'), 'installs menu augmenter');
         ackAssert(menuFns.includes('COMMENT_MENU_ROOT_SELECTOR'), 'menu injection uses shared root selector');
     });
