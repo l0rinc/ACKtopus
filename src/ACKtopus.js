@@ -1693,6 +1693,41 @@
         });
     }
 
+    function fetchCommitPullRequests(owner, repo, sha) {
+        const url = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls`;
+        const tryHeaders = [
+            {...ghApiHeaders(), Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json'},
+            {Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json'},
+        ];
+        return new Promise((resolve, reject) => {
+            let attempt = 0;
+            const run = () => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    headers: tryHeaders[attempt],
+                    onload: (r) => {
+                        if (r.status >= 200 && r.status < 300) {
+                            try {
+                                resolve(JSON.parse(r.responseText));
+                            } catch (e) {
+                                reject(new Error(`JSON parse failed for ${url}: ${r.responseText.slice(0, 120)}`));
+                            }
+                            return;
+                        }
+                        if ((r.status === 401 || r.status === 403) && attempt === 0 && ghApiHeaders().Authorization) {
+                            run(++attempt);
+                            return;
+                        }
+                        reject(new Error(`HTTP ${r.status} for ${url}: ${r.responseText.slice(0, 120)}`));
+                    },
+                    onerror: reject,
+                });
+            };
+            run();
+        });
+    }
+
     function gmPost(url, body) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -2446,9 +2481,10 @@
             for (const sha of [headSha, baseSha]) {
                 if (prNum) break;
                 try {
-                    const prs = await gmFetchTimeout(
-                        `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls`
-                    );
+                    const prs = await Promise.race([
+                        fetchCommitPullRequests(owner, repo, sha),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+                    ]);
                     if (prs.length > 0) {
                         prNum = prs[0].number;
                         console.log('ACKtopus: compare -- PR #' + prNum + ' (from commits/pulls, sha:', sha.slice(0, 8) + ')');
@@ -5705,7 +5741,20 @@ Rules:
                     setTimeout(() => restoreButton(), 500);
                     return;
                 }
-                console.log('ACKtopus: proofread: nothing to proofread (empty textarea/selection)');
+                console.log('ACKtopus: proofread: empty textarea/selection, generating draft reply/comment');
+                const suggested = await suggestDraftReplyForTextarea(ta, {
+                    provider,
+                    taContainer,
+                    taSelector,
+                    title: commentEl.dataset.ackToolbarMode === 'suggest'
+                        ? 'Suggest a reply/comment in my style'
+                        : 'Suggest a reply/comment in my style',
+                });
+                if (suggested) {
+                    stopSpin('✅');
+                    setTimeout(() => restoreButton(), 500);
+                    return;
+                }
                 stopSpin();
                 return;
             }
@@ -8149,15 +8198,17 @@ Rules:
 	            if (!m.target?.closest?.(COMMENT_CONTAINER_SELECTOR)) continue;
 	            const lt = ensureAckLifetime('attr-observer');
 	            if (lt.gen !== _attrObserverAbortGen) {
-	                _attrObserverAbortGen = lt.gen;
+	            _attrObserverAbortGen = lt.gen;
 	                lt.onAbort(() => {
 	                    attrRefreshPending = false;
 	                });
 	            }
 	            attrRefreshPending = true;
-	            scheduleQuickActionsSoftRescan(180);
 	            ackSetTimeout(() => {
 	                attrRefreshPending = false;
+                    const ctx = currentInjectContext();
+                    runRootInjectors(document, ctx);
+                    runDocInjectors(ctx);
             }, 300);
             return;
         }
@@ -10497,6 +10548,7 @@ Rules:
     const CHAT_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M3.25 3.25h9.5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H8l-3.25 2v-2H3.25a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1Z"/></svg>`;
     const FOLD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5.25 4.75 8 2l2.75 2.75"/><path d="M5.25 11.25 8 14l2.75-2.75"/><path d="M2 8h12"/></svg>`;
     const PROOFREAD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5 2.25h4.25L12 5v7.25a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z"/><path d="M9.25 2.25V5H12"/><path d="m5.9 9 1.25 1.25L10.1 7.3"/></svg>`;
+    const WAND_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="m9.75 2.25.35 1.05a1 1 0 0 0 .63.63l1.05.35-1.05.35a1 1 0 0 0-.63.63l-.35 1.05-.35-1.05a1 1 0 0 0-.63-.63l-1.05-.35 1.05-.35a1 1 0 0 0 .63-.63Z"/><path d="m5.1 6.4 4.5 4.5"/><path d="m3.25 12.75 1.2-3.05 1.85-1.85 1.85 1.85-1.85 1.85Z"/></svg>`;
 
 	    function getToolbarEditorRoot(toolbar) {
 	        return toolbar?.closest(
@@ -10533,6 +10585,187 @@ Rules:
 	            || candidates[0]
 	            || null;
 	    }
+
+        function updateToolbarProofreadButton(toolbar) {
+            const btn = toolbar?.querySelector?.('.ack-toolbar-proofread');
+            if (!btn) return;
+            const ta = getToolbarTextarea(toolbar);
+            const isEmpty = !String(ta?.value || '').trim();
+            const nextHtml = isEmpty ? WAND_ICON : PROOFREAD_ICON;
+            if ((btn.innerHTML || '').trim() !== nextHtml.trim()) btn.innerHTML = nextHtml;
+            btn.title = isEmpty ? 'Suggest a reply/comment in your style' : 'Proofread this comment';
+            btn.dataset.ackToolbarMode = isEmpty ? 'suggest' : 'proofread';
+            if (toolbar.tagName === 'MARKDOWN-TOOLBAR') {
+                const icon = btn.querySelector('svg');
+                if (icon) icon.classList.add('Button-visual');
+            }
+        }
+
+        function bindToolbarProofreadState(toolbar) {
+            const ta = getToolbarTextarea(toolbar);
+            if (!ta || ta.dataset.ackToolbarProofreadBound === '1') return;
+            ta.dataset.ackToolbarProofreadBound = '1';
+            const refresh = () => updateToolbarProofreadButton(toolbar);
+            ta.addEventListener('input', refresh);
+            ta.addEventListener('change', refresh);
+            ta.addEventListener('focus', refresh);
+        }
+
+        function getCurrentUserStyleSamples(limit = 3) {
+            const currentUser = (
+                document.querySelector('meta[name="user-login"]')?.content
+                || document.querySelector('meta[name="octolytics-actor-login"]')?.content
+                || ''
+            ).trim().toLowerCase();
+            if (!currentUser) return '';
+            const seen = new Set();
+            const samples = [];
+            for (const bodyEl of document.querySelectorAll(MARKDOWN_BODY_SELECTOR)) {
+                const author = (getCommentAuthor(bodyEl) || '').trim().toLowerCase();
+                if (!author || author !== currentUser) continue;
+                const text = String(bodyEl.innerText || bodyEl.textContent || '').trim();
+                if (!text || text.length < 8) continue;
+                if (seen.has(text)) continue;
+                seen.add(text);
+                samples.push(text);
+                if (samples.length >= limit) break;
+            }
+            return samples.join('\n---\n');
+        }
+
+        function getCurrentUserLogin() {
+            return (
+                document.querySelector('meta[name="user-login"]')?.content
+                || document.querySelector('meta[name="octolytics-actor-login"]')?.content
+                || ''
+            ).trim().toLowerCase();
+        }
+
+        function getLatestThreadReplyTarget(threadRoot) {
+            if (!threadRoot) return null;
+            const bodies = [...threadRoot.querySelectorAll(MARKDOWN_BODY_SELECTOR)];
+            const currentUser = getCurrentUserLogin();
+            const comments = bodies.map(bodyEl => ({
+                bodyEl,
+                container: bodyEl.closest(COMMENT_CONTAINER_SELECTOR) || bodyEl.closest('.timeline-comment-group, .review-thread-component, .js-discussion') || null,
+                author: (getCommentAuthor(bodyEl) || '').trim(),
+                text: String(bodyEl.innerText || bodyEl.textContent || '').trim(),
+            })).filter(c => c.text);
+            for (let i = comments.length - 1; i >= 0; i--) {
+                const c = comments[i];
+                if (!currentUser || c.author.toLowerCase() !== currentUser) return c;
+            }
+            return comments[comments.length - 1] || null;
+        }
+
+        function findReactionTriggerForComment(container) {
+            if (!container) return null;
+            return container.querySelector(
+                'details.js-reaction-popover-container, details.new-reactions-dropdown, details.js-comment-header-reaction-button, ' +
+                'summary[aria-label*="reaction" i], summary[aria-label*="react" i], ' +
+                'button[aria-label*="reaction" i], button[aria-label*="react" i], .octicon-smiley'
+            )?.closest?.('details, button, summary')
+                || null;
+        }
+
+        async function suggestDraftReplyForTextarea(ta, {provider, taContainer, taSelector, title = 'Suggest a reply/comment in your style'} = {}) {
+            const page = parsePageContext();
+            const ctx = await fetchPRContext(page);
+            const container = taContainer || ta.closest(EXTENDED_COMMENT_CONTAINER_SELECTOR) || ta.parentElement;
+            const threadRoot = container?.closest(
+                '.js-discussion, .js-line-comments, [data-testid="review-thread"], .review-thread-component, .inline-comments, .js-resolvable-timeline-thread-container'
+            );
+            const bodyEl = container?.querySelector?.(MARKDOWN_BODY_SELECTOR) || null;
+            const threadContext = threadRoot ? buildSelectionThreadContextFromRoot({threadRoot, targetBodyEl: bodyEl}) : '';
+            const replyTarget = getLatestThreadReplyTarget(threadRoot);
+            const styleSamples = getCurrentUserStyleSamples();
+            let codeContext = '';
+            const diffFile = container?.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
+            if (diffFile) {
+                const fileName = diffFile.querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')?.textContent?.trim() || '';
+                const commentRow = container?.closest('tr.inline-comments, tr.js-inline-comments-container');
+                const tbody = commentRow?.closest('tbody') || diffFile.querySelector('tbody');
+                if (tbody) {
+                    const codeRows = [...tbody.querySelectorAll('tr:not(.inline-comments):not(.js-inline-comments-container)')];
+                    const targetRow = commentRow?.previousElementSibling;
+                    let targetIdx = targetRow ? codeRows.indexOf(targetRow) : codeRows.length - 1;
+                    const start = Math.max(0, targetIdx - 8);
+                    const end = Math.min(codeRows.length, targetIdx + 5);
+                    const lines = [];
+                    for (let i = start; i < end; i++) {
+                        const row = codeRows[i];
+                        const lineNum = row.querySelector('[data-line-number]')?.getAttribute('data-line-number') || '';
+                        const code = row.querySelector('.blob-code, td.diff-text')?.textContent?.trimEnd() || '';
+                        lines.push(`${lineNum.padStart(4)}| ${code}${i === targetIdx ? ' <<<' : ''}`);
+                    }
+                    if (lines.length) codeContext = `Code context${fileName ? ` (${fileName})` : ''}:\n${lines.join('\n')}`;
+                }
+            }
+            const comparePatch = isPRCreationPage() ? await fetchComparePatchForDraftPR() : '';
+            const contextParts = [
+                ctx?.title ? `PR title:\n${ctx.title}` : '',
+                ctx?.description ? `PR description:\n${ctx.description.slice(0, 8000)}` : '',
+                ctx?.commitMessages ? `Commit messages:\n${ctx.commitMessages.slice(0, 12000)}` : '',
+                !ctx?.commitMessages ? (() => {
+                    const pageCommits = parseCommitsFromPage().map(c => `${c.sha.slice(0, 8)} ${c.msg}`).join('\n');
+                    return pageCommits ? `Commit messages:\n${pageCommits.slice(0, 12000)}` : '';
+                })() : '',
+                threadContext ? `Thread context:\n${threadContext}` : '',
+                codeContext,
+                comparePatch ? `Compare patch:\n${comparePatch.slice(0, 120000)}` : '',
+                styleSamples ? `Examples of my writing style on this page:\n${styleSamples.slice(0, 4000)}` : '',
+            ].filter(Boolean).join('\n\n');
+
+            const system = `${SYSTEM_BASE}
+
+You are drafting a GitHub review reply or comment for me.
+
+Write a best-guess response in my style, using the full available context.
+
+RULES:
+- Output only the suggested comment text in Markdown.
+- Be concise, technically grounded, and useful.
+- Match my style from the examples when available.
+- If this is a reply thread, reply to the current thread, not to the PR in general.
+- Prefer answering the latest relevant non-me comment in the thread.
+- It is fine to quote a short line from an earlier comment when that makes the reply clearer.
+- Only draft a written comment if it adds substantive new information.
+- If the right response is just agreement/acknowledgment that the latest change addressed the point, output exactly \`👍\` and nothing else.
+- Do not restate what was already said unless needed to add a new technical point.
+- If there is no direct question, write the most useful direct thread reply based on the latest code and prior comments.
+- Do not mention that this was generated.
+- Do not use markdown fences unless code is genuinely needed.`;
+            const user = [
+                title,
+                replyTarget ? `Comment to reply to:\n${replyTarget.author}: ${replyTarget.text}` : '',
+                contextParts,
+                'Draft reply/comment: currently empty.',
+            ].filter(Boolean).join('\n\n');
+
+            const raw = await callLLM(provider, system, user);
+            const generated = String(raw || '').trim().replace(/^```[a-z]*\n?|\n?```$/g, '').trim();
+            if (!generated) throw new Error('empty draft reply result');
+            if (/^👍$/u.test(generated) && replyTarget?.container) {
+                const reactionTrigger = findReactionTriggerForComment(replyTarget.container);
+                if (reactionTrigger) {
+                    await applyReactionChoice(reactionTrigger, '+1');
+                    return true;
+                }
+            }
+            const {action, text} = await showDiffDialog('', generated);
+            if (action === false) return false;
+            if (/^👍$/u.test(String(text || generated).trim()) && replyTarget?.container) {
+                const reactionTrigger = findReactionTriggerForComment(replyTarget.container);
+                if (reactionTrigger) {
+                    await applyReactionChoice(reactionTrigger, '+1');
+                    return true;
+                }
+            }
+            const freshTa = taContainer.querySelector(taSelector) || ta;
+            freshTa.focus();
+            await setTextareaValueRobust(taContainer, freshTa, text || generated, taSelector);
+            return true;
+        }
 
         function normalizeExpectedReplyResult(raw) {
             try {
@@ -10786,11 +11019,13 @@ Rules:
 	                    () => wrapSelectionInDetails(toolbar)), {dockRight: true});
 	            }
 
-	            if (!hasProofreadBtn) {
+            if (!hasProofreadBtn) {
 	                appendToolbarBtn(makeToolbarBtn('ack-toolbar-proofread', PROOFREAD_ICON,
 	                    'Proofread this comment',
 	                    (btn) => runProofreadOnComment(btn)));
 	            }
+                bindToolbarProofreadState(toolbar);
+                updateToolbarProofreadButton(toolbar);
 	        });
 	    }
 
@@ -13751,11 +13986,11 @@ Rules:
 
         const currentSha = shaMatch?.[1] || null;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
-        const hasJumpMenu = commits.length > 3;
 
         const commits = await fetchCommitList(owner, repo, prNum);
         if (gen !== commitNavGeneration) return;
         if (commits.length === 0) return;
+        const hasJumpMenu = commits.length > 3;
 
         let prevCommit = null, nextCommit = null, currentIdx = -1;
 
@@ -16170,6 +16405,37 @@ Rules:
 	        ackAssert(section.includes("querySelectorAll?.('textarea')"), 'fallback scans textareas within editor root');
 	    });
 
+    ackTest('empty toolbar proofread switches to wand-mode suggestion flow', () => {
+        const source = _ackSource;
+        const toolbarFn = source.slice(source.indexOf('function updateToolbarProofreadButton'), source.indexOf('function bindToolbarProofreadState'));
+        ackAssert(toolbarFn.includes('WAND_ICON'), 'uses wand icon for empty toolbar textarea');
+        ackAssert(toolbarFn.includes("Suggest a reply/comment in your style"), 'empty toolbar title advertises reply suggestion');
+        const proofFn = source.slice(source.indexOf('async function runProofreadOnComment'), source.indexOf('// --- Start a review ---'));
+        ackAssert(proofFn.includes('suggestDraftReplyForTextarea'), 'empty proofread routes to draft reply generator');
+        ackAssert(proofFn.includes('empty textarea/selection, generating draft reply/comment'), 'logs empty-to-suggestion path');
+    });
+
+    ackTest('draft reply generator uses full context and style samples', () => {
+        const fn = _ackSource.slice(_ackSource.indexOf('async function suggestDraftReplyForTextarea'), _ackSource.indexOf('function addDetailsButtons'));
+        ackAssert(fn.includes('getCurrentUserStyleSamples'), 'uses visible authored comments as style samples');
+        ackAssert(fn.includes('getLatestThreadReplyTarget'), 'detects the latest thread comment to answer');
+        ackAssert(fn.includes('Comment to reply to:'), 'passes explicit reply target into prompt');
+        ackAssert(fn.includes('Thread context:'), 'includes thread context');
+        ackAssert(fn.includes('Code context'), 'includes nearby code context when available');
+        ackAssert(fn.includes('PR title:'), 'includes PR title context');
+        ackAssert(fn.includes('PR description:'), 'includes PR description context');
+        ackAssert(fn.includes('Commit messages:'), 'includes commit messages context');
+        ackAssert(fn.includes('Compare patch:'), 'includes compare patch context when available');
+        ackAssert(fn.includes('Write a best-guess response in my style'), 'system prompt asks for style-matched reply drafting');
+        ackAssert(fn.includes('reply to the current thread'), 'prompt says to answer the thread rather than draft a generic PR comment');
+        ackAssert(fn.includes('latest relevant non-me comment'), 'prompt anchors on the latest external thread comment');
+        ackAssert(fn.includes('Only draft a written comment if it adds substantive new information'), 'avoids generating redundant agreement comments');
+        ackAssert(fn.includes('nothing else.'), 'uses thumbs-up-only output for pure agreement');
+        ackAssert(fn.includes('Do not restate what was already said'), 'discourages repetitive replies');
+        ackAssert(fn.includes('findReactionTriggerForComment'), 'can map thumbs-up-only output to a reaction target');
+        ackAssert(fn.includes("applyReactionChoice(reactionTrigger, '+1')"), 'uses native reaction flow for thumbs-up-only replies');
+    });
+
 	    ackTest('PR title proofread supports compare-page draft forms', () => {
 	        const source = _ackSource;
 	        const domFn = source.slice(source.indexOf('function findPRTitleDom'), source.indexOf('function getPRTitleText'));
@@ -16879,6 +17145,13 @@ Rules:
         // Guard stores 'e' or 'v' instead of just 'true'
         ackAssert(source.includes("ackQuickProcessed === editState"), 'guard checks edit state, not just processed flag');
         ackAssert(source.includes("? 'e' : 'v'"), 'edit state encoded as e/v');
+    });
+
+    ackTest('attribute observer re-runs editor injectors on class/open flips', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf("new MutationObserver((mutations) => {"), source.indexOf("}).observe(document.body, {\n        attributes: true"));
+        ackAssert(fn.includes("runRootInjectors(document, ctx)"), 'attribute observer re-runs root injectors');
+        ackAssert(fn.includes('runDocInjectors(ctx)'), 'attribute observer re-runs doc injectors');
     });
 
     ackTest('proofread uses setTextareaValue/setTextareaValueRobust for React-compatible textarea updates', () => {
@@ -18800,6 +19073,14 @@ Rules:
         ackAssert(fn.includes('addFiles'), 'uses helper to build union of file sets');
         ackAssert(fn.includes('previous_filename'), 'includes renamed file paths');
         ackAssert(fn.includes('total unique PR file paths'), 'logs total unique paths');
+    });
+
+    ackTest('fetchCommitPullRequests uses preview accept header and auth fallback', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function fetchCommitPullRequests'), source.indexOf('function getCurrentUserAckSha'));
+        ackAssert(fn.includes('application/vnd.github.groot-preview+json'), 'uses pulls-for-commit preview accept header');
+        ackAssert(fn.includes('ghApiHeaders().Authorization'), 'retries without auth when PAT-auth request fails');
+        ackAssert(fn.includes('/commits/${sha}/pulls'), 'queries the commits/{sha}/pulls endpoint');
     });
 
     ackTest('autoCollapseCompareFiles has robust path matching with fallbacks', () => {
@@ -22736,6 +23017,7 @@ Rules:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function _addFloatingCommitNavInner'), source.indexOf('function isPRPage'));
         ackAssert(fn.includes('const hasJumpMenu = commits.length > 3;'), 'only enables jump dropdown when more than 3 commits exist');
+        ackAssert(fn.indexOf('const commits = await fetchCommitList') < fn.indexOf('const hasJumpMenu = commits.length > 3;'), 'computes hasJumpMenu only after commits are loaded');
         ackAssert(fn.includes('const jumpDetails = document.createElement(\'details\')'), 'creates middle commit jump dropdown');
         ackAssert(fn.includes('jumpSummary.textContent'), 'shows clickable middle summary');
         ackAssert(fn.includes('commits.forEach((commit, idx) => {'), 'builds dropdown items from all commits');
