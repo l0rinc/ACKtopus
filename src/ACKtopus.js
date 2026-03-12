@@ -4688,7 +4688,39 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 if (sha) commits.push({sha, msg, el});
             });
         }
+        if (commits.length === 0) {
+            try {
+                const scriptEl = document.querySelector(
+                    'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
+                );
+                const data = scriptEl?.textContent ? JSON.parse(scriptEl.textContent) : null;
+                const ssrCommits = data?.payload?.pullRequestsChangesRoute?.commits || [];
+                for (const c of ssrCommits) {
+                    const sha = c?.oid || c?.sha || '';
+                    const msg = c?.messageHeadline || c?.commit?.message || '';
+                    if (sha) commits.push({sha, msg, el: null});
+                }
+            } catch (_) {
+            }
+        }
         return commits;
+    }
+
+    async function fetchComparePatchForDraftPR() {
+        if (!isPRCreationPage()) return '';
+        try {
+            const patchUrl = `${location.origin}${location.pathname}.patch`;
+            const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
+            const resp = await pageFetch(patchUrl, {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: {Accept: 'text/plain, text/x-patch, text/x-diff, */*'},
+            });
+            if (!resp.ok) return '';
+            return await resp.text();
+        } catch (_) {
+            return '';
+        }
     }
 
     // Navigate to the next (+1) or previous (-1) commit in the list.
@@ -5565,7 +5597,55 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const selStart = ta.selectionStart, selEnd = ta.selectionEnd;
             const hasSelection = selStart !== selEnd;
             const textToProofread = hasSelection ? ta.value.slice(selStart, selEnd) : ta.value;
+            const isDraftPRDescription =
+                isPRCreationPage()
+                && !hasSelection
+                && ta.matches?.('textarea[name="pull_request[body]"], textarea#pull_request_body');
             if (!textToProofread.trim()) {
+                if (isDraftPRDescription) {
+                    const titleInput = document.querySelector('input[name="pull_request[title]"], input#pull_request_title');
+                    const titleText = titleInput?.value?.trim() || '';
+                    const pageCommits = parseCommitsFromPage().map(c => `${String(c.sha).slice(0, 8)} ${c.msg}`).join('\n');
+                    const comparePatch = await fetchComparePatchForDraftPR();
+                    const system = `${SYSTEM_BASE}
+
+You are drafting a short GitHub pull request description for a new PR.
+
+Write exactly two short paragraphs in Markdown:
+- First paragraph: explain the problem, motivation, or gap being addressed.
+- Second paragraph: summarize the fix or approach taken.
+
+Rules:
+- Be concise and factual.
+- Do not use headings, bullet points, marketing language, or filler.
+- Use backticks for code identifiers, filenames, classes, and functions.
+- If the context is incomplete, stay conservative and avoid inventing specifics.
+- Output only the PR description text.`;
+                    const parts = [];
+                    if (titleText) parts.push(`Draft PR title:\n${titleText}`);
+                    if (pageCommits) parts.push(`Commit messages:\n${pageCommits.slice(0, 12000)}`);
+                    if (comparePatch) parts.push(`Compare patch:\n${comparePatch.slice(0, 120000)}`);
+                    const user = parts.join('\n\n');
+                    if (!user.trim()) {
+                        console.log('ACKtopus: proofread: no compare context available for empty draft PR description');
+                        stopSpin();
+                        return;
+                    }
+                    console.log('ACKtopus: proofread: generating draft PR description from compare context');
+                    const raw = await callLLM(provider, system, user);
+                    const generated = String(raw || '').trim().replace(/^```[a-z]*\n?|\n?```$/g, '').trim();
+                    stopSpin('✅');
+                    const { action: accepted, text: finalText } = await showDiffDialog('', generated);
+                    if (accepted === false) {
+                        setTimeout(() => restoreButton(), 500);
+                        return;
+                    }
+                    const freshTa = container.querySelector(taSelector) || ta;
+                    freshTa.focus();
+                    await setTextareaValueRobust(taContainer, freshTa, finalText || generated, taSelector);
+                    setTimeout(() => restoreButton(), 500);
+                    return;
+                }
                 console.log('ACKtopus: proofread: nothing to proofread (empty textarea/selection)');
                 stopSpin();
                 return;
@@ -8747,14 +8827,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     // --- PR Title Proofread ---
     function findPRTitleDom() {
+        if (!isPRPage() && !isPRCreationPage()) return {headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null};
         const draftInput = document.querySelector(
             'input[name="pull_request[title]"], input#pull_request_title, input[id*="pull_request_title"], ' +
             'input[aria-label*="title" i], input[data-testid*="title" i]'
         );
-        if (!isPRPage() && !isPRCreationPage()) return {headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null};
-        if (!isPRPage() && draftInput) {
+        if (draftInput && isVisible(draftInput)) {
             const draftHost =
-                draftInput.closest('.discussion-timeline-actions, .gh-header, form, .subnav, .Box')
+                draftInput.closest('.discussion-timeline-actions, .gh-header, form, .subnav, .Box, [class*="PageHeader"], header')
                 || draftInput.parentElement
                 || document.body;
             return {headerRoot: draftHost, titleHost: draftHost, titleTextEl: draftInput, titleInputEl: draftInput};
@@ -8970,7 +9050,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             'input[data-testid*="title" i]'
         ) || titleInputEl || null;
         const original = (titleInput && isVisible(titleInput) ? titleInput.value : getPRTitleText()).trim();
-        if (!original) return;
+        const generateTitle = !original;
 
         const origText = btn.textContent;
         const stopSpin = startSpin(btn);
@@ -8987,12 +9067,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const pageCommits = parseCommitsFromPage().map(c => `${c.sha.slice(0, 8)} ${c.msg}`).join('\n');
             if (ctx.description || draftBody) parts.push(wrap('PR description', (ctx.description || draftBody).slice(0, 8000)));
             if (ctx.commitMessages || pageCommits) parts.push(wrap('Commit messages', (ctx.commitMessages || pageCommits).slice(0, 12000)));
+            if (generateTitle) {
+                const comparePatch = await fetchComparePatchForDraftPR();
+                if (comparePatch) parts.push(wrap('Compare patch', comparePatch.slice(0, 120000)));
+            }
             const ctxBlock = parts.length
-                ? `\n\nContext (for understanding only; do NOT include in title):\n\n${parts.join('\n\n')}`
+                ? `\n\nContext (for understanding only; do NOT include extra explanation):\n\n${parts.join('\n\n')}`
                 : '';
 
-            const system = `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
-            const user = `Original title:\n${original}${ctxBlock}`;
+            const system = generateTitle
+                ? `You are drafting a GitHub Pull Request title for a new PR.\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
+                : `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
+            const user = generateTitle
+                ? `Draft PR title is empty. Propose a concise title from the context below.${ctxBlock}`
+                : `Original title:\n${original}${ctxBlock}`;
             // Skip prompt cache for title proofreading. A wrong cache hit is very
             // confusing (it can return a title from a different prompt/PR).
             const raw = await callLLM(provider, system, user, {skipCache: true});
@@ -9024,8 +9112,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const union = a.size + b.size - inter;
             const sim = union ? (inter / union) : 1;
             const suspicious = (
-                (origPrefix && (!newPrefix || newPrefix !== origPrefix))
-                || sim < 0.25
+                (!generateTitle && origPrefix && (!newPrefix || newPrefix !== origPrefix))
+                || (!generateTitle && sim < 0.25)
             );
             if (suspicious) {
                 console.warn('ACKtopus: PR title proofread result looks unrelated; forcing edit mode', {
@@ -9300,10 +9388,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 const isEditing = editState === 'e';
 
                 if (isEditing) {
-                    // While editing: proofread + cancel
-                    actionContainer.appendChild(makeIconBtn(PROOFREAD_ICON, 'Proofread comment', (btn) => {
-                        runProofreadOnComment(btn);
-                    }));
+                    // While editing: keep only cancel here. Proofread lives in the edit toolbar.
                     actionContainer.appendChild(makeIconBtn('❌', 'Cancel edit', () => {
                         clickWithRetry(container, (c) => {
                             return c.querySelector(
@@ -14334,7 +14419,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const result = ghco.fmt('abc', pr);
             ackAssert(result.includes('github.com/bitcoin/bitcoin/pull/123'));
             ackAssert(result.includes('--force'));
-            ackAssert(result.includes('git pull --rebase upstream main'));
+            ackAssert(result.includes("git pull --rebase upstream 'main'"));
         } finally {
             getReviewBaseBranch = origBase;
         }
@@ -14695,7 +14780,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 getReviewBaseBranch = () => 'main';
                 prFileCategories = {cpp: ['src/validation.cpp', 'src/validation.h']};
 	            const cmd = f.fmt();
-	            ackAssert(cmd.includes('git merge-base HEAD upstream/main'), 'uses merge-base vs upstream/main');
+	            ackAssert(cmd.includes("git merge-base HEAD 'upstream/main'"), 'uses merge-base vs upstream/main');
 	            ackAssert(cmd.includes('clang-format-diff.py'), 'invokes clang-format-diff.py');
                 ackAssert(cmd.includes('src/validation.cpp'), 'includes exact changed file path(s)');
                 ackAssert(cmd.includes('src/validation.h'), 'includes exact changed file path(s)');
@@ -14713,8 +14798,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             getReviewBaseBranch = () => 'main';
             userAckSha = 'abc123';
             const cmd = f.fmt('def456');
-            ackAssert(cmd.includes('git fetch upstream main $B $A'), 'fetches the dynamic base branch');
-            ackAssert(cmd.includes('git rebase upstream/main'), 'rebases against the dynamic base branch');
+            ackAssert(cmd.includes("git fetch upstream 'main' $B $A"), 'fetches the dynamic base branch');
+            ackAssert(cmd.includes("git rebase 'upstream/main'"), 'rebases against the dynamic base branch');
         } finally {
             getReviewBaseBranch = origBase;
             userAckSha = origAck;
@@ -15515,7 +15600,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             ackAssert(result.includes('gh pr co'), 'has gh pr co');
             ackAssert(result.includes('https://github.com/bitcoin/bitcoin/pull/42'), 'has full PR URL');
             ackAssert(result.includes('--force'), 'has --force flag');
-            ackAssert(result.includes('&& git pull --rebase upstream main'), 'has rebase');
+            ackAssert(result.includes("&& git pull --rebase upstream 'main'"), 'has rebase');
         } finally {
             getReviewBaseBranch = origBase;
         }
@@ -15911,6 +15996,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ackAssert(proofFn.includes('showDiffDialog'), 'shows diff dialog');
     });
 
+    ackTest('empty compare-page PR description proofread generates a draft from compare context', () => {
+        const fn = _ackSource.slice(_ackSource.indexOf('async function runProofreadOnComment'), _ackSource.indexOf('// --- Start a review ---'));
+        ackAssert(fn.includes('isDraftPRDescription'), 'detects empty draft PR description textareas on compare pages');
+        ackAssert(fn.includes('fetchComparePatchForDraftPR'), 'loads compare patch context for draft PR descriptions');
+        ackAssert(fn.includes('First paragraph: explain the problem'), 'generation prompt asks for problem first');
+        ackAssert(fn.includes('Second paragraph: summarize the fix'), 'generation prompt asks for fix summary second');
+        ackAssert(fn.includes('Draft PR title:'), 'includes draft PR title in generation context');
+        ackAssert(fn.includes('Commit messages:'), 'includes commit messages in generation context');
+    });
+
 	    ackTest('toolbar proofread resolves textarea via markdown-toolbar for attribute', () => {
 	        const section = _ackSource.slice(
 	            _ackSource.indexOf('Toolbar proofread (for drafting new comments)'),
@@ -15926,7 +16021,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        const source = _ackSource;
 	        const domFn = source.slice(source.indexOf('function findPRTitleDom'), source.indexOf('function getPRTitleText'));
 	        ackAssert(domFn.includes('input[name="pull_request[title]"]'), 'findPRTitleDom looks for draft PR title input');
-	        ackAssert(domFn.includes('!isPRPage() && !isPRCreationPage()'), 'findPRTitleDom allows compare/new-PR pages');
+	        ackAssert(domFn.includes('draftInput && isVisible(draftInput)'), 'findPRTitleDom prefers visible title input when editing');
 
 	        const addFn = source.slice(source.indexOf('function addPRTitleProofreadButton'), source.indexOf('async function applyPRTitleEdit'));
 	        ackAssert(addFn.includes('titleInputEl?.parentElement'), 'title proofread button can attach next to visible draft title input');
@@ -15937,6 +16032,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        ackAssert(runFn.includes('parseCommitsFromPage()'), 'draft title proofread can use page commit messages as context');
 	        ackAssert(runFn.includes('textarea[name="pull_request[body]"]'), 'draft title proofread can use current description draft as context');
 	    });
+
+    ackTest('empty PR title proofread can generate title from compare context', () => {
+        const runFn = _ackSource.slice(_ackSource.indexOf('async function runProofreadOnPRTitle'), _ackSource.indexOf('function addQuickCommentActions'));
+        ackAssert(runFn.includes('const generateTitle = !original'), 'detects empty title generation mode');
+        ackAssert(runFn.includes('fetchComparePatchForDraftPR()'), 'uses compare patch when generating empty titles');
+        ackAssert(runFn.includes('Draft PR title is empty'), 'empty-title prompt is explicit');
+        ackAssert(runFn.includes('drafting a GitHub Pull Request title for a new PR'), 'uses dedicated title-generation system prompt');
+    });
+
+    ackTest('parseCommitsFromPage falls back to SSR commits on compare pages', () => {
+        const fn = _ackSource.slice(_ackSource.indexOf('function parseCommitsFromPage'), _ackSource.indexOf('// Navigate to the next (+1) or previous (-1) commit in the list.'));
+        ackAssert(fn.includes('pullRequestsChangesRoute?.commits'), 'reads compare-page commits from embedded SSR data');
+        ackAssert(fn.includes('messageHeadline'), 'uses commit message headline from SSR commits');
+    });
 
     // ============================================================================
     // Delete flow -- no duplicate confirm
@@ -16609,7 +16718,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const editBranch = source.slice(source.indexOf('if (isEditing)'), source.indexOf("} else if (author)"));
         const editBlock = editBranch.slice(0, editBranch.indexOf('} else {'));
         ackAssert(!editBlock.includes('Delete comment'), 'no delete button while editing');
-        ackAssert(editBlock.includes('Proofread comment'), 'proofread button shown while editing');
+        ackAssert(!editBlock.includes('Proofread comment'), 'proofread button not duplicated above the comment while editing');
     });
 
     ackTest('quick action guard re-processes when edit state changes', () => {
@@ -17626,8 +17735,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            addQuickCommentActions(root);
 	            const qa = actions.querySelector('.ack-quick-actions');
 	            ackAssert(qa, 'missing .ack-quick-actions inside timeline-comment-actions');
-	            ackAssert(qa.querySelector('button[title="Proofread comment"]'), 'missing proofread button');
 	            ackAssert(qa.querySelector('button[title="Cancel edit"]'), 'missing cancel edit button');
+	            ackAssert(!qa.querySelector('button[title="Proofread comment"]'), 'proofread button should stay in edit toolbar, not header quick actions');
 	            ackEq(qa.nextElementSibling, details, 'quick-actions stay grouped with the native action menu');
 	        } finally {
 	            root.remove();
