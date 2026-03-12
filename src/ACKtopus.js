@@ -245,6 +245,21 @@
         }
     }
 
+    function readHeadBranchFromSSR() {
+        try {
+            const scriptEl = document.querySelector(
+                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
+            );
+            if (!scriptEl?.textContent) return '';
+            const data = JSON.parse(scriptEl.textContent);
+            return data?.payload?.pullRequestsChangesRoute?.pullRequest?.headBranch
+                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headBranch
+                || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
     function readBaseBranchFromSummaryDom() {
         const summary =
             document.querySelector('.PullRequestHeaderSummary-module__summaryContainer__dA7dP')
@@ -258,6 +273,42 @@
 
     function getReviewBaseBranch() {
         return readBaseBranchFromSSR() || readBaseBranchFromSummaryDom() || 'master';
+    }
+
+    function normalizePRHeaderHeadBranch(root = document) {
+        if (!isPRPage()) return false;
+        const summaries = qsa(root, '.PullRequestHeaderSummary-module__summaryContainer__dA7dP');
+        const summary = summaries.find(isVisible) || summaries[0];
+        if (!summary) return false;
+        const branchLinks = [...summary.querySelectorAll('a[href*="/tree/"]')];
+        if (branchLinks.length < 2) return false;
+        const headLink = branchLinks[branchLinks.length - 1];
+        const currentText = headLink.textContent?.trim() || '';
+        const branchOnly = readHeadBranchFromSSR() || currentText.replace(/^[^:]+:/, '').trim();
+        if (!branchOnly) return false;
+
+        headLink.textContent = branchOnly;
+        headLink.title = branchOnly;
+        const headTipId = headLink.getAttribute('aria-describedby') || '';
+        const headTip = headTipId ? document.getElementById(headTipId) : null;
+        if (headTip) headTip.textContent = branchOnly;
+
+        const copyBtn = headLink.parentElement?.querySelector?.('button[data-component="IconButton"], button');
+        if (!copyBtn) return true;
+        copyBtn.dataset.ackHeadBranchValue = branchOnly;
+        const copyTipId = copyBtn.getAttribute('aria-labelledby') || '';
+        const copyTip = copyTipId ? document.getElementById(copyTipId) : null;
+        if (copyTip) copyTip.textContent = 'Copy branch name to clipboard';
+        copyBtn.title = 'Copy branch name to clipboard';
+        if (copyBtn.dataset.ackHeadBranchBound === '1') return true;
+        copyBtn.dataset.ackHeadBranchBound = '1';
+        copyBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation?.();
+            GM_setClipboard(copyBtn.dataset.ackHeadBranchValue || '');
+        }, true);
+        return true;
     }
 
     const CLANG_TOOLING_CONFIGURE_CMD =
@@ -2743,6 +2794,7 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "files_overview": For each modified file, one sentence explaining what role it plays in Bitcoin Core and what this commit changes in it. Format: "\`path/to/file.cpp\`: <role in the project>. <what changed here>." Use {{annotations||...}} for subsystem names. Skip test files unless the test logic itself is interesting. Skip if only 1 file changed.
 "why_care": 2 to 4 sentences, written for a reviewer at elevator-pitch level. Explain the pain or friction the author is likely trying to remove, how that pain shows up in practice, and why reviewing this well makes later work or maintenance easier. Stay top-down: no file lists, no line-level mechanics, no implementation details. Mention symbols only if unavoidable.
 "pseudocode": Very high-level Python-like pseudocode that conveys only the concept/gist (not line-by-line). Show only the new behavior and the main data flow. Omit glue. Omit implementation details: helper structure, condition-by-condition logic, error plumbing, logging, includes, boilerplate, and trivial iteration. Collapse details aggressively into a good abstraction. Keep original identifiers only when they matter (with \`backticks\`). Use # comments for WHY, not WHAT. If purely mechanical, say "# mechanical: rename/move/format" in one line.
+"verify_repro": Optional. The simplest practical way to verify or reproduce the commit. Prefer minimal commands, test names, or 2 to 4 short manual steps. If nothing obvious exists, use an empty string. Do not invent heavy setups.
 "performance_simplifications": Short notes on performance and simplification opportunities. Mention any obvious perf regressions/improvements (extra copies/allocations, complexity changes) and any clear simplifications (reuse existing helpers/types, better data structure choice, remove duplication). Empty string if none.
 "concerns": Compact review flags using \`backticks\` for symbols: thread safety, UB, lifetime, overflow, signedness, endianness, locking, consensus, DoS, missing error handling, missing tests. Empty string if none found.
 "message_check": "OK" if commit message matches the diff. Otherwise, one sentence describing the mismatch.
@@ -4728,6 +4780,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     // On single-commit/changes pages: click GitHub's prev/next nav buttons.
     let currentCommitIdx = -1;
 
+    function focusCommitEntry(target, idx = currentCommitIdx) {
+        if (!target?.el) return false;
+        document.querySelectorAll('.ack-commit-highlight').forEach(el => {
+            el.classList.remove('ack-commit-highlight');
+            el.style.outline = '';
+            el.style.outlineOffset = '';
+            el.style.borderRadius = '';
+        });
+        target.el.scrollIntoView({behavior: 'smooth', block: 'center'});
+        target.el.classList.add('ack-commit-highlight');
+        target.el.style.outline = '2px solid #58a6ff';
+        target.el.style.outlineOffset = '-2px';
+        target.el.style.borderRadius = '6px';
+        currentCommitIdx = idx;
+        return true;
+    }
+
     function navigateCommit(dir) {
         // Try commit list navigation first
         const commits = parseCommitsFromPage();
@@ -4742,17 +4811,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             // Circular wrap: next after last goes to first, prev before first goes to last
             currentCommitIdx = (currentCommitIdx + dir + commits.length) % commits.length;
             const target = commits[currentCommitIdx];
-            if (target?.el) {
-                // Remove previous highlight
-                document.querySelectorAll('.ack-commit-highlight').forEach(el => {
-                    el.classList.remove('ack-commit-highlight');
-                    el.style.outline = '';
-                });
-                target.el.scrollIntoView({behavior: 'smooth', block: 'center'});
-                target.el.classList.add('ack-commit-highlight');
-                target.el.style.outline = '2px solid #58a6ff';
-                target.el.style.outlineOffset = '-2px';
-                target.el.style.borderRadius = '6px';
+            if (focusCommitEntry(target, currentCommitIdx)) {
                 return;
             }
         }
@@ -7999,6 +8058,7 @@ Rules:
 
     const DOC_INJECTORS = [
         {name: 'hideNativeCommitNav', when: ctx => ctx.onPR, fn: hideNativeCommitNav},
+        {name: 'normalizePRHeaderHeadBranch', when: ctx => ctx.onPR, fn: normalizePRHeaderHeadBranch},
         {name: 'commitExplainButtons', when: ctx => ctx.onPR, fn: addCommitExplainButtons},
         {name: 'enhanceForcePushLinks', when: ctx => ctx.onPR, fn: enhanceForcePushLinks},
         {name: 'commentMenuAugmenter', when: ctx => ctx.onToolbar, fn: installCommentMenuAugmenter},
@@ -8842,17 +8902,17 @@ Rules:
         const headerRoot =
             document.getElementById('partial-discussion-header')
             || document.querySelector('[data-testid*="issue-viewer-header" i], [data-testid*="pull-request-header" i], [data-testid*="issue-header" i]')
-            || document;
+            || document.querySelector('[data-component="PH_Actions"]')?.closest?.('header, .gh-header, .gh-header-show, .js-discussion-header')
+            || document.querySelector('.gh-header-show, .gh-header, .js-discussion-header')
+            || null;
+        if (!headerRoot) return {headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null};
 
         const hostSel = 'h1.gh-header-title, h1[data-testid*="title" i], h1[class*="Title" i], h1, h2[class*="Title" i], h2';
-        const scopedHostSel = hostSel.split(',').map(s => `#partial-discussion-header ${s.trim()}`).join(', ');
-        const host = (headerRoot !== document ? headerRoot.querySelector(hostSel) : null)
-            || document.querySelector(scopedHostSel)
-            || document.querySelector(hostSel);
+        const host = headerRoot.querySelector(hostSel);
 
         // If there's no <h1> (GitHub UI variants), fall back to a direct title element.
         if (!host) {
-            const directTitle = (headerRoot !== document ? headerRoot : document).querySelector(
+            const directTitle = headerRoot.querySelector(
                 '.js-issue-title, [data-testid="issue-title"], [data-testid*="issue-title" i], ' +
                 '[data-testid*="pull-request-title" i], .markdown-title'
             );
@@ -11262,6 +11322,11 @@ Rules:
         });
         if (pseudoEl) panel.appendChild(pseudoEl);
 
+        const verifyEl = makeSection('🧪 Verify / reproduce', data.verify_repro, false, {
+            tip: 'The simplest practical way to verify or reproduce what this commit changes'
+        });
+        if (verifyEl) panel.appendChild(verifyEl);
+
         const perfEl = makeSection('⚡ Performance / simplifications', data.performance_simplifications, false, {
             tip: 'Performance implications and obvious simplification opportunities'
         });
@@ -11431,7 +11496,7 @@ Rules:
 
         const config = getLLMConfig();
         const extraInstr = config.instructions.pseudocode || DEFAULT_INSTRUCTIONS.pseudocode;
-        const system = `${SYSTEM_BASE}\n\n${extraInstr}\n\nReturn ONLY valid JSON. No markdown fences, no preamble.\nFormat: {"<8-char-sha>": {"summary": "...", "context": "...", "files_overview": "...", "why_care": "...", "pseudocode": "...", "performance_simplifications": "...", "concerns": "...", "message_check": "...", "depends": "..."}}`;
+        const system = `${SYSTEM_BASE}\n\n${extraInstr}\n\nReturn ONLY valid JSON. No markdown fences, no preamble.\nFormat: {"<8-char-sha>": {"summary": "...", "context": "...", "files_overview": "...", "why_care": "...", "pseudocode": "...", "verify_repro": "...", "performance_simplifications": "...", "concerns": "...", "message_check": "...", "depends": "..."}}`;
         const contextBlock = extraContext
             ? `\n\nComprehensive PR context (description, commits, responses, and patch where available):\n${extraContext}`
             : '';
@@ -12250,6 +12315,7 @@ Rules:
         const summary = pick('summary', 3000);
         const whyCare = pick('why_care', 4000);
         const pseudo = pick('pseudocode', 8000);
+        const verify = pick('verify_repro', 4000);
         const perf = pick('performance_simplifications', 4000);
         const concerns = pick('concerns', 3000);
         return [
@@ -12257,6 +12323,7 @@ Rules:
             summary ? `Summary:\n${summary}` : '',
             whyCare ? `Why this matters:\n${whyCare}` : '',
             pseudo ? `Pseudocode:\n${pseudo}` : '',
+            verify ? `Verify/reproduce:\n${verify}` : '',
             perf ? `Performance/simplifications:\n${perf}` : '',
             concerns ? `Concerns:\n${concerns}` : '',
         ].filter(Boolean).join('\n\n');
@@ -12885,7 +12952,7 @@ Rules:
         const btn = document.createElement('button');
         btn.className = 'ack-commit-explain';
         btn.textContent = '💡';
-        btn.title = 'Commit review aid: background context, pseudocode, concerns, message check';
+        btn.title = 'Commit review aid: background context, pseudocode, verify/repro, concerns, message check';
         Object.assign(btn.style, {
             background: 'none', border: 'none', cursor: 'pointer', padding: '0 4px 0 0',
             fontSize: '14px', opacity: '0.4', lineHeight: 'inherit', verticalAlign: 'middle',
@@ -12979,6 +13046,7 @@ Rules:
                         files_overview: '',
                         why_care: '',
                         pseudocode: '',
+                        verify_repro: '',
                         performance_simplifications: '',
                         concerns: '',
                         message_check: '',
@@ -13683,6 +13751,7 @@ Rules:
 
         const currentSha = shaMatch?.[1] || null;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
+        const hasJumpMenu = commits.length > 3;
 
         const commits = await fetchCommitList(owner, repo, prNum);
         if (gen !== commitNavGeneration) return;
@@ -13710,22 +13779,24 @@ Rules:
             zIndex: '99998', display: 'flex', gap: '8px', padding: '6px 14px',
             background: '#161b22', border: '1px solid #30363d', borderRadius: '8px',
             boxShadow: '0 2px 12px rgba(0,0,0,0.5)', alignItems: 'center',
-            maxWidth: 'calc(100vw - 24px)', overflow: 'hidden',
+            maxWidth: 'calc(100vw - 24px)', overflow: hasJumpMenu ? 'visible' : 'hidden',
         });
 
         const truncMsg = (msg, max = 40) => {
             const line = (msg || '').split('\n')[0];
             return line.length > max ? line.slice(0, max) + '...' : line;
         };
+        const commitLine = (commit) => (commit?.commit?.message || commit?.msg || '').split('\n')[0];
+        const commitHref = (commit) => `${basePath}/${commit.sha}`;
 
         const makeNavBtn = (commit, chevron, isNext) => {
             const hintKey = isNext ? 'K' : 'J';
-            const href = `${basePath}/${commit.sha}`;
-            const msg = escapeHTML(truncMsg(commit.commit?.message));
+            const href = commitHref(commit);
+            const msg = escapeHTML(truncMsg(commitLine(commit)));
             const hint = `<span class="ack-shortcut-hint" style="background:#1f6feb;color:#fff;font-size:9px;font-weight:bold;padding:0 3px;border-radius:2px;margin:0 2px;display:none">${hintKey}</span>`;
             const a = document.createElement('a');
             a.href = href;
-            a.title = `${commit.commit?.message?.split('\n')[0] || ''} [Ctrl+${hintKey}]`;
+            a.title = `${commitLine(commit) || ''} [Ctrl+${hintKey}]`;
             a.setAttribute('aria-label', `${isNext ? 'Next' : 'Previous'} commit [Ctrl+${hintKey}]`);
             a.innerHTML = isNext
                 ? `<span style="font-size:11px;color:#adbac7">${msg}</span> ${hint} <span style="font-weight:700;color:#58a6ff">▶</span>`
@@ -13752,16 +13823,98 @@ Rules:
             return a;
         };
 
-        // Position indicator - always show for both commit view and list view
-        const pos = document.createElement('span');
-        if (currentIdx >= 0) {
-            pos.textContent = `${currentIdx + 1}/${commits.length}`;
-        } else {
-            pos.textContent = `-/${commits.length}`;
-        }
-        Object.assign(pos.style, {fontSize: '11px', color: '#484f58', minWidth: '30px', textAlign: 'center', flex: '0 0 auto'});
         if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, '◀', false));
-        bar.appendChild(pos);
+        if (hasJumpMenu) {
+            const jumpDetails = document.createElement('details');
+            Object.assign(jumpDetails.style, {position: 'relative', flex: '0 0 auto'});
+            const jumpSummary = document.createElement('summary');
+            const currentLabel = currentIdx >= 0
+                ? `${currentIdx + 1}/${commits.length} ${commits[currentIdx]?.sha?.slice(0, 8) || ''}`
+                : `Commits (${commits.length})`;
+            jumpSummary.textContent = `${currentLabel} ▾`;
+            jumpSummary.title = 'Jump to any commit';
+            Object.assign(jumpSummary.style, {
+                listStyle: 'none',
+                padding: '4px 10px',
+                fontSize: '11px',
+                color: '#adbac7',
+                background: '#0d1117',
+                border: '1px solid #57606a',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+                minWidth: '90px',
+                textAlign: 'center',
+            });
+            jumpSummary.addEventListener('mouseenter', () => {
+                jumpSummary.style.background = '#161b22';
+                jumpSummary.style.borderColor = '#8b949e';
+            });
+            jumpSummary.addEventListener('mouseleave', () => {
+                jumpSummary.style.background = '#0d1117';
+                jumpSummary.style.borderColor = '#57606a';
+            });
+            const jumpMenu = document.createElement('div');
+            Object.assign(jumpMenu.style, {
+                position: 'absolute',
+                left: '50%',
+                bottom: 'calc(100% + 8px)',
+                transform: 'translateX(-50%)',
+                background: '#161b22',
+                border: '1px solid #30363d',
+                borderRadius: '8px',
+                boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+                minWidth: '360px',
+                maxWidth: 'min(92vw, 560px)',
+                maxHeight: '320px',
+                overflow: 'auto',
+                padding: '6px',
+                zIndex: '99999',
+            });
+            commits.forEach((commit, idx) => {
+                const item = document.createElement('a');
+                item.href = commitHref(commit);
+                item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
+                Object.assign(item.style, {
+                    display: 'block',
+                    padding: '6px 8px',
+                    borderRadius: '6px',
+                    textDecoration: 'none',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    background: idx === currentIdx ? '#1f2937' : 'transparent',
+                    fontWeight: idx === currentIdx ? '600' : '400',
+                });
+                item.addEventListener('mouseenter', () => {
+                    item.style.background = idx === currentIdx ? '#263244' : '#21262d';
+                });
+                item.addEventListener('mouseleave', () => {
+                    item.style.background = idx === currentIdx ? '#1f2937' : 'transparent';
+                });
+                item.addEventListener('click', (e) => {
+                    jumpDetails.removeAttribute('open');
+                    if (isCommitsList && focusCommitEntry(commit, idx)) {
+                        e.preventDefault();
+                    }
+                });
+                jumpMenu.appendChild(item);
+            });
+            jumpDetails.appendChild(jumpSummary);
+            jumpDetails.appendChild(jumpMenu);
+            bar.appendChild(jumpDetails);
+        } else {
+            const pos = document.createElement('span');
+            pos.textContent = currentIdx >= 0 ? `${currentIdx + 1}/${commits.length}` : `-/${commits.length}`;
+            Object.assign(pos.style, {
+                fontSize: '11px',
+                color: '#484f58',
+                minWidth: '30px',
+                textAlign: 'center',
+                flex: '0 0 auto',
+            });
+            bar.appendChild(pos);
+        }
         if (nextCommit) bar.appendChild(makeNavBtn(nextCommit, '▶', true));
 
         if (gen !== commitNavGeneration) return;
@@ -18432,6 +18585,47 @@ Rules:
         ackAssert(!section.includes('origin master'), 'does not hardcode origin/master');
     });
 
+    ackTest('normalizePRHeaderHeadBranch strips owner prefix and copies branch only', () => {
+        const origIsPRPage = isPRPage;
+        const origReadHead = readHeadBranchFromSSR;
+        const origClipboard = GM_setClipboard;
+        let copied = '';
+        try {
+            isPRPage = () => true;
+            readHeadBranchFromSSR = () => '';
+            GM_setClipboard = (text) => { copied = text; };
+            const host = document.createElement('div');
+            host.style.position = 'absolute';
+            host.style.left = '-99999px';
+            host.innerHTML = `
+                <span class="PullRequestHeaderSummary-module__summaryContainer__dA7dP">
+                    <a href="/bitcoin/bitcoin/tree/master">bitcoin:master</a>
+                    <div>
+                        <a id="ack-head-branch" href="/l0rinc/bitcoin/tree/l0rinc/test-macos-bind-netutil" aria-describedby="ack-head-tip">l0rinc:l0rinc/test-macos-bind-netutil</a>
+                        <span id="ack-head-tip">l0rinc/bitcoin:l0rinc/test-macos-bind-netutil</span>
+                        <button type="button" data-component="IconButton" aria-labelledby="ack-copy-tip">copy</button>
+                        <span id="ack-copy-tip">Copy head branch name to clipboard</span>
+                    </div>
+                </span>
+            `;
+            document.body.appendChild(host);
+            try {
+                ackEq(normalizePRHeaderHeadBranch(host), true, 'normalizes PR header branch summary');
+                ackEq(host.querySelector('#ack-head-branch').textContent.trim(), 'l0rinc/test-macos-bind-netutil', 'removes owner prefix from displayed head branch');
+                ackEq(host.querySelector('#ack-head-tip').textContent.trim(), 'l0rinc/test-macos-bind-netutil', 'updates branch tooltip to branch-only text');
+                ackEq(host.querySelector('#ack-copy-tip').textContent.trim(), 'Copy branch name to clipboard', 'updates copy tooltip text');
+                host.querySelector('button[data-component="IconButton"]').dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                ackEq(copied, 'l0rinc/test-macos-bind-netutil', 'copies branch name without owner prefix');
+            } finally {
+                host.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            readHeadBranchFromSSR = origReadHead;
+            GM_setClipboard = origClipboard;
+        }
+    });
+
     // --- Force-Push Compare Enhancement ---
 
     ackTest('fetchRepoMembers: org members cached globally, PR associations always fresh', () => {
@@ -21985,6 +22179,8 @@ Rules:
         ackAssert(fn.includes('How each modified file'), 'files section has tooltip');
         ackAssert(fn.includes("'🎯 Why this matters'"), 'why this matters section exists');
         ackAssert(fn.includes('data.why_care'), 'reads why_care from LLM response');
+        ackAssert(fn.includes("'🧪 Verify / reproduce'"), 'verify/repro section exists');
+        ackAssert(fn.includes('data.verify_repro'), 'reads verify_repro from LLM response');
     });
 
     ackTest('LLM prompt includes files_overview field and JSON format', () => {
@@ -21995,9 +22191,12 @@ Rules:
         ackAssert(prompt.includes('Skip if only 1 file changed'), 'skip for single-file commits');
         ackAssert(prompt.includes('"why_care"'), 'prompt defines why_care field');
         ackAssert(prompt.includes('pain or friction the author is likely trying to remove'), 'why_care explains reviewer-facing motivation');
+        ackAssert(prompt.includes('"verify_repro"'), 'prompt defines verify_repro field');
+        ackAssert(prompt.includes('The simplest practical way to verify or reproduce the commit'), 'verify_repro explains simple validation goal');
         // JSON format spec
         ackAssert(source.includes('"files_overview": "..."'), 'JSON format includes files_overview');
         ackAssert(source.includes('"why_care": "..."'), 'JSON format includes why_care');
+        ackAssert(source.includes('"verify_repro": "..."'), 'JSON format includes verify_repro');
     });
 
     ackTest('compact toolbar reduces gap, padding, and hides disabled buttons', () => {
@@ -22455,6 +22654,7 @@ Rules:
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('context'), 'includes context field');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('why_care'), 'includes why_care field');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('pseudocode'), 'includes pseudocode field');
+        ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('verify_repro'), 'includes verify_repro field');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('performance_simplifications'), 'includes performance_simplifications field');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('concerns'), 'includes concerns field');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('message_check'), 'includes message_check field');
@@ -22465,6 +22665,7 @@ Rules:
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('backtick'), 'requires backticks for symbol names');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('Do NOT repeat the commit message'), 'avoids parroting commit message');
         ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('abbreviation'), 'explains abbreviations');
+        ackAssert(DEFAULT_INSTRUCTIONS.pseudocode.includes('simplest practical way to verify or reproduce'), 'asks for simple verify/repro guidance');
     });
 
     ackTest('pseudocode instruction is exposed in config panel', () => {
@@ -22503,6 +22704,7 @@ Rules:
         const fn = source.slice(source.indexOf('function addSingleCommitExplainButton'), source.indexOf('// --- Co-authored-by'));
         ackAssert(fn.includes('review aid'), 'tooltip mentions review aid');
         ackAssert(fn.includes('pseudocode'), 'tooltip mentions pseudocode');
+        ackAssert(fn.includes('verify/repro'), 'tooltip mentions verify/repro');
         ackAssert(fn.includes('concerns'), 'tooltip mentions concerns');
     });
 
@@ -22524,9 +22726,21 @@ Rules:
         const source = _ackSource;
         const navFn = source.slice(source.indexOf('async function _addFloatingCommitNavInner'), source.indexOf('function isPRPage'));
         ackAssert(navFn.includes("maxWidth: 'calc(100vw - 24px)'"), 'bar width is clamped to viewport');
+        ackAssert(navFn.includes("overflow: hasJumpMenu ? 'visible' : 'hidden'"), 'bar allows dropdown overflow only when jump menu is present');
         const btnFn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
         ackAssert(btnFn.includes("maxWidth: 'min(300px, calc(50vw - 70px))'"), 'button width shrinks on narrow viewports');
         ackAssert(btnFn.includes("minWidth: '0'"), 'button text can shrink instead of pushing buttons off-screen');
+    });
+
+    ackTest('floating commit nav has middle jump dropdown only for larger commit sets', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function _addFloatingCommitNavInner'), source.indexOf('function isPRPage'));
+        ackAssert(fn.includes('const hasJumpMenu = commits.length > 3;'), 'only enables jump dropdown when more than 3 commits exist');
+        ackAssert(fn.includes('const jumpDetails = document.createElement(\'details\')'), 'creates middle commit jump dropdown');
+        ackAssert(fn.includes('jumpSummary.textContent'), 'shows clickable middle summary');
+        ackAssert(fn.includes('commits.forEach((commit, idx) => {'), 'builds dropdown items from all commits');
+        ackAssert(fn.includes('Jump to any commit'), 'middle section is explicitly a commit jump control');
+        ackAssert(fn.includes('const pos = document.createElement(\'span\')'), 'keeps a simple middle indicator when the jump menu is disabled');
     });
 
     ackTest('navigateCommit wraps around circularly', () => {
