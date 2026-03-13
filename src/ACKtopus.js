@@ -82,24 +82,7 @@
 
     // Deterministic markdown post-processor used after proofreading:
     // - upgrades "Note/Tip/Important/Warning/Caution" lead-ins to GitHub alerts
-    // - upgrades generic <details><summary> labels when content clearly implies a better label
-    // Code-fence language labeling is intentionally LLM-driven (not static heuristics).
-    const PROOFREAD_DETAIL_LABELS = [
-        [/bench|perf|timing|flamegraph/i, 'Benchmark results'],
-        [/cmake|make|build|compile|link|ninja/i, 'Build log'],
-        [/test|assert|fail|pass|expect/i, 'Test output'],
-        [/valgrind|asan|tsan|msan|ubsan|sanitiz/i, 'Sanitizer output'],
-        [/stack|trace|backtrace|signal|abort|crash/i, 'Backtrace'],
-        [/script|bash|python|\.sh|\.py/i, 'Script output'],
-        [/commit|merge|rebase|cherry/i, 'Commit list'],
-        [/log|debug|info|warn|error/i, 'Log output'],
-        [/diff|patch|hunk/i, 'Diff'],
-        [/\[!WARNING\]/i, 'Warning'],
-        [/\[!CAUTION\]/i, 'Caution'],
-        [/\[!IMPORTANT\]/i, 'Important'],
-        [/\[!TIP\]/i, 'Tip'],
-        [/\[!NOTE\]/i, 'Note'],
-    ];
+    // `<details><summary>` labels are left entirely to the model.
     const PROOFREAD_ALERT_KIND_MAP = {
         note: 'NOTE',
         tip: 'TIP',
@@ -107,7 +90,6 @@
         warning: 'WARNING',
         caution: 'CAUTION',
     };
-    const PROOFREAD_GENERIC_DETAIL_SUMMARY_RE = /^(details?|info|more|output|logs?|notes?|snippet|code|text)$/i;
 
     function applyProofreadAlertBlocks(text) {
         const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
@@ -186,39 +168,9 @@
         return out.join('\n');
     }
 
-    function applyProofreadDetailsSummary(text) {
-        const chooseDetailLabel = (content, currentSummary) => {
-            const summary = String(currentSummary || '').trim();
-            const isGeneric = !summary || PROOFREAD_GENERIC_DETAIL_SUMMARY_RE.test(summary);
-            if (!isGeneric) return summary;
-
-            for (const [re, name] of PROOFREAD_DETAIL_LABELS) {
-                if (re.test(content)) return name;
-            }
-            const fenceLang = (content.match(/(?:^|\n)\s*(`{3,}|~{3,})([A-Za-z0-9_+-]+)\s*(?:\n|$)/) || [])[2] || '';
-            if (/^(cpp|cxx|cc|c)$/i.test(fenceLang)) return 'Code snippet';
-            if (/^(python|py)$/i.test(fenceLang)) return 'Python snippet';
-            if (/^(bash|sh|shell|zsh)$/i.test(fenceLang)) return 'Command output';
-            if (/^(json|yaml|yml|toml|ini)$/i.test(fenceLang)) return 'Configuration';
-            if (/^(sql)$/i.test(fenceLang)) return 'SQL query';
-            if (/^(diff|patch)$/i.test(fenceLang)) return 'Diff';
-            return 'Details';
-        };
-
-        return String(text || '').replace(
-            /(<details>\s*<summary>)([\s\S]*?)(<\/summary>)([\s\S]*?)(<\/details>)/gi,
-            (match, open, summary, closeSummary, content, closeDetails) => {
-                const nextSummary = chooseDetailLabel(content, summary);
-                return `${open}${nextSummary}${closeSummary}${content}${closeDetails}`;
-            }
-        );
-    }
-
     function postProcessProofreadMarkdown(text) {
-        // Keep this pipeline deterministic and conservative:
-        // only strong pattern matches get transformed.
+        // Keep this pipeline deterministic and conservative.
         let out = String(text || '');
-        out = applyProofreadDetailsSummary(out);
         out = applyProofreadAlertBlocks(out);
         return out;
     }
@@ -5558,9 +5510,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             return stripGitHubMeta(s);
         };
 
-        // Keep the old local symbol names for structural tests; implementation is
-        // centralized in the deterministic markdown post-processor.
-        const DETAIL_LABELS = PROOFREAD_DETAIL_LABELS;
         const postProcessDetails = (text) => postProcessProofreadMarkdown(text);
 
         const findSubmitBtn = (container, ta) => {
@@ -22506,17 +22455,13 @@ RULES:
     ackTest('proofread uses deterministic post-processing for collapsibles and alerts', () => {
         const source = _ackSource;
         // LLM prompt should NOT contain bespoke collapsible rewriting rules.
-        // Collapsible summaries and alerts are deterministic post-process transforms.
+        // Alerts are deterministic post-process transforms; collapsible summaries are left to the model.
         const fn = source.slice(source.indexOf('async function runProofreadOnComment'), source.indexOf('// --- Start a review ---'));
         ackAssert(!fn.includes('COLLAPSIBLE SECTIONS'), 'no LLM instruction for collapsible sections');
         // Deterministic post-processor exists and is applied to results
         ackAssert(source.includes('postProcessDetails'), 'postProcessDetails exists');
         ackAssert(source.includes('postProcessDetails(parsed.fromXML'), 'applied to proofread results');
-        const helpers = source.slice(source.indexOf('const PROOFREAD_DETAIL_LABELS'), source.indexOf('function postProcessProofreadMarkdown'));
-        ackAssert(helpers.includes('PROOFREAD_DETAIL_LABELS'), 'uses heuristic labels');
-        ackAssert(helpers.includes('Benchmark results'), 'detects benchmark content');
-        ackAssert(helpers.includes('Build log'), 'detects build content');
-        ackAssert(helpers.includes('Test output'), 'detects test content');
+        const helpers = source.slice(source.indexOf('const PROOFREAD_ALERT_KIND_MAP'), source.indexOf('function postProcessProofreadMarkdown'));
         ackAssert(helpers.includes('PROOFREAD_ALERT_KIND_MAP'), 'maps Note/Tip/Important/Warning/Caution to GitHub alerts');
         ackAssert(!source.includes('function guessCodeFenceLanguage'), 'no static fence-language guessing');
     });
@@ -22533,11 +22478,11 @@ RULES:
         ackEq(out, '> [!NOTE]\n> this should be treated as a callout.');
     });
 
-    ackTest('postProcessProofreadMarkdown upgrades generic details summary based on content', () => {
+    ackTest('postProcessProofreadMarkdown leaves details summaries unchanged', () => {
         const input = '<details><summary>Details</summary>\n\n```bash\ngit status\n```\n\n</details>';
         const out = postProcessProofreadMarkdown(input);
-        ackAssert(out.includes('<summary>Script output</summary>') || out.includes('<summary>Command output</summary>'),
-            'replaces generic details summary with content-aware label');
+        ackAssert(out.includes('<summary>Details</summary>'),
+            'does not rewrite details summary labels locally');
     });
 
     ackTest('postProcessProofreadMarkdown keeps specific details summary unchanged', () => {
