@@ -1339,14 +1339,24 @@
     // GitHub recently stopped wrapping these buttons in `.ajax-pagination-form`
     // in some views (buttons now appear directly under `.discussion-item-header`).
     const AJAX_PAGINATION_BTN_SELECTOR = '.ajax-pagination-form .ajax-pagination-btn, .ajax-pagination-btn';
+    const HIDDEN_CONVERSATION_SELECTOR = '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form';
 
     function getHiddenCount() {
         let total = 0;
+        document.querySelectorAll(HIDDEN_CONVERSATION_SELECTOR).forEach(el => {
+            const m = (el.textContent || '').match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
+            if (m) total += parseInt(m[1], 10);
+        });
         document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR).forEach(b => {
-            const m = b.textContent.match(/(\d+)\s+hidden\s+items/i);
+            const m = b.textContent.match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
             if (m) total += parseInt(m[1], 10);
         });
         return total;
+    }
+
+    function getCollapsedSectionCount() {
+        const {minimized, outdated, loadDiffs} = getLoadableElements();
+        return minimized.length + outdated.length + loadDiffs.length;
     }
 
     function getLoadableElements() {
@@ -1367,6 +1377,67 @@
         return {paginationBtns, minimized, outdated, loadDiffs};
     }
 
+    async function showCollapsedSections(btn) {
+        if (btn._running) {
+            btn._cancel = true;
+            return;
+        }
+        btn._running = true;
+        btn._cancel = false;
+        const origText = btn.textContent;
+        const origTitle = btn.title;
+        btn.title = 'Click to cancel';
+        const compact = GM_getValue('compactToolbar', false);
+
+        const firstTarget = document.querySelector(
+            '.minimized-comment,' +
+            '.outdated-comment details:not([open]):not([data-resolved])'
+        ) || [...document.querySelectorAll('button span, [class*="Button-Label"]')].find(
+            el => /^load\s*diff$/i.test(el.textContent.trim())
+        );
+        if (firstTarget) firstTarget.scrollIntoView({behavior: 'smooth', block: 'center'});
+
+        let spinHandle = null;
+        if (compact) spinHandle = startSpin(btn);
+        const stopAnim = compact ? null : startBrailleAnimation(frame => {
+            btn.textContent = `${frame} ${getCollapsedSectionCount()} remaining...`;
+        }, 100);
+
+        const finish = (msg, shortMsg) => {
+            if (stopAnim) stopAnim();
+            const display = compact ? (shortMsg || msg) : msg;
+            if (spinHandle) spinHandle(display);
+            else btn.textContent = display;
+            ackSetTimeout(() => {
+                btn.textContent = origText;
+                btn.title = origTitle;
+                btn._running = false;
+                btn._cancel = false;
+            }, 1200);
+        };
+
+        try {
+            for (let round = 0; round < 50; round++) {
+                if (btn._cancel) {
+                    finish('Cancelled', '✖');
+                    return;
+                }
+                const {minimized, outdated, loadDiffs} = getLoadableElements();
+                if (minimized.length === 0 && outdated.length === 0 && loadDiffs.length === 0) break;
+                const scrollTarget = minimized[0] || outdated[0] || loadDiffs[0];
+                if (scrollTarget) scrollTarget.scrollIntoView({behavior: 'smooth', block: 'center'});
+                minimized.forEach(h => h.click());
+                outdated.forEach(d => d.setAttribute('open', ''));
+                loadDiffs.forEach(b => b.click());
+                await new Promise(r => setTimeout(r, 250));
+            }
+            finish('Done', '✓');
+        } catch (e) {
+            console.error('ACKtopus showCollapsedSections failed:', e);
+            finish('Error', '!');
+        }
+    }
+
     async function showHidden(btn) {
         if (btn._running) {
             btn._cancel = true;
@@ -1380,6 +1451,7 @@
         const compact = GM_getValue('compactToolbar', false);
 
         const firstTarget = document.querySelector(
+            '.js-review-hidden-comment-ids,' +
             '.ajax-pagination-btn,' +
             '.ajax-pagination-form,' +
             '.minimized-comment,' +
@@ -8183,6 +8255,18 @@ Rules:
             focusVisibleDeleteCommentConfirmButton();
             if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
             runDocInjectors(ctx);
+            const hiddenLoadersChanged = ctx.onToolbar && [...mutations].some(m =>
+                [...m.addedNodes, ...m.removedNodes].some(n =>
+                    n.nodeType === 1 && (
+                        n.matches?.('.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn')
+                        || n.querySelector?.('.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn')
+                    )
+                )
+            );
+            if (hiddenLoadersChanged) {
+                refreshToolbarForLiveUpdate('hidden-conversations');
+                return;
+            }
             if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
         });
     }).observe(document.body, {childList: true, subtree: true});
@@ -13671,11 +13755,7 @@ RULES:
         function disableBtn(btn, emoji) {
             btn.textContent = emoji;
             btn.disabled = true;
-            if (compact) {
-                btn.style.display = 'none';
-            } else {
-                Object.assign(btn.style, {opacity: '0.35', cursor: 'default', padding: '4px 6px'});
-            }
+            Object.assign(btn.style, {opacity: '0.35', cursor: 'default', padding: '4px 6px'});
         }
 
         function enableBtn(btn) {
@@ -13685,21 +13765,113 @@ RULES:
             btn.style.cursor = '';
         }
 
-        const hiddenBtn = createBtn(compact ? '📦' : '📦 Show hidden', function () {
-            showHidden(this);
-        }, 'Load all hidden comments and expand minimized items');
-        if (compact) hiddenBtn.style.padding = '4px 8px';
-        const {paginationBtns, minimized, outdated, loadDiffs} = getLoadableElements();
-        const hiddenCount = getHiddenCount() + minimized.length + outdated.length + loadDiffs.length;
-        if (hiddenCount === 0) disableBtn(hiddenBtn, '📦');
-        toolbar.appendChild(hiddenBtn);
-
-        const resolvedBtn = createBtn(compact ? '📂' : '📂 Show resolved', function () {
-            showResolved(this);
-        }, 'Expand all resolved review threads');
-        if (compact) resolvedBtn.style.padding = '4px 8px';
-        if (getCollapsedResolved().length === 0) disableBtn(resolvedBtn, '📂');
-        toolbar.appendChild(resolvedBtn);
+        const EXPAND_ACTIONS = [
+            {
+                key: 'hidden',
+                emoji: '📦',
+                label: 'Show hidden',
+                tip: 'Load hidden conversations/comments',
+                count: () => getHiddenCount(),
+                run: (btn) => showHidden(btn),
+            },
+            {
+                key: 'resolved',
+                emoji: '📂',
+                label: 'Show resolved',
+                tip: 'Expand all resolved review threads',
+                count: () => getCollapsedResolved().length,
+                run: (btn) => showResolved(btn),
+            },
+            {
+                key: 'collapsed',
+                emoji: '🪟',
+                label: 'Open collapsed',
+                tip: 'Expand minimized comments, outdated collapsed threads, and load-diff sections',
+                count: () => getCollapsedSectionCount(),
+                run: (btn) => showCollapsedSections(btn),
+            },
+        ];
+        let selectedExpandAction = GM_getValue('expandToolbarAction', 'hidden');
+        const getExpandAction = () => EXPAND_ACTIONS.find(a => a.key === selectedExpandAction) || EXPAND_ACTIONS[0];
+        const expandGroup = document.createElement('div');
+        Object.assign(expandGroup.style, {display: 'flex', position: 'relative'});
+        const expandMainBtn = createBtn('', function () {
+            const act = getExpandAction();
+            if (expandMainBtn.disabled) return;
+            act.run(this);
+        }, '');
+        expandMainBtn.style.borderRadius = '6px 0 0 6px';
+        expandMainBtn.style.borderRight = 'none';
+        if (compact) expandMainBtn.style.padding = '4px 8px';
+        const expandDropBtn = document.createElement('button');
+        expandDropBtn.textContent = '▾';
+        expandDropBtn.title = 'Choose expand action';
+        Object.assign(expandDropBtn.style, {
+            padding: '4px 6px', fontSize: '12px', cursor: 'pointer',
+            border: '1px solid #444c56', borderRadius: '0 6px 6px 0',
+            color: '#c9d1d9', background: '#21262d', lineHeight: '1.5',
+        });
+        const expandMenu = document.createElement('div');
+        Object.assign(expandMenu.style, {
+            display: 'none', position: 'absolute', top: '100%', left: '0',
+            marginTop: '4px', background: '#161b22', border: '1px solid #30363d',
+            borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+            zIndex: '100000', minWidth: 'max-content', padding: '4px 0',
+        });
+        const updateExpandMainBtn = () => {
+            const act = getExpandAction();
+            const count = act.count();
+            expandMainBtn.innerHTML = compact ? `${act.emoji}` : `${act.emoji} ${act.label}`;
+            expandMainBtn.title = act.tip;
+            if (count === 0) disableBtn(expandMainBtn, act.emoji);
+            else enableBtn(expandMainBtn);
+        };
+        for (const act of EXPAND_ACTIONS) {
+            const item = document.createElement('div');
+            item.dataset.ackExpandKey = act.key;
+            Object.assign(item.style, {
+                padding: '6px 12px', fontSize: '12px', color: '#c9d1d9',
+                cursor: 'pointer', whiteSpace: 'nowrap',
+                background: act.key === selectedExpandAction ? '#30363d' : 'transparent',
+            });
+            const render = () => {
+                const count = act.count();
+                item.textContent = `${act.emoji} ${act.label}${count > 0 ? ` (${count})` : ''}`;
+                item.style.opacity = count > 0 ? '1' : '0.45';
+            };
+            render();
+            item.title = act.tip;
+            item.addEventListener('mouseenter', () => item.style.background = '#30363d');
+            item.addEventListener('mouseleave', () => {
+                item.style.background = act.key === selectedExpandAction ? '#30363d' : 'transparent';
+            });
+            item.addEventListener('click', () => {
+                selectedExpandAction = act.key;
+                GM_setValue('expandToolbarAction', act.key);
+                [...expandMenu.children].forEach(c => c.style.background = 'transparent');
+                item.style.background = '#30363d';
+                updateExpandMainBtn();
+                expandMenu.style.display = 'none';
+                if (act.count() > 0) act.run(expandMainBtn);
+            });
+            expandMenu.appendChild(item);
+        }
+        updateExpandMainBtn();
+        expandDropBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            [...expandMenu.children].forEach(item => {
+                const act = EXPAND_ACTIONS.find(a => a.key === item.dataset.ackExpandKey);
+                if (!act) return;
+                item.textContent = `${act.emoji} ${act.label}${act.count() > 0 ? ` (${act.count()})` : ''}`;
+                item.style.opacity = act.count() > 0 ? '1' : '0.45';
+            });
+            expandMenu.style.display = expandMenu.style.display === 'none' ? 'block' : 'none';
+        });
+        document.addEventListener('click', () => expandMenu.style.display = 'none');
+        expandGroup.appendChild(expandMainBtn);
+        expandGroup.appendChild(expandDropBtn);
+        expandGroup.appendChild(expandMenu);
+        toolbar.appendChild(expandGroup);
 
         // --- 💬 Comment navigator ---
         const commentNavBtn = createBtn(compact ? '💬' : '💬 Comments', function (e) {
@@ -18475,8 +18647,28 @@ RULES:
         const block = source.slice(source.indexOf('const AJAX_PAGINATION_BTN_SELECTOR'), source.indexOf('function getHiddenCount'));
         ackAssert(block.includes('.ajax-pagination-btn'), 'includes .ajax-pagination-btn');
         ackAssert(block.includes('.ajax-pagination-form'), 'keeps legacy .ajax-pagination-form support');
+        ackAssert(source.includes('HIDDEN_CONVERSATION_SELECTOR'), 'has shared hidden-conversation selector');
         const fn = source.slice(source.indexOf('function getHiddenCount'), source.indexOf('function getLoadableElements'));
         ackAssert(fn.includes('AJAX_PAGINATION_BTN_SELECTOR'), 'getHiddenCount uses shared selector constant');
+        ackAssert(fn.includes('hidden\\s+(?:items|conversations)'), 'counts both hidden items and hidden conversations');
+    });
+
+    ackTest('grouped expand dropdown exposes hidden, resolved, and collapsed actions', () => {
+        const source = _ackSource;
+        const inject = source.slice(source.indexOf('function inject()'));
+        ackAssert(inject.includes("const EXPAND_ACTIONS = ["), 'defines grouped expand actions');
+        ackAssert(inject.includes("label: 'Show hidden'"), 'includes hidden action');
+        ackAssert(inject.includes("label: 'Show resolved'"), 'includes resolved action');
+        ackAssert(inject.includes("label: 'Open collapsed'"), 'includes collapsed action');
+        ackAssert(inject.includes('showCollapsedSections'), 'collapsed action has dedicated runner');
+        ackAssert(inject.includes('GM_setValue(\'expandToolbarAction\''), 'persists selected expand action');
+    });
+
+    ackTest('childList observer refreshes toolbar when hidden loaders appear later', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf("new MutationObserver((mutations) => {"), source.indexOf("}).observe(document.body, {childList: true, subtree: true});") + 60);
+        ackAssert(fn.includes('hiddenLoadersChanged'), 'detects hidden loader mutations');
+        ackAssert(fn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"), 'refreshes toolbar when hidden conversation loaders appear');
     });
 
     ackTest('showHidden and showResolved use overlay spinner in compact mode', () => {
@@ -20955,18 +21147,19 @@ RULES:
         ackAssert(fn.includes("'🔑'"), 'shows key overlay');
     });
 
-    ackTest('toolbar order: 📦 💬 ⏳/⚡ [📎|🤖] Settings ☑️', () => {
+    ackTest('toolbar order: expand group, 💬, [📎|🤖], Settings, ☑️', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf('function inject()'));
-        const hiddenIdx = inject.indexOf("toolbar.appendChild(hiddenBtn)");
-        const resolvedIdx = inject.indexOf("toolbar.appendChild(resolvedBtn)");
+        const expandIdx = inject.indexOf("toolbar.appendChild(expandGroup)");
+        const commentIdx = inject.indexOf("toolbar.appendChild(commentNavBtn)");
         const llmGroupIdx = inject.indexOf("toolbar.appendChild(llmGroup)");
         const settingsIdx = inject.indexOf("toolbar.appendChild(settingsGroup)");
         const queueIdx = inject.indexOf("toolbar.appendChild(queueBtn)");
-        ackAssert(hiddenIdx < resolvedIdx, '📦 before 💬');
-        ackAssert(resolvedIdx < llmGroupIdx, '💬 before [📎|🤖] group');
+        ackAssert(expandIdx < commentIdx, 'expand group before 💬');
+        ackAssert(commentIdx < llmGroupIdx, '💬 before [📎|🤖] group');
         ackAssert(llmGroupIdx < settingsIdx, '[📎|🤖] group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
+        ackAssert(inject.includes("const EXPAND_ACTIONS = ["), 'grouped expand action list exists');
         // Context and Chat are segmented inside llmGroup
         const contextInGroup = inject.indexOf("llmGroup.appendChild(contextBtn)");
         const analyzeInGroup = inject.indexOf("llmGroup.appendChild(analyzeBtn)");
@@ -22509,15 +22702,15 @@ RULES:
         // Toolbar wrapper
         ackAssert(inject.includes("gap: compact ? '2px' : '6px'"), 'toolbar gap reduced in compact');
         ackAssert(inject.includes("padding: compact ? '4px 6px' : '6px 10px'"), 'toolbar padding reduced in compact');
-        // disableBtn hides in compact
+        // disableBtn keeps buttons visible but disabled
         const disableFn = inject.slice(inject.indexOf('function disableBtn'), inject.indexOf('function enableBtn'));
-        ackAssert(disableFn.includes("btn.style.display = 'none'"), 'disableBtn hides button in compact');
+        ackAssert(!disableFn.includes("btn.style.display = 'none'"), 'disableBtn does not hide disabled buttons');
+        ackAssert(disableFn.includes("opacity: '0.35'"), 'disableBtn dims disabled buttons');
         // enableBtn restores display
-        const enableFn = inject.slice(inject.indexOf('function enableBtn'), inject.indexOf('const hiddenBtn'));
+        const enableFn = inject.slice(inject.indexOf('function enableBtn'), inject.indexOf('const EXPAND_ACTIONS'));
         ackAssert(enableFn.includes("btn.style.display = ''"), 'enableBtn restores display');
-        // Compact padding on individual buttons
-        ackAssert(inject.includes("if (compact) hiddenBtn.style.padding = '4px 8px'"), 'hiddenBtn compact padding');
-        ackAssert(inject.includes("if (compact) resolvedBtn.style.padding = '4px 8px'"), 'resolvedBtn compact padding');
+        // Compact padding on grouped expand button + comment nav button
+        ackAssert(inject.includes("if (compact) expandMainBtn.style.padding = '4px 8px'"), 'expand main button compact padding');
         ackAssert(inject.includes("if (compact) commentNavBtn.style.padding = '4px 8px'"), 'commentNavBtn compact padding');
     });
 
