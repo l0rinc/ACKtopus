@@ -13863,6 +13863,7 @@ RULES:
         const compact = GM_getValue('compactToolbar', false);
         const group = document.createElement('div');
         Object.assign(group.style, {display: 'flex', position: 'relative'});
+        const isIssue = pageKind() === 'issue';
 
         const actions = [
             {
@@ -13870,6 +13871,7 @@ RULES:
                 emoji: '📄',
                 label: 'Patch',
                 tip: 'Copy PR description, commits, and full patch to clipboard',
+                enabled: () => !isIssue,
                 run: (btn) => copyPatchContext(btn),
             },
             {
@@ -13877,6 +13879,7 @@ RULES:
                 emoji: '📎',
                 label: 'Full',
                 tip: 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)',
+                enabled: () => true,
                 run: (btn) => copyPRContext(btn),
             },
         ];
@@ -13888,6 +13891,10 @@ RULES:
             const action = getAction();
             mainBtn.innerHTML = compact ? action.emoji : `${action.emoji} ${action.label}`;
             mainBtn.title = action.tip;
+            const enabled = action.enabled();
+            mainBtn.disabled = !enabled;
+            mainBtn.style.opacity = enabled ? '' : '0.35';
+            mainBtn.style.cursor = enabled ? 'pointer' : 'default';
         };
         updateMainLabel();
         Object.assign(mainBtn.style, {
@@ -13899,7 +13906,9 @@ RULES:
         mainBtn.addEventListener('mouseenter', () => mainBtn.style.background = '#30363d');
         mainBtn.addEventListener('mouseleave', () => mainBtn.style.background = '#21262d');
         mainBtn.addEventListener('click', function () {
-            getAction().run(this);
+            const action = getAction();
+            if (!action.enabled()) return;
+            action.run(this);
         });
 
         const dropBtn = document.createElement('button');
@@ -13932,6 +13941,7 @@ RULES:
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
             item.addEventListener('click', () => {
+                if (!action.enabled()) return;
                 selectedAction = action.key;
                 GM_setValue('contextCopyAction', action.key);
                 updateMainLabel();
@@ -13940,6 +13950,12 @@ RULES:
                 menu.style.display = 'none';
                 action.run(mainBtn);
             });
+            const renderItemState = () => {
+                const enabled = action.enabled();
+                item.style.opacity = enabled ? '1' : '0.45';
+                item.style.cursor = enabled ? 'pointer' : 'default';
+            };
+            renderItemState();
             menu.appendChild(item);
         }
         dropBtn.addEventListener('click', (e) => {
@@ -14212,9 +14228,9 @@ RULES:
             toolbar.appendChild(ackToggleBtn);
 
             toolbar.appendChild(buildSHAGroup());
-            if (getAnalysisMode() !== ANALYSIS_MODES.commit) {
-                toolbar.appendChild(buildContextCopyGroup());
-            }
+        }
+        if (getAnalysisMode() !== ANALYSIS_MODES.commit) {
+            toolbar.appendChild(buildContextCopyGroup());
         }
 
         function disableBtn(btn, emoji) {
@@ -21117,6 +21133,7 @@ RULES:
         // ACK toggle and SHA group only on PR
         const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('function disableBtn'));
         ackAssert(ackSection.includes('if (onPR)'), 'ACK toggle gated behind onPR');
+        ackAssert(injectFn.includes("toolbar.appendChild(buildContextCopyGroup())"), 'context copy group is available on toolbar pages, not only PRs');
     });
 
     ackTest('currentInjectContext exposes compare-page compose mode', () => {
@@ -21618,6 +21635,9 @@ RULES:
         const group = source.slice(source.indexOf('function buildContextCopyGroup'), source.indexOf('async function loadAsyncPRData'));
         ackAssert(group.includes('copyPatchContext'), 'context split group offers patch context copy');
         ackAssert(group.includes('copyPRContext'), 'context split group offers full context copy');
+        ackAssert(group.includes("const isIssue = pageKind() === 'issue'"), 'context split group detects issue pages');
+        ackAssert(group.includes("enabled: () => !isIssue"), 'patch action is disabled on issues');
+        ackAssert(group.includes("mainBtn.disabled = !enabled"), 'main button disables unavailable action');
 
         const helper = source.slice(source.indexOf('async function copyContextWith'), source.indexOf('async function copyCommentContext'));
         ackAssert(helper.includes('GM_setClipboard'), 'copies via GM_setClipboard');
