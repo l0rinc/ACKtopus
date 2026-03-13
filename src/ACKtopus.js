@@ -6266,6 +6266,47 @@ Rules:
         throw new Error(`web submit endpoint not found (${tried.map(u => u.split('/').pop()).join(', ')})`);
     }
 
+    async function submitPendingReviewViaPageData(pr, {event, body} = {}) {
+        if (!pr) throw new Error('not on a PR page');
+        const eventValue = String(event || 'COMMENT').toUpperCase();
+        if (eventValue !== 'COMMENT') throw new Error(`page_data submit_review only supports COMMENT, got ${eventValue}`);
+
+        let nonce = getGitHubVerifiedFetchNonce();
+        let clientVersion = getGitHubClientVersion();
+        const meta = await fetchVerifiedFetchMetaFromChanges(pr, true);
+        if (meta.nonce && meta.clientVersion) {
+            nonce = meta.nonce;
+            clientVersion = meta.clientVersion;
+        }
+        if (!nonce || !clientVersion) throw new Error('missing verified-fetch headers');
+
+        const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
+        const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/page_data/submit_review`;
+        const resp = await pageFetchWithRetry(pageFetch, url, {
+            method: 'PUT',
+            mode: 'cors',
+            credentials: 'same-origin',
+            referrer: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`,
+            headers: {
+                'accept': 'application/json',
+                'content-type': 'application/json',
+                'x-fetch-nonce': nonce,
+                'x-github-client-version': clientVersion,
+                'x-requested-with': 'XMLHttpRequest',
+            },
+            body: JSON.stringify({body: String(body || '')}),
+        }, {
+            label: 'submit review page_data',
+            attempts: 2,
+            transientStatuses: [502, 503, 504],
+        });
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => '');
+            throw new Error(`page_data submit_review HTTP ${resp.status}: ${text.slice(0, 200)}`);
+        }
+        return {state: 'COMMENTED', method: 'page-data'};
+    }
+
     async function submitPendingReviewViaPatGraphQL(pr, {event, body} = {}) {
         if (!pr) throw new Error('not on a PR page');
         const number = Number(pr.pr);
@@ -7194,7 +7235,14 @@ Rules:
                 const mainTa = form.querySelector('textarea#new_comment_field, textarea[name="comment[body]"]');
                 const rawBody = mainTa?.value || '';
                 const body = rawBody.trim() ? rawBody : '';
-                await submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body});
+                try {
+                    await submitPendingReviewViaPageData(pr, {event: 'COMMENT', body});
+                } catch (pageDataErr) {
+                    if (!_ackTesting) {
+                        console.warn('ACKtopus: page_data submit review failed, falling back:', pageDataErr?.message || pageDataErr);
+                    }
+                    await submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body});
+                }
                 stopSpin('✅');
                 submitBtn.textContent = '✅';
                 _ackPendingReviewActive = false;
@@ -9658,7 +9706,7 @@ Rules:
             ? trigger.closest('details')
             : trigger.closest?.('details');
         if (details) {
-            if (!details.hasAttribute('open')) details.setAttribute('open', '');
+            if (!details.hasAttribute('open')) trigger.click();
             return true;
         }
         trigger.click();
@@ -17349,7 +17397,7 @@ RULES:
     ackTest('menu actions ensure details-based menus are opened, not toggled closed', () => {
         const source = _ackSource;
         const helper = source.slice(source.indexOf('function openMenuTrigger'), source.indexOf('function buildClassicCommentContextMenuItem'));
-        ackAssert(helper.includes("details.setAttribute('open', '')"), 'details-backed menus are force-opened');
+        ackAssert(helper.includes("if (!details.hasAttribute('open')) trigger.click();"), 'details-backed menus only click when closed');
         const editFn = source.slice(source.indexOf('async function triggerMenuEdit'), source.indexOf('function triggerMenuAction'));
         const actionFn = source.slice(source.indexOf('function triggerMenuAction'), source.indexOf('function makeStickyEditToolbar'));
         ackAssert(editFn.includes('openMenuTrigger(kebab);'), 'edit path uses deterministic menu opener');
@@ -21972,7 +22020,8 @@ RULES:
                 ackAssert(host.querySelector('.ack-submit-review-wrap'), 'leaves submit review wrapper');
                 ackAssert(!host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'demotes main Comment button while pending');
                 const fn = _ackSource.slice(_ackSource.indexOf('function addSubmitReviewButtonToConversation'), _ackSource.indexOf('// --- Auto-prefill commit hash in new comments'));
-                ackAssert(fn.includes("submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body})"), 'submits pending review directly from main page');
+                ackAssert(fn.includes("submitPendingReviewViaPageData(pr, {event: 'COMMENT', body})"), 'tries page_data submit_review directly from main page');
+                ackAssert(fn.includes("submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body})"), 'falls back to generic pending review submit path');
                 ackAssert(!fn.includes('showSubmitReviewPopover(submitBtn'), 'does not open an extra submit-review popup from main page');
             } finally {
                 host.remove();
@@ -22153,6 +22202,16 @@ RULES:
         const webIdx = fn.indexOf('submitPendingReviewViaWebEvents(pr, {event, body})');
         const nativeIdx = fn.indexOf('submitPendingReviewViaNativeDialog(pr, {event, body})');
         ackAssert(webIdx >= 0 && nativeIdx >= 0 && webIdx < nativeIdx, 'same-origin web submit happens before native dialog fallback');
+    });
+
+    ackTest('submitPendingReviewViaPageData uses verified-fetch submit_review endpoint', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function submitPendingReviewViaPageData'), source.indexOf('async function submitPendingReviewViaPatGraphQL'));
+        ackAssert(fn.includes('/page_data/submit_review'), 'targets page_data submit_review endpoint');
+        ackAssert(fn.includes("method: 'PUT'"), 'uses PUT');
+        ackAssert(fn.includes("'x-fetch-nonce'"), 'sends verified fetch nonce');
+        ackAssert(fn.includes("'x-github-client-version'"), 'sends client version');
+        ackAssert(fn.includes("JSON.stringify({body: String(body || '')})"), 'sends JSON body only');
     });
 
     ackTest('openReviewDialog ignores ACKtopus Submit review buttons', () => {
