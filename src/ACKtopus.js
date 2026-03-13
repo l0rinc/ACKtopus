@@ -9619,6 +9619,19 @@ Rules:
         return btn;
     }
 
+    function openMenuTrigger(trigger) {
+        if (!trigger) return false;
+        const details = trigger.tagName === 'SUMMARY'
+            ? trigger.closest('details')
+            : trigger.closest?.('details');
+        if (details) {
+            if (!details.hasAttribute('open')) details.setAttribute('open', '');
+            return true;
+        }
+        trigger.click();
+        return true;
+    }
+
     function buildClassicCommentContextMenuItem(container) {
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -9942,7 +9955,7 @@ Rules:
         // which would prevent finding/clicking the Edit item.
         menuHost.style.opacity = '0.01';
         console.log('ACKtopus: triggerMenuEdit: opening kebab menu');
-        kebab.click();
+        openMenuTrigger(kebab);
 
         const actionRe = /^edit(\s|$)/i;
         const ok = await clickWithRetry(container, () => {
@@ -10051,7 +10064,7 @@ Rules:
 	            } catch (_) {
 	            }
 	        });
-	        kebab.click();
+	        openMenuTrigger(kebab);
 	        const tryFind = (attempt) => {
 	            if (attempt > 8) {
 	                menu.style.opacity = origOpacity;
@@ -17210,6 +17223,16 @@ RULES:
         const fnEnd = source.indexOf('\n    function ', fnStart + 1);
         const fn = source.slice(fnStart, fnEnd);
         ackAssert(fn.includes('scheduleDeleteConfirmDefault()'), 'delete action schedules default Delete focus');
+    });
+
+    ackTest('menu actions ensure details-based menus are opened, not toggled closed', () => {
+        const source = _ackSource;
+        const helper = source.slice(source.indexOf('function openMenuTrigger'), source.indexOf('function buildClassicCommentContextMenuItem'));
+        ackAssert(helper.includes("details.setAttribute('open', '')"), 'details-backed menus are force-opened');
+        const editFn = source.slice(source.indexOf('async function triggerMenuEdit'), source.indexOf('function triggerMenuAction'));
+        const actionFn = source.slice(source.indexOf('function triggerMenuAction'), source.indexOf('function makeStickyEditToolbar'));
+        ackAssert(editFn.includes('openMenuTrigger(kebab);'), 'edit path uses deterministic menu opener');
+        ackAssert(actionFn.includes('openMenuTrigger(kebab);'), 'generic menu action path uses deterministic menu opener');
     });
 
 	    ackTest('edit button uses clickWithRetry via triggerMenuEdit', () => {
