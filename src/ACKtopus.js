@@ -1381,7 +1381,7 @@
                 minimized.forEach(h => h.click());
                 outdated.forEach(d => d.setAttribute('open', ''));
                 loadDiffs.forEach(b => b.click());
-                await new Promise(r => setTimeout(r, 250));
+                await ackSleep(250);
             }
             finish('Done', '✓');
         } catch (e) {
@@ -1459,7 +1459,7 @@
                 outdated.forEach(d => d.setAttribute('open', ''));
                 loadDiffs.forEach(b => b.click());
 
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                await ackSleep(2000);
             }
             finish('✓ all loaded', '✓');
             // After the success message fades, recheck -- disable if nothing left
@@ -2811,6 +2811,11 @@
     };
 
     const DEFAULT_INSTRUCTIONS = {
+        chat: `Answer questions about the current page directly and concisely.
+Prefer concrete conclusions over brainstorming.
+When the answer depends on specific comments or code, cite them with [ref:N] markers when that reference index is available.
+Do not repeat the full PR description or diff back to the user unless asked.
+Add context, implications, and the minimum necessary technical detail.`,
         pr: `Start with "Plan:" in 2 to 4 short sentences describing what you will verify.
 Then write "Worthwhile:" with whether the change seems desirable and worth the complexity/maintenance cost. Mention simpler alternatives and opportunity cost. If unclear, ask 2 specific questions.
 Then write "Assessment:" with a TENTATIVE view of whether it looks safe to merge and the top risk areas. Do not give a final verdict or write a review comment.
@@ -2836,17 +2841,15 @@ If you propose code, do not output a diff. Show a minimal self-contained snippet
 <sha8>: <what changed>. <why>. Risk: low|med|high.
 If a commit message does not match the diff, say so.
 If a commit should be split or squashed (mechanical changes mixed with behavior), say so briefly.
-Commit message quality: each message should start with the problem, then describe the change. Prefer short narrative prose over lists. Use \`backticks\` around symbol/command names. Flag forward references (a commit explaining itself via future commits).
-Flag scope violations: mechanical renames mixed with behavior changes, benchmark input changes mixed with API changes, build-system fixes that should be coupled with the functional change they unblock.
-Identify scripted-diff commits (\`-BEGIN VERIFY SCRIPT-\` / \`-END VERIFY SCRIPT-\` markers) and note if the script is verifiable independently.
+Flag forward references explicitly (a commit explaining itself via future commits).
 Mention test implications when relevant.`,
         commit: `Only annotate high-signal lines. Avoid restating the whole diff.
 Use the format "Line N: ..." for each note.
 For each note, state what is wrong or surprising, the impact, and the smallest safe fix.
 Be aggressive about flagging UB, lifetime and ownership, alignment, integer overflow, signedness, endianness, locking, atomic ordering, and error-handling issues.
 If something is correct but subtle, state the invariant it relies on and what would break it.
-For scripted-diff commits (look for \`-BEGIN VERIFY SCRIPT-\` / \`-END VERIFY SCRIPT-\`): verify the script is self-contained, handles overlapping patterns (longer token first), and does not mix behavioral changes. Note if it uses GNU-only \`sed\` features.
-For benchmark changes: flag when inputs may not be representative, when harness overhead can dominate measurement, or when work is too small relative to fixture setup. Prefer deterministic, reproducible setups with representative larger inputs.
+For scripted-diffs, also check overlapping patterns (longer token first) and GNU-only \`sed\` features.
+For benchmarks, also flag work too small relative to fixture setup and prefer representative larger inputs.
 Do not output a diff. If code is needed, show a minimal snippet or a full function.`,
         pseudocode: `For each commit, produce a structured review aid as a JSON object with these fields:
 "summary": One sentence, outside-in: first name the subsystem/area being changed, then what the commit does and why. Use \`backticks\` for every symbol name. Do NOT repeat the commit message -- add context the message omits.
@@ -2861,6 +2864,47 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
+        reimplementation: `Write a rebuild brief: a self-contained problem description a coding agent uses to recreate this PR from the base commit with no other context.
+
+State the PROBLEM, never the solution. The agent derives implementation from the tree. Be as terse as possible -- if the PR title suffices, stay at that level. Never narrate the diff or quote patch text. Never expose commit SHAs -- the agent must not know about the existing PR. Use the checkout metadata to emit a warning that the agent must NOT access the PR URL or its branch.
+
+Output exactly:
+
+## Goal
+What is wrong or missing and why it matters. 1-3 sentences max.
+
+## Steps
+One numbered entry per logical step (derived from commits but without referencing them). Each entry: one paragraph stating the subproblem, what should be true after, and what to test. Problem-level only.`,
+        maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
+The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
+
+STRICT RULES:
+- Be compact. Only include information that changes the overall state assessment.
+- Prefer later comments over earlier comments when summarizing each reviewer's current opinion.
+- Treat resolved early comments as historical unless they still appear unresolved in later discussion.
+- Distinguish clearly between addressed comments, unresolved comments, and uncertain items.
+- Summarize each reviewer's likely current position, not every comment they ever made.
+- If there is disagreement, state exactly where it is and who disagrees.
+- Surface obvious merge blockers, correctness risks, missing tests, or design objections first.
+- Include a brief history section summarizing the major conceptual shifts in the PR/review over time, so a maintainer can see how the focus changed.
+- Include navigable [ref:N] citations whenever you mention a specific comment or thread and a reference index is available.
+- Do not pad with generic praise or rephrase the PR description.
+- If mergeability is unclear, say exactly what evidence is missing.
+
+Output only these markdown sections:
+## Mergeability
+- [ ] Mergeable now
+- [ ] Needs follow-up before merge
+- [ ] Blocked / not ready
+
+## History
+## Top concerns
+## Unresolved review threads
+## Reviewer positions
+## Tests / verification state
+## Suggested maintainer focus
+
+Under each section, keep bullets short and high signal.`,
         proofread: `Use American English.
 Fix grammar, spelling, and clarity with minimal edits. Preserve the author's tone and intent.
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
@@ -2871,7 +2915,6 @@ Do not change code blocks, inline code, links, or formatting unless it is clearl
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
 When a fenced code block has no language (or only a generic one like text/plain), add a language tag only when the language is obvious.
-Use plain ASCII. No em dashes.
 Return only the corrected text. If nothing needs fixing, return the original text unchanged.`,
     };
 
@@ -2913,10 +2956,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            openai: {key: GM_getValue('llm_openai_key', ''), model: LLM_MODELS.openai},
             active,
             instructions: {
+                chat: GM_getValue(`llm_instr_${active}_chat`, ''),
                 pr: GM_getValue(`llm_instr_${active}_pr`, ''),
                 commits: GM_getValue(`llm_instr_${active}_commits`, ''),
                 commit: GM_getValue(`llm_instr_${active}_commit`, ''),
                 pseudocode: GM_getValue(`llm_instr_${active}_pseudocode`, ''),
+                reimplementation: GM_getValue(`llm_instr_${active}_reimplementation`, ''),
+                maintainer_summary: GM_getValue(`llm_instr_${active}_maintainer_summary`, ''),
                 proofread: GM_getValue(`llm_instr_${active}_proofread`, ''),
             },
             includeFullPatch: GM_getValue('llm_include_patch', true),
@@ -3027,6 +3073,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const isCacheKey = k =>
             k.startsWith('llm_explain_') || k.startsWith('llm_lightbulb_') ||
             k.startsWith('llm_pr_overview_') || k.startsWith('llm_lightbulb_autoopen_') ||
+            k.startsWith('llm_cache_') || k.startsWith('llm_prompt_') ||
             k.startsWith('org_members_') || k.startsWith('repo_members_') ||
             k.startsWith('pr_context_') || k.startsWith('commitlist_') ||
             k === 'llm_cache_timestamps';
@@ -3040,6 +3087,22 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         Object.keys(_orgMemberCache).forEach(k => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
         console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
+        return count;
+    }
+
+    function factoryReset() {
+        const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
+        const keep = new Set(['llm_claude_key', 'llm_openai_key', 'github_pat']);
+        let count = 0;
+        keys.forEach(k => {
+            if (!keep.has(k)) {
+                GM_deleteValue(k);
+                count++;
+            }
+        });
+        Object.keys(_orgMemberCache).forEach(k => delete _orgMemberCache[k]);
+        _reviewCommitMap = null;
+        console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
 
@@ -3309,25 +3372,48 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         panel.appendChild(instrTitle);
 
         function addInstruction(key, label, placeholder) {
+            const row = document.createElement('div');
+            Object.assign(row.style, {display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '3px'});
             const lbl = document.createElement('div');
             lbl.textContent = label;
-            Object.assign(lbl.style, {fontSize: '12px', color: '#8b949e', marginBottom: '3px'});
-            panel.appendChild(lbl);
+            Object.assign(lbl.style, {fontSize: '12px', color: '#8b949e', flex: '1'});
+            row.appendChild(lbl);
+            const isCustom = config.instructions[key] && config.instructions[key].trim() !== placeholder.trim();
+            const resetBtn = document.createElement('button');
+            resetBtn.textContent = '↺ Reset';
+            Object.assign(resetBtn.style, {
+                fontSize: '10px', padding: '1px 5px', background: 'transparent',
+                border: '1px solid #30363d', borderRadius: '4px', color: '#8b949e',
+                cursor: 'pointer', display: isCustom ? '' : 'none',
+            });
+            row.appendChild(resetBtn);
+            panel.appendChild(row);
             const ta = document.createElement('textarea');
             ta.value = config.instructions[key] || placeholder;
             ta.dataset.instrKey = key;
+            ta.dataset.instrDefault = placeholder;
             Object.assign(ta.style, {
                 width: '100%', padding: '6px 8px', minHeight: '40px', resize: 'vertical',
                 background: '#0d1117', border: '1px solid #30363d', borderRadius: '6px',
                 color: '#c9d1d9', fontSize: '11px', boxSizing: 'border-box', marginBottom: '8px',
             });
+            resetBtn.addEventListener('click', () => {
+                ta.value = placeholder;
+                resetBtn.style.display = 'none';
+            });
+            ta.addEventListener('input', () => {
+                resetBtn.style.display = ta.value.trim() !== placeholder.trim() ? '' : 'none';
+            });
             panel.appendChild(ta);
         }
 
+        addInstruction('chat', '🤖 Chat', DEFAULT_INSTRUCTIONS.chat);
         addInstruction('pr', '🔍 Full PR analysis', DEFAULT_INSTRUCTIONS.pr);
         addInstruction('commits', '📋 Commits list', DEFAULT_INSTRUCTIONS.commits);
         addInstruction('commit', '🔬 Single commit annotation', DEFAULT_INSTRUCTIONS.commit);
         addInstruction('pseudocode', '💡 Commit review aid (💡 button: pseudocode, concerns, message check)', DEFAULT_INSTRUCTIONS.pseudocode);
+        addInstruction('reimplementation', '🧬 Rebuild brief recipe', DEFAULT_INSTRUCTIONS.reimplementation);
+        addInstruction('maintainer_summary', '🧭 Maintainer summary recipe', DEFAULT_INSTRUCTIONS.maintainer_summary);
         addInstruction('proofread', '✏️ Proofread', DEFAULT_INSTRUCTIONS.proofread);
 
         // --- Options ---
@@ -3391,6 +3477,26 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             }, 2000);
         });
         clearRow.appendChild(clearAllBtn);
+
+        const resetAllBtn = document.createElement('button');
+        resetAllBtn.textContent = '☢ Factory reset';
+        resetAllBtn.title = 'Deletes ALL stored data except API keys: caches, custom instructions, preferences, usage stats. Cannot be undone.';
+        Object.assign(resetAllBtn.style, {
+            padding: '4px 12px', fontSize: '11px', background: '#21262d', color: '#f85149',
+            border: '1px solid #f8514950', borderRadius: '6px', cursor: 'pointer', marginLeft: '6px',
+        });
+        resetAllBtn.addEventListener('click', () => {
+            if (!confirm('This will delete ALL stored data except API keys (caches, custom instructions, preferences, usage stats). Continue?')) return;
+            const n = factoryReset();
+            resetAllBtn.textContent = `✓ Reset ${n} entries`;
+            panel.querySelectorAll('textarea[data-instr-key]').forEach(el => {
+                el.value = el.dataset.instrDefault || '';
+            });
+            setTimeout(() => {
+                resetAllBtn.textContent = '☢ Factory reset';
+            }, 2000);
+        });
+        clearRow.appendChild(resetAllBtn);
         panel.appendChild(clearRow);
 
         // --- Usage Stats ---
@@ -3535,7 +3641,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 GM_setValue(`llm_${el.dataset.provider}_key`, el.value);
             });
             panel.querySelectorAll('textarea[data-instr-key]').forEach(el => {
-                GM_setValue(`llm_instr_${active}_${el.dataset.instrKey}`, el.value);
+                const val = el.value.trim() === (el.dataset.instrDefault || '').trim() ? '' : el.value;
+                GM_setValue(`llm_instr_${active}_${el.dataset.instrKey}`, val);
             });
             panel.querySelectorAll('input[data-opt-key]').forEach(el => {
                 GM_setValue(`llm_${el.dataset.optKey}`, el.checked);
@@ -4348,6 +4455,27 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.join('\n\n');
     }
 
+    async function gatherPatchContext(onProgress = () => {}) {
+        return gatherFullPRContext(onProgress, {includePatch: true, includeComments: false});
+    }
+
+    async function gatherRecipeContext(onProgress = () => {}) {
+        const pr = parsePR();
+        if (!pr) return '';
+        let meta = [];
+        try {
+            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+            if (prData?.base?.sha) meta.push(`Base commit: \`${prData.base.sha}\``);
+            if (prData?.base?.ref) meta.push(`Base branch: \`${prData.base.ref}\``);
+            if (prData?.head?.sha) meta.push(`Head commit: \`${prData.head.sha}\``);
+            if (prData?.head?.ref) meta.push(`Head branch: \`${prData.head.ref}\``);
+        } catch (_) {
+        }
+        const context = await gatherFullPRContext(onProgress, {includePatch: true, includeComments: true});
+        if (!meta.length) return context;
+        return `## Checkout metadata\n${meta.map(x => `- ${x}`).join('\n')}\n\n${context}`;
+    }
+
     function scrollToAndHighlight(el) {
         if (!el) return;
         el.scrollIntoView({behavior: 'smooth', block: 'center'});
@@ -4384,7 +4512,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }).join('');
     }
 
-    function buildChatPanel() {
+    function buildChatPanel(opts = {}) {
+        const {initialRecipe = null} = opts;
         const panel = document.createElement('div');
         panel.id = 'acktopus-analysis';
         Object.assign(panel.style, {
@@ -4502,42 +4631,116 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             } else {
                 Object.assign(msg.style, {
                     background: 'transparent', color: '#c9d1d9', alignSelf: 'flex-start',
-                    borderLeft: '3px solid #30363d', paddingLeft: '10px',
+                    borderLeft: '3px solid #30363d', paddingLeft: '10px', position: 'relative',
                 });
-                msg.innerHTML = html;
+                const copyBtn = document.createElement('button');
+                copyBtn.type = 'button';
+                copyBtn.textContent = '⧉';
+                copyBtn.title = 'Copy reply to clipboard';
+                Object.assign(copyBtn.style, {
+                    position: 'absolute', top: '0', right: '0',
+                    padding: '0 4px', fontSize: '11px', lineHeight: '1.4',
+                    background: 'transparent', color: '#8b949e',
+                    border: '1px solid transparent', borderRadius: '4px', cursor: 'pointer',
+                });
+                copyBtn.addEventListener('mouseenter', () => {
+                    copyBtn.style.color = '#c9d1d9';
+                    copyBtn.style.borderColor = '#30363d';
+                });
+                copyBtn.addEventListener('mouseleave', () => {
+                    copyBtn.style.color = '#8b949e';
+                    copyBtn.style.borderColor = 'transparent';
+                });
+                copyBtn.addEventListener('click', () => {
+                    const text = msg.dataset.ackRawContent || msg._ackBody?.innerText || '';
+                    if (!text.trim()) return;
+                    GM_setClipboard(text);
+                    const orig = copyBtn.textContent;
+                    copyBtn.textContent = '✓';
+                    setTimeout(() => { copyBtn.textContent = orig; }, 1000);
+                });
+                const body = document.createElement('div');
+                body.style.paddingRight = '20px';
+                body.innerHTML = html;
+                msg._ackCopyBtn = copyBtn;
+                msg._ackBody = body;
+                msg.dataset.ackRawContent = '';
+                msg.appendChild(copyBtn);
+                msg.appendChild(body);
             }
             messages.appendChild(msg);
             messages.scrollTop = messages.scrollHeight;
             return msg;
         }
 
-        async function send() {
-            const text = input.value.trim();
-            if (!text) return;
-            input.value = '';
-            input.style.height = 'auto';
+        function setAssistantText(msg, text, color = '') {
+            if (msg?._ackBody) {
+                msg._ackBody.textContent = text;
+                msg.dataset.ackRawContent = text;
+                msg._ackBody.style.color = color || '';
+            } else {
+                msg.textContent = text;
+            }
+        }
 
+        function setAssistantHtml(msg, html, rawText = '') {
+            if (msg?._ackBody) {
+                msg._ackBody.innerHTML = html;
+                msg.dataset.ackRawContent = rawText || msg._ackBody.innerText || '';
+                msg._ackBody.style.color = '';
+            } else {
+                msg.innerHTML = html;
+            }
+        }
+
+        async function send(recipe = null) {
             const provider = getActiveProvider();
             if (!isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
                 return;
             }
 
-            addMessage('user', text);
-            history.push({role: 'user', content: text});
+            const recipeMap = {
+                chat: {
+                    label: 'Open chat',
+                    userText: '',
+                    sendAsConversation: false,
+                },
+                reimplementation: {
+                    label: 'Rebuild brief',
+                    userText: 'Generate the rebuild brief now.',
+                    sendAsConversation: false,
+                },
+                maintainer_summary: {
+                    label: 'Maintainer summary',
+                    userText: 'Generate the maintainer-facing PR status summary now.',
+                    sendAsConversation: false,
+                },
+            };
+            const recipeCfg = recipe ? recipeMap[recipe] : null;
+            const text = recipeCfg ? recipeCfg.userText : input.value.trim();
+            if (recipeCfg?.sendAsConversation === false && recipeCfg.userText === '') return;
+            if (!recipeCfg && !text) return;
+            if (!recipeCfg) {
+                input.value = '';
+                input.style.height = 'auto';
+            }
+
+            addMessage('user', recipeCfg ? recipeCfg.label : text);
+            history.push({role: 'user', content: recipeCfg ? recipeCfg.label : text});
 
             // Spinner message
             const assistantMsg = addMessage('assistant', '');
             const stopSpin = startBrailleAnimation(frame => {
-                assistantMsg.textContent = frame;
+                setAssistantText(assistantMsg, frame);
             });
 
             // Build/refresh page index (shared across regular chat and /find)
             chatPageIndex = gatherPageIndex();
 
             try {
-                const isQuiz = /^\/quiz\b/i.test(text);
-                const isNavQuery = NAV_QUERY_RE.test(text);
+                const isQuiz = !recipeCfg && /^\/quiz\b/i.test(text);
+                const isNavQuery = !recipeCfg && NAV_QUERY_RE.test(text);
 
                 if (isQuiz) {
                     // Quiz mode: ask high-leverage questions (do NOT answer)
@@ -4547,12 +4750,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         ? `\n\nIMPORTANT: When a question is about a specific comment or code from the page, cite it using [ref:N] markers (e.g. [ref:3]) that match the "Visible review comments" reference numbers, so the user can navigate.`
                         : '';
                     const focus = text.replace(/^\/quiz\s*/i, '').trim();
-                    const quizSystem = `${SYSTEM_BASE}\n\nYou are a review coach. Your job is to ask high-leverage questions that help a human reviewer validate correctness, test coverage, and whether the change is worthwhile.\n\nRULES:\n- Output questions ONLY. Do not answer.\n- Each question must be on its own line and start with \"Q:\".\n- Ask 5 to 10 questions.\n- Do not draft or suggest posting a PR review comment.\n${citationInstructions}\n\n${context}${diffBlock}`;
+                    const quizSystem = `${SYSTEM_BASE}\n\nYou are a review coach. Your job is to ask high-leverage questions that help a human reviewer validate correctness, test coverage, and whether the change is worthwhile.\n\nRULES:\n- Output questions ONLY. Do not answer.\n- Each question must be on its own line and start with \"Q:\".\n- Ask 5 to 10 questions.\n${citationInstructions}\n\n${context}${diffBlock}`;
                     const quizUser = focus ? `Focus: ${focus}` : 'Generate questions to guide my review.';
                     const result = await callLLM(provider, quizSystem, quizUser);
                     stopSpin();
                     const trimmed = result.trim();
-                    assistantMsg.innerHTML = linkifyRefs(renderMarkdown(trimmed), chatPageIndex);
+                    setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     history.push({role: 'assistant', content: trimmed});
                     messages.scrollTop = messages.scrollHeight;
                 } else if (isNavQuery) {
@@ -4574,19 +4777,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         const cleaned = result.trim().replace(/^```json\n?|\n?```$/g, '').trim();
                         matches = JSON.parse(cleaned);
                     } catch (_) {
-                        assistantMsg.textContent = 'Could not parse navigation results.';
-                        assistantMsg.style.color = '#f85149';
+                        setAssistantText(assistantMsg, 'Could not parse navigation results.', '#f85149');
                         return;
                     }
 
                     if (!matches.length) {
-                        assistantMsg.textContent = 'No matching content found on this page.';
+                        setAssistantText(assistantMsg, 'No matching content found on this page.');
                         history.push({role: 'assistant', content: 'No matches found.'});
                         return;
                     }
 
                     // Render clickable results
-                    assistantMsg.innerHTML = '';
+                    setAssistantHtml(assistantMsg, '');
                     const resultList = document.createElement('div');
                     Object.assign(resultList.style, {display: 'flex', flexDirection: 'column', gap: '6px'});
 
@@ -4622,9 +4824,30 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
                         resultList.appendChild(link);
                     }
-                    assistantMsg.appendChild(resultList);
+                    (assistantMsg._ackBody || assistantMsg).appendChild(resultList);
                     const summary = `Found ${matches.length} match${matches.length > 1 ? 'es' : ''}.`;
                     history.push({role: 'assistant', content: summary});
+                    messages.scrollTop = messages.scrollHeight;
+                } else if (recipe === 'reimplementation' || recipe === 'maintainer_summary') {
+                    if (!parsePR()) throw new Error('this recipe is only available on pull request pages');
+                    const fullContext = await gatherRecipeContext(msg => {
+                        setAssistantText(assistantMsg, msg);
+                    });
+                    const extraInstr = recipe === 'reimplementation'
+                        ? ((getLLMConfig().instructions.reimplementation || DEFAULT_INSTRUCTIONS.reimplementation).trim())
+                        : ((getLLMConfig().instructions.maintainer_summary || DEFAULT_INSTRUCTIONS.maintainer_summary).trim());
+                    // Rebuild briefs are copied out for downstream agents — no [ref:N] citations.
+                    // Maintainer summaries stay on the page — keep citations for navigation.
+                    const citationInstructions = (recipe !== 'reimplementation' && chatPageIndex.length)
+                        ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
+                        : '';
+                    const system = `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
+                    const userContent = `Use the full PR context below.\n\n${fullContext}`;
+                    const result = await callLLM(provider, system, userContent);
+                    stopSpin();
+                    const trimmed = result.trim();
+                    setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
+                    history.push({role: 'assistant', content: trimmed});
                     messages.scrollTop = messages.scrollHeight;
                 } else {
                     // Regular chat mode - with [ref:N] citation support
@@ -4633,7 +4856,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     const citationInstructions = chatPageIndex.length
                         ? `\n\nIMPORTANT: When your answer references specific comments or code from the page, cite the source using [ref:N] markers (e.g. [ref:3]) matching the reference numbers in the "Visible review comments" section. Always cite sources so the user can navigate to them. Use multiple [ref:N] markers when synthesizing from multiple sources.`
                         : '';
-                    const system = `${SYSTEM_BASE}\n\nYou have access to the following PR context. Answer questions about this PR concisely and directly.${citationInstructions}\n\n${context}${diffBlock}`;
+                    const extra = getLLMConfig().instructions.chat || DEFAULT_INSTRUCTIONS.chat;
+                    const system = `${SYSTEM_BASE}\n\n${extra}${citationInstructions}\n\n${context}${diffBlock}`;
 
                     const historyText = history.map(m =>
                         m.role === 'user' ? `User: ${m.content}` : `Assistant: ${m.content}`
@@ -4643,15 +4867,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     stopSpin();
                     const trimmed = result.trim();
                     // Render markdown then replace [ref:N] with clickable navigation links
-                    const rendered = linkifyRefs(renderMarkdown(trimmed), chatPageIndex);
-                    assistantMsg.innerHTML = rendered;
+                    setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     history.push({role: 'assistant', content: trimmed});
                     messages.scrollTop = messages.scrollHeight;
                 }
             } catch (e) {
                 stopSpin();
-                assistantMsg.textContent = `Error: ${e.message}`;
-                assistantMsg.style.color = '#f85149';
+                setAssistantText(assistantMsg, `Error: ${e.message}`, '#f85149');
             }
         }
 
@@ -4665,13 +4887,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         // Auto-focus input
         setTimeout(() => input.focus(), 100);
+        if (initialRecipe && initialRecipe !== 'chat') {
+            ackSetTimeout(() => {
+                send(initialRecipe);
+            }, 50);
+        }
 
         return panel;
     }
 
     function addResultCard(panel, label, color) {
         const card = document.createElement('div');
-        Object.assign(card.style, {padding: '10px 14px', borderBottom: '1px solid #21262d'});
+        Object.assign(card.style, {padding: '10px 14px', borderBottom: '1px solid #21262d', position: 'relative'});
         const header = document.createElement('div');
         const renderHeaderFrame = frame => {
             header.innerHTML = `${label} ${frame}`;
@@ -4679,17 +4906,40 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         renderHeaderFrame(BRAILLE_START_FRAME);
         Object.assign(header.style, {fontWeight: '600', fontSize: '12px', color, marginBottom: '6px'});
         card.appendChild(header);
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.textContent = '⧉';
+        copyBtn.title = 'Copy markdown to clipboard';
+        Object.assign(copyBtn.style, {
+            position: 'absolute', top: '8px', right: '8px',
+            padding: '0 4px', fontSize: '11px', lineHeight: '1.4',
+            background: 'transparent', color: '#8b949e',
+            border: '1px solid transparent', borderRadius: '4px', cursor: 'pointer',
+            display: 'none',
+        });
+        copyBtn.addEventListener('mouseenter', () => { copyBtn.style.color = '#c9d1d9'; copyBtn.style.borderColor = '#30363d'; });
+        copyBtn.addEventListener('mouseleave', () => { copyBtn.style.color = '#8b949e'; copyBtn.style.borderColor = 'transparent'; });
+        card.appendChild(copyBtn);
         const body = document.createElement('div');
         Object.assign(body.style, {fontSize: '12px', color: '#c9d1d9', lineHeight: '1.5'});
         body.textContent = 'Analyzing...';
         card.appendChild(body);
         panel.appendChild(card);
         const stopSpin = startBrailleAnimation(renderHeaderFrame);
+        let rawMarkdown = '';
         return {
             resolve: (text) => {
                 stopSpin();
+                rawMarkdown = text;
                 header.innerHTML = label;
                 body.innerHTML = renderMarkdown(text);
+                copyBtn.style.display = '';
+                copyBtn.onclick = () => {
+                    GM_setClipboard(rawMarkdown);
+                    const orig = copyBtn.textContent;
+                    copyBtn.textContent = '✓';
+                    setTimeout(() => { copyBtn.textContent = orig; }, 1000);
+                };
             },
             reject: (err) => {
                 stopSpin();
@@ -4948,7 +5198,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         addTruncNotice(panel, commitPatch.length);
 
         const extra = config.instructions.commit || DEFAULT_INSTRUCTIONS.commit;
-        const system = `${SYSTEM_BASE}\n\n${extra}\n\nWhen annotating, reference specific line numbers and code. Use format: "Line N: explanation" for easy scanning.`;
+        const system = `${SYSTEM_BASE}\n\n${extra}`;
         const contextBlock = fullPatch ? `\n\nFull PR patch for context (may be truncated):\n${fullPatch}` : '';
         const user = `Annotate this commit (${sha.slice(0, 8)}):\n\n${truncated}${contextBlock}`;
         await dispatchToProviders(panel, pr, `commit_${sha.slice(0, 12)}`, system, user);
@@ -4958,14 +5208,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     // Old analyzePR/analyzeCommitsList/analyzeSingleCommit are retained above
     // because they seed the cache that gatherChatContext reads from.
 
-    async function runAnalysis(wrapper) {
+    async function runAnalysis(wrapper, recipe = 'chat') {
         if (!isProviderAvailable(getActiveProvider())) {
             document.body.appendChild(buildConfigPanel());
             return;
         }
         const old = document.getElementById('acktopus-analysis');
         if (old) old.remove();
-        const panel = buildChatPanel();
+        const panel = buildChatPanel({initialRecipe: recipe});
         wrapper.appendChild(panel);
     }
 
@@ -5495,7 +5745,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 stripped: text !== cleaned ? text : null
             };
             return {
-                system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- Fix grammar, spelling, punctuation, and word choice in prose text.\n- Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.\n- If a claim is demonstrably wrong, exaggerated, or contradicted by the diff/commit messages/PR context provided below, fix it with a minimal correction. Examples: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n- If something is a matter of opinion or interpretation, leave it unchanged - only correct objective errors.\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Your output for each section must NEVER be longer than the input for that section (except for corrected spelling of individual words or minimal accuracy fixes).\n${isPRBody ? '- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve ALL markdown formatting. Nothing outside <output> tags.`,
+                system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Your output for each section must NEVER be longer than the input for that section (except for corrected spelling of individual words or minimal accuracy fixes).\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve ALL markdown formatting. Nothing outside <output> tags.`,
                 user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                 parsed,
                 stripped: text !== cleaned ? text : null,
@@ -8594,7 +8844,7 @@ Rules:
                 const ctx = await fetchPRContext(pr);
                 const prTitle = normalizeInlineWhitespace(ctx.title) || normalizeInlineWhitespace(getPRTitleText()) || '';
 
-                system = `${SYSTEM_BASE}\n\nYou are helping a Bitcoin Core reviewer understand a PR before starting their review. Structure your response outside-in:\n1. First, briefly explain the subsystem/area being changed (what it does in the project, why it exists)\n2. Then the problem being addressed (why change is needed)\n3. Then the approach taken (how the solution works)\n4. Finally, areas needing careful review (consensus, memory safety, thread safety, etc)\n\nUse \`backticks\` for every symbol, file, function, and type name. Explain every abbreviation and domain term (IBD, UTXO, dbcache, etc) on first use. Do NOT repeat what the PR description already says - the reviewer can read it right next to your explanation. Add what's missing: context, implications, risks. Be concise: 4-8 sentences, then optionally a brief list of key files changed.`;
+                system = `${SYSTEM_BASE}\n\nYou are helping a Bitcoin Core reviewer understand a PR before starting their review. Structure your response outside-in:\n1. First, briefly explain the subsystem/area being changed (what it does in the project, why it exists)\n2. Then the problem being addressed (why change is needed)\n3. Then the approach taken (how the solution works)\n4. Finally, areas needing careful review (consensus, memory safety, thread safety, etc)\n\nBe concise: 4-8 sentences, then optionally a brief list of key files changed.`;
                 const parts = [];
                 if (prTitle) parts.push(`PR: "${prTitle}"`);
                 parts.push(wrap('PR DESCRIPTION', `by ${author}\n${commentText}`));
@@ -8683,7 +8933,7 @@ Rules:
                 const prContext = buildContextBlock(ctx, {maxDiff: 120000, maxCommits: 12000, maxDesc: 5000});
 
                 if (isInline) {
-                    system = `${SYSTEM_BASE}\n\nYou are explaining an inline code review comment on a GitHub PR. The comment is attached to a SPECIFIC line of code (marked with <<<). Structure your response outside-in:\n1. First, briefly explain what this code area does (the function/class/subsystem context)\n2. Then what the reviewer is pointing out about THAT specific line\n3. Then what concern or improvement they are suggesting, and why it matters\n4. What action the PR author should take\n\nUse \`backticks\` for every symbol, file, function, type, and variable name. Explain any non-obvious technical terms or abbreviations. Do NOT repeat the reviewer's words - they appear right next to your explanation. Add what's missing: the WHY behind the concern. Be concise (3-5 sentences).`;
+                    system = `${SYSTEM_BASE}\n\nYou are explaining an inline code review comment on a GitHub PR. The comment is attached to a SPECIFIC line of code (marked with <<<). Structure your response outside-in:\n1. First, briefly explain what this code area does (the function/class/subsystem context)\n2. Then what the reviewer is pointing out about THAT specific line\n3. Then what concern or improvement they are suggesting, and why it matters\n4. What action the PR author should take\n\nBe concise (3-5 sentences).`;
 
                     const parts = [`COMMENT by ${author}:\n"${commentText}"`];
                     if (targetLine) {
@@ -8701,7 +8951,7 @@ Rules:
                     if (prContext) parts.push(prContext);
                     user = parts.join('\n\n');
                 } else {
-                    system = `${SYSTEM_BASE}\n\nYou are explaining a GitHub PR comment to help the PR author understand what the reviewer means. Structure your response outside-in:\n1. First, briefly explain the relevant concept/subsystem the comment touches on\n2. Then the reviewer's concern - WHY it matters for correctness, performance, or safety\n3. Then what action (if any) the author should take\n\nUse \`backticks\` for every symbol, file, function, type, and variable name. Explain any technical terms, abbreviations, or protocol concepts that are not universally known. Do NOT repeat the reviewer's words - they appear right next to your explanation. Add what's missing: background context and implications. Be concise (3-5 sentences).`;
+                    system = `${SYSTEM_BASE}\n\nYou are explaining a GitHub PR comment to help the PR author understand what the reviewer means. Structure your response outside-in:\n1. First, briefly explain the relevant concept/subsystem the comment touches on\n2. Then the reviewer's concern - WHY it matters for correctness, performance, or safety\n3. Then what action (if any) the author should take\n\nBe concise (3-5 sentences).`;
 
                     const parts = [`COMMENT by ${author}:\n"${commentText}"`];
                     if (threadContext) {
@@ -10969,7 +11219,7 @@ RULES:
                     threadContext ? `Thread context:\n${threadContext}` : '',
                 ].filter(Boolean).join('\n\n');
 
-                const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer sanity-check a pending GitHub comment by estimating how the PR author would respond.\n\nReturn ONLY valid JSON with this schema:\n{"verdict":"accurate|change|unclear","feedback":"...","reply":"..."}\n\nRULES:\n- \`verdict\` means whether the pending comment looks accurate enough to post as-is, should be changed before posting, or is unclear from context.\n- \`feedback\` is the important part. Keep it short, blunt, and factual. Say what is factually wrong, missing, or already correct.\n- If \`verdict\` is \`accurate\`, start \`feedback\` with a brief acknowledgment that this is a real catch.\n- If \`verdict\` is \`change\`, start \`feedback\` with a blunt corrective sentence that makes clear the premise is wrong.\n- \`reply\` is a short potential author response. Do not restate the pending comment. Do not repeat the question unless needed for clarity.\n- Keep \`reply\` shorter than \`feedback\` whenever possible.\n- Answer from the PR author's perspective.\n- If the pending comment contains an incorrect factual assumption, point that out in \`feedback\` and correct it in \`reply\`.\n- Be technically accurate, concise, and grounded in the provided context.\n- Do not critique tone/style unless it affects correctness.\n- No markdown fences, no preamble.`;
+                const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer sanity-check a pending GitHub comment by estimating how the PR author would respond.\n\nReturn ONLY valid JSON with this schema:\n{"verdict":"accurate|change|unclear","feedback":"...","reply":"..."}\n\nRULES:\n- \`verdict\` means whether the pending comment looks accurate enough to post as-is, should be changed before posting, or is unclear from context.\n- \`feedback\` is the important part. Keep it short, blunt, and factual. Say what is factually wrong, missing, or already correct.\n- If \`verdict\` is \`accurate\`, start \`feedback\` with a brief acknowledgment that this is a real catch.\n- If \`verdict\` is \`change\`, start \`feedback\` with a blunt corrective sentence that makes clear the premise is wrong.\n- \`reply\` is a short potential author response. Do not restate the pending comment. Do not repeat the question unless needed for clarity.\n- Keep \`reply\` shorter than \`feedback\` whenever possible.\n- Answer from the PR author's perspective.\n- If the pending comment contains an incorrect factual assumption, point that out in \`feedback\` and correct it in \`reply\`.\n- Be technically accurate, concise, and grounded in the provided context.\n- If the pending comment references specifics not visible in the provided context, say so in \`feedback\` rather than guessing.\n- Do not critique tone/style unless it affects correctness.\n- No markdown fences, no preamble.`;
                 // Keep the changing part last to maximize any provider-side prefix caching.
                 const user = [
                     'Stable context (most of this should remain reusable across retries/edits):',
@@ -13552,30 +13802,23 @@ RULES:
 
     // --- Inject helpers ---
 
-    async function copyPRContext(btn) {
+    async function copyContextWith(btn, {gather, initialStatus, successLabel, errorLabel = 'copy context'} = {}) {
         if (btn._running) return;
         btn._running = true;
         const origText = btn.textContent;
         const stopSpin = startBrailleAnimation(frame => {
             btn.textContent = frame;
         });
-        const mode = getAnalysisMode();
-        const isCommitPage = mode === ANALYSIS_MODES.commit;
-        const popup = makeStatusPopup(
-            isCommitPage
-                ? 'Gathering commit context...'
-                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`
-        );
+        const popup = makeStatusPopup(initialStatus);
 
         try {
-            const gather = isCommitPage ? gatherSingleCommitContext : gatherFullPRContext;
             const context = await gather(msg => {
                 popup.textContent = msg;
             });
             if (context) {
                 GM_setClipboard(context);
                 btn.textContent = '✅';
-                popup.textContent = `✅ Copied ${(context.length / 1024).toFixed(0)}KB to clipboard`;
+                popup.textContent = `✅ ${successLabel} ${(context.length / 1024).toFixed(0)}KB to clipboard`;
             } else {
                 btn.textContent = '❌';
                 popup.textContent = '❌ No context found';
@@ -13583,7 +13826,7 @@ RULES:
         } catch (e) {
             btn.textContent = '❌';
             popup.textContent = `❌ Error: ${e.message}`;
-            console.error('ACKtopus: copy context failed:', e);
+            console.error(`ACKtopus: ${errorLabel} failed:`, e);
         } finally {
             stopSpin();
         }
@@ -13592,6 +13835,228 @@ RULES:
             popup.remove();
             btn._running = false;
         }, 2000);
+    }
+
+    async function copyPRContext(btn) {
+        const mode = getAnalysisMode();
+        const isCommitPage = mode === ANALYSIS_MODES.commit;
+        return copyContextWith(btn, {
+            gather: isCommitPage ? gatherSingleCommitContext : gatherFullPRContext,
+            initialStatus: isCommitPage
+                ? 'Gathering commit context...'
+                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`,
+            successLabel: 'Copied',
+            errorLabel: 'copy context',
+        });
+    }
+
+    async function copyPatchContext(btn) {
+        return copyContextWith(btn, {
+            gather: gatherPatchContext,
+            initialStatus: `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} patch context...`,
+            successLabel: 'Copied',
+            errorLabel: 'copy patch context',
+        });
+    }
+
+    function buildContextCopyGroup() {
+        const compact = GM_getValue('compactToolbar', false);
+        const group = document.createElement('div');
+        Object.assign(group.style, {display: 'flex', position: 'relative'});
+
+        const actions = [
+            {
+                key: 'patch',
+                emoji: '📄',
+                label: 'Patch',
+                tip: 'Copy PR description, commits, and full patch to clipboard',
+                run: (btn) => copyPatchContext(btn),
+            },
+            {
+                key: 'full',
+                emoji: '📎',
+                label: 'Full',
+                tip: 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)',
+                run: (btn) => copyPRContext(btn),
+            },
+        ];
+        let selectedAction = GM_getValue('contextCopyAction', 'patch');
+        const getAction = () => actions.find(a => a.key === selectedAction) || actions[0];
+
+        const mainBtn = document.createElement('button');
+        const updateMainLabel = () => {
+            const action = getAction();
+            mainBtn.innerHTML = compact ? action.emoji : `${action.emoji} ${action.label}`;
+            mainBtn.title = action.tip;
+        };
+        updateMainLabel();
+        Object.assign(mainBtn.style, {
+            padding: '4px 10px', fontSize: '12px', fontWeight: '500',
+            cursor: 'pointer', border: '1px solid #444c56',
+            borderRadius: '6px 0 0 6px', color: '#c9d1d9', background: '#21262d',
+            lineHeight: '1.5', whiteSpace: 'nowrap', borderRight: 'none',
+        });
+        mainBtn.addEventListener('mouseenter', () => mainBtn.style.background = '#30363d');
+        mainBtn.addEventListener('mouseleave', () => mainBtn.style.background = '#21262d');
+        mainBtn.addEventListener('click', function () {
+            getAction().run(this);
+        });
+
+        const dropBtn = document.createElement('button');
+        dropBtn.textContent = '▾';
+        dropBtn.title = 'Choose context copy format';
+        Object.assign(dropBtn.style, {
+            padding: '4px 6px', fontSize: '12px', cursor: 'pointer',
+            border: '1px solid #444c56', borderRadius: '0 6px 6px 0',
+            color: '#c9d1d9', background: '#21262d', lineHeight: '1.5',
+        });
+
+        const menu = document.createElement('div');
+        Object.assign(menu.style, {
+            display: 'none', position: 'absolute', top: '100%', left: '0',
+            marginTop: '4px', background: '#161b22', border: '1px solid #30363d',
+            borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+            zIndex: '100000', minWidth: 'max-content', padding: '4px 0',
+        });
+        for (const action of actions) {
+            const item = document.createElement('div');
+            item.textContent = `${action.emoji} ${action.label}`;
+            item.title = action.tip;
+            Object.assign(item.style, {
+                padding: '6px 12px', fontSize: '12px', color: '#c9d1d9',
+                cursor: 'pointer', whiteSpace: 'nowrap',
+                background: action.key === selectedAction ? '#30363d' : 'transparent',
+            });
+            item.addEventListener('mouseenter', () => item.style.background = '#30363d');
+            item.addEventListener('mouseleave', () => {
+                item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
+            });
+            item.addEventListener('click', () => {
+                selectedAction = action.key;
+                GM_setValue('contextCopyAction', action.key);
+                updateMainLabel();
+                [...menu.children].forEach(c => c.style.background = 'transparent');
+                item.style.background = '#30363d';
+                menu.style.display = 'none';
+                action.run(mainBtn);
+            });
+            menu.appendChild(item);
+        }
+        dropBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+        });
+        document.addEventListener('click', () => menu.style.display = 'none');
+
+        group.appendChild(mainBtn);
+        group.appendChild(dropBtn);
+        group.appendChild(menu);
+        return group;
+    }
+
+    function buildRobotRecipeGroup(wrapper) {
+        const compact = GM_getValue('compactToolbar', false);
+        const group = document.createElement('div');
+        Object.assign(group.style, {display: 'flex', position: 'relative'});
+
+        const actions = [
+            {
+                key: 'chat',
+                emoji: '🤖',
+                label: 'Chat',
+                tip: 'Open an LLM chat about this page, using cached analyses as context',
+            },
+            {
+                key: 'reimplementation',
+                emoji: '🧬',
+                label: 'Rebuild brief',
+                tip: 'Generate a minimal brief another coding agent can use to recreate the PR from the base commit only',
+            },
+            {
+                key: 'maintainer_summary',
+                emoji: '🧭',
+                label: 'Maintainer view',
+                tip: 'Generate a compact maintainer-facing status summary with unresolved items and reviewer positions',
+            },
+        ];
+        let selectedAction = GM_getValue('robotRecipeAction', 'chat');
+        const getAction = () => actions.find(a => a.key === selectedAction) || actions[0];
+
+        const mainBtn = document.createElement('button');
+        const updateMainLabel = () => {
+            const action = getAction();
+            mainBtn.innerHTML = compact ? action.emoji : `${action.emoji} ${action.label}`;
+            mainBtn.title = action.tip;
+        };
+        updateMainLabel();
+        Object.assign(mainBtn.style, {
+            padding: '4px 10px', fontSize: '12px', fontWeight: '500',
+            cursor: 'pointer', border: '1px solid #444c56',
+            borderRadius: '6px 0 0 6px', color: '#c9d1d9', background: '#21262d',
+            lineHeight: '1.5', whiteSpace: 'nowrap', borderRight: 'none',
+        });
+        mainBtn.addEventListener('mouseenter', () => mainBtn.style.background = '#30363d');
+        mainBtn.addEventListener('mouseleave', () => mainBtn.style.background = '#21262d');
+        mainBtn.addEventListener('click', async function () {
+            const action = getAction();
+            const existing = document.getElementById('acktopus-analysis');
+            if (action.key === 'chat' && existing) {
+                existing.remove();
+                return;
+            }
+            await runAnalysis(wrapper, action.key);
+        });
+
+        const dropBtn = document.createElement('button');
+        dropBtn.textContent = '▾';
+        dropBtn.title = 'Choose robot recipe';
+        Object.assign(dropBtn.style, {
+            padding: '4px 6px', fontSize: '12px', cursor: 'pointer',
+            border: '1px solid #444c56', borderRadius: '0 6px 6px 0',
+            color: '#c9d1d9', background: '#21262d', lineHeight: '1.5',
+        });
+
+        const menu = document.createElement('div');
+        Object.assign(menu.style, {
+            display: 'none', position: 'absolute', top: '100%', left: '0',
+            marginTop: '4px', background: '#161b22', border: '1px solid #30363d',
+            borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+            zIndex: '100000', minWidth: 'max-content', padding: '4px 0',
+        });
+        for (const action of actions) {
+            const item = document.createElement('div');
+            item.textContent = `${action.emoji} ${action.label}`;
+            item.title = action.tip;
+            Object.assign(item.style, {
+                padding: '6px 12px', fontSize: '12px', color: '#c9d1d9',
+                cursor: 'pointer', whiteSpace: 'nowrap',
+                background: action.key === selectedAction ? '#30363d' : 'transparent',
+            });
+            item.addEventListener('mouseenter', () => item.style.background = '#30363d');
+            item.addEventListener('mouseleave', () => {
+                item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
+            });
+            item.addEventListener('click', async () => {
+                selectedAction = action.key;
+                GM_setValue('robotRecipeAction', action.key);
+                updateMainLabel();
+                [...menu.children].forEach(c => c.style.background = 'transparent');
+                item.style.background = '#30363d';
+                menu.style.display = 'none';
+                await runAnalysis(wrapper, action.key);
+            });
+            menu.appendChild(item);
+        }
+        dropBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+        });
+        document.addEventListener('click', () => menu.style.display = 'none');
+
+        group.appendChild(mainBtn);
+        group.appendChild(dropBtn);
+        group.appendChild(menu);
+        return group;
     }
 
     async function copyCommentContext(btn, container) {
@@ -13747,6 +14212,9 @@ RULES:
             toolbar.appendChild(ackToggleBtn);
 
             toolbar.appendChild(buildSHAGroup());
+            if (getAnalysisMode() !== ANALYSIS_MODES.commit) {
+                toolbar.appendChild(buildContextCopyGroup());
+            }
         }
 
         function disableBtn(btn, emoji) {
@@ -13879,41 +14347,7 @@ RULES:
 
 	        _ackPendingReviewActive = onPR ? (detectPendingReview() && hasPendingReviewChanges()) : false;
 
-        // --- 📎 Copy PR Context + 🤖 Chat: segmented control ---
-        const llmGroup = document.createElement('div');
-        Object.assign(llmGroup.style, {display: 'flex'});
-
-        const contextBtnTitle = getAnalysisMode() === ANALYSIS_MODES.commit
-            ? 'Copy current commit context to clipboard (PR info, current commit patch, visible comments on this commit)'
-            : 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)';
-        const contextBtn = createBtn(compact ? '📎' : '📎 Context', function () {
-            copyPRContext(this);
-        }, contextBtnTitle);
-        contextBtn.style.borderRadius = '6px 0 0 6px';
-        contextBtn.style.borderRight = 'none';
-        if (compact) contextBtn.style.padding = '4px 8px';
-        llmGroup.appendChild(contextBtn);
-
-        // --- 🤖 Chat button (LLM cluster: next to 📎) ---
-        const analyzeBtn = createBtn(compact ? '🤖' : '🤖 Chat', async function () {
-            const existing = document.getElementById('acktopus-analysis');
-            if (existing) {
-                existing.remove();
-                setButtonActive(analyzeBtn, false);
-                analyzeBtn.textContent = compact ? '🤖' : '🤖 Chat';
-                return;
-            }
-            try {
-                await runAnalysis(wrapper);
-                setButtonActive(analyzeBtn, true);
-            } finally {
-                analyzeBtn.textContent = compact ? '🤖' : '🤖 Chat';
-            }
-        }, 'Chat with LLM about this page, uses cached analyses as context');
-        analyzeBtn.style.borderRadius = '0 6px 6px 0';
-        if (compact) analyzeBtn.style.padding = '4px 8px';
-	        llmGroup.appendChild(analyzeBtn);
-	        toolbar.appendChild(llmGroup);
+        toolbar.appendChild(buildRobotRecipeGroup(wrapper));
 	        runRootInjectors(document, ctx);
 	        runDocInjectors(ctx);
 
@@ -16243,10 +16677,13 @@ RULES:
     // DEFAULT_INSTRUCTIONS
     // ============================================================================
 
-    ackTest('DEFAULT_INSTRUCTIONS has all 4 instruction types', () => {
+    ackTest('DEFAULT_INSTRUCTIONS has chat, analysis, recipe, and proofread instruction types', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.chat, 'has chat instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.pr, 'has pr instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.commits, 'has commits instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.commit, 'has commit instructions');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation, 'has reimplementation recipe instructions');
+        ackAssert(DEFAULT_INSTRUCTIONS.maintainer_summary, 'has maintainer summary recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread, 'has proofread instructions');
     });
 
@@ -16262,10 +16699,6 @@ RULES:
     ackTest('proofread instructions prefer preserving sentence structure', () => {
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Keep the original sentence structure'), 'mentions preserving sentence structure');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('mix a question with a statement'), 'mentions question/statement exception');
-    });
-
-    ackTest('proofread instructions say no em dashes', () => {
-        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('em dashes'), 'mentions em dashes');
     });
 
     ackTest('proofread instructions preserve quoted text', () => {
@@ -16661,10 +17094,10 @@ RULES:
         ackAssert(!handler.includes('confirm('), 'delete handler has no confirm() call');
     });
 
-    ackTest('only one confirm() in entire script (navigation warning)', () => {
+    ackTest('confirm() calls are accounted for (navigation warning + factory reset)', () => {
         // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const confirms = (_ackSource.match(/[^/]confirm\(/g) || []).length;
-        ackEq(confirms, 1, `expected 1 confirm(), found ${confirms}`);
+        ackEq(confirms, 2, `expected 2 confirm(), found ${confirms}`);
     });
 
     // ============================================================================
@@ -18464,7 +18897,7 @@ RULES:
     ackTest('runAnalysis opens chat panel, not old analyzers', () => {
         const source = _ackSource;
         // runAnalysis should call buildChatPanel
-        ackAssert(source.includes('buildChatPanel()'), 'runAnalysis uses buildChatPanel');
+        ackAssert(source.includes('buildChatPanel({initialRecipe: recipe})'), 'runAnalysis uses buildChatPanel');
         // runAnalysis should NOT call analyzePR/analyzeCommitsList/analyzeSingleCommit
         const runAnalysisBody = source.slice(
             source.indexOf('async function runAnalysis'),
@@ -18993,15 +19426,13 @@ RULES:
         ackAssert(fn.includes("parts.push(`Thread (for context only)"), 'thread context explicitly labeled as secondary');
     });
 
-    ackTest('explainComment: all prompts use outside-in approach and backtick symbols', () => {
+    ackTest('explainComment: all prompts use outside-in approach and inherit SYSTEM_BASE rules', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function explainComment'), source.indexOf('function addQuickCommentActions'));
         // All three paths should mention outside-in structure
         ackAssert(fn.includes('outside-in'), 'PR body prompt uses outside-in approach');
-        // Backtick requirement
-        ackAssert((fn.match(/backtick/g) || []).length >= 2, 'backtick requirement in multiple prompts');
-        // Don't repeat what's already visible
-        ackAssert((fn.match(/Do NOT repeat/g) || []).length >= 2, 'multiple prompts say not to repeat');
+        // All three variants use SYSTEM_BASE which provides backtick, abbreviation, and non-repetition rules
+        ackAssert((fn.match(/SYSTEM_BASE/g) || []).length >= 3, 'all three explain variants use SYSTEM_BASE');
     });
 
     ackTest('explainComment: inline system prompt focuses on specific line, general explains context', () => {
@@ -19763,6 +20194,19 @@ RULES:
         ackAssert(configFn.includes('github_pat'), 'saves to github_pat key');
         ackAssert(configFn.includes('ghp_'), 'placeholder mentions ghp_ format');
         ackAssert(configFn.includes('settings/tokens'), 'links to GitHub token page');
+    });
+
+    ackTest('config panel exposes robot recipe instructions and getLLMConfig loads them', () => {
+        const source = _ackSource;
+        const configFn = source.slice(source.indexOf('function buildConfigPanel'), source.indexOf('function addUsage'));
+        ackAssert(configFn.includes("addInstruction('chat'"), 'config panel exposes chat instructions');
+        ackAssert(configFn.includes("addInstruction('reimplementation'"), 'config panel exposes reimplementation recipe instructions');
+        ackAssert(configFn.includes("addInstruction('maintainer_summary'"), 'config panel exposes maintainer summary recipe instructions');
+
+        const cfgFn = source.slice(source.indexOf('function getLLMConfig'), source.indexOf('function isProviderAvailable'));
+        ackAssert(cfgFn.includes("llm_instr_${active}_chat"), 'getLLMConfig loads chat instructions');
+        ackAssert(cfgFn.includes("llm_instr_${active}_reimplementation"), 'getLLMConfig loads reimplementation recipe instructions');
+        ackAssert(cfgFn.includes("llm_instr_${active}_maintainer_summary"), 'getLLMConfig loads maintainer summary recipe instructions');
     });
 
 	    ackTest('selection helpers use active provider/model (no separate settings)', () => {
@@ -20530,7 +20974,7 @@ RULES:
     ackTest('chat supports /quiz review-coach mode', () => {
         const source = _ackSource;
         ackAssert(source.includes('/quiz for review questions'), 'placeholder mentions /quiz');
-        ackAssert(source.includes('const isQuiz = /^\\/quiz'), 'detects /quiz command');
+        ackAssert(source.includes("const isQuiz = !recipeCfg && /^\\/quiz\\b/i.test(text);"), 'detects /quiz command');
         ackAssert(source.includes('review coach'), 'quiz system prompt mentions review coach');
     });
 
@@ -20726,12 +21170,14 @@ RULES:
 
     ackTest('proofread prompt checks accuracy and uses structural output wrapper', () => {
         const source = _ackSource;
-        const prompt = source.slice(source.indexOf('RULES:'), source.indexOf('Nothing outside'));
-        ackAssert(prompt.includes('Fix grammar'), 'fixes grammar');
-        ackAssert(prompt.includes('demonstrably wrong'), 'checks factual accuracy');
-        ackAssert(prompt.includes('exaggerated'), 'flags exaggeration');
-        ackAssert(prompt.includes('opinion'), 'leaves opinions unchanged');
-        ackAssert(prompt.includes('<output>...</output>'), 'wraps output in <output> tags');
+        const makePromptSection = source.slice(source.indexOf('const makePrompt'), source.indexOf('const cleanResult'));
+        // Accuracy and grammar rules come from DEFAULT_INSTRUCTIONS.proofread via ${extra}
+        ackAssert(makePromptSection.includes('${extra}'), 'includes proofread instructions via extra');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Fix grammar'), 'DEFAULT_INSTRUCTIONS.proofread fixes grammar');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('demonstrably wrong'), 'DEFAULT_INSTRUCTIONS.proofread checks factual accuracy');
+        // Inline RULES add accuracy examples and output format
+        ackAssert(makePromptSection.includes('exaggerated'), 'RULES block has accuracy examples');
+        ackAssert(makePromptSection.includes('<output>...</output>'), 'wraps output in <output> tags');
         // Strips GitHub metadata before proofreading
         ackAssert(source.includes('stripGitHubMeta'), 'strips GitHub metadata footer');
         ackAssert(source.includes('_Originally posted by'), 'matches cross-post footer');
@@ -21144,45 +21590,58 @@ RULES:
         ackAssert(fn.includes("'🔑'"), 'shows key overlay');
     });
 
-    ackTest('toolbar order: expand group, 💬, [📎|🤖], Settings, ☑️', () => {
+    ackTest('toolbar order: context copy group stays with SHA copy before expand/comment/robot', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf('function inject()'));
+        const shaIdx = inject.indexOf("toolbar.appendChild(buildSHAGroup())");
+        const contextGroupIdx = inject.indexOf("toolbar.appendChild(buildContextCopyGroup())");
         const expandIdx = inject.indexOf("toolbar.appendChild(expandGroup)");
         const commentIdx = inject.indexOf("toolbar.appendChild(commentNavBtn)");
-        const llmGroupIdx = inject.indexOf("toolbar.appendChild(llmGroup)");
+        const robotIdx = inject.indexOf("toolbar.appendChild(buildRobotRecipeGroup(wrapper))");
         const settingsIdx = inject.indexOf("toolbar.appendChild(settingsGroup)");
         const queueIdx = inject.indexOf("toolbar.appendChild(queueBtn)");
+        ackAssert(shaIdx > -1, 'SHA copy group exists');
+        ackAssert(contextGroupIdx > -1, 'context copy group exists');
+        ackAssert(shaIdx < contextGroupIdx, 'context copy group sits next to SHA copy group');
+        ackAssert(contextGroupIdx < expandIdx, 'context copy group before expand group');
         ackAssert(expandIdx < commentIdx, 'expand group before 💬');
-        ackAssert(commentIdx < llmGroupIdx, '💬 before [📎|🤖] group');
-        ackAssert(llmGroupIdx < settingsIdx, '[📎|🤖] group before Settings');
+        ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
+        ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
         ackAssert(inject.includes("const EXPAND_ACTIONS = ["), 'grouped expand action list exists');
-        // Context and Chat are segmented inside llmGroup
-        const contextInGroup = inject.indexOf("llmGroup.appendChild(contextBtn)");
-        const analyzeInGroup = inject.indexOf("llmGroup.appendChild(analyzeBtn)");
-        ackAssert(contextInGroup > -1, '📎 inside llmGroup');
-        ackAssert(analyzeInGroup > -1, '🤖 inside llmGroup');
-        ackAssert(contextInGroup < analyzeInGroup, '📎 before 🤖 in segment');
     });
 
-    ackTest('📎 Context button delegates to copyPRContext helper (GM_setClipboard)', () => {
+    ackTest('context copy helpers delegate to shared clipboard helper', () => {
         ensureSelfSource();
         const source = _ackSource;
 
-        // inject() should call the helper (keeps toolbar construction simple)
-        const inject = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
-        ackAssert(inject.includes('copyPRContext(this)'), 'inject calls copyPRContext(this)');
+        const group = source.slice(source.indexOf('function buildContextCopyGroup'), source.indexOf('async function loadAsyncPRData'));
+        ackAssert(group.includes('copyPatchContext'), 'context split group offers patch context copy');
+        ackAssert(group.includes('copyPRContext'), 'context split group offers full context copy');
 
-        // Helper should do the actual work and use userscript clipboard API directly.
-        const helper = source.slice(source.indexOf('async function copyPRContext'), source.indexOf('async function loadAsyncPRData'));
-        ackAssert(helper.includes('gatherFullPRContext'), 'copyPRContext gathers full PR context');
-        ackAssert(helper.includes('gatherSingleCommitContext'), 'copyPRContext can gather single-commit context');
+        const helper = source.slice(source.indexOf('async function copyContextWith'), source.indexOf('async function copyCommentContext'));
         ackAssert(helper.includes('GM_setClipboard'), 'copies via GM_setClipboard');
         ackAssert(!helper.includes('navigator.clipboard'), 'does not use navigator.clipboard API');
         ackAssert(helper.includes('startBrailleAnimation'), 'shows loading spinner');
         ackAssert(helper.includes("popup.textContent"), 'updates progress popup');
-        ackAssert(helper.includes("Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context"), 'shows page-type-aware initial gathering message');
-        ackAssert(helper.includes('Gathering commit context'), 'shows commit-specific initial gathering message');
+
+        const fullFn = source.slice(source.indexOf('async function copyPRContext'), source.indexOf('async function copyPatchContext'));
+        ackAssert(fullFn.includes('gatherFullPRContext'), 'copyPRContext gathers full PR context');
+        ackAssert(fullFn.includes('gatherSingleCommitContext'), 'copyPRContext can gather single-commit context');
+        ackAssert(fullFn.includes("Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context"), 'shows page-type-aware initial gathering message');
+        ackAssert(fullFn.includes('Gathering commit context'), 'shows commit-specific initial gathering message');
+
+        const patchFn = source.slice(source.indexOf('async function copyPatchContext'), source.indexOf('function buildContextCopyGroup'));
+        ackAssert(patchFn.includes('gatherPatchContext'), 'copyPatchContext gathers patch-only context');
+        ackAssert(patchFn.includes('patch context'), 'shows patch-specific status text');
+    });
+
+    ackTest('gatherPatchContext omits comments but keeps patch content', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherPatchContext'), source.indexOf('async function copyContextWith'));
+        ackAssert(fn.includes('gatherFullPRContext'), 'reuses full PR context helper');
+        ackAssert(fn.includes('includePatch: true'), 'keeps patch content');
+        ackAssert(fn.includes('includeComments: false'), 'omits conversations');
     });
 
     ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
@@ -21427,20 +21886,40 @@ RULES:
     ackTest('clearAllCaches clears only cache entries, not API keys or config', () => {
         const source = _ackSource;
         ackAssert(source.includes('function clearAllCaches'), 'clearAllCaches function exists');
-        const fn = source.slice(source.indexOf('function clearAllCaches'), source.indexOf('// --- Config Panel'));
+        const fn = source.slice(source.indexOf('function clearAllCaches'), source.indexOf('function factoryReset'));
         ackAssert(fn.includes('llm_explain_'), 'clears explain caches');
         ackAssert(fn.includes('llm_lightbulb_'), 'clears lightbulb caches');
         ackAssert(fn.includes('llm_pr_overview_'), 'clears PR overview caches');
         ackAssert(fn.includes('llm_lightbulb_autoopen_'), 'clears lightbulb auto-open flags');
+        ackAssert(fn.includes('llm_cache_'), 'clears LLM response caches');
+        ackAssert(fn.includes('llm_prompt_'), 'clears LLM prompt caches');
         ackAssert(fn.includes('org_members_'), 'clears org member cache');
         ackAssert(fn.includes('repo_members_'), 'clears legacy repo member cache');
         ackAssert(fn.includes('llm_cache_timestamps'), 'clears cache timestamps');
         ackAssert(fn.includes('_orgMemberCache'), 'clears in-memory org cache');
         ackAssert(fn.includes('_reviewCommitMap'), 'clears review commit map');
         ackAssert(fn.includes('GM_deleteValue'), 'actually deletes GM values');
-        // Must NOT clear config keys
-        ackAssert(!fn.includes("'llm_'"), 'does not use broad llm_ prefix (would delete API keys)');
-        ackAssert(!fn.includes('maintainer_logins'), 'does not delete maintainer config');
+    });
+
+    ackTest('factoryReset deletes everything except API keys', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function factoryReset'), source.indexOf('// --- Config Panel'));
+        ackAssert(fn.includes('llm_claude_key'), 'keeps Claude API key');
+        ackAssert(fn.includes('llm_openai_key'), 'keeps OpenAI API key');
+        ackAssert(fn.includes('github_pat'), 'keeps GitHub PAT');
+        ackAssert(fn.includes('GM_deleteValue'), 'deletes GM values');
+        ackAssert(fn.includes('keep.has'), 'uses keep set to filter');
+    });
+
+    ackTest('config panel save does not persist instructions matching the default', () => {
+        const source = _ackSource;
+        const saveFn = source.slice(source.indexOf("saveBtn.addEventListener('click'"), source.indexOf('cancelBtn'));
+        ackAssert(saveFn.includes('instrDefault'), 'save compares against default');
+        ackAssert(saveFn.includes('.trim()'), 'comparison is trimmed');
+
+        const addInstr = source.slice(source.indexOf('function addInstruction'), source.indexOf("addInstruction('chat'"));
+        ackAssert(addInstr.includes('instrDefault'), 'textarea stores default in data attribute');
+        ackAssert(addInstr.includes('↺ Reset'), 'has reset button');
     });
 
     ackTest('config panel has both PR and global cache clear buttons', () => {
@@ -21449,6 +21928,9 @@ RULES:
         ackAssert(cfg.includes('Clear cache for this PR'), 'has PR cache clear button');
         ackAssert(cfg.includes('Clear all caches'), 'has global cache clear button');
         ackAssert(cfg.includes('clearAllCaches'), 'global button calls clearAllCaches');
+        ackAssert(cfg.includes('Factory reset'), 'has factory reset button');
+        ackAssert(cfg.includes('factoryReset'), 'factory reset button calls factoryReset');
+        ackAssert(cfg.includes('confirm('), 'factory reset requires confirmation');
     });
 
     ackTest('settings button supports Shift+click to clear all caches', () => {
@@ -22718,16 +23200,34 @@ RULES:
         ackAssert(inject.includes("if (compact) commentNavBtn.style.padding = '4px 8px'"), 'commentNavBtn compact padding');
     });
 
-    ackTest('contextBtn and analyzeBtn form a segmented control inside llmGroup', () => {
+    ackTest('robot recipe group offers chat and the two predefined recipes', () => {
         const source = _ackSource;
-        const inject = source.slice(source.indexOf('function inject()'));
-        ackAssert(inject.includes("const llmGroup = document.createElement('div')"), 'llmGroup container created');
-        ackAssert(inject.includes("llmGroup.appendChild(contextBtn)"), 'contextBtn in llmGroup');
-        ackAssert(inject.includes("llmGroup.appendChild(analyzeBtn)"), 'analyzeBtn in llmGroup');
-        ackAssert(inject.includes("toolbar.appendChild(llmGroup)"), 'llmGroup appended to toolbar');
-        ackAssert(inject.includes("contextBtn.style.borderRadius = '6px 0 0 6px'"), 'contextBtn left segment radius');
-        ackAssert(inject.includes("contextBtn.style.borderRight = 'none'"), 'no border between segments');
-        ackAssert(inject.includes("analyzeBtn.style.borderRadius = '0 6px 6px 0'"), 'analyzeBtn right segment radius');
+        const fn = source.slice(source.indexOf('function buildRobotRecipeGroup'), source.indexOf('function inject()'));
+        ackAssert(fn.includes("key: 'chat'"), 'has chat action');
+        ackAssert(fn.includes("key: 'reimplementation'"), 'has reimplementation action');
+        ackAssert(fn.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
+        ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
+        ackAssert(fn.includes('runAnalysis(wrapper, action.key)'), 'dispatches selected recipe through runAnalysis');
+    });
+
+    ackTest('chat panel recipe mode supports reimplementation and maintainer summary prompts', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        ackAssert(fn.includes("reimplementation: {"), 'defines reimplementation recipe');
+        ackAssert(fn.includes("maintainer_summary: {"), 'defines maintainer summary recipe');
+        ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses full recipe context');
+        ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.reimplementation'), 'reimplementation recipe uses configurable instructions');
+        ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.maintainer_summary'), 'maintainer summary uses configurable instructions');
+        ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
+    });
+
+    ackTest('recipe context includes explicit base checkout metadata', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherRecipeContext'), source.indexOf('function scrollToAndHighlight'));
+        ackAssert(fn.includes('Base commit:'), 'includes base commit');
+        ackAssert(fn.includes('Base branch:'), 'includes base branch');
+        ackAssert(fn.includes('Head commit:'), 'includes head commit');
+        ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
@@ -23960,10 +24460,10 @@ RULES:
     });
 
     // --- copyPRContext structural test ---
-    ackTest('copyPRContext is a standalone async function called from inject', () => {
+    ackTest('copyPRContext is a standalone async function used by the context copy group', () => {
         ensureSelfSource();
         ackAssert(_ackSource.includes('async function copyPRContext(btn)'), 'copyPRContext function exists');
-        ackAssert(_ackSource.includes('copyPRContext(this)'), 'inject calls copyPRContext(this)');
+        ackAssert(_ackSource.includes('copyPRContext(btn)'), 'context copy group calls copyPRContext');
     });
 
     // =========================================================================
