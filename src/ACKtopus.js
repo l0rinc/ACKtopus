@@ -1717,6 +1717,22 @@
         });
     }
 
+    // Fetch raw same-origin page HTML via the userscript transport so we avoid
+    // GitHub's patched window.fetch path and its page-side side effects.
+    function gmFetchPageText(url, {accept = 'text/html'} = {}) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                headers: {Accept: accept},
+                onload: r => r.status >= 200 && r.status < 300
+                    ? resolve(r.responseText)
+                    : reject(new Error(`HTTP ${r.status} for ${url}`)),
+                onerror: reject,
+            });
+        });
+    }
+
     function fetchCommitPullRequests(owner, repo, sha) {
         const url = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls`;
         const tryHeaders = [
@@ -6637,15 +6653,20 @@ Rules:
 	            if (!force && cached && (now - cached.ts) < 5_000 && cached.nonce && cached.clientVersion) return cached;
 	
 	            const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes`;
-	            const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-	            const resp = await pageFetchWithRetry(pageFetch, url, {
-	                method: 'GET',
-	                credentials: 'same-origin',
-	                cache: 'no-store',
-	                headers: {'Accept': 'text/html'},
-	            }, {label: 'fetch /changes meta', attempts: 2});
-                if (!resp.ok) throw new Error(`fetch /changes meta HTTP ${resp.status}`);
-	            const html = await resp.text();
+	            let html = '';
+	            try {
+	                html = await gmFetchPageText(url);
+	            } catch (gmErr) {
+	                const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
+	                const resp = await pageFetchWithRetry(pageFetch, url, {
+	                    method: 'GET',
+	                    credentials: 'same-origin',
+	                    cache: 'no-store',
+	                    headers: {'Accept': 'text/html'},
+	                }, {label: 'fetch /changes meta', attempts: 2});
+                    if (!resp.ok) throw new Error(`fetch /changes meta HTTP ${resp.status}: ${gmErr?.message || gmErr}`);
+	                html = await resp.text();
+	            }
 	            const nonce =
 	                html.match(/name=["']fetch-nonce["'][^>]*content=["']([^"']+)["']/i)?.[1] ||
 	                '';
@@ -20866,7 +20887,7 @@ RULES:
         ackAssert(fetchCommit.includes('gmFetchText('), 'fetchCommitPatch uses gmFetchText');
     });
 
-    ackTest('no standalone GM_xmlhttpRequest GET wrappers outside gmFetch/gmFetchText', () => {
+    ackTest('no standalone GM_xmlhttpRequest GET wrappers outside shared GET helpers', () => {
         const source = _ackSource;
         // fetchPatch, fetchRawFile, fetchCommitPatch should no longer have raw GM_xmlhttpRequest
         const fetchPatch = source.slice(source.indexOf('function fetchPatch'), source.indexOf('function categorizePRFiles'));
@@ -24210,8 +24231,9 @@ RULES:
 	        ackAssert(fn.includes('connection closed'), 'retry helper treats connection closes as transient');
 	        ackAssert(fn.includes('502, 503, 504'), 'retry helper retries transient gateway statuses');
 	        ackAssert(fn.includes('fetchVerifiedFetchMetaFromChanges'), 'has /changes meta helper');
+	        ackAssert(fn.includes('gmFetchPageText(url)'), 'prefers userscript GET for /changes meta');
 	        ackAssert(fn.includes("cache: 'no-store'") || fn.includes('cache:"no-store"'), 'forces no-store when fetching /changes meta');
-	        ackAssert(fn.includes('pageFetchWithRetry(pageFetch, url'), 'uses retry helper when fetching /changes meta');
+	        ackAssert(fn.includes('pageFetchWithRetry(pageFetch, url'), 'keeps retry fallback when fetching /changes meta');
 	        const createFn = _ackSource.slice(
 	            _ackSource.indexOf('function createReviewCommentViaPageData'),
 	            _ackSource.indexOf('function findReviewThreadPathForReplyForm')
