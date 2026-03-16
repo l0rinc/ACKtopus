@@ -371,7 +371,7 @@
             fmt: () => {
                 const f = prFileCategories?.fuzz;
                 if (!f?.length) return null;
-                const build = 'cmake --preset=libfuzzer && cmake --build build_fuzz -j';
+                const build = 'cmake --preset=libfuzzer && cmake --build build_fuzz --target fuzz -j';
                 if (f.length === 1) return `${build} && FUZZ=${f[0]} build_fuzz/bin/fuzz -runs=10000`;
                 return `${build} && for f in ${f.join(' ')}; do FUZZ=$f build_fuzz/bin/fuzz -runs=10000; done`;
             }
@@ -3872,7 +3872,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            benchFiles: filenames.filter(f => /^src\/bench\/.*\.cpp$/.test(f)),
 	            bench: [],
 	            test: filenames.filter(f => /^src\/test\/[^/]+_tests\.cpp$/.test(f)).map(base).filter(Boolean),
-	            fuzz: filenames.filter(f => /^src\/test\/fuzz\/.*\.cpp$/.test(f)).map(base).filter(Boolean),
+	            fuzz: filenames.filter(f => /^src\/(?:.+\/)?test\/fuzz\/.*\.cpp$/.test(f)).map(base).filter(Boolean),
 	            functional: filenames.filter(f => /^test\/functional\/[^/]+\.py$/.test(f) && !f.includes('test_runner')).map(pyBase).filter(Boolean),
 	            // C/C++ files under src/ (used for per-PR code-quality helpers like clang-format-diff / clang-tidy-diff / IWYU).
 	            cpp: filenames.filter(f => f.startsWith('src/') && isCppLike(f)),
@@ -15892,6 +15892,7 @@ RULES:
         const fuzzFmt = _ackSource.slice(_ackSource.indexOf("key: 'fuzz'"), _ackSource.indexOf("key: 'functional'"));
         ackAssert(fuzzFmt.includes('--preset=libfuzzer'), 'fuzz uses libfuzzer preset');
         ackAssert(fuzzFmt.includes('build_fuzz'), 'fuzz uses build_fuzz dir');
+        ackAssert(fuzzFmt.includes('--target fuzz'), 'fuzz build targets the fuzz binary explicitly');
         ackAssert(fuzzFmt.includes('build_fuzz/bin/fuzz'), 'fuzz binary in build_fuzz/bin');
         ackAssert(fuzzFmt.includes('f.length === 1'), 'single fuzzer avoids loop');
         ackAssert(fuzzFmt.includes('-runs=10000'), 'fuzz has run limit for termination');
@@ -15969,6 +15970,11 @@ RULES:
     ackTest('categorizePRFiles detects fuzz targets', () => {
         const c = categorizePRFiles(['src/test/fuzz/coins_view.cpp', 'src/test/fuzz/deserialize.cpp']);
         ackDeepEq(c.fuzz, ['coins_view', 'deserialize']);
+    });
+
+    ackTest('categorizePRFiles detects nested fuzz targets such as wallet fuzzers', () => {
+        const c = categorizePRFiles(['src/wallet/test/fuzz/coincontrol.cpp', 'src/node/test/fuzz/something.cpp']);
+        ackDeepEq(c.fuzz, ['coincontrol', 'something']);
     });
 
     ackTest('categorizePRFiles detects functional tests', () => {
