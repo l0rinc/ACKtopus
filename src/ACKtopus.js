@@ -4536,8 +4536,55 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             background: '#161b22', border: '1px solid #30363d',
             borderRadius: '8px', boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
             marginTop: '4px', overflow: 'hidden',
-            display: 'flex', flexDirection: 'column', maxHeight: '70vh',
+            display: 'flex', flexDirection: 'column',
+            minHeight: '180px', height: '340px', maxHeight: '75vh',
+            resize: 'vertical',
         });
+
+        const titleMap = {
+            chat: 'Chat',
+            reimplementation: 'Rebuild brief',
+            maintainer_summary: 'Maintainer view',
+        };
+
+        const header = document.createElement('div');
+        Object.assign(header.style, {
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            gap: '8px', padding: '8px 12px', borderBottom: '1px solid #30363d',
+            background: '#0d1117',
+        });
+
+        const title = document.createElement('div');
+        title.textContent = `🤖 ${titleMap[initialRecipe] || 'Chat'}`;
+        Object.assign(title.style, {
+            color: '#c9d1d9', fontSize: '12px', fontWeight: '600',
+        });
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.textContent = '✕';
+        closeBtn.title = 'Close robot panel';
+        closeBtn.setAttribute('aria-label', 'Close robot panel');
+        Object.assign(closeBtn.style, {
+            padding: '0 6px', background: 'transparent', color: '#8b949e',
+            border: '1px solid transparent', borderRadius: '6px', cursor: 'pointer',
+            fontSize: '14px', lineHeight: '1.4', flexShrink: '0',
+        });
+        closeBtn.addEventListener('mouseenter', () => {
+            closeBtn.style.color = '#c9d1d9';
+            closeBtn.style.borderColor = '#30363d';
+            closeBtn.style.background = '#161b22';
+        });
+        closeBtn.addEventListener('mouseleave', () => {
+            closeBtn.style.color = '#8b949e';
+            closeBtn.style.borderColor = 'transparent';
+            closeBtn.style.background = 'transparent';
+        });
+        closeBtn.addEventListener('click', () => panel.remove());
+
+        header.appendChild(title);
+        header.appendChild(closeBtn);
+        panel.appendChild(header);
 
         // Messages area
         const messages = document.createElement('div');
@@ -4734,6 +4781,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 },
             };
             const recipeCfg = recipe ? recipeMap[recipe] : null;
+            title.textContent = `🤖 ${titleMap[recipe] || titleMap.chat}`;
             const text = recipeCfg ? recipeCfg.userText : input.value.trim();
             if (recipeCfg?.sendAsConversation === false && recipeCfg.userText === '') return;
             if (!recipeCfg && !text) return;
@@ -21095,6 +21143,9 @@ RULES:
         ackAssert(panelFn.includes('.ack-ref-link'), 'delegates on ack-ref-link class');
         ackAssert(panelFn.includes('scrollToAndHighlight'), 'calls scrollToAndHighlight');
         ackAssert(panelFn.includes('chatPageIndex'), 'looks up item from chatPageIndex');
+        ackAssert(panelFn.includes("resize: 'vertical'"), 'chat panel is vertically resizable');
+        ackAssert(panelFn.includes("closeBtn.textContent = '✕'"), 'chat panel has a close button');
+        ackAssert(panelFn.includes("closeBtn.addEventListener('click', () => panel.remove())"), 'close button removes the panel');
     });
 
     ackTest('container walk-up limited to 8 levels (not 15)', () => {
@@ -23262,6 +23313,8 @@ RULES:
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(fn.includes("reimplementation: {"), 'defines reimplementation recipe');
         ackAssert(fn.includes("maintainer_summary: {"), 'defines maintainer summary recipe');
+        ackAssert(fn.includes("titleMap = {"), 'defines panel titles for robot actions');
+        ackAssert(fn.includes("title.textContent = `🤖 ${titleMap[recipe] || titleMap.chat}`"), 'updates panel title for selected robot action');
         ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses full recipe context');
         ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.reimplementation'), 'reimplementation recipe uses configurable instructions');
         ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.maintainer_summary'), 'maintainer summary uses configurable instructions');
@@ -24647,19 +24700,27 @@ RULES:
 	    });
 
     ackDomTest('DOM: kebab menu buttons exist in comment containers', () => {
+        if (!isPRConversationPage(location.pathname)) return;
+        if (/\/pull\/\d+\/(?:files|changes)(?:\/|$)/.test(location.pathname)) return;
         const containers = document.querySelectorAll(COMMENT_CONTAINER_SELECTOR);
         if (containers.length === 0) return;
         let found = 0;
-        const sel = 'button[data-testid="comment-header-hamburger"], ' +
-            'button[aria-label*="action" i][data-component="IconButton"], ' +
-            'details.details-overlay summary';
+        let broadCandidates = 0;
+        const broadSel =
+            '[data-testid*="hamburger" i], [data-testid*="kebab" i], ' +
+            'button[aria-haspopup="menu"], button[aria-expanded][data-component="IconButton"], ' +
+            'summary.timeline-comment-action, details.details-overlay summary';
         for (const c of containers) {
-            if (c.querySelector(sel)) found++;
+            const header = c.querySelector('[data-morpheus-enabled], [class*="__activityHeader"]') || c;
+            if (header.querySelector(COMMENT_MENU_TRIGGER_SELECTOR)) found++;
+            if (header.querySelector(broadSel)) broadCandidates++;
         }
-        // Not all containers have kebab menus (e.g. bot comments), but some should
-        if (containers.length >= 3) {
+        // Some pages only contain system/bot comments with no action menu at all.
+        // Only fail when broader menu-like controls exist but our shared selector
+        // fails to match any of them.
+        if (broadCandidates > 0) {
             ackAssert(found > 0,
-                `0/${containers.length} containers have kebab menus — selector may be stale`);
+                `0/${containers.length} containers matched COMMENT_MENU_TRIGGER_SELECTOR despite ${broadCandidates} broad menu candidates`);
         }
     });
 
