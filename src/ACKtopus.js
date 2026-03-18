@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.21
+// @version      1.22
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -1140,6 +1140,7 @@
             }
             // Add navigation shortcuts that aren't SHA formats
             if (!menu.querySelector('[data-ack-nav-hint]')) {
+                const compareNav = isComparePage();
                 const sep = document.createElement('div');
                 Object.assign(sep.style, {borderTop: '1px solid #30363d', margin: '4px 0'});
                 sep.dataset.ackNavHint = 'true';
@@ -1150,7 +1151,7 @@
                     { key: 'D', emoji: '📝', label: 'Review dialog' },
                     { key: 'J', emoji: '◀', label: 'Prev commit' },
                     { key: 'K', emoji: '▶', label: 'Next commit' },
-                    { key: 'N', emoji: '💬', label: 'Prev comment' },
+                    { key: 'N', emoji: compareNav ? '🗂️' : '💬', label: compareNav ? 'Next file' : 'Prev comment' },
                 ]) {
                     const item = document.createElement('div');
                     item.textContent = `[${key}]  ${emoji} ${label}`;
@@ -1254,7 +1255,7 @@
                 e.preventDefault();
                 hideHotkeyHints();
                 menu.style.display = 'none';
-                navigateComment(-1);
+                navigatePrimaryReviewTarget(-1);
                 return;
             }
 
@@ -2628,7 +2629,7 @@
         }
 
         // CSS-based collapse: inject a <style> with attribute selectors for non-PR paths.
-        // Unlike toggle clicks, CSS rules survive GitHub's progressive DOM re-renders instantly.
+        // Hide unrelated file cards entirely so the compare stays fast and focused.
         const styleEl = document.createElement('style');
         styleEl.id = 'ack-compare-collapse';
         document.head.appendChild(styleEl);
@@ -2645,10 +2646,7 @@
             }
             const rules = [...collapsedPaths].map(p => {
                 const escaped = CSS.escape(p);
-                return `[data-tagsearch-path="${escaped}"] .js-file-content,\n` +
-                    `[data-tagsearch-path="${escaped}"] .blob-wrapper,\n` +
-                    `[data-tagsearch-path="${escaped}"] [data-diff-anchor],\n` +
-                    `[data-tagsearch-path="${escaped}"] .data.highlight { display: none !important; }`;
+                return `[data-tagsearch-path="${escaped}"] { display: none !important; }`;
             });
             styleEl.textContent = rules.join('\n');
         }
@@ -2691,14 +2689,6 @@
                 totalCollapsed++;
             }
             if (newCollapsed > 0) updateCollapseCSS();
-            // Click "Load diff" on any visible PR file that has it (may appear on re-render)
-            for (const file of fileEls) {
-                const path = file.getAttribute('data-tagsearch-path');
-                if (path && !collapsedPaths.has(path)) {
-                    const loadBtn = file.querySelector('button.load-diff-button');
-                    if (loadBtn) loadBtn.click();
-                }
-            }
             if (newCollapsed > 0 || newKept > 0) {
                 console.log('ACKtopus: compare -- batch: +' + newCollapsed + ' collapsed, +' + newKept + ' kept (total: ' + totalCollapsed + '/' + totalKept + ')');
                 if (unmatched.length > 0 && totalCollapsed === newCollapsed) {
@@ -2714,13 +2704,13 @@
             for (const file of document.querySelectorAll('[data-tagsearch-path]')) {
                 const path = file.getAttribute('data-tagsearch-path');
                 if (!path || collapsedPaths.has(path)) continue;
-                const openContent =
-                    file.querySelector('.js-file-content, .blob-wrapper, [data-diff-anchor], .data.highlight')
-                    || file.querySelector('button.load-diff-button')
+                const anchor =
+                    file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info')
                     || file;
-                file.scrollIntoView({behavior: 'smooth', block: 'start'});
+                anchor.scrollIntoView({behavior: 'smooth', block: 'start'});
+                openCompareFileIfCollapsed(file);
                 scrolledToFirstKeptFile = true;
-                return !!openContent;
+                return true;
             }
             return false;
         }
@@ -2738,8 +2728,8 @@
                 _compareObserver.disconnect();
                 _compareObserver = null;
             }
-            console.log('ACKtopus: compare -- observer done (60s), total:', totalCollapsed, 'collapsed,', totalKept, 'kept');
-        }, 60000);
+            console.log('ACKtopus: compare -- observer done (20s), total:', totalCollapsed, 'collapsed,', totalKept, 'kept');
+        }, 20000);
         _compareObserver = new MutationObserver(() => {
             if (_ackTesting) return;
             if (debounceTimer) clearTimeout(debounceTimer);
@@ -8483,14 +8473,14 @@ Rules:
     // pass and the mutation observers stay consistent and idempotent.
     const ROOT_INJECTORS = [
         {name: 'prefillCommitHash', when: ctx => ctx.onPR, fn: prefillCommitHash},
-        {name: 'queueLazyComments', when: ctx => ctx.onToolbar, fn: queueLazyComments},
+        {name: 'queueLazyComments', when: ctx => ctx.onToolbar && !ctx.onCompare, fn: queueLazyComments},
         {name: 'startReviewButtons', when: ctx => ctx.onPR, fn: addStartReviewButtons},
-        {name: 'detailsButtons', when: ctx => ctx.onToolbar || ctx.onCompose, fn: addDetailsButtons},
-        {name: 'trackEditForms', when: ctx => ctx.onToolbar || ctx.onCompose, fn: trackEditForms},
+        {name: 'detailsButtons', when: ctx => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose, fn: addDetailsButtons},
+        {name: 'trackEditForms', when: ctx => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose, fn: trackEditForms},
         {name: 'prTitleProofread', when: ctx => ctx.onPR || ctx.onCompose, fn: addPRTitleProofreadButton},
-        {name: 'stickyEditToolbar', when: ctx => ctx.onToolbar || ctx.onCompose, fn: makeStickyEditToolbar},
-        {name: 'quickActions', when: ctx => ctx.onToolbar, fn: addQuickCommentActions},
-        {name: 'reactionHover', when: ctx => ctx.onToolbar, fn: autoOpenReactionPopup},
+        {name: 'stickyEditToolbar', when: ctx => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose, fn: makeStickyEditToolbar},
+        {name: 'quickActions', when: ctx => ctx.onToolbar && !ctx.onCompare, fn: addQuickCommentActions},
+        {name: 'reactionHover', when: ctx => ctx.onToolbar && !ctx.onCompare, fn: autoOpenReactionPopup},
     ];
 
     const DOC_INJECTORS = [
@@ -8498,12 +8488,12 @@ Rules:
         {name: 'normalizePRHeaderHeadBranch', when: ctx => ctx.onPR, fn: normalizePRHeaderHeadBranch},
         {name: 'commitExplainButtons', when: ctx => ctx.onPR, fn: addCommitExplainButtons},
         {name: 'enhanceForcePushLinks', when: ctx => ctx.onPR, fn: enhanceForcePushLinks},
-        {name: 'commentMenuAugmenter', when: ctx => ctx.onToolbar, fn: installCommentMenuAugmenter},
+        {name: 'commentMenuAugmenter', when: ctx => ctx.onToolbar && !ctx.onCompare, fn: installCommentMenuAugmenter},
         {name: 'diffSelection', when: ctx => ctx.onPR, fn: installDiffSelectionActions},
     ];
 
     function currentInjectContext() {
-        return {onPR: isPRPage(), onToolbar: isToolbarPage(), onCompose: isPRCreationPage()};
+        return {onPR: isPRPage(), onCompare: isComparePage(), onToolbar: isToolbarPage(), onCompose: isPRCreationPage()};
     }
 
     function shouldRunEditorInjectors() {
@@ -11486,6 +11476,8 @@ RULES:
 
     let commentNavEntries = [];
     let commentNavIdx = -1;
+    let compareFileNavEntries = [];
+    let compareFileNavIdx = -1;
 
     function gatherCommentElements() {
         const entries = [];
@@ -11612,6 +11604,57 @@ RULES:
     function resetCommentNav() {
         commentNavIdx = -1;
         commentNavEntries = [];
+    }
+
+    function gatherCompareFileElements() {
+        const entries = [];
+        for (const file of document.querySelectorAll('[data-tagsearch-path]')) {
+            if (!isVisible(file)) continue;
+            const anchor =
+                file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info')
+                || file;
+            if (!isVisible(anchor)) continue;
+            entries.push({el: file, anchor});
+        }
+        return entries;
+    }
+
+    function openCompareFileIfCollapsed(file) {
+        const loadBtn = file?.querySelector?.('button.load-diff-button');
+        if (!loadBtn || !isVisible(loadBtn) || loadBtn.dataset.ackClicked === '1') return false;
+        loadBtn.dataset.ackClicked = '1';
+        loadBtn.click();
+        return true;
+    }
+
+    function navigateCompareFile(dir) {
+        compareFileNavEntries = gatherCompareFileElements();
+        if (compareFileNavEntries.length === 0) return;
+
+        if (compareFileNavIdx < 0) {
+            compareFileNavIdx = dir < 0 ? 0 : compareFileNavEntries.length - 1;
+        } else {
+            compareFileNavIdx += dir < 0 ? 1 : -1;
+            compareFileNavIdx = Math.max(0, Math.min(compareFileNavEntries.length - 1, compareFileNavIdx));
+        }
+
+        const entry = compareFileNavEntries[compareFileNavIdx];
+        if (!entry) return;
+        scrollToAndHighlight(entry.anchor || entry.el);
+        openCompareFileIfCollapsed(entry.el);
+    }
+
+    function resetCompareFileNav() {
+        compareFileNavIdx = -1;
+        compareFileNavEntries = [];
+    }
+
+    function navigatePrimaryReviewTarget(dir) {
+        if (isComparePage()) {
+            navigateCompareFile(dir);
+            return;
+        }
+        navigateComment(dir);
     }
 
     // --- Commit Badges on Comments ---
@@ -14263,7 +14306,8 @@ RULES:
 	    function inject() {
 	        if (document.getElementById(BUTTON_CONTAINER_ID)) return;
 	        const onPR = isPRPage();
-	        const ctx = {onPR, onToolbar: isToolbarPage()};
+	        const onCompare = isComparePage();
+	        const ctx = {onPR, onCompare, onToolbar: isToolbarPage()};
 
         const wrapper = document.createElement('div');
         wrapper.id = BUTTON_CONTAINER_ID;
@@ -14298,7 +14342,7 @@ RULES:
 
             toolbar.appendChild(buildSHAGroup());
         }
-        if (getAnalysisMode() !== ANALYSIS_MODES.commit) {
+        if (!onCompare && getAnalysisMode() !== ANALYSIS_MODES.commit) {
             toolbar.appendChild(buildContextCopyGroup());
         }
 
@@ -14424,15 +14468,21 @@ RULES:
         toolbar.appendChild(expandGroup);
 
         // --- 💬 Comment navigator ---
-        const commentNavBtn = createBtn(compact ? '💬' : '💬 Comments', function (e) {
-            navigateComment(e?.shiftKey ? 1 : -1);
-        }, 'Navigate posted comments by date (newest first; Shift reverses) [Ctrl+N]');
+        const commentNavBtn = createBtn(
+            compact ? (onCompare ? '🗂️' : '💬') : (onCompare ? '🗂️ Files' : '💬 Comments'),
+            function (e) {
+                navigatePrimaryReviewTarget(e?.shiftKey ? 1 : -1);
+            },
+            onCompare
+                ? 'Navigate visible compare files top-to-bottom (Shift reverses) [Ctrl+N]'
+                : 'Navigate posted comments by date (newest first; Shift reverses) [Ctrl+N]'
+        );
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
 
 	        _ackPendingReviewActive = onPR ? (detectPendingReview() && hasPendingReviewChanges()) : false;
 
-        toolbar.appendChild(buildRobotRecipeGroup(wrapper));
+        if (!onCompare) toolbar.appendChild(buildRobotRecipeGroup(wrapper));
 	        runRootInjectors(document, ctx);
 	        runDocInjectors(ctx);
 
@@ -14880,8 +14930,13 @@ RULES:
         );
     }
 
+    function isComparePage(path = location.pathname, root = document) {
+        if (!/\/compare\/[^/]+\.\.\.?[^/]+/.test(path)) return false;
+        return !isPRCreationPage(path, root);
+    }
+
     function isToolbarPage(path = location.pathname) {
-        return isPRPage(path) || isIssuePage(path);
+        return isPRPage(path) || isIssuePage(path) || isComparePage(path);
     }
 
     function parseIssue(path = location.pathname) {
@@ -14995,6 +15050,7 @@ RULES:
 	                clearCommitPatchCache();
 	                invalidatePRContext();
 	                resetCommentNav();
+                    resetCompareFileNav();
 	            }
 	            inject();
 	            normalizeUnreadTimelineUrls();
@@ -20022,7 +20078,7 @@ RULES:
         const fn = source.slice(source.indexOf('async function autoCollapseCompareFiles'), source.indexOf('// --- LLM Config'));
         ackAssert(fn.includes('ack-compare-collapse'), 'injects style element with known ID');
         ackAssert(fn.includes('CSS.escape'), 'escapes paths for CSS selectors');
-        ackAssert(fn.includes('display: none !important'), 'hides diff content');
+        ackAssert(fn.includes('display: none !important'), 'hides unrelated files');
         ackAssert(!fn.includes('toggle.click'), 'does NOT use toggle clicks');
         ackAssert(fn.includes('updateCollapseCSS'), 'has CSS update function');
     });
@@ -20033,14 +20089,16 @@ RULES:
         ackAssert(fn.includes('scrollToFirstKeptFile'), 'uses helper to target kept files');
         ackAssert(fn.includes('scrolledToFirstKeptFile'), 'guards against repeated scroll jumps');
         ackAssert(fn.includes('scrollIntoView'), 'scrolls to first visible file');
+        ackAssert(fn.includes('openCompareFileIfCollapsed(file)'), 'opens Load diff for the auto-targeted file');
         ackAssert(fn.includes("behavior: 'smooth'"), 'uses smooth scrolling');
     });
 
-    ackTest('autoCollapseCompareFiles auto-clicks Load diff buttons on visible files', () => {
+    ackTest('compare file navigation opens Load diff only for the targeted file', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function autoCollapseCompareFiles'), source.indexOf('// --- LLM Config'));
-        ackAssert(fn.includes('load-diff-button'), 'targets Load diff buttons');
-        ackAssert(fn.includes('loadBtn'), 'clicks load buttons');
+        const fn = source.slice(source.indexOf('function openCompareFileIfCollapsed'), source.indexOf('function resetCompareFileNav'));
+        ackAssert(fn.includes('button.load-diff-button'), 'targets Load diff buttons');
+        ackAssert(fn.includes("loadBtn.dataset.ackClicked = '1'"), 'marks clicked buttons to avoid repeats');
+        ackAssert(fn.includes('loadBtn.click()'), 'clicks Load diff when navigating to a closed file');
     });
 
     ackTest('autoCollapseCompareFiles cleans up CSS on navigation away', () => {
@@ -21164,9 +21222,10 @@ RULES:
         ackEq(isIssuePage('/bitcoin/bitcoin'), false);
     });
 
-    ackTest('isToolbarPage detects both PR and issue URLs', () => {
+    ackTest('isToolbarPage detects PR, issue, and compare URLs', () => {
         ackEq(isToolbarPage('/bitcoin/bitcoin/pull/123'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin/issues/34645'), true);
+        ackEq(isToolbarPage('/bitcoin/bitcoin/compare/abc123...def456'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin'), false);
         ackEq(isToolbarPage('/bitcoin/bitcoin/pulls'), false);
     });
@@ -21207,6 +21266,7 @@ RULES:
         const source = _ackSource;
         const injectFn = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
         ackAssert(injectFn.includes("const onPR = isPRPage()"), 'inject checks isPRPage');
+        ackAssert(injectFn.includes('const onCompare = isComparePage()'), 'inject checks compare mode');
         ackAssert(injectFn.includes('if (onPR)'), 'gates features behind onPR');
         // ACK toggle and SHA group only on PR
         const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('function disableBtn'));
@@ -21214,9 +21274,10 @@ RULES:
         ackAssert(injectFn.includes("toolbar.appendChild(buildContextCopyGroup())"), 'context copy group is available on toolbar pages, not only PRs');
     });
 
-    ackTest('currentInjectContext exposes compare-page compose mode', () => {
+    ackTest('currentInjectContext exposes compare-page mode and compose mode', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function currentInjectContext'), source.indexOf('function runRootInjectors'));
+        ackAssert(fn.includes('onCompare: isComparePage()'), 'tracks compare page mode');
         ackAssert(fn.includes('onCompose: isPRCreationPage()'), 'tracks compare/new-PR compose mode');
     });
 
@@ -23695,23 +23756,33 @@ RULES:
         ackAssert(fn.includes('Math.max(0,'), 'clamps index');
     });
 
-    ackTest('comment navigator button added to toolbar', () => {
+    ackTest('navigatePrimaryReviewTarget switches to compare file navigation on compare pages', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function navigatePrimaryReviewTarget'), source.indexOf('// --- Commit Badges'));
+        ackAssert(fn.includes('isComparePage()'), 'checks compare mode');
+        ackAssert(fn.includes('navigateCompareFile(dir)'), 'routes compare pages to file navigation');
+        ackAssert(fn.includes('navigateComment(dir)'), 'routes non-compare pages to comment navigation');
+    });
+
+    ackTest('primary navigator button added to toolbar', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf("const commentNavBtn = createBtn"), source.indexOf("toolbar.appendChild(commentNavBtn);"));
-        ackAssert(source.includes("'💬 Comments'") || source.includes("'💬'"), 'toolbar has speech bubble comment nav button');
-        ackAssert(inject.includes('navigateComment(e?.shiftKey ? 1 : -1)'), 'button navigates with Shift-reverse support');
+        ackAssert(source.includes("'💬 Comments'") || source.includes("'🗂️ Files'"), 'toolbar has primary navigation button');
+        ackAssert(inject.includes('navigatePrimaryReviewTarget(e?.shiftKey ? 1 : -1)'), 'button navigates with Shift-reverse support');
     });
 
-    ackTest('Ctrl+N shortcut for comment navigation', () => {
+    ackTest('Ctrl+N shortcut uses primary navigation target', () => {
         const source = _ackSource;
         ackAssert(source.includes("letter === 'n'"), 'has N key handler');
-        ackAssert(source.includes("{ key: 'N', emoji: '💬', label: 'Prev comment' }"), 'N key in hint list');
+        ackAssert(source.includes('navigatePrimaryReviewTarget(-1)'), 'N key uses shared navigation helper');
+        ackAssert(source.includes("compareNav ? '🗂️' : '💬'"), 'N key hint adapts to compare pages');
     });
 
-    ackTest('resetCommentNav called on PR teardown', () => {
+    ackTest('primary navigation state resets on PR teardown', () => {
         const source = _ackSource;
         const teardown = source.slice(source.indexOf('commitListCache.clear()'), source.indexOf('lastInjectedPR = prKey'));
         ackAssert(teardown.includes('resetCommentNav()'), 'comment nav reset in teardown');
+        ackAssert(teardown.includes('resetCompareFileNav()'), 'compare file nav reset in teardown');
     });
 
     ackTest('addCommitBadges decorates comments with clickable SHA and API fallback', () => {
@@ -25139,6 +25210,7 @@ RULES:
     function resyncAfterSelfTests() {
         try {
             resetCommentNav();
+            resetCompareFileNav();
             _ackPendingReviewActive = isPRPage() ? (detectPendingReview() && hasPendingReviewChanges()) : false;
             tryInject();
             if (isPRPage()) {
