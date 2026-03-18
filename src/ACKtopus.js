@@ -2882,7 +2882,7 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
         reimplementation: `Write a rebuild brief: a self-contained problem description a coding agent uses to recreate this PR from the base commit with no other context.
 
-State the PROBLEM, never the solution. The agent derives implementation from the tree. Be as terse as possible -- if the PR title suffices, stay at that level. Never narrate the diff or quote patch text. Never expose commit SHAs -- the agent must not know about the existing PR. Use the checkout metadata to emit a warning that the agent must NOT access the PR URL, must NOT check out the PR branch or head branch, and must work only from the exact base commit.
+State the PROBLEM, never the solution. The agent derives implementation from the tree. Be as terse as possible -- if the PR title suffices, stay at that level. Never narrate the diff or quote patch text, explain in prose. Never expose commit SHAs -- the agent must not know about the existing PR. Use the checkout metadata to emit a warning that the agent must NOT access the PR URL, must NOT check out the PR branch or head branch, and must work only from the exact base commit.
 
 Output exactly:
 
@@ -2890,7 +2890,7 @@ Output exactly:
 What is wrong or missing and why it matters. 1-3 sentences max.
 
 ## Steps
-One numbered entry per logical step (derived from commits but without referencing them). Each entry: one short paragraph stating the subproblem, what should be true after, and the most important test coverage. Tell the agent to implement the steps in order as separate self-contained commits, each limited to the requested change, each buildable/reviewable on its own. Problem-level only.`,
+One numbered entry per logical step (derived from commits but without referencing them). Each entry: one short paragraph stating the subproblem, what should be true after, and the most important test coverage. Tell the agent to implement the steps in order as separate self-contained commits, each limited to the requested change, each buildable/reviewable on its own. Problem-level only, high abstraction level, laconic.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
