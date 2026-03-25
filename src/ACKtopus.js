@@ -1015,21 +1015,55 @@
         return ta;
     }
 
+    function waitForNextPaint() {
+        return new Promise(resolve => ackRaf(() => resolve()));
+    }
+
+    async function copyTextWithSpinner(btn, text, {successContent = '✓', restoreMs = 1000} = {}) {
+        if (!btn || btn.dataset.ackCopyBusy === '1' || !text) return false;
+        btn.dataset.ackCopyBusy = '1';
+        const origHTML = btn.innerHTML;
+        const stopSpin = startBrailleAnimation(frame => {
+            btn.textContent = frame;
+        });
+        await waitForNextPaint();
+        GM_setClipboard(text);
+        stopSpin();
+        if (/<[^>]+>/.test(String(successContent || ''))) btn.innerHTML = String(successContent);
+        else btn.textContent = String(successContent || '✓');
+        ackSetTimeout(() => {
+            btn.innerHTML = origHTML;
+            delete btn.dataset.ackCopyBusy;
+        }, restoreMs);
+        return true;
+    }
+
     async function copySHA(mainBtn, updateMainLabel) {
-        const pr = parsePR();
-        const sha = await fetchSHA();
-        const text = sha && pr ? getFormat().fmt(sha, pr) : null;
-        if (text) {
-            // Clipboard-only: never auto-insert into any active text field.
-            GM_setClipboard(text);
-            mainBtn.innerHTML = `${CHECK_ICON}`;
-            setTimeout(() => updateMainLabel(), 1500);
-        } else if (getFormat().key === 'rdiff') {
-            mainBtn.textContent = '✗ no force-push';
-            setTimeout(() => updateMainLabel(), 1500);
-        } else {
-            mainBtn.textContent = '✗ not found';
-            setTimeout(() => updateMainLabel(), 1500);
+        if (mainBtn.dataset.ackCopyBusy === '1') return;
+        mainBtn.dataset.ackCopyBusy = '1';
+        const stopSpin = startBrailleAnimation(frame => {
+            mainBtn.textContent = frame;
+        });
+        await waitForNextPaint();
+        try {
+            const pr = parsePR();
+            const sha = await fetchSHA();
+            const text = sha && pr ? getFormat().fmt(sha, pr) : null;
+            stopSpin();
+            if (text) {
+                // Clipboard-only: never auto-insert into any active text field.
+                GM_setClipboard(text);
+                mainBtn.innerHTML = `${CHECK_ICON}`;
+            } else if (getFormat().key === 'rdiff') {
+                mainBtn.textContent = '✗ no force-push';
+            } else {
+                mainBtn.textContent = '✗ not found';
+            }
+        } finally {
+            ackSetTimeout(() => {
+                delete mainBtn.dataset.ackCopyBusy;
+                updateMainLabel();
+            }, 1500);
         }
     }
 
@@ -4704,13 +4738,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     copyBtn.style.color = '#8b949e';
                     copyBtn.style.borderColor = 'transparent';
                 });
-                copyBtn.addEventListener('click', () => {
+                copyBtn.addEventListener('click', async () => {
                     const text = msg.dataset.ackRawContent || msg._ackBody?.innerText || '';
                     if (!text.trim()) return;
-                    GM_setClipboard(text);
-                    const orig = copyBtn.textContent;
-                    copyBtn.textContent = '✓';
-                    setTimeout(() => { copyBtn.textContent = orig; }, 1000);
+                    await copyTextWithSpinner(copyBtn, text);
                 });
                 const body = document.createElement('div');
                 body.style.paddingRight = '20px';
@@ -4988,11 +5019,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 header.innerHTML = label;
                 body.innerHTML = renderMarkdown(text);
                 copyBtn.style.display = '';
-                copyBtn.onclick = () => {
-                    GM_setClipboard(rawMarkdown);
-                    const orig = copyBtn.textContent;
-                    copyBtn.textContent = '✓';
-                    setTimeout(() => { copyBtn.textContent = orig; }, 1000);
+                copyBtn.onclick = async () => {
+                    await copyTextWithSpinner(copyBtn, rawMarkdown);
                 };
             },
             reject: (err) => {
@@ -14191,18 +14219,25 @@ RULES:
         if (btn._running) return;
         btn._running = true;
         const origText = btn.textContent;
+        const stopSpin = startBrailleAnimation(frame => {
+            btn.textContent = frame;
+        });
         const popup = makeStatusPopup('Gathering comment context...');
         try {
+            await waitForNextPaint();
             const context = gatherCommentContext(container);
             if (!context) {
+                stopSpin();
                 btn.textContent = '❌';
                 popup.textContent = '❌ No comment context found';
             } else {
                 GM_setClipboard(context);
+                stopSpin();
                 btn.textContent = '✅';
                 popup.textContent = `✅ Copied ${(context.length / 1024).toFixed(1)}KB to clipboard`;
             }
         } catch (e) {
+            stopSpin();
             btn.textContent = '❌';
             popup.textContent = `❌ Error: ${e.message}`;
             console.error('ACKtopus: copy comment context failed:', e);
@@ -16358,6 +16393,8 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
         ackAssert(fn.includes('GM_setClipboard('), 'copies via GM_setClipboard');
+        ackAssert(fn.includes('startBrailleAnimation'), 'shows spinner while resolving clipboard text');
+        ackAssert(fn.includes('waitForNextPaint()'), 'yields a paint before slow clipboard work');
         ackAssert(!fn.includes('insertIntoTextarea('), 'does not insert into textarea');
         ackAssert(!fn.includes('execCommand('), 'does not use execCommand for insertion');
     });
@@ -21784,6 +21821,10 @@ RULES:
         ackAssert(helper.includes('startBrailleAnimation'), 'shows loading spinner');
         ackAssert(helper.includes("popup.textContent"), 'updates progress popup');
 
+        const copyHelper = source.slice(source.indexOf('function waitForNextPaint'), source.indexOf('async function copySHA'));
+        ackAssert(copyHelper.includes('ackRaf'), 'clipboard helper yields until next paint');
+        ackAssert(copyHelper.includes('copyTextWithSpinner'), 'shared clipboard spinner helper exists');
+
         const fullFn = source.slice(source.indexOf('async function copyPRContext'), source.indexOf('async function copyPatchContext'));
         ackAssert(fullFn.includes('gatherFullPRContext'), 'copyPRContext gathers full PR context');
         ackAssert(fullFn.includes('gatherSingleCommitContext'), 'copyPRContext can gather single-commit context');
@@ -21812,6 +21853,7 @@ RULES:
         const copyFn = source.slice(source.indexOf('async function copyCommentContext'), source.indexOf('async function loadAsyncPRData'));
         ackAssert(copyFn.includes('gatherCommentContext(container)'), 'copyCommentContext gathers per-comment context');
         ackAssert(copyFn.includes('GM_setClipboard'), 'copyCommentContext writes to clipboard');
+        ackAssert(copyFn.includes('startBrailleAnimation'), 'copyCommentContext shows spinner while copying');
 
         const menuFns = source.slice(source.indexOf('function getCommentMenuRoots'), source.indexOf('async function waitForEditTextarea'));
         ackAssert(menuFns.includes('Copy comment'), 'injects copy action into menu');
@@ -23400,7 +23442,9 @@ RULES:
 
     ackTest('updateMainLabel drops SVG icon in compact mode', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('const updateMainLabel'), source.indexOf('updateMainLabel();'));
+        const start = source.indexOf('const updateMainLabel');
+        const end = source.indexOf('updateMainLabel();', start);
+        const fn = source.slice(start, end);
         ackAssert(fn.includes("compact ? `${f.emoji}` :"), 'compact shows only emoji');
         ackAssert(fn.includes("${f.label}${COPY_ICON}"), 'non-compact shows label + icon');
     });
