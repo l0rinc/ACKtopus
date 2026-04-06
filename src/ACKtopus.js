@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.23
+// @version      1.24
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
+// @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
+// @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @match        https://github.com/*
 // @grant        GM_setClipboard
 // @grant        GM_getValue
@@ -14811,7 +14813,8 @@ RULES:
         // Detect page type: individual commit diff or commit list
         const shaMatch = location.pathname.match(/\/pull\/\d+\/(?:changes|commits)\/([0-9a-f]+)/);
         const isCommitsList = /\/pull\/\d+\/commits\/?$/.test(location.pathname);
-        if (!shaMatch && !isCommitsList) return;
+        const isConversation = isPRConversationPage(location.pathname);
+        if (!shaMatch && !isCommitsList && !isConversation) return;
 
         const currentSha = shaMatch?.[1] || null;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
@@ -14823,7 +14826,7 @@ RULES:
 
         let prevCommit = null, nextCommit = null, currentIdx = -1;
 
-        if (isCommitsList) {
+        if (isCommitsList || isConversation) {
             nextCommit = commits[0];
         } else {
             // Match bidirectionally: API returns full SHAs, HTML scrape may return short
@@ -14969,7 +14972,9 @@ RULES:
             bar.appendChild(jumpDetails);
         } else {
             const pos = document.createElement('span');
-            pos.textContent = currentIdx >= 0 ? `${currentIdx + 1}/${commits.length}` : `-/${commits.length}`;
+            pos.textContent = currentIdx >= 0
+                ? `${currentIdx + 1}/${commits.length}`
+                : `Commits (${commits.length})`;
             Object.assign(pos.style, {
                 fontSize: '11px',
                 color: '#484f58',
@@ -19201,7 +19206,7 @@ RULES:
         ackAssert(block.includes('addFloatingCommitNav()'), 'rebuilds floating commit nav on pageshow');
     });
 
-    ackTest('floating commit nav matches both /changes/SHA and /commits/SHA URLs', () => {
+    ackTest('floating commit nav matches conversation, /changes/SHA and /commits routes', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function _addFloatingCommitNavInner'),
@@ -19210,6 +19215,7 @@ RULES:
         // Must match both /changes/ and /commits/ URL patterns
         ackAssert(fn.includes('changes|commits'), 'regex matches both changes and commits paths');
         ackAssert(fn.includes('isCommitsList'), 'handles commit list page separately');
+        ackAssert(fn.includes('isPRConversationPage'), 'handles conversation page too');
     });
 
     ackTest('addFloatingCommitNav runs on all navigation events', () => {
@@ -24009,6 +24015,7 @@ RULES:
         ackAssert(fn.indexOf('const commits = await fetchCommitList') < fn.indexOf('const hasJumpMenu = commits.length > 3;'), 'computes hasJumpMenu only after commits are loaded');
         ackAssert(fn.includes('const jumpDetails = document.createElement(\'details\')'), 'creates middle commit jump dropdown');
         ackAssert(fn.includes('jumpSummary.textContent'), 'shows clickable middle summary');
+        ackAssert(fn.includes('Commits (${commits.length})'), 'shows commits summary when no current commit is selected');
         ackAssert(fn.includes('commits.forEach((commit, idx) => {'), 'builds dropdown items from all commits');
         ackAssert(fn.includes('Jump to any commit'), 'middle section is explicitly a commit jump control');
         ackAssert(fn.includes('const pos = document.createElement(\'span\')'), 'keeps a simple middle indicator when the jump menu is disabled');
