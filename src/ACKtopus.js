@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.22
+// @version      1.23
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -207,6 +207,26 @@
             return data?.payload?.pullRequestsChangesRoute?.pullRequest?.headBranch
                 || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headBranch
                 || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function readHeadShaFromSSR() {
+        try {
+            const scriptEl = document.querySelector(
+                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
+            );
+            if (!scriptEl?.textContent) return '';
+            const data = JSON.parse(scriptEl.textContent);
+            const sha =
+                data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRefOid
+                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid
+                || data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRef?.target?.oid
+                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid
+                || data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha
+                || '';
+            return /^[0-9a-f]{40}$/i.test(sha) ? sha : '';
         } catch (_) {
             return '';
         }
@@ -815,6 +835,16 @@
         return m ? {owner: m[1], repo: m[2], pr: m[3]} : null;
     }
 
+    function getImmediatePRHeadSHA(path = location.pathname) {
+        const pr = parsePR(path);
+        if (!pr) return '';
+        const cached = (_prContextCache && _prContextKey.startsWith(`${pr.owner}/${pr.repo}/${pr.pr}:`))
+            ? (_prContextCache.headSha || '')
+            : '';
+        if (/^[0-9a-f]{40}$/i.test(cached)) return cached;
+        return readHeadShaFromSSR();
+    }
+
     function flash(btn, msg) {
         const orig = btn.textContent;
         btn.textContent = msg;
@@ -859,6 +889,8 @@
     }
 
     async function fetchSHA() {
+        const immediate = getImmediatePRHeadSHA();
+        if (immediate) return immediate;
         const pr = parsePR();
         if (pr) {
             try {
@@ -1039,6 +1071,18 @@
     }
 
     async function copySHA(mainBtn, updateMainLabel) {
+        const pr = parsePR();
+        const immediateSha = getImmediatePRHeadSHA();
+        if (immediateSha && pr) {
+            const text = getFormat().fmt(immediateSha, pr);
+            if (text) {
+                GM_setClipboard(text);
+                mainBtn.innerHTML = `${CHECK_ICON}`;
+                ackSetTimeout(() => updateMainLabel(), 1500);
+                return;
+            }
+        }
+
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation(frame => {
@@ -1046,7 +1090,6 @@
         });
         await waitForNextPaint();
         try {
-            const pr = parsePR();
             const sha = await fetchSHA();
             const text = sha && pr ? getFormat().fmt(sha, pr) : null;
             stopSpin();
@@ -16393,6 +16436,7 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
         ackAssert(fn.includes('GM_setClipboard('), 'copies via GM_setClipboard');
+        ackAssert(fn.includes('getImmediatePRHeadSHA()'), 'tries immediate authoritative head SHA first');
         ackAssert(fn.includes('startBrailleAnimation'), 'shows spinner while resolving clipboard text');
         ackAssert(fn.includes('waitForNextPaint()'), 'yields a paint before slow clipboard work');
         ackAssert(!fn.includes('insertIntoTextarea('), 'does not insert into textarea');
@@ -20457,8 +20501,18 @@ RULES:
     ackTest('fetchSHA uses gmFetch instead of bare fetch', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function fetchSHA'), source.indexOf('function setTextareaValue'));
+        ackAssert(fn.includes('getImmediatePRHeadSHA()'), 'checks immediate authoritative head SHA before network');
         ackAssert(fn.includes('gmFetch'), 'uses gmFetch for authenticated request');
         ackAssert(!fn.includes('await fetch('), 'no bare fetch to api.github.com');
+    });
+
+    ackTest('getImmediatePRHeadSHA only uses cached or SSR PR head SHA', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function getImmediatePRHeadSHA'), source.indexOf('function flash'));
+        ackAssert(fn.includes('_prContextCache'), 'uses cached PR context head SHA');
+        ackAssert(fn.includes('readHeadShaFromSSR'), 'uses embedded SSR PR head SHA');
+        ackAssert(!fn.includes('parseCommitsFromPage'), 'does not infer from commit list ordering');
+        ackAssert(!fn.includes('querySelectorAll(\'a[href*="/commit"]\')'), 'does not infer from visible commit links');
     });
 
     ackTest('setTextareaValue uses native setter with _valueTracker reset and event dispatch', () => {
