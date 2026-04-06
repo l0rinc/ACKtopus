@@ -2960,6 +2960,7 @@ STRICT RULES:
 - Never narrate the diff or quote patch text.
 - Never expose commit SHAs, branch names, or the PR URL. The agent must not know about the existing PR.
 - Use the checkout metadata only to warn that the agent must work from the exact base commit and must not fetch the PR branch/head branch or open the PR URL.
+- The Steps section must map 1:1 to the original commits, in order. Do not merge commits together and do not split one commit into multiple steps.
 - Keep every step abstract enough that a different implementation is still possible if it satisfies the same goal.
 
 Output exactly:
@@ -2968,7 +2969,7 @@ Output exactly:
 1-2 sentences. What is wrong or missing and why it matters.
 
 ## Steps
-One numbered item per logical subproblem. Each item must be a short paragraph describing what to investigate, what property should hold after the change, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values.`,
+One numbered item per original commit, in order. Each item must be a short paragraph describing that commit's subproblem, what property should hold after it, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -23508,6 +23509,8 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('fewest words possible'), 'reimplementation prompt demands brevity');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not list files, functions, classes, constants, exact values'), 'reimplementation prompt forbids low-level listings');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('say how to find it instead of giving the current answer'), 'reimplementation prompt prefers search/discovery guidance');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('map 1:1 to the original commits, in order'), 'reimplementation prompt preserves commit-by-commit mapping');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('One numbered item per original commit, in order'), 'reimplementation output requires one step per commit');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('No low-level edit plan, no file list, no copied values'), 'reimplementation output forbids copied low-level details');
     });
 
