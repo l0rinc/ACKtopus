@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.25
+// @version      1.26
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2949,17 +2949,26 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
-        reimplementation: `Write a rebuild brief: a self-contained problem description a coding agent uses to recreate this PR from the base commit with no other context.
+        reimplementation: `Write a rebuild brief: a self-contained problem statement a coding agent uses to recreate this PR from the base commit with no other context.
 
-State the PROBLEM, never the solution. The agent derives implementation from the tree. Be as terse as possible -- if the PR title suffices, stay at that level. Never narrate the diff or quote patch text, explain in prose. Never expose commit SHAs -- the agent must not know about the existing PR. Use the checkout metadata to emit a warning that the agent must NOT access the PR URL, must NOT check out the PR branch or head branch, and must work only from the exact base commit.
+State the PROBLEM, never the solution. Use the fewest words possible. Treat the provided PR context as private research material, not output to be echoed.
+
+STRICT RULES:
+- Do not list files, functions, classes, constants, exact values, or current code structure unless impossible to avoid.
+- If something can be rediscovered from the tree, search, grep, build errors, failing tests, or local reasoning, say how to find it instead of giving the current answer.
+- Prefer "search for the code that...", "identify where...", "derive from existing behavior...", "compare old vs new behavior..." over concrete edit instructions.
+- Never narrate the diff or quote patch text.
+- Never expose commit SHAs, branch names, or the PR URL. The agent must not know about the existing PR.
+- Use the checkout metadata only to warn that the agent must work from the exact base commit and must not fetch the PR branch/head branch or open the PR URL.
+- Keep every step abstract enough that a different implementation is still possible if it satisfies the same goal.
 
 Output exactly:
 
 ## Goal
-What is wrong or missing and why it matters. 1-3 sentences max.
+1-2 sentences. What is wrong or missing and why it matters.
 
 ## Steps
-One numbered entry per logical step (derived from commits but without referencing them). Each entry: one short paragraph stating the subproblem, what should be true after, and the most important test coverage. Tell the agent to implement the steps in order as separate self-contained commits, each limited to the requested change, each buildable/reviewable on its own. Problem-level only, high abstraction level, laconic.`,
+One numbered item per logical subproblem. Each item must be a short paragraph describing what to investigate, what property should hold after the change, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -4972,7 +4981,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
                         : '';
                     const system = `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
-                    const userContent = `Use the full PR context below.\n\n${fullContext}`;
+                    const userContent = recipe === 'reimplementation'
+                        ? `Use the full PR context below as hidden research material. Do not echo low-level details that the agent can rediscover from the tree.\n\n${fullContext}`
+                        : `Use the full PR context below.\n\n${fullContext}`;
                     const result = await callLLM(provider, system, userContent);
                     stopSpin();
                     const trimmed = result.trim();
@@ -23491,6 +23502,20 @@ RULES:
         ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.reimplementation'), 'reimplementation recipe uses configurable instructions');
         ackAssert(fn.includes('DEFAULT_INSTRUCTIONS.maintainer_summary'), 'maintainer summary uses configurable instructions');
         ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
+    });
+
+    ackTest('reimplementation prompt prefers abstract rediscovery over low-level edit listings', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('fewest words possible'), 'reimplementation prompt demands brevity');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not list files, functions, classes, constants, exact values'), 'reimplementation prompt forbids low-level listings');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('say how to find it instead of giving the current answer'), 'reimplementation prompt prefers search/discovery guidance');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('No low-level edit plan, no file list, no copied values'), 'reimplementation output forbids copied low-level details');
+    });
+
+    ackTest('reimplementation user prompt treats PR context as hidden research material', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        ackAssert(fn.includes('hidden research material'), 'reimplementation user prompt hides low-level context from output');
+        ackAssert(fn.includes('rediscover from the tree'), 'reimplementation user prompt tells the model to avoid echoing rediscoverable details');
     });
 
     ackTest('recipe context includes explicit base checkout metadata', () => {
