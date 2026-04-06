@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.27
+// @version      1.28
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2992,21 +2992,25 @@ STRICT RULES:
 - Before finalizing each step, mentally redact all exact symbol names and mechanism words. If the step still distinguishes the commit and remains implementable, keep the redacted version instead of the concrete one.
 - Do not teach by examples. Do not include "bad/good" contrasts, sample rewrites, or mini-tutorials. State the abstraction directly.
 - Never narrate the diff or quote patch text.
-- Never expose commit SHAs, branch names, or the PR URL. The agent must not know about the existing PR.
-- Use the checkout metadata only to warn that the agent must work from the exact base commit and must not fetch the PR branch/head branch or open the PR URL.
+- Use the checkout metadata to emit a short, explicit checkout warning section. That section may name the exact base commit, base branch, head branch, and PR URL only for the purpose of telling the implementer what to start from and what NOT to check out.
+- Be explicit that the implementation must start from the exact base commit on the base branch, and that the PR URL and head branch are comparison targets only and must not be checked out.
 - If review comments reveal a bug, omission, or design flaw in the implemented PR, prefer the corrected target behavior over the literal implementation. Reconstruct the ideal solution, not the flawed artifact.
 - Treat reviewer objections and discovered errors as evidence about what each commit should have accomplished. Keep the same commit count/order, but describe the repaired intent of each step when needed.
 - The Steps section must map 1:1 to the original commits, in order. Do not merge commits together and do not split one commit into multiple steps.
+- Be explicit that each numbered step is a separate commit to be created in order, and that every step must be independently buildable/reviewable and should pass on its own before the next step is applied.
 - Keep every step abstract enough that a different implementation is still possible if it satisfies the same goal.
 - Optimize for the smallest instruction set that still lets the implementer recreate each commit and compare it to the PR. If a detail does not help the reimplementation or later comparison, omit it.
 
 Output exactly:
 
+## Checkout
+A compact warning section naming the exact base commit and base branch to start from, plus the head branch and PR URL that must NOT be checked out. Make clear that the work is a fresh reimplementation from the base commit, not a checkout of the existing PR branch.
+
 ## Goal
 One compact paragraph describing only the essential problem, impact, and target properties needed to reproduce the change. Avoid exact API names, replacement types, and mechanism words unless unavoidable.
 
 ## Steps
-One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. Prefer the most abstract wording that still keeps the commit distinguishable. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
+One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. State explicitly that the numbered items are separate commits to create in order, and that each one must stand alone and pass on its own. Prefer the most abstract wording that still keeps the commit distinguishable. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -23617,6 +23621,8 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('mentally redact all exact symbol names and mechanism words'), 'reimplementation prompt explicitly asks for abstraction pass');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not teach by examples'), 'reimplementation prompt forbids explanatory examples');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('map 1:1 to the original commits, in order'), 'reimplementation prompt preserves commit-by-commit mapping');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('each numbered step is a separate commit to be created in order'), 'reimplementation prompt says steps are separate commits');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('each one must stand alone and pass on its own'), 'reimplementation prompt says each step must be self-sufficient');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('One numbered item per original commit, in order'), 'reimplementation output requires one step per commit');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('requirements-style paragraph'), 'reimplementation output uses requirements-style steps');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer the most abstract wording that still keeps the commit distinguishable'), 'reimplementation output explicitly prefers maximum abstraction consistent with comparability');
@@ -23643,9 +23649,16 @@ RULES:
         ackAssert(fn.includes('Base commit:'), 'includes base commit');
         ackAssert(fn.includes('Base branch:'), 'includes base branch');
         ackAssert(fn.includes('Head commit:'), 'includes head commit');
+        ackAssert(fn.includes('Head branch:'), 'includes head branch');
         ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
         ackAssert(fn.includes('includePatch: true'), 'recipe context keeps raw patch details');
         ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
+    });
+
+    ackTest('reimplementation output format includes checkout warning section', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('## Checkout'), 'reimplementation output requires checkout section');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('must NOT be checked out'), 'checkout section forbids checking out PR/head branch');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('fresh reimplementation from the base commit'), 'checkout section says to reimplement from base commit');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
