@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.24
+// @version      1.25
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -14297,6 +14297,23 @@ RULES:
     async function loadAsyncPRData(wrapper, toolbar) {
         const pr = parsePR();
         const ackToggleBtn = toolbar.querySelector('button[title*="ACK panel"]');
+        let fileCategoriesApplied = false;
+        const applyFileCategories = (cats) => {
+            if (fileCategoriesApplied) return;
+            if (!wrapper.isConnected) return;
+            fileCategoriesApplied = true;
+            prFileCategories = cats;
+            if (prFileCategories) {
+                console.log('ACKtopus: file categories:', JSON.stringify(prFileCategories));
+                for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
+                    if (prFileCategories[cat].length > 0) {
+                        document.querySelectorAll(`[data-ack-cond="${cat}"]`).forEach(el => { el.style.display = ''; });
+                    }
+                }
+            }
+        };
+        const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);
+        fileCategoriesPromise.then(applyFileCategories).catch(() => {});
         let acks = parseAcksFromPage();
         console.log('ACKtopus: DOM ACKs found:', acks.length);
         if (acks.length === 0) {
@@ -14365,15 +14382,7 @@ RULES:
             document.querySelectorAll('[data-ack-rdiff]').forEach(el => { el.style.display = ''; });
         }
 
-        prFileCategories = pr ? await fetchPRFileCategories(pr) : null;
-        if (prFileCategories) {
-            console.log('ACKtopus: file categories:', JSON.stringify(prFileCategories));
-            for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
-                if (prFileCategories[cat].length > 0) {
-                    document.querySelectorAll(`[data-ack-cond="${cat}"]`).forEach(el => { el.style.display = ''; });
-                }
-            }
-        }
+        applyFileCategories(await fileCategoriesPromise);
 
         if (pr) {
             await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
@@ -24734,6 +24743,19 @@ RULES:
         );
         const prCalls = (fn.match(/parsePR\(\)/g) || []).length;
         ackEq(prCalls, 1, `expected exactly 1 parsePR() call in loadAsyncPRData, found ${prCalls}`);
+    });
+
+    ackTest('loadAsyncPRData starts file category fetch before slower ACK metadata work', () => {
+        ensureSelfSource();
+        const fn = _ackSource.slice(
+            _ackSource.indexOf('async function loadAsyncPRData'),
+            _ackSource.indexOf('// --- Inject ---')
+        );
+        ackAssert(fn.includes('const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);'),
+            'starts file category fetch immediately');
+        ackAssert(fn.indexOf('fetchPRFileCategories(pr)') < fn.indexOf('parseAcksFromAPI()'),
+            'starts file category fetch before ACK API fallback');
+        ackAssert(fn.includes('fileCategoriesPromise.then(applyFileCategories)'), 'applies file categories as soon as they resolve');
     });
 
     // --- copyPRContext structural test ---
