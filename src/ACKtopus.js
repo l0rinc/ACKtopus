@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.26
+// @version      1.27
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2949,27 +2949,39 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
-        reimplementation: `Write a rebuild brief: a self-contained problem statement a coding agent uses to recreate this PR from the base commit with no other context.
+        reimplementation: `Write the smallest possible rebuild brief a coding agent can use to recreate this PR from the base commit and then compare the result against the original PR commit-by-commit.
 
-State the PROBLEM, never the solution. Use the fewest words possible. Treat the provided PR context as private research material, not output to be echoed.
+State the PROBLEM, never the solution. Treat the provided PR context as private research material, not output to be echoed.
 
 STRICT RULES:
 - Do not list files, functions, classes, constants, exact values, or current code structure unless impossible to avoid.
 - If something can be rediscovered from the tree, search, grep, build errors, failing tests, or local reasoning, say how to find it instead of giving the current answer.
 - Prefer "search for the code that...", "identify where...", "derive from existing behavior...", "compare old vs new behavior..." over concrete edit instructions.
+- When the source material contains concrete file names, symbol names, constants, or current values, compress them into the smallest reusable abstraction unless that detail is essential to distinguishing this commit from another one.
+- Prefer invariants, failure modes, constraints, and desired properties over fix verbs. Explain what must become true, not what line-level action to take.
+- Do not name exact annotations, macros, helper functions, includes, or control-flow rewrites unless omitting them would make two steps indistinguishable. Describe the contract or invariant they enforce instead.
+- If a concrete symbol name is unavoidable, use the minimum needed to anchor the step. Prefer subsystem or role names over exact API names.
+- Do not write implementation-shaped verbs like "mark", "annotate", "replace", "collapse", "switch to", "use X", "wrap with", or "add include". Rewrite those into requirement language about the resulting contract or property.
+- Each step should read like an acceptance criterion for that commit: what must hold after it, what class of callers or subsystem is affected, and what evidence would show it is complete.
+- Optimize for minimum instruction count. Assume the implementer can search the tree, inspect types, run the build, and derive local details. Only include information that is necessary to distinguish this commit's intent from the others.
+- If a sentence names an exact API, annotation, macro, helper, file, or control-flow pattern that is not strictly necessary for distinguishing the commit, that sentence is too concrete and should be rewritten more abstractly.
+- Do not teach by examples. Do not include "bad/good" contrasts, sample rewrites, or mini-tutorials. State the abstraction directly.
 - Never narrate the diff or quote patch text.
 - Never expose commit SHAs, branch names, or the PR URL. The agent must not know about the existing PR.
 - Use the checkout metadata only to warn that the agent must work from the exact base commit and must not fetch the PR branch/head branch or open the PR URL.
+- If review comments reveal a bug, omission, or design flaw in the implemented PR, prefer the corrected target behavior over the literal implementation. Reconstruct the ideal solution, not the flawed artifact.
+- Treat reviewer objections and discovered errors as evidence about what each commit should have accomplished. Keep the same commit count/order, but describe the repaired intent of each step when needed.
 - The Steps section must map 1:1 to the original commits, in order. Do not merge commits together and do not split one commit into multiple steps.
 - Keep every step abstract enough that a different implementation is still possible if it satisfies the same goal.
+- Optimize for the smallest instruction set that still lets the implementer recreate each commit and compare it to the PR. If a detail does not help the reimplementation or later comparison, omit it.
 
 Output exactly:
 
 ## Goal
-1-2 sentences. What is wrong or missing and why it matters.
+One compact paragraph describing only the essential problem, impact, and target properties needed to reproduce the change. Avoid exact API names unless unavoidable.
 
 ## Steps
-One numbered item per original commit, in order. Each item must be a short paragraph describing that commit's subproblem, what property should hold after it, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values.`,
+One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, and no unnecessary concrete API/mechanism names.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -4983,7 +4995,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         : '';
                     const system = `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
                     const userContent = recipe === 'reimplementation'
-                        ? `Use the full PR context below as hidden research material. Do not echo low-level details that the agent can rediscover from the tree.\n\n${fullContext}`
+                        ? `Use the full PR context below as source material. Keep all commit distinctions, but minimize instruction count aggressively. Abstract away concrete symbols, enforcement mechanisms, and rediscoverable low-level details unless they are strictly necessary to distinguish one commit from another.\n\n${fullContext}`
                         : `Use the full PR context below.\n\n${fullContext}`;
                     const result = await callLLM(provider, system, userContent);
                     stopSpin();
@@ -23506,19 +23518,33 @@ RULES:
     });
 
     ackTest('reimplementation prompt prefers abstract rediscovery over low-level edit listings', () => {
-        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('fewest words possible'), 'reimplementation prompt demands brevity');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('smallest possible rebuild brief'), 'reimplementation prompt optimizes for minimal rebuild brief');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not list files, functions, classes, constants, exact values'), 'reimplementation prompt forbids low-level listings');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('say how to find it instead of giving the current answer'), 'reimplementation prompt prefers search/discovery guidance');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('compress them into the smallest reusable abstraction'), 'reimplementation prompt compresses concrete details into abstractions');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer invariants, failure modes, constraints, and desired properties over fix verbs'), 'reimplementation prompt prefers properties over fix verbs');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not name exact annotations, macros, helper functions, includes, or control-flow rewrites'), 'reimplementation prompt avoids exact enforcement mechanisms');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not write implementation-shaped verbs like "mark", "annotate", "replace", "collapse"'), 'reimplementation prompt forbids remediation-style verbs');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Each step should read like an acceptance criterion for that commit'), 'reimplementation prompt frames steps as acceptance criteria');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Optimize for minimum instruction count'), 'reimplementation prompt minimizes instruction count');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('that sentence is too concrete and should be rewritten more abstractly'), 'reimplementation prompt treats unnecessary concrete naming as failure');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not teach by examples'), 'reimplementation prompt forbids explanatory examples');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('map 1:1 to the original commits, in order'), 'reimplementation prompt preserves commit-by-commit mapping');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('One numbered item per original commit, in order'), 'reimplementation output requires one step per commit');
-        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('No low-level edit plan, no file list, no copied values'), 'reimplementation output forbids copied low-level details');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('requirements-style paragraph'), 'reimplementation output uses requirements-style steps');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('no unnecessary concrete API/mechanism names'), 'reimplementation output forbids unnecessary concrete names');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('prefer the corrected target behavior over the literal implementation'), 'reimplementation prompt prefers ideal behavior when comments reveal flaws');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Keep the same commit count/order, but describe the repaired intent of each step'), 'reimplementation prompt repairs flawed commits without changing step count/order');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('recreate each commit and compare it to the PR'), 'reimplementation prompt centers reimplementation and comparison workflow');
     });
 
-    ackTest('reimplementation user prompt treats PR context as hidden research material', () => {
+    ackTest('reimplementation user prompt keeps full context but asks for aggressive abstraction', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
-        ackAssert(fn.includes('hidden research material'), 'reimplementation user prompt hides low-level context from output');
-        ackAssert(fn.includes('rediscover from the tree'), 'reimplementation user prompt tells the model to avoid echoing rediscoverable details');
+        ackAssert(fn.includes('Keep all commit distinctions'), 'reimplementation user prompt preserves per-commit distinctions');
+        ackAssert(fn.includes('minimize instruction count aggressively'), 'reimplementation user prompt enforces minimal instructions');
+        ackAssert(fn.includes('abstract away concrete symbols, enforcement mechanisms'), 'reimplementation user prompt suppresses mechanism-shaped output');
+        ackAssert(fn.includes('modelOverride: getHighContextModelOverride(provider)'), 'reimplementation recipe uses high-context model override');
     });
 
     ackTest('recipe context includes explicit base checkout metadata', () => {
@@ -23528,6 +23554,8 @@ RULES:
         ackAssert(fn.includes('Base branch:'), 'includes base branch');
         ackAssert(fn.includes('Head commit:'), 'includes head commit');
         ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
+        ackAssert(fn.includes('includePatch: true'), 'recipe context keeps raw patch details');
+        ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
