@@ -2824,8 +2824,25 @@
 
     const LLM_MODELS = {
         claude: 'claude-sonnet-4-6',
+        claude_high_context: 'claude-opus-4-6',
         openai: 'gpt-5.4',
     };
+
+    function getHighContextModelOverride(provider) {
+        if (provider === 'claude') return LLM_MODELS.claude_high_context;
+        return '';
+    }
+
+    function getHighContextReasoningEffort(provider) {
+        if (provider === 'openai') return 'high';
+        return '';
+    }
+
+    function getHighContextMaxTokens(provider) {
+        if (provider === 'claude') return 32768;
+        if (provider === 'openai') return 32768;
+        return 0;
+    }
 
     // Provider API configuration -- drives callLLM, validateKey, and any future providers.
     // Adding a new provider = one entry here + branding in PROVIDER_META + validation logic.
@@ -2837,8 +2854,8 @@
                 'content-type': 'application/json',
                 'anthropic-dangerous-direct-browser-access': 'true',
             }),
-	            body: (model, system, userContent) => ({
-	                model, max_tokens: 4096, temperature: 0, system,
+	            body: (model, system, userContent, {maxTokens = 4096} = {}) => ({
+	                model, max_tokens: maxTokens || 4096, temperature: 0, system,
 	                messages: [{role: 'user', content: userContent}],
 	            }),
             validateBody: (model) => ({model, max_tokens: 1, messages: [{role: 'user', content: 'hi'}]}),
@@ -2850,8 +2867,8 @@
             headers: (key) => ({
                 Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
             }),
-	            body: (model, system, userContent) => ({
-	                model, max_completion_tokens: 4096, reasoning_effort: 'none', temperature: 0,
+            body: (model, system, userContent, {reasoningEffort = 'none', maxTokens = 4096} = {}) => ({
+	                model, max_completion_tokens: maxTokens || 4096, reasoning_effort: reasoningEffort || 'none', temperature: 0,
 	                messages: [{role: 'developer', content: system}, {role: 'user', content: userContent}],
 	            }),
             validateBody: (model) => ({
@@ -2954,6 +2971,8 @@ INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performan
 State the PROBLEM, never the solution. Treat the provided PR context as private research material, not output to be echoed.
 
 STRICT RULES:
+- Your job is not to summarize the implementation. Your job is to emit the minimum commit-by-commit constraints needed to recreate the change and compare the result against the PR.
+- Think at the level of "what must be true after this commit?" not "what code was written?"
 - Do not list files, functions, classes, constants, exact values, or current code structure unless impossible to avoid.
 - If something can be rediscovered from the tree, search, grep, build errors, failing tests, or local reasoning, say how to find it instead of giving the current answer.
 - Prefer "search for the code that...", "identify where...", "derive from existing behavior...", "compare old vs new behavior..." over concrete edit instructions.
@@ -2961,10 +2980,16 @@ STRICT RULES:
 - Prefer invariants, failure modes, constraints, and desired properties over fix verbs. Explain what must become true, not what line-level action to take.
 - Do not name exact annotations, macros, helper functions, includes, or control-flow rewrites unless omitting them would make two steps indistinguishable. Describe the contract or invariant they enforce instead.
 - If a concrete symbol name is unavoidable, use the minimum needed to anchor the step. Prefer subsystem or role names over exact API names.
+- In the \`## Steps\` section, naming exact APIs, annotations, macros, helper names, assertion facilities, control-flow shapes, or standard-library replacement types is a failure unless that name is strictly necessary to distinguish one commit from another.
+- In the \`## Steps\` section, do not enumerate subsystem buckets or broad file-group lists for a mechanical sweep. Summarize the class of contract being strengthened and the validation signal only.
+- In the \`## Steps\` section, do not use parenthetical symbol lists like "(Foo, Bar, Baz)" or replacement-type framing like "this is basically \`std::optional\`". If the abstraction works without the name, omit the name.
+- In the \`## Steps\` section, avoid mentioning assertion facilities, test-framework mechanisms, include churn, or conditional/control-flow restructuring. Describe the invariant or fallback behavior instead.
+- A step should usually name zero exact symbols. One exact symbol is acceptable only when it is the minimum needed to distinguish that commit from the others.
 - Do not write implementation-shaped verbs like "mark", "annotate", "replace", "collapse", "switch to", "use X", "wrap with", or "add include". Rewrite those into requirement language about the resulting contract or property.
 - Each step should read like an acceptance criterion for that commit: what must hold after it, what class of callers or subsystem is affected, and what evidence would show it is complete.
 - Optimize for minimum instruction count. Assume the implementer can search the tree, inspect types, run the build, and derive local details. Only include information that is necessary to distinguish this commit's intent from the others.
 - If a sentence names an exact API, annotation, macro, helper, file, or control-flow pattern that is not strictly necessary for distinguishing the commit, that sentence is too concrete and should be rewritten more abstractly.
+- Before finalizing each step, mentally redact all exact symbol names and mechanism words. If the step still distinguishes the commit and remains implementable, keep the redacted version instead of the concrete one.
 - Do not teach by examples. Do not include "bad/good" contrasts, sample rewrites, or mini-tutorials. State the abstraction directly.
 - Never narrate the diff or quote patch text.
 - Never expose commit SHAs, branch names, or the PR URL. The agent must not know about the existing PR.
@@ -2978,10 +3003,10 @@ STRICT RULES:
 Output exactly:
 
 ## Goal
-One compact paragraph describing only the essential problem, impact, and target properties needed to reproduce the change. Avoid exact API names unless unavoidable.
+One compact paragraph describing only the essential problem, impact, and target properties needed to reproduce the change. Avoid exact API names, replacement types, and mechanism words unless unavoidable.
 
 ## Steps
-One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, and no unnecessary concrete API/mechanism names.`,
+One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. Prefer the most abstract wording that still keeps the commit distinguishable. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -3813,21 +3838,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     // Build a deterministic cache key for an LLM prompt (provider + model + page + content hash).
-    function buildPromptCacheKey(provider, model, system, userContent) {
+    function buildPromptCacheKey(provider, model, system, userContent, reasoningEffort = '') {
         const pr = parsePageContext();
         if (!pr) return null;
         const kind = pageKind() || 'pull';
-        return `llm_prompt_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${hashPrompt(system + '\0' + userContent)}`;
+        return `llm_prompt_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${reasoningEffort || 'default'}_${hashPrompt(system + '\0' + userContent)}`;
     }
 
     // Single LLM call implementation driven by PROVIDER_API config.
-	    function callLLM(provider, system, userContent, {skipCache = false, modelOverride = ''} = {}) {
+	    function callLLM(provider, system, userContent, {skipCache = false, modelOverride = '', reasoningEffort = '', maxTokens = 0} = {}) {
 	        // Check prompt-level cache first (exact same prompt → cached response)
 	        const llmCfg = getLLMConfig();
 	        const cfg = llmCfg[provider];
 	        const model = (modelOverride || cfg?.model || '').trim();
 	        const cacheEnabled = llmCfg.cacheEnabled;
-	        const promptKey = (!skipCache && cacheEnabled && cfg) ? buildPromptCacheKey(provider, model, system, userContent) : null;
+	        const promptKey = (!skipCache && cacheEnabled && cfg) ? buildPromptCacheKey(provider, model, system, userContent, reasoningEffort) : null;
 	        if (promptKey) {
 	            const cached = GM_getValue(promptKey, null);
 	            if (cached !== null) {
@@ -3842,12 +3867,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	        console.groupCollapsed(`ACKtopus: LLM request → ${label} (${model})`);
 	        console.log('system:', system);
 	        console.log('user:', userContent);
+            if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
+            if (maxTokens) console.log('max_tokens:', maxTokens);
 	        console.groupEnd();
 	        return new Promise((resolve, reject) => {
 	            GM_xmlhttpRequest({
 	                method: 'POST', url: api.url,
 	                headers: api.headers(cfg.key),
-	                data: JSON.stringify(api.body(model, system, userContent)),
+	                data: JSON.stringify(api.body(model, system, userContent, {reasoningEffort, maxTokens})),
 	                onload: r => {
 	                    if (r.status >= 200 && r.status < 300) {
 	                        let data;
@@ -4997,7 +5024,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     const userContent = recipe === 'reimplementation'
                         ? `Use the full PR context below as source material. Keep all commit distinctions, but minimize instruction count aggressively. Abstract away concrete symbols, enforcement mechanisms, and rediscoverable low-level details unless they are strictly necessary to distinguish one commit from another.\n\n${fullContext}`
                         : `Use the full PR context below.\n\n${fullContext}`;
-                    const result = await callLLM(provider, system, userContent);
+                    const result = await callLLM(provider, system, userContent, {
+                        modelOverride: getHighContextModelOverride(provider),
+                        reasoningEffort: getHighContextReasoningEffort(provider),
+                        maxTokens: getHighContextMaxTokens(provider),
+                    });
                     stopSpin();
                     const trimmed = result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
@@ -12289,7 +12320,11 @@ RULES:
             ? `\n\nComprehensive PR context (description, commits, responses, and patch where available):\n${extraContext}`
             : '';
         const user = `PR has ${commits.length} commit(s) in this batch. For each one, produce a structured review aid.\n\n${commitEntries.join('\n---\n')}${contextBlock}\n\nReturn JSON mapping each 8-char SHA prefix to its review aid object.`;
-        const raw = await callLLM(provider, system, user);
+        const raw = await callLLM(provider, system, user, {
+            modelOverride: extraContext ? getHighContextModelOverride(provider) : '',
+            reasoningEffort: extraContext ? getHighContextReasoningEffort(provider) : '',
+            maxTokens: extraContext ? getHighContextMaxTokens(provider) : 0,
+        });
         return parseLLMJsonObject(raw);
     }
 
@@ -12318,7 +12353,11 @@ RULES:
             ? `\n\nAdditional PR context (description, commits, and responses):\n${extraContext}`
             : '';
         const user = `PR commits:\n\n${commitEntries.join('\n---\n')}\n\n${fullPatch ? `Full PR patch for context:\n${fullPatch}` : ''}${extraContextBlock}\n\nFor each commit, explain at a high level how it fits into the whole PR. Return JSON mapping each 8-char SHA prefix to a brief explanation.`;
-        const raw = await callLLM(provider, system, user);
+        const raw = await callLLM(provider, system, user, {
+            modelOverride: (extraContext || fullPatch) ? getHighContextModelOverride(provider) : '',
+            reasoningEffort: (extraContext || fullPatch) ? getHighContextReasoningEffort(provider) : '',
+            maxTokens: (extraContext || fullPatch) ? getHighContextMaxTokens(provider) : 0,
+        });
         return parseLLMJsonObject(raw);
     }
 
@@ -15716,11 +15755,13 @@ RULES:
 
     ackTest('has claude and openai models', () => {
         ackAssert(LLM_MODELS.claude, 'missing claude model');
+        ackAssert(LLM_MODELS.claude_high_context, 'missing high-context claude model');
         ackAssert(LLM_MODELS.openai, 'missing openai model');
     });
 
     ackTest('model strings are non-empty', () => {
         ackAssert(LLM_MODELS.claude.length > 0);
+        ackAssert(LLM_MODELS.claude_high_context.length > 0);
         ackAssert(LLM_MODELS.openai.length > 0);
     });
 
@@ -15971,6 +16012,10 @@ RULES:
 
     ackTest('LLM_MODELS.claude is claude-sonnet-4-6', () => {
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+    });
+
+    ackTest('LLM_MODELS.claude_high_context is claude-opus-4-6', () => {
+        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-6');
     });
 
     // --- getFormat rdiff fallback ---
@@ -17765,9 +17810,9 @@ RULES:
     // LLM_MODELS -- extended
     // ============================================================================
 
-    ackTest('LLM_MODELS has exactly claude and openai', () => {
+    ackTest('LLM_MODELS has claude, claude_high_context, and openai', () => {
         const keys = Object.keys(LLM_MODELS);
-        ackDeepEq(keys.sort(), ['claude', 'openai']);
+        ackDeepEq(keys.sort(), ['claude', 'claude_high_context', 'openai']);
     });
 
     ackTest('LLM_MODELS model strings are non-empty and contain expected patterns', () => {
@@ -20491,11 +20536,11 @@ RULES:
 	        ackAssert(!cfg.includes('ack-tooltips-model'), 'config panel has no selection helper model input');
 	    });
 
-	    ackTest('selection helper one-line summary uses fixed throttle and high max-chars (no settings)', () => {
-	        const source = _ackSource;
-	        const install = source.slice(source.indexOf('function installDiffSelectionActions'), source.indexOf('function hideDiffSelectionToolbar'));
-	        ackAssert(install.includes('const selectionDelayMs = 300'), 'selection helper waits for a stable 300ms selection before showing');
-	        ackAssert(install.includes('sel.isCollapsed'), 'stable-selection delay aborts if selection was cleared');
+    ackTest('selection helper one-line summary uses fixed throttle and high max-chars (no settings)', () => {
+        const source = _ackSource;
+        const install = source.slice(source.indexOf('function installDiffSelectionActions'), source.indexOf('function hideDiffSelectionToolbar'));
+        ackAssert(install.includes('const selectionDelayMs = 300'), 'selection helper waits for a stable 300ms selection before showing');
+        ackAssert(install.includes('sel.isCollapsed'), 'stable-selection delay aborts if selection was cleared');
 	        const fn = source.slice(source.indexOf('function updateDiffSelectionOneLiner'), source.indexOf('async function fetchBatchCommitExplanations'));
 	        ackAssert(fn.includes('const maxChars = 4000'), 'high max chars constant (4000)');
 	        ackAssert(fn.includes('const throttleMs = 250'), 'fast throttle constant (250ms)');
@@ -20506,6 +20551,38 @@ RULES:
 	        const diff = source.slice(source.indexOf('async function runDiffSelectionLLM'), source.indexOf('async function openChatWithDiffSelection'));
 	        ackAssert(!diff.includes('modelOverride'), 'selection actions do not override model (uses active provider model)');
 	    });
+
+    ackTest('high-context workflows use provider-specific upgrades on important full-context calls', () => {
+        const source = _ackSource;
+
+        const modelHelper = source.slice(source.indexOf('function getHighContextModelOverride'), source.indexOf('function getHighContextReasoningEffort'));
+        ackAssert(modelHelper.includes("provider === 'claude'"), 'high-context model helper special-cases Claude');
+        ackAssert(modelHelper.includes('claude_high_context'), 'high-context model helper points to Claude Opus');
+
+        const reasoningHelper = source.slice(source.indexOf('function getHighContextReasoningEffort'), source.indexOf('function getActiveProvider'));
+        ackAssert(reasoningHelper.includes("provider === 'openai'"), 'high-context helper special-cases OpenAI');
+        ackAssert(reasoningHelper.includes("return 'high'"), 'high-context helper raises reasoning effort');
+
+        const tokenHelper = source.slice(source.indexOf('function getHighContextMaxTokens'), source.indexOf('const PROVIDER_API'));
+        ackAssert(tokenHelper.includes("provider === 'claude'"), 'high-context token helper special-cases Claude');
+        ackAssert(tokenHelper.includes("provider === 'openai'"), 'high-context token helper special-cases OpenAI');
+        ackAssert(tokenHelper.includes('return 32768'), 'high-context token helper raises token cap for full-context calls');
+
+        const recipeFn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        ackAssert(recipeFn.includes('modelOverride: getHighContextModelOverride(provider)'), 'recipe path uses high-context model override');
+        ackAssert(recipeFn.includes('reasoningEffort: getHighContextReasoningEffort(provider)'), 'recipe path uses high-context reasoning effort');
+        ackAssert(recipeFn.includes('maxTokens: getHighContextMaxTokens(provider)'), 'recipe path uses high-context token cap');
+
+        const reviewAidFn = source.slice(source.indexOf('async function fetchCommitReviewAidChunk'), source.indexOf('async function fetchCommitExplainChunk'));
+        ackAssert(reviewAidFn.includes("modelOverride: extraContext ? getHighContextModelOverride(provider) : ''"), 'review aid chunk uses high-context model override when full context is present');
+        ackAssert(reviewAidFn.includes("reasoningEffort: extraContext ? getHighContextReasoningEffort(provider) : ''"), 'review aid chunk uses high-context reasoning effort when full context is present');
+        ackAssert(reviewAidFn.includes("maxTokens: extraContext ? getHighContextMaxTokens(provider) : 0"), 'review aid chunk uses high-context token cap when full context is present');
+
+        const explainFn = source.slice(source.indexOf('async function fetchCommitExplainChunk'), source.indexOf('async function fetchBatchCommitExplanations'));
+        ackAssert(explainFn.includes("modelOverride: (extraContext || fullPatch) ? getHighContextModelOverride(provider) : ''"), 'commit explain chunk uses high-context model override when full context is present');
+        ackAssert(explainFn.includes("reasoningEffort: (extraContext || fullPatch) ? getHighContextReasoningEffort(provider) : ''"), 'commit explain chunk uses high-context reasoning effort when full context is present');
+        ackAssert(explainFn.includes("maxTokens: (extraContext || fullPatch) ? getHighContextMaxTokens(provider) : 0"), 'commit explain chunk uses high-context token cap when full context is present');
+    });
 
 	    ackTest('selection helpers include cached PR overview from main lightbulb when available', () => {
 	        const source = _ackSource;
@@ -21669,12 +21746,13 @@ RULES:
         const origGM = GM_xmlhttpRequest;
         const origGetEditFormRequest = getEditFormRequest;
         let gmCalls = 0;
-        GM_xmlhttpRequest = () => {
-            gmCalls++;
+        const targetUrl = `${location.origin}/bitcoin/bitcoin/pull/1/review_comment/333/edit_form?textarea_id=discussion_r333-body&comment_context=discussion`;
+        GM_xmlhttpRequest = (opts) => {
+            if (opts?.url === targetUrl) gmCalls++;
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
-            url: `${location.origin}/bitcoin/bitcoin/pull/1/review_comment/333/edit_form?textarea_id=discussion_r333-body&comment_context=discussion`,
+            url: targetUrl,
             roots: [container],
         });
         try {
@@ -23518,21 +23596,32 @@ RULES:
     });
 
     ackTest('reimplementation prompt prefers abstract rediscovery over low-level edit listings', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Your job is not to summarize the implementation'), 'reimplementation prompt is explicit about its meta task');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('what must be true after this commit'), 'reimplementation prompt frames output in postconditions');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('smallest possible rebuild brief'), 'reimplementation prompt optimizes for minimal rebuild brief');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not list files, functions, classes, constants, exact values'), 'reimplementation prompt forbids low-level listings');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('say how to find it instead of giving the current answer'), 'reimplementation prompt prefers search/discovery guidance');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('compress them into the smallest reusable abstraction'), 'reimplementation prompt compresses concrete details into abstractions');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer invariants, failure modes, constraints, and desired properties over fix verbs'), 'reimplementation prompt prefers properties over fix verbs');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not name exact annotations, macros, helper functions, includes, or control-flow rewrites'), 'reimplementation prompt avoids exact enforcement mechanisms');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('naming exact APIs, annotations, macros, helper names, assertion facilities'), 'reimplementation prompt forbids exact APIs and mechanisms in steps');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('do not enumerate subsystem buckets or broad file-group lists for a mechanical sweep'), 'reimplementation prompt forbids subsystem bucket lists in steps');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('do not use parenthetical symbol lists'), 'reimplementation prompt forbids parenthetical symbol lists');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('replacement-type framing like "this is basically `std::optional`"'), 'reimplementation prompt forbids replacement-type framing');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('avoid mentioning assertion facilities, test-framework mechanisms, include churn, or conditional/control-flow restructuring'), 'reimplementation prompt forbids mechanism-level wording');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('A step should usually name zero exact symbols'), 'reimplementation prompt minimizes exact symbol names');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not write implementation-shaped verbs like "mark", "annotate", "replace", "collapse"'), 'reimplementation prompt forbids remediation-style verbs');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Each step should read like an acceptance criterion for that commit'), 'reimplementation prompt frames steps as acceptance criteria');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Optimize for minimum instruction count'), 'reimplementation prompt minimizes instruction count');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('that sentence is too concrete and should be rewritten more abstractly'), 'reimplementation prompt treats unnecessary concrete naming as failure');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('mentally redact all exact symbol names and mechanism words'), 'reimplementation prompt explicitly asks for abstraction pass');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not teach by examples'), 'reimplementation prompt forbids explanatory examples');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('map 1:1 to the original commits, in order'), 'reimplementation prompt preserves commit-by-commit mapping');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('One numbered item per original commit, in order'), 'reimplementation output requires one step per commit');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('requirements-style paragraph'), 'reimplementation output uses requirements-style steps');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer the most abstract wording that still keeps the commit distinguishable'), 'reimplementation output explicitly prefers maximum abstraction consistent with comparability');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('no unnecessary concrete API/mechanism names'), 'reimplementation output forbids unnecessary concrete names');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('no subsystem-bucket enumeration for broad mechanical passes'), 'reimplementation output forbids broad subsystem enumeration');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('prefer the corrected target behavior over the literal implementation'), 'reimplementation prompt prefers ideal behavior when comments reveal flaws');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Keep the same commit count/order, but describe the repaired intent of each step'), 'reimplementation prompt repairs flawed commits without changing step count/order');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('recreate each commit and compare it to the PR'), 'reimplementation prompt centers reimplementation and comparison workflow');
@@ -23543,8 +23632,9 @@ RULES:
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(fn.includes('Keep all commit distinctions'), 'reimplementation user prompt preserves per-commit distinctions');
         ackAssert(fn.includes('minimize instruction count aggressively'), 'reimplementation user prompt enforces minimal instructions');
-        ackAssert(fn.includes('abstract away concrete symbols, enforcement mechanisms'), 'reimplementation user prompt suppresses mechanism-shaped output');
-        ackAssert(fn.includes('modelOverride: getHighContextModelOverride(provider)'), 'reimplementation recipe uses high-context model override');
+        ackAssert(fn.includes('Abstract away concrete symbols, enforcement mechanisms'), 'reimplementation user prompt suppresses mechanism-shaped output');
+        ackAssert(fn.includes('modelOverride: getHighContextModelOverride(provider)'), 'reimplementation recipe uses high-context Claude override');
+        ackAssert(fn.includes('reasoningEffort: getHighContextReasoningEffort(provider)'), 'reimplementation recipe uses high-context OpenAI reasoning effort');
     });
 
     ackTest('recipe context includes explicit base checkout metadata', () => {
