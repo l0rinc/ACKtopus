@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.28
+// @version      1.29
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -14036,7 +14036,7 @@ RULES:
             const text = desc.innerHTML;
             let caIdx = 0;
             const replaced = text.replace(
-                /Co-authored-by:\s*([^<&]+?)\s*(?:&lt;|<)\s*([^>&]+?)\s*(?:&gt;|>)/gi,
+                /Co-authored-by:\s*([^\n<&]+?)\s*(?:&lt;|<)\s*([^\n]*?)\s*(?:&gt;|>)/gi,
                 (match, rawName, email) => {
                     const name = rawName.trim();
                     const key = `${name}|${email.trim()}`;
@@ -20346,6 +20346,12 @@ RULES:
         ackAssert(fn.includes('ackCoauthorProcessed'), 'guards against reprocessing');
         ackAssert(fn.includes('<img src='), 'inserts avatar images');
         ackAssert(fn.includes('border-radius:50%'), 'avatars are circular');
+    });
+
+    ackTest('addCoAuthorAvatars tolerates unusual co-author emails in innerHTML replacement', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function addCoAuthorAvatars'), source.indexOf('// --- Inject ---'));
+        ackAssert(fn.includes('[^\\n]*?'), 'replacement regex tolerates unusual email characters until line end');
     });
 
     // --- Security & hardening (source inspection) ---
