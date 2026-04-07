@@ -393,7 +393,7 @@
             fmt: () => {
                 const f = prFileCategories?.fuzz;
                 if (!f?.length) return null;
-                const build = 'cmake --preset=libfuzzer && cmake --build build_fuzz --target fuzz -j';
+                const build = 'cmake --preset=libfuzzer && cmake --build build_fuzz --target fuzz -j1';
                 if (f.length === 1) return `${build} && FUZZ=${f[0]} build_fuzz/bin/fuzz -runs=10000`;
                 return `${build} && for f in ${f.join(' ')}; do FUZZ=$f build_fuzz/bin/fuzz -runs=10000; done`;
             }
