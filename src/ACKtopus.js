@@ -6597,6 +6597,14 @@ Rules:
 
     async function submitPendingReviewViaNativeDialog(pr, {event, body} = {}) {
         if (!pr) throw new Error('not on a PR page');
+        if (!_ackTesting) {
+            console.log('ACKtopus: native submit fallback starting', {
+                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
+                event: String(event || 'COMMENT').toUpperCase(),
+                bodyLen: String(body || '').length,
+                triggerFound: !!findNativeReviewTrigger(),
+            });
+        }
         await openReviewDialog(String(event || 'COMMENT').toUpperCase());
         const dialog = await waitForElement(
             document,
@@ -6605,7 +6613,23 @@ Rules:
             12,
             150,
         );
-        if (!dialog) throw new Error('native submit review dialog not found');
+        if (!dialog) {
+            if (!_ackTesting) {
+                const visibleDialogs = [
+                    ...document.querySelectorAll('details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]'),
+                ].filter(isVisible).map(root => ({
+                    tag: root.tagName,
+                    cls: root.className || '',
+                    text: (root.textContent || '').trim().slice(0, 160),
+                }));
+                console.warn('ACKtopus: native submit review dialog lookup failed', {
+                    pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
+                    event: String(event || 'COMMENT').toUpperCase(),
+                    visibleDialogs,
+                });
+            }
+            throw new Error('native submit review dialog not found');
+        }
         dialog.dataset.ackNativeSubmitHidden = '1';
         dialog.style.visibility = 'hidden';
         try {
@@ -6643,6 +6667,14 @@ Rules:
 
             const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
             if (!submitBtn) throw new Error('native submit review button not found');
+            if (!_ackTesting) {
+                console.log('ACKtopus: native submit review dialog ready', {
+                    event: eventValue,
+                    radioFound: !!radio,
+                    textareaFound: !!reviewBody,
+                    submitText: (submitBtn.textContent || '').trim(),
+                });
+            }
             submitBtn.click();
             return {id: 'native-dialog', state: eventValue};
         } catch (err) {
@@ -6656,6 +6688,12 @@ Rules:
         if (!pr) throw new Error('not on a PR page');
         const pendingRefs = await findPendingReviewRefs(pr);
         const reviewId = Number(pendingRefs?.apiId);
+        if (!_ackTesting) {
+            console.log('ACKtopus: web submit review refs', {
+                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
+                pendingRefs,
+            });
+        }
         if (!Number.isFinite(reviewId) || reviewId <= 0) throw new Error('no pending review id found');
         const csrf = getCsrfToken();
         if (!csrf) throw new Error('missing csrf token');
@@ -6686,6 +6724,14 @@ Rules:
         const tried = [];
         for (const url of [`${baseUrl}/events`, `${baseUrl}/event`]) {
             tried.push(url);
+            if (!_ackTesting) {
+                console.log('ACKtopus: trying web submit review endpoint', {
+                    url,
+                    eventValue,
+                    bodyLen: bodyText.length,
+                    params: params.toString().slice(0, 240),
+                });
+            }
             const resp = await pageFetchWithRetry(pageFetch, url, initFor(url), {
                 label: `submit review web ${url.split('/').pop()}`,
                 attempts: 2,
@@ -6694,8 +6740,15 @@ Rules:
             if (resp.ok) {
                 return {id: reviewId, state: eventValue, method: 'web-events'};
             }
+            const text = await resp.text().catch(() => '');
+            if (!_ackTesting) {
+                console.warn('ACKtopus: web submit review endpoint failed', {
+                    url,
+                    status: resp.status,
+                    body: text.slice(0, 240),
+                });
+            }
             if (![404, 405, 422].includes(resp.status)) {
-                const text = await resp.text().catch(() => '');
                 throw new Error(`web submit HTTP ${resp.status}: ${text.slice(0, 200)}`);
             }
         }
@@ -6713,6 +6766,15 @@ Rules:
         if (meta.nonce && meta.clientVersion) {
             nonce = meta.nonce;
             clientVersion = meta.clientVersion;
+        }
+        if (!_ackTesting) {
+            console.log('ACKtopus: page_data submit review headers', {
+                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
+                eventValue,
+                bodyLen: String(body || '').length,
+                nonce: nonce ? `${nonce.slice(0, 8)}...` : '',
+                clientVersion,
+            });
         }
         if (!nonce || !clientVersion) throw new Error('missing verified-fetch headers');
 
@@ -6738,6 +6800,15 @@ Rules:
         });
         if (!resp.ok) {
             const text = await resp.text().catch(() => '');
+            if (!_ackTesting) {
+                console.warn('ACKtopus: page_data submit review failed', {
+                    url,
+                    status: resp.status,
+                    eventValue,
+                    body: String(body || ''),
+                    response: text.slice(0, 400),
+                });
+            }
             throw new Error(`page_data submit_review HTTP ${resp.status}: ${text.slice(0, 200)}`);
         }
         return {state: 'COMMENTED', method: 'page-data'};
@@ -6751,6 +6822,12 @@ Rules:
         let pendingRefs = null;
         try {
             pendingRefs = await findPendingReviewRefs(pr);
+            if (!_ackTesting) {
+                console.log('ACKtopus: submit review pending refs before REST', {
+                    pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
+                    pendingRefs,
+                });
+            }
             const review = await patApiJson(
                 'POST',
                 `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${number}/reviews/${pendingRefs.apiId}/events`,
