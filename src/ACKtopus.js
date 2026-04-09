@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.29
+// @version      1.30
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2868,7 +2868,7 @@
                 Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
             }),
             body: (model, system, userContent, {reasoningEffort = 'none', maxTokens = 4096} = {}) => ({
-	                model, max_completion_tokens: maxTokens || 4096, reasoning_effort: reasoningEffort || 'none', temperature: 0,
+	                model, max_completion_tokens: maxTokens || 4096, reasoning_effort: reasoningEffort || 'none',
 	                messages: [{role: 'developer', content: system}, {role: 'user', content: userContent}],
 	            }),
             validateBody: (model) => ({
@@ -21312,11 +21312,13 @@ RULES:
         }
     });
 
-    ackTest('LLM requests are deterministic when possible (temperature: 0)', () => {
+    ackTest('LLM requests only set temperature when the provider/model supports it', () => {
         const source = _ackSource;
         const config = source.slice(source.indexOf('const PROVIDER_API'), source.indexOf('// Provider branding'));
         const temps = config.match(/temperature:\s*0/g) || [];
-        ackAssert(temps.length >= 2, `expected temperature: 0 in both providers (found ${temps.length})`);
+        ackAssert(temps.length >= 1, `expected temperature: 0 only where supported (found ${temps.length})`);
+        const openaiBlock = config.slice(config.indexOf('openai:'), config.indexOf('},', config.indexOf('openai:')) + 2);
+        ackAssert(!/temperature:\s*0/.test(openaiBlock), 'openai requests omit unsupported temperature override');
     });
 
     ackTest('callClaude and callOpenAI no longer exist as separate functions', () => {
