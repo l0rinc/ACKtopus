@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.30
+// @version      1.31
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4368,6 +4368,30 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return comments;
     }
 
+    async function fetchIssueCommentsForContext(page) {
+        if (!page) return [];
+        const out = [];
+        for (let pageNum = 1; pageNum <= 10; pageNum++) {
+            let batch = [];
+            try {
+                batch = await gmFetch(`https://api.github.com/repos/${page.owner}/${page.repo}/issues/${page.pr}/comments?per_page=100&page=${pageNum}`);
+            } catch (_) {
+                break;
+            }
+            if (!Array.isArray(batch) || batch.length === 0) break;
+            for (const c of batch) {
+                out.push({
+                    author: c?.user?.login || '?',
+                    date: c?.created_at || '',
+                    markdown: c?.body || '',
+                    permalink: c?.html_url || '',
+                });
+            }
+            if (batch.length < 100) break;
+        }
+        return out;
+    }
+
     // --- Full PR Context Builder ---
     // Gathers everything about a PR into a single markdown document.
     // onProgress(msg) is called with status updates for the UI.
@@ -4442,8 +4466,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // 6. Visible comments
         if (includeComments) {
             onProgress('Gathering comments...');
-            const comments = gatherVisibleComments();
+            const comments = isIssue ? await fetchIssueCommentsForContext(pr) : gatherVisibleComments();
             if (comments.length > 0) {
+                if (isIssue) {
+                    const commentParts = comments.map(c => {
+                        const hdr = `**${c.author}**${c.date ? ` (${c.date})` : ''}:`;
+                        const metaLine = c.permalink ? `* Permalink: ${c.permalink}\n\n` : '\n';
+                        return `${hdr}\n${metaLine}${c.markdown}`;
+                    });
+                    parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+                } else {
                 // Group by thread
                 const threads = new Map(); // threadId -> [comment, ...]
                 const general = []; // non-threaded comments
@@ -4486,6 +4518,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     commentParts.push(`### Thread${loc}${resolved}\n${threadLines}`);
                 }
                 parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+                }
             }
         }
 
@@ -15652,16 +15685,27 @@ RULES:
     // --- cacheKey ---
 
     ackTest('generates correct cache key', () => {
+        const origPageKind = pageKind;
         const pr = {owner: 'bitcoin', repo: 'bitcoin', pr: '123'};
-        // pageKind() returns null in test harness, falls back to 'pull'; model from LLM_MODELS
-        ackEq(cacheKey('claude', pr, 'pr'),
-            `llm_cache_pull_bitcoin_bitcoin_123_claude_${LLM_MODELS.claude}_pr`);
+        try {
+            pageKind = () => 'pull';
+            ackEq(cacheKey('claude', pr, 'pr'),
+                `llm_cache_pull_bitcoin_bitcoin_123_claude_${LLM_MODELS.claude}_pr`);
+        } finally {
+            pageKind = origPageKind;
+        }
     });
 
     ackTest('handles different providers', () => {
+        const origPageKind = pageKind;
         const pr = {owner: 'alice', repo: 'bitcoin', pr: '106'};
-        ackEq(cacheKey('openai', pr, 'commit_abc'),
-            `llm_cache_pull_alice_bitcoin_106_openai_${LLM_MODELS.openai}_commit_abc`);
+        try {
+            pageKind = () => 'pull';
+            ackEq(cacheKey('openai', pr, 'commit_abc'),
+                `llm_cache_pull_alice_bitcoin_106_openai_${LLM_MODELS.openai}_commit_abc`);
+        } finally {
+            pageKind = origPageKind;
+        }
     });
 
     // --- fmtTokens ---
@@ -15951,10 +15995,16 @@ RULES:
     });
 
     ackTest('cacheKey escapes nothing -- relies on clean inputs', () => {
+        const origPageKind = pageKind;
         const pr = {owner: 'a/b', repo: 'c', pr: '1'};
-        const key = cacheKey('x', pr, 'y');
-        // Should just concatenate -- unknown provider 'x' falls back to model 'default'
-        ackEq(key, 'llm_cache_pull_a/b_c_1_x_default_y');
+        try {
+            pageKind = () => 'pull';
+            const key = cacheKey('x', pr, 'y');
+            // Should just concatenate -- unknown provider 'x' falls back to model 'default'
+            ackEq(key, 'llm_cache_pull_a/b_c_1_x_default_y');
+        } finally {
+            pageKind = origPageKind;
+        }
     });
 
     ackTest('fmtTokens handles boundary at exactly 1000', () => {
@@ -21749,6 +21799,13 @@ RULES:
         ackAssert(fn.includes('if (!isIssue && includePatch)'), 'guards patch section for PRs only');
     });
 
+    ackTest('gatherFullPRContext uses issue comments API on issue pages', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
+        ackAssert(fn.includes('fetchIssueCommentsForContext(pr)'), 'issue pages fetch comments from API instead of DOM');
+        ackAssert(fn.includes('const hdr = `**${c.author}**'), 'issue comments are rendered from authoritative API author/date data');
+    });
+
     ackTest('gatherSingleCommitContext focuses on current commit only', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherSingleCommitContext'), source.indexOf('function scrollToAndHighlight'));
@@ -22935,9 +22992,13 @@ RULES:
     ackTest('addSubmitReviewButtonToConversation injects button for pending reviews on the main PR form', () => {
         const origIsConv = isPRConversationPage;
         const origPending = _ackPendingReviewActive;
+        const origHasPendingChanges = hasPendingReviewChanges;
+        const origSyncPending = syncPendingReviewState;
         try {
             isPRConversationPage = () => true;
             _ackPendingReviewActive = true;
+            hasPendingReviewChanges = () => true;
+            syncPendingReviewState = () => {};
 
             const host = document.createElement('div');
             host.style.position = 'absolute';
@@ -22972,6 +23033,8 @@ RULES:
         } finally {
             isPRConversationPage = origIsConv;
             _ackPendingReviewActive = origPending;
+            hasPendingReviewChanges = origHasPendingChanges;
+            syncPendingReviewState = origSyncPending;
             addSubmitReviewButtonToConversation(document);
         }
     });
