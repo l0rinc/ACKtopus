@@ -298,14 +298,6 @@
             fmt: (sha, pr) => `ACK ${sha}`
         },
         {
-            key: 'concept',
-            hotkey: 'c',
-            emoji: '💡',
-            label: 'Concept ACK',
-            tip: 'Copy Concept ACK, agree with the approach, not yet reviewed',
-            fmt: (sha, pr) => `Concept ACK ${sha}`
-        },
-        {
             key: 'fetch',
             hotkey: 's',
             emoji: '🔀',
@@ -15824,11 +15816,6 @@ RULES:
         ackEq(ack.fmt('abc123', {}), 'ACK abc123');
     });
 
-    ackTest('concept format produces correct output', () => {
-        const concept = SHA_FORMATS.find(f => f.key === 'concept');
-        ackEq(concept.fmt('abc123', {}), 'Concept ACK abc123');
-    });
-
     ackTest('fetch format produces correct output', () => {
         const fetch = SHA_FORMATS.find(f => f.key === 'fetch');
         const result = fetch.fmt('abc123', {});
@@ -16506,11 +16493,6 @@ RULES:
         ackAssert(!ack.label.includes('<sha>'), 'ACK label should not contain <sha>');
     });
 
-    ackTest('SHA_FORMATS Concept ACK label does not contain <sha>', () => {
-        const concept = SHA_FORMATS.find(f => f.key === 'concept');
-        ackAssert(!concept.label.includes('<sha>'), 'Concept ACK label should not contain <sha>');
-    });
-
     // --- isProviderAvailable ---
 
     ackTest('isProviderAvailable returns false when no key set', () => {
@@ -17055,11 +17037,6 @@ RULES:
     ackTest('ack format is plain ACK + SHA', () => {
         const f = SHA_FORMATS.find(f => f.key === 'ack');
         ackEq(f.fmt('deadbeef', {}), 'ACK deadbeef');
-    });
-
-    ackTest('concept format is Concept ACK + SHA', () => {
-        const f = SHA_FORMATS.find(f => f.key === 'concept');
-        ackEq(f.fmt('deadbeef', {}), 'Concept ACK deadbeef');
     });
 
     ackTest('rdiff format returns null when no force push', () => {
