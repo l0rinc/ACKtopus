@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.31
+// @version      1.32
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -66,6 +66,7 @@
         'markdown-toolbar.ack-compact-md-toolbar .ActionBar-divider{margin-inline:1px!important}',
 	        'markdown-toolbar.ack-compact-md-toolbar .ack-toolbar-item--dock-right{margin-inline-start:auto!important}',
 	        'markdown-toolbar.ack-compact-md-toolbar .ack-toolbar-item>.Button.Button--iconOnly{min-width:20px!important;min-height:20px!important;padding:0 1px!important}',
+        '.ack-toolbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;margin:6px 0}',
 	        // Diff selection toolbar: keep any overflow chrome hidden
 	        '.ack-diff-selection-btnrow::-webkit-scrollbar{display:none}',
 	        '.ack-diff-selection-btnrow{-ms-overflow-style:none;scrollbar-width:none}',
@@ -4236,8 +4237,53 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         ) || null;
     }
 
+    function getCommentPermalink(container) {
+        const href = getCommentPermalinkEl(container)?.getAttribute?.('href') || '';
+        if (!href) return '';
+        try {
+            return new URL(href, location.href).href;
+        } catch (_) {
+            return href;
+        }
+    }
+
     function getCommentThreadRoot(container) {
         return container?.closest?.(COMMENT_THREAD_SELECTOR) || null;
+    }
+
+    function getCommentThreadId(container, threadRoot = null) {
+        const threadEl = threadRoot || getCommentThreadRoot(container);
+        if (!threadEl) return '';
+        const directId = threadEl.id || threadEl.getAttribute('data-marker-id') || '';
+        if (directId) return directId;
+        const deferredUrl = threadEl.getAttribute('data-deferred-details-content-url')
+            || threadEl.querySelector?.('[data-deferred-details-content-url]')?.getAttribute?.('data-deferred-details-content-url')
+            || '';
+        const deferredMatch = deferredUrl.match(/\/threads\/(\d+)(?:[/?#]|$)/);
+        if (deferredMatch) return `thread-${deferredMatch[1]}`;
+        const permalinkHref = getCommentPermalinkEl(container)?.getAttribute?.('href') || '';
+        const anchorMatch = permalinkHref.match(/#(?:discussion_r\d+|pullrequestreview-\d+)(?:[/?#]|$)/i);
+        return anchorMatch ? anchorMatch[0].slice(1) : '';
+    }
+
+    function getCommentThreadFlags(container, threadRoot = null) {
+        const threadEl = threadRoot || getCommentThreadRoot(container) || container;
+        const labels = [...(threadEl?.querySelectorAll?.('.Label[title], .Label') || [])]
+            .map(el => (el.getAttribute('title') || el.textContent || '').trim().toLowerCase())
+            .filter(Boolean);
+        return {
+            isResolved: !!container.closest('details[data-resolved="true"]'),
+            isOutdated: labels.some(label => /(^|: )outdated$/.test(label) || label === 'outdated'),
+            isPending: labels.some(label => /(^|: )pending$/.test(label) || label === 'pending'),
+        };
+    }
+
+    function formatCommentFlags({isOutdated, isPending, isResolved} = {}) {
+        const flags = [];
+        if (isOutdated) flags.push('outdated');
+        if (isPending) flags.push('pending');
+        if (isResolved) flags.push('resolved');
+        return flags.map(flag => ` [${flag}]`).join('');
     }
 
     function getCommentLocationInfo(container, threadRoot = null) {
@@ -4294,9 +4340,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
 
         if (!commitSha) {
-            const commitLink = threadEl.querySelector?.('a[href*="/commit/"], a[href*="/commits/"], a.ack-commit-badge');
+            const commitLink = threadEl.querySelector?.('a[href*="/commit/"], a[href*="/commits/"], a[href*="/changes/"], a.ack-commit-badge');
             if (commitLink) {
-                const m = commitLink.getAttribute('href')?.match(/\/(?:commit|commits)\/([0-9a-f]{7,40})/);
+                const m = commitLink.getAttribute('href')?.match(/\/(?:commit|commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/);
                 if (m) commitSha = m[1].slice(0, 8);
             }
         }
@@ -4351,11 +4397,22 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
             // Thread detection
             const threadRoot = getCommentThreadRoot(container);
-            const threadId = threadRoot?.id || threadRoot?.getAttribute('data-marker-id') || '';
-            const isResolved = !!container.closest('details[data-resolved="true"]');
+            const threadId = getCommentThreadId(container, threadRoot);
+            const {isResolved, isOutdated, isPending} = getCommentThreadFlags(container, threadRoot);
             const {file, line, commitSha} = getCommentLocationInfo(container, threadRoot);
-
-            comments.push({author, date, markdown, threadId, isResolved, file, line, commitSha});
+            comments.push({
+                author,
+                date,
+                markdown,
+                permalink: getCommentPermalink(container),
+                threadId,
+                isResolved,
+                isOutdated,
+                isPending,
+                file,
+                line,
+                commitSha
+            });
         }
         return comments;
     }
@@ -4491,7 +4548,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 // General comments first
                 for (const c of general) {
                     const datePart = c.date ? ` (${c.date})` : '';
-                    commentParts.push(`**${c.author}**${datePart}${fmtLoc(c)}:\n${c.markdown}`);
+                    const metaLines = [];
+                    if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
+                    if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
+                    commentParts.push(
+                        [`**${c.author}**${datePart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n')
+                    );
                 }
                 // Then threaded comments
                 for (const [tid, thread] of threads) {
@@ -4502,12 +4564,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         if (first.line) loc += ':' + first.line;
                         if (first.commitSha) loc += '@' + first.commitSha;
                     }
-                    const resolved = first.isResolved ? ' [resolved]' : '';
+                    const threadMeta = [];
+                    if (first.threadId) threadMeta.push(`* Thread: ${first.threadId}`);
+                    if (first.permalink) threadMeta.push(`* Permalink: ${first.permalink}`);
                     const threadLines = thread.map(c => {
                         const datePart = c.date ? ` (${c.date})` : '';
                         return `> **${c.author}**${datePart}:\n> ${c.markdown.replace(/\n/g, '\n> ')}`;
                     }).join('\n>\n');
-                    commentParts.push(`### Thread${loc}${resolved}\n${threadLines}`);
+                    commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
                 }
                 parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
                 }
@@ -4594,7 +4658,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const commentParts = [];
             for (const c of general) {
                 const datePart = c.date ? ` (${c.date})` : '';
-                commentParts.push(`**${c.author}**${datePart}${fmtLoc(c)}:\n${c.markdown}`);
+                const metaLines = [];
+                if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
+                if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
+                commentParts.push(
+                    [`**${c.author}**${datePart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n')
+                );
             }
             for (const [tid, thread] of threads) {
                 const first = thread[0];
@@ -4604,12 +4673,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     if (first.line) loc += ':' + first.line;
                     if (first.commitSha) loc += '@' + first.commitSha;
                 }
-                const resolved = first.isResolved ? ' [resolved]' : '';
+                const threadMeta = [];
+                if (first.threadId) threadMeta.push(`* Thread: ${first.threadId}`);
+                if (first.permalink) threadMeta.push(`* Permalink: ${first.permalink}`);
                 const threadLines = thread.map(c => {
                     const datePart = c.date ? ` (${c.date})` : '';
                     return `> **${c.author}**${datePart}:\n> ${c.markdown.replace(/\n/g, '\n> ')}`;
                 }).join('\n>\n');
-                commentParts.push(`### Thread${loc}${resolved}\n${threadLines}`);
+                commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
             }
             parts.push(`## Visible Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
         }
@@ -6086,7 +6157,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            // Toolbar proofread (for drafting new comments): use the textarea
 	            // associated with this markdown toolbar.
 	            const toolbar = commentEl.closest(
-	                'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]'
+	                'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"], .ack-toolbar-actions'
 	            );
 	            const editorRoot =
 	                toolbar?.closest(
@@ -11089,9 +11160,10 @@ Rules:
             namesText = namesText.replace(/,\s+and\s+/g, ', ');
             namesText = namesText.replace(/\s+and\s+/g, ', ');
             const names = namesText.split(/,\s*/).map(s => s.trim()).filter(Boolean);
+            const avatarSrc = li.querySelector('img[src], [data-testid="avatar-link"] img[src]')?.getAttribute('src') || '';
             result[alias] = names.map(login => ({
                 login,
-                avatar: `https://github.com/${login}.png?size=32`,
+                avatar: avatarSrc,
             }));
         }
         return Object.keys(result).length > 0 ? result : null;
@@ -11118,20 +11190,33 @@ Rules:
             // Primary: parse from page (no API call, no rate limit)
             let reactorsByAlias = getReactorsFromPage(container);
 
-            // Fallback: API (may be rate-limited)
-            if (!reactorsByAlias) {
+            const needsAvatarEnrichment = reactorsByAlias && Object.values(reactorsByAlias).some(users =>
+                (users || []).some(user => !user?.avatar)
+            );
+
+            // Fallback/enrichment: API (may be rate-limited)
+            if (!reactorsByAlias || needsAvatarEnrichment) {
                 const pr = parsePR();
                 if (pr) {
                     const meta = getCommentReactionMeta(btns[0]);
                     if (meta) {
                         const apiResult = await fetchCommentReactors(pr.owner, pr.repo, pr.pr, meta);
-                        // Convert API content keys to DOM aliases
-                        reactorsByAlias = {};
+                        const next = reactorsByAlias ? {...reactorsByAlias} : {};
                         for (const [apiKey, users] of Object.entries(apiResult)) {
                             // Find the DOM alias that maps to this API key
                             const domAlias = Object.entries(DOM_TO_API_CONTENT).find(([, v]) => v === apiKey)?.[0] || apiKey;
-                            reactorsByAlias[domAlias] = users.map(u => ({login: u.login, avatar: u.avatar}));
+                            const apiUsers = users.map(u => ({login: u.login, avatar: u.avatar}));
+                            if (!next[domAlias]?.length) {
+                                next[domAlias] = apiUsers;
+                                continue;
+                            }
+                            const avatarByLogin = new Map(apiUsers.map(u => [String(u.login || '').toLowerCase(), u.avatar || '']));
+                            next[domAlias] = next[domAlias].map(u => ({
+                                login: u.login,
+                                avatar: u.avatar || avatarByLogin.get(String(u.login || '').toLowerCase()) || '',
+                            }));
                         }
+                        reactorsByAlias = next;
                     }
                 }
             }
@@ -11149,6 +11234,8 @@ Rules:
                 if (!countEl) continue;
                 const count = parseInt(countEl.textContent.trim(), 10);
                 if (!count || count > 9) continue;
+                const visibleUsers = users.slice(0, count);
+                if (visibleUsers.some(u => !u?.avatar)) continue;
 
                 // Build overlapping avatar row
                 const row = document.createElement('span');
@@ -11156,16 +11243,16 @@ Rules:
                 Object.assign(row.style, {
                     display: 'inline-flex', alignItems: 'center', marginLeft: '2px',
                 });
-                for (let i = 0; i < Math.min(users.length, count); i++) {
+                for (let i = 0; i < visibleUsers.length; i++) {
                     const img = document.createElement('img');
-                    img.src = users[i].avatar;
-                    img.alt = users[i].login;
-                    img.title = users[i].login;
+                    img.src = visibleUsers[i].avatar;
+                    img.alt = visibleUsers[i].login;
+                    img.title = visibleUsers[i].login;
                     Object.assign(img.style, {
                         width: '14px', height: '14px', borderRadius: '50%',
                         border: '1px solid #30363d', marginLeft: i === 0 ? '0' : '-4px',
                         verticalAlign: 'middle', position: 'relative',
-                        zIndex: String(users.length - i),
+                        zIndex: String(visibleUsers.length - i),
                     });
                     row.appendChild(img);
                 }
@@ -11188,6 +11275,13 @@ Rules:
     const WAND_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="m9.75 2.25.35 1.05a1 1 0 0 0 .63.63l1.05.35-1.05.35a1 1 0 0 0-.63.63l-.35 1.05-.35-1.05a1 1 0 0 0-.63-.63l-1.05-.35 1.05-.35a1 1 0 0 0 .63-.63Z"/><path d="m5.1 6.4 4.5 4.5"/><path d="m3.25 12.75 1.2-3.05 1.85-1.85 1.85 1.85-1.85 1.85Z"/></svg>`;
 
 	    function getToolbarEditorRoot(toolbar) {
+            if (toolbar?.classList?.contains('ack-toolbar-actions')) {
+                return toolbar.closest(
+                    'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
+                    '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
+                    'form.js-comment-update, [data-testid="edit-comment-form"], form'
+                ) || toolbar.parentElement || null;
+            }
 	        return toolbar?.closest(
 	            'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
 	            '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
@@ -11538,7 +11632,8 @@ RULES:
         }
 
 		    function addDetailsButtons(root = document) {
-		        qsa(root, 'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]').forEach(toolbar => {
+                const toolbarSelector = 'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]';
+		        qsa(root, toolbarSelector).forEach(toolbar => {
 		            // GitHub CSS modules can produce unrelated classes like
 		            // `PullRequestFilesToolbar-module__toolbar__...` which still contain the
 		            // substring `Toolbar-module__toolbar`. Only inject into toolbars that are
@@ -11664,6 +11759,66 @@ RULES:
                 bindToolbarProofreadState(toolbar);
                 updateToolbarProofreadButton(toolbar);
 	        });
+
+                qsa(root, 'form.js-comment-update, [data-testid="edit-comment-form"]').forEach(form => {
+                    const usableToolbar = [...qsa(form, toolbarSelector)].find(tb => tb !== form && isVisible(tb) && !!getToolbarTextarea(tb));
+                    const existingRow = form.querySelector('.ack-toolbar-actions');
+                    const textarea = [...form.querySelectorAll('textarea')].find(isVisible)
+                        || form.querySelector('textarea');
+                    if (!textarea || usableToolbar) {
+                        existingRow?.remove();
+                        return;
+                    }
+
+                    const row = existingRow || document.createElement('div');
+                    row.className = 'ack-toolbar-actions';
+                    if (!existingRow) {
+                        const anchor = form.querySelector('.comment-form-error, .js-comment-update-error');
+                        if (anchor?.parentElement) anchor.insertAdjacentElement('afterend', row);
+                        else textarea.parentElement?.insertBefore(row, textarea);
+                    }
+
+                    const ensureBtn = (selector, className, html, title, handler) => {
+                        let btn = row.querySelector(selector);
+                        if (btn) return btn;
+                        btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.className = className;
+                        btn.innerHTML = html;
+                        btn.title = title;
+                        Object.assign(btn.style, {
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            padding: '2px 5px',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '14px',
+                            opacity: '0.6',
+                            lineHeight: '1',
+                            color: 'inherit',
+                        });
+                        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
+                        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.6'; });
+                        btn.addEventListener('click', e => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handler(btn);
+                        });
+                        row.appendChild(btn);
+                        return btn;
+                    };
+
+                    ensureBtn('.ack-details-btn', 'ack-details-btn', FOLD_ICON,
+                        'Wrap selection in collapsible <details> (auto-detects code blocks)',
+                        () => wrapSelectionInDetails(row));
+                    ensureBtn('.ack-toolbar-proofread', 'ack-toolbar-proofread', PROOFREAD_ICON,
+                        'Proofread this comment',
+                        (btn) => runProofreadOnComment(btn));
+                    bindToolbarProofreadState(row);
+                    updateToolbarProofreadButton(row);
+                });
 	    }
 
     function wrapSelectionInDetails(toolbar) {
@@ -15801,7 +15956,6 @@ RULES:
     ackTest('has expected format keys', () => {
         const keys = SHA_FORMATS.map(f => f.key);
         ackAssert(keys.includes('ack'), 'missing ack');
-        ackAssert(keys.includes('concept'), 'missing concept');
         ackAssert(keys.includes('fetch'), 'missing fetch');
         ackAssert(keys.includes('ghco'), 'missing ghco');
         ackAssert(keys.includes('rdiff'), 'missing rdiff');
@@ -16993,13 +17147,13 @@ RULES:
     // SHA_FORMATS -- all formats
     // ============================================================================
 
-	    ackTest('SHA_FORMATS has exactly 13 formats', () => {
-	        ackEq(SHA_FORMATS.length, 13);
+	    ackTest('SHA_FORMATS has exactly 12 formats', () => {
+	        ackEq(SHA_FORMATS.length, 12);
 	    });
 
-	    ackTest('SHA_FORMATS keys are ack, concept, fetch, ghco, rdiff, rebasediff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
+	    ackTest('SHA_FORMATS keys are ack, fetch, ghco, rdiff, rebasediff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
 	        const keys = SHA_FORMATS.map(f => f.key);
-	        ackDeepEq(keys, ['ack', 'concept', 'fetch', 'ghco', 'rdiff', 'rebasediff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
+	        ackDeepEq(keys, ['ack', 'fetch', 'ghco', 'rdiff', 'rebasediff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
 	    });
 
     ackTest('all SHA_FORMATS have key, emoji, label, tip, fmt', () => {
@@ -18321,7 +18475,6 @@ RULES:
     ackTest('SHA_FORMATS entries have hardcoded hotkey letters', () => {
         const hotkeys = {
             ack: 'a',
-            concept: 'c',
             fetch: 's',
             ghco: 'g',
             rdiff: 'r',
@@ -18585,11 +18738,20 @@ RULES:
         const rocket = result.rocket?.map(x => x.login) || [];
         ackAssert(rocket.includes('kaloudis'), 'should include last username without "and " prefix');
         ackAssert(!rocket.some(x => x.startsWith('and ')), 'should not include "and <user>" tokens');
-        ackEq(result.rocket.find(x => x.login === 'kaloudis')?.avatar, 'https://github.com/kaloudis.png?size=32');
+        ackEq(result.rocket.find(x => x.login === 'kaloudis')?.avatar, '', 'does not fabricate avatar URLs from login names');
 
         const plusOne = result['+1']?.map(x => x.login) || [];
         ackAssert(plusOne.includes('k0ns0l'), 'should include usernames before truncation');
         ackAssert(!plusOne.some(x => x.includes('more')), 'should drop "and N more" truncation token');
+    });
+
+    ackTest('expandReactionAvatars enriches DOM-parsed usernames with API avatars before rendering', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function expandReactionAvatars'), source.indexOf('// --- Collapsible <details> Button'));
+        ackAssert(fn.includes('needsAvatarEnrichment'), 'detects DOM-parsed users lacking avatar URLs');
+        ackAssert(fn.includes('avatarByLogin'), 'merges API avatar URLs back into DOM-parsed usernames');
+        ackAssert(fn.includes('if (visibleUsers.some(u => !u?.avatar)) continue;'),
+            'leaves native count intact instead of rendering broken image URLs');
     });
 
     ackTest('reaction avatars are overlapping with z-index stacking', () => {
@@ -18743,6 +18905,30 @@ RULES:
 	        ackAssert(html.includes('<svg'), 'edit-mode proofread uses shared SVG icon');
 	        ackAssert(!html.includes('📝'), 'edit-mode proofread does not use emoji icon');
 	    });
+
+        ackTest('addDetailsButtons adds fallback edit action row when no usable toolbar exists', () => {
+            const root = document.createElement('div');
+            root.innerHTML = `
+              <form class="js-comment-update">
+                <div class="comment-form-error"></div>
+                <textarea>nit: wording</textarea>
+              </form>
+            `;
+            addDetailsButtons(root);
+            const row = root.querySelector('.ack-toolbar-actions');
+            ackAssert(!!row, 'fallback action row injected for edit form without toolbar');
+            ackAssert(!!row.querySelector('.ack-toolbar-proofread'), 'fallback row includes proofread button');
+            ackAssert(!!row.querySelector('.ack-details-btn'), 'fallback row includes details button');
+        });
+
+        ackTest('toolbar proofread path accepts fallback edit action rows', () => {
+            const source = _ackSource;
+            const fn = source.slice(source.indexOf('async function runProofreadOnComment'), source.indexOf('// --- Start a review ---'));
+            ackAssert(fn.includes('.ack-toolbar-actions'), 'proofread toolbar lookup includes fallback action rows');
+            const helper = source.slice(source.indexOf('function getToolbarEditorRoot'), source.indexOf('function getToolbarTextarea'));
+            ackAssert(helper.includes("toolbar?.classList?.contains('ack-toolbar-actions')"),
+                'fallback action rows resolve to the surrounding edit form');
+        });
 
     ackTest('addCommitListExplainButtons guard checks c.el, inserts inside c.el subtree', () => {
         // Guard: c.el.querySelector('.ack-commit-explain')
@@ -21747,6 +21933,9 @@ RULES:
         ackAssert(fn.includes("nothing to preview"), 'skips preview placeholders');
         ackAssert(fn.includes("data-resolved"), 'checks resolved thread state');
         ackAssert(fn.includes("!resolvedDetails.hasAttribute('open')"), 'skips collapsed resolved threads');
+        ackAssert(fn.includes('getCommentPermalink(container)'), 'captures absolute comment permalink');
+        ackAssert(fn.includes('getCommentThreadId(container, threadRoot)'), 'derives stable thread IDs from modern thread wrappers');
+        ackAssert(fn.includes('getCommentThreadFlags(container, threadRoot)'), 'captures outdated/pending/resolved thread flags');
     });
 
     ackTest('gatherFullPRContext fetches PR URL, title, description, commits, patch, comments', () => {
@@ -21806,7 +21995,9 @@ RULES:
         ackAssert(helper.includes('allLineNums[allLineNums.length - 1]'), 'uses last diff line number');
         ackAssert(helper.includes('shaMatch[1].slice(0, 8)'), 'truncates file-link SHA to 8 chars');
         ackAssert(helper.includes('js-resolvable-timeline-thread-container'), 'includes conversation tab thread wrapper');
-        ackAssert(helper.includes('a[href*="/commit/"], a[href*="/commits/"], a.ack-commit-badge'), 'reads commit from commit links or badge');
+        ackAssert(helper.includes('a[href*="/commit/"], a[href*="/commits/"], a[href*="/changes/"], a.ack-commit-badge'),
+            'reads commit from commit links, conversation changes links, or badge');
+        ackAssert(helper.includes('a[href*="/changes/"]'), 'also reads commit SHA from conversation-thread /changes links');
 
         const fn = source.slice(source.indexOf('function gatherVisibleComments'), source.indexOf('function gatherFullPRContext'));
         ackAssert(fn.includes('getCommentLocationInfo(container, threadRoot)'), 'gatherVisibleComments uses shared location helper');
@@ -21824,8 +22015,10 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
         ackAssert(fn.includes("threads.set(c.threadId, [])"), 'groups by threadId');
-        ackAssert(fn.includes('[resolved]'), 'labels resolved threads');
         ackAssert(fn.includes('### Thread'), 'uses thread headers');
+        ackAssert(fn.includes('formatCommentFlags(first)'), 'labels outdated/pending/resolved thread state');
+        ackAssert(fn.includes('Permalink: ${first.permalink}') || fn.includes('Permalink: ${c.permalink}'),
+            'includes comment permalink metadata');
     });
 
     ackTest('getEditFormRequest prefers local edit fragment over unrelated earlier one', () => {
