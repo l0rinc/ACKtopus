@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.32
+// @version      1.33
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -904,6 +904,38 @@
         return null;
     }
 
+    async function resolveFullCommitSha(pr, sha) {
+        const raw = String(sha || '').trim();
+        if (!raw) return '';
+        if (/^[0-9a-f]{40}$/i.test(raw)) return raw;
+
+        const pageMatch = parseCommitsFromPage().find(c => {
+            const full = String(c?.sha || '').trim();
+            return /^[0-9a-f]{40}$/i.test(full) && (full.startsWith(raw) || raw.startsWith(full));
+        });
+        if (pageMatch?.sha) return pageMatch.sha;
+
+        if (pr) {
+            try {
+                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+                const apiMatch = commits.find(c => {
+                    const full = String(c?.sha || c?.oid || '').trim();
+                    return /^[0-9a-f]{40}$/i.test(full) && (full.startsWith(raw) || raw.startsWith(full));
+                });
+                if (apiMatch?.sha) return apiMatch.sha;
+                if (apiMatch?.oid) return apiMatch.oid;
+            } catch (_) {
+            }
+            try {
+                const commit = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/commits/${raw}`);
+                if (/^[0-9a-f]{40}$/i.test(String(commit?.sha || ''))) return commit.sha;
+            } catch (_) {
+            }
+        }
+
+        return raw;
+    }
+
     // Single authoritative textarea setter -- React-compatible via native property
     // descriptor. All code that writes to a textarea value MUST use this helper
     // (or insertIntoTextarea which calls it) to avoid React state desync.
@@ -1069,7 +1101,12 @@
         const pr = parsePR();
         const immediateSha = getImmediatePRHeadSHA();
         if (immediateSha && pr) {
-            const text = getFormat().fmt(immediateSha, pr);
+            const fmt = getFormat();
+            const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
+            if (compareFmt && userAckSha && userAckSha.length < 40) {
+                userAckSha = await resolveFullCommitSha(pr, userAckSha);
+            }
+            const text = fmt.fmt(immediateSha, pr);
             if (text) {
                 GM_setClipboard(text);
                 mainBtn.innerHTML = `${CHECK_ICON}`;
@@ -1086,7 +1123,12 @@
         await waitForNextPaint();
         try {
             const sha = await fetchSHA();
-            const text = sha && pr ? getFormat().fmt(sha, pr) : null;
+            const fmt = getFormat();
+            const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
+            if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
+                userAckSha = await resolveFullCommitSha(pr, userAckSha);
+            }
+            const text = sha && pr ? fmt.fmt(sha, pr) : null;
             stopSpin();
             if (text) {
                 // Clipboard-only: never auto-insert into any active text field.
@@ -2482,7 +2524,13 @@
             const bodyEl = container.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!bodyEl) continue;
             const m = bodyEl.textContent.match(ackShaRe);
-            if (m) foundSha = m[1]; // keep scanning -- last one wins (chronological)
+            if (m) {
+                const linkedFullSha = [...bodyEl.querySelectorAll('a[href*="/commit/"], a[href*="/commits/"]')]
+                    .map(a => a.getAttribute('href') || '')
+                    .map(href => href.match(/\/commits?\/([0-9a-f]{40})(?:[/?#]|$)/i)?.[1] || '')
+                    .find(full => full && (full.startsWith(m[1]) || m[1].startsWith(full)));
+                foundSha = linkedFullSha || m[1]; // keep scanning -- last one wins (chronological)
+            }
         }
         if (foundSha) {
             console.log('ACKtopus: found user ACK SHA from page:', foundSha);
@@ -2499,8 +2547,12 @@
                     const bodyEl = container?.querySelector(MARKDOWN_BODY_SELECTOR);
                     const m = bodyEl?.textContent?.match(ackShaRe);
                     if (m) {
-                        console.log('ACKtopus: found user ACK SHA from fragment:', m[1]);
-                        return m[1];
+                        const linkedFullSha = [...(bodyEl?.querySelectorAll?.('a[href*="/commit/"], a[href*="/commits/"]') || [])]
+                            .map(a => a.getAttribute('href') || '')
+                            .map(href => href.match(/\/commits?\/([0-9a-f]{40})(?:[/?#]|$)/i)?.[1] || '')
+                            .find(full => full && (full.startsWith(m[1]) || m[1].startsWith(full)));
+                        console.log('ACKtopus: found user ACK SHA from fragment:', linkedFullSha || m[1]);
+                        return linkedFullSha || m[1];
                     }
                 }
             }
@@ -20246,6 +20298,7 @@ RULES:
         ackAssert(fn.includes('.author'), 'filters by author');
         ackAssert(fn.includes('foundSha = m[1]'), 'takes last match (chronological)');
         ackAssert(fn.includes('CSS.escape'), 'safely handles fragment navigation');
+        ackAssert(fn.includes('a[href*="/commit/"], a[href*="/commits/"]'), 'prefers full linked commit SHAs when present in ACK comment body');
     });
 
     ackTest('userAckSha is reset on PR change and enables rdiff visibility', () => {
@@ -20261,6 +20314,13 @@ RULES:
         ackAssert(injectFn.includes('userAckSha.length < 40'), 'detects short SHA');
         ackAssert(injectFn.includes('/commits/'), 'resolves via commits API');
         ackAssert(injectFn.includes('commit.sha'), 'extracts full SHA from response');
+    });
+
+    ackTest('copySHA resolves short userAckSha before rdiff/rebasediff output', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
+        ackAssert(fn.includes("fmt.key === 'rdiff' || fmt.key === 'rebasediff'"), 'special-cases compare commands');
+        ackAssert(fn.includes('resolveFullCommitSha(pr, userAckSha)'), 'resolves short last-ACK SHAs before building compare commands');
     });
 
     ackTest('DOM force push SHA extraction requires 40-char hex in href', () => {
@@ -20916,10 +20976,18 @@ RULES:
 
     ackTest('fetchSHA uses gmFetch instead of bare fetch', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function fetchSHA'), source.indexOf('function setTextareaValue'));
+        const fn = source.slice(source.indexOf('async function fetchSHA'), source.indexOf('async function resolveFullCommitSha'));
         ackAssert(fn.includes('getImmediatePRHeadSHA()'), 'checks immediate authoritative head SHA before network');
         ackAssert(fn.includes('gmFetch'), 'uses gmFetch for authenticated request');
         ackAssert(!fn.includes('await fetch('), 'no bare fetch to api.github.com');
+    });
+
+    ackTest('resolveFullCommitSha expands short SHAs before compare commands are built', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function resolveFullCommitSha'), source.indexOf('function setTextareaValue'));
+        ackAssert(fn.includes('parseCommitsFromPage()'), 'tries full SHAs already visible on the page');
+        ackAssert(fn.includes('fetchCommitList'), 'falls back to PR commit list');
+        ackAssert(fn.includes('/commits/${raw}'), 'falls back to commit API lookup');
     });
 
     ackTest('getImmediatePRHeadSHA only uses cached or SSR PR head SHA', () => {
