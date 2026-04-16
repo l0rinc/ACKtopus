@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.35
+// @version      1.36
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -5038,6 +5038,42 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return gatherFullPRContext(onProgress, {includePatch: true, includeComments: false});
     }
 
+    async function getRecipeCheckoutMeta(pr) {
+        if (!pr) return {};
+        const meta = {};
+        try {
+            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+            if (prData?.base?.ref) meta.baseRef = prData.base.ref;
+            if (prData?.head?.sha) meta.headSha = prData.head.sha;
+            if (prData?.head?.ref) meta.headRef = prData.head.ref;
+            if (prData?.html_url) meta.prUrl = prData.html_url;
+            if (prData?.base?.sha) meta.apiBaseSha = prData.base.sha;
+        } catch (_) {
+        }
+
+        try {
+            const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+            const firstCommit = commits[0] || null;
+            const firstSha = String(firstCommit?.sha || firstCommit?.oid || '').trim();
+            if (firstSha) meta.firstCommitSha = firstSha;
+            const firstParent = String(firstCommit?.parents?.[0]?.sha || '').trim();
+            if (firstParent) {
+                meta.baseSha = firstParent;
+            } else if (firstSha) {
+                try {
+                    const commit = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/commits/${firstSha}`);
+                    const parentSha = String(commit?.parents?.[0]?.sha || '').trim();
+                    if (parentSha) meta.baseSha = parentSha;
+                } catch (_) {
+                }
+            }
+        } catch (_) {
+        }
+
+        if (!meta.baseSha && meta.apiBaseSha) meta.baseSha = meta.apiBaseSha;
+        return meta;
+    }
+
     async function gatherSingleCommitPatchContext(onProgress = () => {}) {
         const pr = parsePR();
         if (!pr) return '';
@@ -5063,11 +5099,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!pr) return '';
         let meta = [];
         try {
-            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
-            if (prData?.base?.sha) meta.push(`Base commit: \`${prData.base.sha}\``);
-            if (prData?.base?.ref) meta.push(`Base branch: \`${prData.base.ref}\``);
-            if (prData?.head?.sha) meta.push(`Head commit: \`${prData.head.sha}\``);
-            if (prData?.head?.ref) meta.push(`Head branch: \`${prData.head.ref}\``);
+            const checkout = await getRecipeCheckoutMeta(pr);
+            if (checkout.baseSha) meta.push(`Base commit: \`${checkout.baseSha}\``);
+            if (checkout.baseRef) meta.push(`Base branch: \`${checkout.baseRef}\``);
+            if (checkout.headSha) meta.push(`Head commit: \`${checkout.headSha}\``);
+            if (checkout.headRef) meta.push(`Head branch: \`${checkout.headRef}\``);
+            if (checkout.prUrl) meta.push(`PR URL: \`${checkout.prUrl}\``);
         } catch (_) {
         }
         const context = await gatherFullPRContext(onProgress, {includePatch: true, includeComments: true});
@@ -24462,6 +24499,11 @@ RULES:
         ackAssert(fn.includes('Base branch:'), 'includes base branch');
         ackAssert(fn.includes('Head commit:'), 'includes head commit');
         ackAssert(fn.includes('Head branch:'), 'includes head branch');
+        ackAssert(fn.includes('getRecipeCheckoutMeta(pr)'), 'uses dedicated checkout metadata helper');
+        const helper = source.slice(source.indexOf('async function getRecipeCheckoutMeta'), source.indexOf('async function gatherSingleCommitPatchContext'));
+        ackAssert(helper.includes('fetchCommitList(pr.owner, pr.repo, pr.pr)'), 'reads the PR commit series');
+        ackAssert(helper.includes('firstCommit?.parents?.[0]?.sha'), 'derives base commit from the parent of the first commit');
+        ackAssert(helper.includes('/commits/${firstSha}'), 'falls back to commit API when the list lacks parent data');
         ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
         ackAssert(fn.includes('includePatch: true'), 'recipe context keeps raw patch details');
         ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
