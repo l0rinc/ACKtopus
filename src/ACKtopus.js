@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.33
+// @version      1.34
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1580,7 +1580,21 @@
             // After the success message fades, recheck -- disable if nothing left
             setTimeout(() => {
                 const {paginationBtns, minimized, outdated, loadDiffs} = getLoadableElements();
-                if (getHiddenCount() + paginationBtns.length + minimized.length + outdated.length + loadDiffs.length === 0) {
+                const hiddenRemaining = getHiddenCount() + paginationBtns.length + minimized.length + outdated.length + loadDiffs.length;
+                const resolvedRemaining = getCollapsedResolved().length;
+                if (hiddenRemaining === 0 && resolvedRemaining > 0) {
+                    GM_setValue('expandToolbarAction', 'resolved');
+                    btn.textContent = compact ? '📂' : '📂 Show resolved';
+                    btn.title = 'Expand all resolved review threads';
+                    btn.disabled = false;
+                    Object.assign(btn.style, {opacity: '', cursor: ''});
+                } else if (hiddenRemaining === 0 && getCollapsedSectionCount() > 0) {
+                    GM_setValue('expandToolbarAction', 'collapsed');
+                    btn.textContent = compact ? '🪟' : '🪟 Open collapsed';
+                    btn.title = 'Expand minimized comments, outdated collapsed threads, and load-diff sections';
+                    btn.disabled = false;
+                    Object.assign(btn.style, {opacity: '', cursor: ''});
+                } else if (hiddenRemaining === 0) {
                     btn.textContent = compact ? '📦' : '📦 Show hidden';
                     btn.disabled = true;
                     Object.assign(btn.style, {opacity: '0.35', cursor: 'default'});
@@ -1616,6 +1630,25 @@
                 el: b.closest('[data-marker-id]') || container,
                 click: () => b.click(),
                 isDone: () => !!b.querySelector('.octicon-chevron-down'),
+            });
+        });
+        // Conversation page React UI: <review-thread-collapsible data-resolved="true">
+        document.querySelectorAll('[data-resolved="true"]').forEach(container => {
+            if (container.matches('details')) return;
+            const toggleBtn =
+                container.querySelector('button[data-target="review-thread-collapsible.button"][aria-expanded="false"]')
+                || container.querySelector('.review-thread-show-text');
+            if (!toggleBtn) return;
+            const body = container.querySelector('[data-target="review-thread-collapsible.body"]');
+            items.push({
+                el: container,
+                click: () => toggleBtn.click(),
+                isDone: () => {
+                    const expanded = toggleBtn.getAttribute('aria-expanded');
+                    if (expanded === 'true') return true;
+                    if (body && !body.hasAttribute('hidden')) return true;
+                    return false;
+                },
             });
         });
         return items;
@@ -14851,7 +14884,12 @@ RULES:
             },
         ];
         let selectedExpandAction = GM_getValue('expandToolbarAction', 'hidden');
-        const getExpandAction = () => EXPAND_ACTIONS.find(a => a.key === selectedExpandAction) || EXPAND_ACTIONS[0];
+        const syncSelectedExpandAction = () => {
+            const stored = GM_getValue('expandToolbarAction', selectedExpandAction);
+            if (EXPAND_ACTIONS.some(a => a.key === stored)) selectedExpandAction = stored;
+            return selectedExpandAction;
+        };
+        const getExpandAction = () => EXPAND_ACTIONS.find(a => a.key === syncSelectedExpandAction()) || EXPAND_ACTIONS[0];
         const expandGroup = document.createElement('div');
         Object.assign(expandGroup.style, {display: 'flex', position: 'relative'});
         const expandMainBtn = createBtn('', function () {
@@ -14918,11 +14956,13 @@ RULES:
         updateExpandMainBtn();
         expandDropBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            const activeKey = syncSelectedExpandAction();
             [...expandMenu.children].forEach(item => {
                 const act = EXPAND_ACTIONS.find(a => a.key === item.dataset.ackExpandKey);
                 if (!act) return;
                 item.textContent = `${act.emoji} ${act.label}${act.count() > 0 ? ` (${act.count()})` : ''}`;
                 item.style.opacity = act.count() > 0 ? '1' : '0.45';
+                item.style.background = act.key === activeKey ? '#30363d' : 'transparent';
             });
             expandMenu.style.display = expandMenu.style.display === 'none' ? 'block' : 'none';
         });
@@ -18817,7 +18857,7 @@ RULES:
     ackTest('reaction avatars only shown for counts <= 9', () => {
         const source = _ackSource;
         ackAssert(source.includes('count > 9) continue'), 'skips counts over 9');
-        ackAssert(source.includes('Math.min(users.length, count)'), 'caps at count');
+        ackAssert(source.includes('const visibleUsers = users.slice(0, count)'), 'caps rendered avatars at count');
     });
 
 	    ackTest('addDetailsButtons injects fold/proofread into markdown-toolbar ActionBar', () => {
@@ -19771,15 +19811,17 @@ RULES:
         ackAssert(showResolvedFn.includes('startSpin(btn)'), 'uses startSpin overlay in compact');
     });
 
-    ackTest('showHidden disables button after successful completion', () => {
+    ackTest('showHidden promotes main action to resolved or collapsed before disabling', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function showHidden'), source.indexOf('async function showResolved'));
         ackAssert(fn.includes("finish('✓ all loaded'"), 'has success finish call');
-        // After success, rechecks counts and disables if nothing left
+        // After success, rechecks counts and either promotes to the next action or disables if nothing is left
         const afterSuccess = fn.slice(fn.indexOf("finish('✓ all loaded'"));
-        ackAssert(afterSuccess.includes('btn.disabled = true'), 'disables button after success');
         ackAssert(afterSuccess.includes('getLoadableElements()'), 'rechecks loadable elements');
-        ackAssert(afterSuccess.includes("opacity: '0.35'"), 'dims the button');
+        ackAssert(afterSuccess.includes('getCollapsedResolved()'), 'checks for newly revealed resolved threads');
+        ackAssert(afterSuccess.includes("GM_setValue('expandToolbarAction', 'resolved')"), 'promotes to resolved when available');
+        ackAssert(afterSuccess.includes("GM_setValue('expandToolbarAction', 'collapsed')"), 'promotes to collapsed when available');
+        ackAssert(afterSuccess.includes('btn.disabled = true'), 'still disables button when nothing remains');
     });
 
     ackTest('showResolved disables button after successful completion', () => {
@@ -19793,6 +19835,16 @@ RULES:
         ackAssert(fn.includes("finish('✓ all visible'"), 'handles nothing-to-do case');
         const earlyReturn = fn.slice(fn.indexOf("finish('✓ all visible'"), fn.indexOf("finish('✓ all shown'"));
         ackAssert(earlyReturn.includes('btn.disabled = true'), 'disables on early return too');
+    });
+
+    ackTest('getCollapsedResolved handles modern conversation review-thread-collapsible markup', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function getCollapsedResolved'), source.indexOf('async function showResolved'));
+        ackAssert(fn.includes('button[data-target="review-thread-collapsible.button"][aria-expanded="false"]'),
+            'detects collapsed resolved conversation threads in modern React markup');
+        ackAssert(fn.includes('[data-target="review-thread-collapsible.body"]'),
+            'checks the lazily revealed thread body visibility');
+        ackAssert(fn.includes(".review-thread-show-text"), 'can fall back to the explicit Show resolved button');
     });
 
     // ============================================================================
@@ -20296,7 +20348,7 @@ RULES:
         ackAssert(fn.includes('[0-9a-f]{7,40}'), 'matches SHA patterns');
         ackAssert(fn.includes('COMMENT_CONTAINER_SELECTOR'), 'scans comment containers');
         ackAssert(fn.includes('.author'), 'filters by author');
-        ackAssert(fn.includes('foundSha = m[1]'), 'takes last match (chronological)');
+        ackAssert(fn.includes('foundSha = linkedFullSha || m[1]'), 'takes last match while preferring linked full commit SHAs');
         ackAssert(fn.includes('CSS.escape'), 'safely handles fragment navigation');
         ackAssert(fn.includes('a[href*="/commit/"], a[href*="/commits/"]'), 'prefers full linked commit SHAs when present in ACK comment body');
     });
