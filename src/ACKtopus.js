@@ -185,54 +185,42 @@
         return files.length ? files.map(shellQuote).join(' ') : '';
     }
 
-    function readBaseBranchFromSSR() {
+    function readPRSSRData() {
         try {
             const scriptEl = document.querySelector(
                 'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
             );
-            if (!scriptEl?.textContent) return '';
-            const data = JSON.parse(scriptEl.textContent);
-            return data?.payload?.pullRequestsChangesRoute?.pullRequest?.baseBranch
-                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.baseBranch
-                || '';
+            if (!scriptEl?.textContent) return null;
+            return JSON.parse(scriptEl.textContent);
         } catch (_) {
-            return '';
+            return null;
         }
+    }
+
+    function readBaseBranchFromSSR() {
+        const data = readPRSSRData();
+        return data?.payload?.pullRequestsChangesRoute?.pullRequest?.baseBranch
+            || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.baseBranch
+            || '';
     }
 
     function readHeadBranchFromSSR() {
-        try {
-            const scriptEl = document.querySelector(
-                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
-            );
-            if (!scriptEl?.textContent) return '';
-            const data = JSON.parse(scriptEl.textContent);
-            return data?.payload?.pullRequestsChangesRoute?.pullRequest?.headBranch
-                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headBranch
-                || '';
-        } catch (_) {
-            return '';
-        }
+        const data = readPRSSRData();
+        return data?.payload?.pullRequestsChangesRoute?.pullRequest?.headBranch
+            || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headBranch
+            || '';
     }
 
     function readHeadShaFromSSR() {
-        try {
-            const scriptEl = document.querySelector(
-                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]'
-            );
-            if (!scriptEl?.textContent) return '';
-            const data = JSON.parse(scriptEl.textContent);
-            const sha =
-                data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRefOid
-                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid
-                || data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRef?.target?.oid
-                || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid
-                || data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha
-                || '';
-            return /^[0-9a-f]{40}$/i.test(sha) ? sha : '';
-        } catch (_) {
-            return '';
-        }
+        const data = readPRSSRData();
+        const sha =
+            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRefOid
+            || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid
+            || data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRef?.target?.oid
+            || data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid
+            || data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha
+            || '';
+        return /^[0-9a-f]{40}$/i.test(sha) ? sha : '';
     }
 
     function readBaseBranchFromSummaryDom() {
@@ -666,11 +654,6 @@
         });
         lt.rafs.add(id);
         return id;
-    }
-
-    function ackCancelRaf(id) {
-        cancelAnimationFrame(id);
-        _ackLifetime?.rafs?.delete(id);
     }
 
     // Like sleep(), but tied to the page lifetime so it resolves early on
@@ -4724,9 +4707,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             .filter(Boolean)
             .join('\n\n')
             .replace(/\n{3,}/g, '\n\n')
-            .trim();
+            .replace(/^\n+|\n+$/g, '');
 
-        return renderBlockChildren(bodyEl).trim();
+        return renderBlockChildren(bodyEl).replace(/^\n+|\n+$/g, '');
     }
 
     function getCommentAnchorGroupKey(comment) {
@@ -7017,38 +7000,9 @@ Rules:
         return review;
     }
 
-    function readPendingReviewApiIdFromSSR() {
-        const pending = readViewerPendingReviewFromSSR();
-        const value = pending?.id;
-        const reviewId = typeof value === 'string' ? parseInt(value, 10) : Number(value);
-        return Number.isFinite(reviewId) && reviewId > 0 ? reviewId : null;
-    }
-
-    function readPendingReviewNodeIdFromSSR() {
-        const pending = readViewerPendingReviewFromSSR();
-        const value = pending?.nodeId || pending?.node_id || pending?.reviewNodeId || pending?.graphqlId || '';
-        return typeof value === 'string' && value ? value : null;
-    }
-
-    async function findPendingReviewRefs(pr, {needNodeId = false} = {}) {
-        const ssrApiId = readPendingReviewApiIdFromSSR();
-        const ssrNodeId = readPendingReviewNodeIdFromSSR();
-        if (ssrApiId && (!needNodeId || ssrNodeId)) {
-            return {apiId: ssrApiId, nodeId: ssrNodeId || null};
-        }
-        const reviews = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews?per_page=100`);
-        const pending = Array.isArray(reviews)
-            ? [...reviews].reverse().find(review => String(review?.state || '').toUpperCase() === 'PENDING')
-            : null;
-        const apiId = Number(pending?.id);
-        const nodeId = typeof pending?.node_id === 'string' && pending.node_id ? pending.node_id : null;
-        if (Number.isFinite(apiId) && apiId > 0) return {apiId, nodeId};
-        throw new Error('no pending review found');
-    }
-
     function isAckOwnedReviewControl(el) {
         return !!el?.closest?.(
-            '#acktopus-buttons, #acktopus-analysis, #ack-submit-review-popover, ' +
+            '#acktopus-buttons, #acktopus-analysis, ' +
             '.ack-submit-review-wrap, .ack-config-overlay'
         );
     }
@@ -7159,17 +7113,15 @@ Rules:
         return null;
     }
 
-    async function submitPendingReviewViaNativeDialog(pr, {event, body} = {}) {
+    // Submit a pending review by driving GitHub's own native dialog: we click the
+    // Submit review trigger, wait for the dialog, fill in the body + event radio,
+    // then click the dialog's submit button. Going through GitHub's UI avoids the
+    // fragile dance of CSRF tokens, fetch nonces, and PAT permissions that the
+    // older API-based paths required.
+    async function submitPendingReview(pr, {event, body} = {}) {
         if (!pr) throw new Error('not on a PR page');
-        if (!_ackTesting) {
-            console.log('ACKtopus: native submit fallback starting', {
-                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-                event: String(event || 'COMMENT').toUpperCase(),
-                bodyLen: String(body || '').length,
-                triggerFound: !!findNativeReviewTrigger(),
-            });
-        }
-        await openReviewDialog(String(event || 'COMMENT').toUpperCase());
+        const eventValue = String(event || 'COMMENT').toUpperCase();
+        await openReviewDialog(eventValue);
         const dialog = await waitForElement(
             document,
             () => findNativeReviewDialog(),
@@ -7177,268 +7129,39 @@ Rules:
             12,
             150,
         );
-        if (!dialog) {
-            if (!_ackTesting) {
-                const visibleDialogs = [
-                    ...document.querySelectorAll('details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]'),
-                ].filter(isVisible).map(root => ({
-                    tag: root.tagName,
-                    cls: root.className || '',
-                    text: (root.textContent || '').trim().slice(0, 160),
-                }));
-                console.warn('ACKtopus: native submit review dialog lookup failed', {
-                    pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-                    event: String(event || 'COMMENT').toUpperCase(),
-                    visibleDialogs,
-                });
-            }
-            throw new Error('native submit review dialog not found');
-        }
-        dialog.dataset.ackNativeSubmitHidden = '1';
-        dialog.style.visibility = 'hidden';
-        try {
-            const eventValue = String(event || 'COMMENT').toUpperCase();
-            const nativeEventValue = ({
-                COMMENT: 'comment',
-                APPROVE: 'approve',
-                REQUEST_CHANGES: 'request changes',
-            })[eventValue] || 'comment';
-            const radio =
-                dialog.querySelector(`input[name="pull_request_review[event]"][value="${eventValue}"]`)
-                || dialog.querySelector(`input[name="reviewEvent"][value="${nativeEventValue}"]`)
-                || dialog.querySelector(`input[type="radio"][value="${eventValue}"]`)
-                || dialog.querySelector(`input[type="radio"][value="${nativeEventValue}"]`);
-            if (radio && !radio.checked) {
-                radio.click();
-                try {
-                    radio.checked = true;
-                } catch (_) {
-                }
-                radio.dispatchEvent(new Event('change', {bubbles: true}));
-                await ackSleep(50);
-            }
+        if (!dialog) throw new Error('native submit review dialog not found');
 
-            const reviewBody =
-                dialog.querySelector('textarea#pull_request_review_body')
-                || dialog.querySelector('textarea[name="pull_request_review[body]"]')
-                || dialog.querySelector('.js-review-body textarea, [data-testid="review-body"] textarea, .review-changes-modal textarea')
-                || [...dialog.querySelectorAll('textarea')].find(isVisible)
-                || null;
-            if (reviewBody) {
-                setTextareaValue(reviewBody, String(body || ''));
-                await ackSleep(50);
-            }
-
-            const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
-            if (!submitBtn) throw new Error('native submit review button not found');
-            if (!_ackTesting) {
-                console.log('ACKtopus: native submit review dialog ready', {
-                    event: eventValue,
-                    radioFound: !!radio,
-                    textareaFound: !!reviewBody,
-                    submitText: (submitBtn.textContent || '').trim(),
-                });
-            }
-            submitBtn.click();
-            return {id: 'native-dialog', state: eventValue};
-        } catch (err) {
-            delete dialog.dataset.ackNativeSubmitHidden;
-            dialog.style.visibility = '';
-            throw err;
-        }
-    }
-
-    async function submitPendingReviewViaWebEvents(pr, {event, body} = {}) {
-        if (!pr) throw new Error('not on a PR page');
-        const pendingRefs = await findPendingReviewRefs(pr);
-        const reviewId = Number(pendingRefs?.apiId);
-        if (!_ackTesting) {
-            console.log('ACKtopus: web submit review refs', {
-                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-                pendingRefs,
-            });
-        }
-        if (!Number.isFinite(reviewId) || reviewId <= 0) throw new Error('no pending review id found');
-        const csrf = getCsrfToken();
-        if (!csrf) throw new Error('missing csrf token');
-        const eventValue = String(event || 'COMMENT').toUpperCase();
-        const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-        const baseUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${Number(pr.pr)}/reviews/${reviewId}`;
-        const bodyText = String(body || '');
-        const params = new URLSearchParams();
-        params.set('authenticity_token', csrf);
-        params.set('event', eventValue);
-        params.set('body', bodyText);
-        params.set('pull_request_review[event]', eventValue);
-        params.set('pull_request_review[body]', bodyText);
-
-        const initFor = (url) => ({
-            method: 'POST',
-            credentials: 'same-origin',
-            referrer: `https://github.com/${pr.owner}/${pr.repo}/pull/${Number(pr.pr)}`,
-            headers: {
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'X-CSRF-Token': csrf,
-                'X-Requested-With': 'XMLHttpRequest',
-            },
-            body: params.toString(),
-        });
-
-        const tried = [];
-        for (const url of [`${baseUrl}/events`, `${baseUrl}/event`]) {
-            tried.push(url);
-            if (!_ackTesting) {
-                console.log('ACKtopus: trying web submit review endpoint', {
-                    url,
-                    eventValue,
-                    bodyLen: bodyText.length,
-                    params: params.toString().slice(0, 240),
-                });
-            }
-            const resp = await pageFetchWithRetry(pageFetch, url, initFor(url), {
-                label: `submit review web ${url.split('/').pop()}`,
-                attempts: 2,
-                transientStatuses: [502, 503, 504],
-            });
-            if (resp.ok) {
-                return {id: reviewId, state: eventValue, method: 'web-events'};
-            }
-            const text = await resp.text().catch(() => '');
-            if (!_ackTesting) {
-                console.warn('ACKtopus: web submit review endpoint failed', {
-                    url,
-                    status: resp.status,
-                    body: text.slice(0, 240),
-                });
-            }
-            if (![404, 405, 422].includes(resp.status)) {
-                throw new Error(`web submit HTTP ${resp.status}: ${text.slice(0, 200)}`);
-            }
-        }
-        throw new Error(`web submit endpoint not found (${tried.map(u => u.split('/').pop()).join(', ')})`);
-    }
-
-    async function submitPendingReviewViaPageData(pr, {event, body} = {}) {
-        if (!pr) throw new Error('not on a PR page');
-        const eventValue = String(event || 'COMMENT').toUpperCase();
-        if (eventValue !== 'COMMENT') throw new Error(`page_data submit_review only supports COMMENT, got ${eventValue}`);
-
-        let nonce = getGitHubVerifiedFetchNonce();
-        let clientVersion = getGitHubClientVersion();
-        const meta = await fetchVerifiedFetchMetaFromChanges(pr, true);
-        if (meta.nonce && meta.clientVersion) {
-            nonce = meta.nonce;
-            clientVersion = meta.clientVersion;
-        }
-        if (!_ackTesting) {
-            console.log('ACKtopus: page_data submit review headers', {
-                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-                eventValue,
-                bodyLen: String(body || '').length,
-                nonce: nonce ? `${nonce.slice(0, 8)}...` : '',
-                clientVersion,
-            });
-        }
-        if (!nonce || !clientVersion) throw new Error('missing verified-fetch headers');
-
-        const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-        const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/page_data/submit_review`;
-        const resp = await pageFetchWithRetry(pageFetch, url, {
-            method: 'PUT',
-            mode: 'cors',
-            credentials: 'same-origin',
-            referrer: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`,
-            headers: {
-                'accept': 'application/json',
-                'content-type': 'application/json',
-                'x-fetch-nonce': nonce,
-                'x-github-client-version': clientVersion,
-                'x-requested-with': 'XMLHttpRequest',
-            },
-            body: JSON.stringify({body: String(body || '')}),
-        }, {
-            label: 'submit review page_data',
-            attempts: 2,
-            transientStatuses: [502, 503, 504],
-        });
-        if (!resp.ok) {
-            const text = await resp.text().catch(() => '');
-            if (!_ackTesting) {
-                console.warn('ACKtopus: page_data submit review failed', {
-                    url,
-                    status: resp.status,
-                    eventValue,
-                    body: String(body || ''),
-                    response: text.slice(0, 400),
-                });
-            }
-            throw new Error(`page_data submit_review HTTP ${resp.status}: ${text.slice(0, 200)}`);
-        }
-        return {state: 'COMMENTED', method: 'page-data'};
-    }
-
-    async function submitPendingReviewViaPatGraphQL(pr, {event, body} = {}) {
-        if (!pr) throw new Error('not on a PR page');
-        const number = Number(pr.pr);
-        if (!Number.isFinite(number)) throw new Error('invalid PR number');
-
-        let pendingRefs = null;
-        try {
-            pendingRefs = await findPendingReviewRefs(pr);
-            if (!_ackTesting) {
-                console.log('ACKtopus: submit review pending refs before REST', {
-                    pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-                    pendingRefs,
-                });
-            }
-            const review = await patApiJson(
-                'POST',
-                `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${number}/reviews/${pendingRefs.apiId}/events`,
-                {
-                    event: String(event || 'COMMENT'),
-                    body: String(body || ''),
-                },
-            );
-            if (!review?.id) throw new Error('submit review REST endpoint returned no id');
-            return review;
-        } catch (restErr) {
-            if (!_ackTesting) {
-                console.warn('ACKtopus: REST submit review failed, falling back to GraphQL:', restErr?.message || restErr);
-            }
+        const nativeEventValue = ({
+            COMMENT: 'comment',
+            APPROVE: 'approve',
+            REQUEST_CHANGES: 'request changes',
+        })[eventValue] || 'comment';
+        const radio =
+            dialog.querySelector(`input[name="pull_request_review[event]"][value="${eventValue}"]`)
+            || dialog.querySelector(`input[name="reviewEvent"][value="${nativeEventValue}"]`)
+            || dialog.querySelector(`input[type="radio"][value="${eventValue}"]`)
+            || dialog.querySelector(`input[type="radio"][value="${nativeEventValue}"]`);
+        if (radio && !radio.checked) {
+            radio.click();
+            radio.dispatchEvent(new Event('change', {bubbles: true}));
+            await ackSleep(50);
         }
 
-        try {
-            pendingRefs = pendingRefs?.nodeId ? pendingRefs : await findPendingReviewRefs(pr, {needNodeId: true});
-            if (!pendingRefs?.nodeId) throw new Error('no pending review node id found');
-            const mutation = `mutation($input: SubmitPullRequestReviewInput!) {
-  submitPullRequestReview(input: $input) { pullRequestReview { id state } }
-}`;
-            const out = await patGraphQL(mutation, {
-                input: {
-                    pullRequestReviewId: pendingRefs.nodeId,
-                    event: String(event || 'COMMENT'),
-                    body: String(body || ''),
-                },
-            });
-            const review = out.data?.submitPullRequestReview?.pullRequestReview;
-            if (!review?.id) throw new Error('submitPullRequestReview returned no id');
-            return review;
-        } catch (graphErr) {
-            if (!_ackTesting) {
-                console.warn('ACKtopus: GraphQL submit review failed, falling back to same-origin web submit:', graphErr?.message || graphErr);
-            }
+        const reviewBody =
+            dialog.querySelector('textarea#pull_request_review_body')
+            || dialog.querySelector('textarea[name="pull_request_review[body]"]')
+            || dialog.querySelector('.js-review-body textarea, [data-testid="review-body"] textarea, .review-changes-modal textarea')
+            || [...dialog.querySelectorAll('textarea')].find(isVisible)
+            || null;
+        if (reviewBody) {
+            setTextareaValue(reviewBody, String(body || ''));
+            await ackSleep(50);
         }
 
-        try {
-            return await submitPendingReviewViaWebEvents(pr, {event, body});
-        } catch (webErr) {
-            if (!_ackTesting) {
-                console.warn('ACKtopus: same-origin web submit failed, falling back to native dialog:', webErr?.message || webErr);
-            }
-        }
-
-        return submitPendingReviewViaNativeDialog(pr, {event, body});
+        const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
+        if (!submitBtn) throw new Error('native submit review button not found');
+        submitBtn.click();
+        return {state: eventValue};
     }
 
     function getGitHubVerifiedFetchNonce() {
@@ -8094,145 +7817,6 @@ Rules:
         return false;
     }
 
-    const SUBMIT_REVIEW_POPOVER_ID = 'ack-submit-review-popover';
-    function hideSubmitReviewPopover() {
-        document.getElementById(SUBMIT_REVIEW_POPOVER_ID)?.remove();
-    }
-
-    function showSubmitReviewPopover(anchorBtn, {pr, getBody} = {}) {
-        hideSubmitReviewPopover();
-        if (!pr) pr = parsePR();
-        if (!pr) throw new Error('not on a PR page');
-
-        const pop = document.createElement('div');
-        pop.id = SUBMIT_REVIEW_POPOVER_ID;
-        Object.assign(pop.style, {
-            position: 'fixed',
-            zIndex: '999999',
-            background: '#161b22',
-            border: '1px solid #30363d',
-            borderRadius: '10px',
-            padding: '10px',
-            color: '#c9d1d9',
-            fontSize: '12px',
-            boxShadow: '0 6px 16px rgba(0,0,0,0.45)',
-            minWidth: '260px',
-            maxWidth: '360px',
-        });
-
-        const title = document.createElement('div');
-        title.textContent = 'Submit review';
-        Object.assign(title.style, {fontWeight: '600', marginBottom: '6px'});
-        pop.appendChild(title);
-
-        const hint = document.createElement('div');
-        hint.textContent = 'Uses the current main comment text as the review summary. Leave it empty to submit pending comments only.';
-        Object.assign(hint.style, {color: '#8b949e', marginBottom: '8px', lineHeight: '1.35'});
-        pop.appendChild(hint);
-
-        const selRow = document.createElement('div');
-        Object.assign(selRow.style, {display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px'});
-
-        const label = document.createElement('div');
-        label.textContent = 'Type:';
-        Object.assign(label.style, {minWidth: '42px', color: '#8b949e'});
-        selRow.appendChild(label);
-
-        const select = document.createElement('select');
-        select.className = 'form-select';
-        Object.assign(select.style, {flex: '1 1 auto', background: '#0d1117', color: '#c9d1d9', border: '1px solid #30363d'});
-        select.innerHTML = `
-            <option value="COMMENT">Comment</option>
-            <option value="APPROVE">Approve</option>
-            <option value="REQUEST_CHANGES">Request changes</option>
-        `;
-        selRow.appendChild(select);
-        pop.appendChild(selRow);
-
-        const btnRow = document.createElement('div');
-        Object.assign(btnRow.style, {display: 'flex', justifyContent: 'flex-end', gap: '8px'});
-
-        const cancel = document.createElement('button');
-        cancel.type = 'button';
-        cancel.className = 'btn btn-sm';
-        cancel.textContent = 'Cancel';
-        cancel.addEventListener('click', () => hideSubmitReviewPopover());
-        btnRow.appendChild(cancel);
-
-        const submit = document.createElement('button');
-        submit.type = 'button';
-        submit.className = 'btn btn-sm btn-primary';
-        submit.textContent = 'Submit review';
-        btnRow.appendChild(submit);
-
-        pop.appendChild(btnRow);
-        document.body.appendChild(pop);
-
-        // Position near the anchor; above when possible.
-        const r = anchorBtn.getBoundingClientRect();
-        const pad = 8;
-        const maxLeft = Math.max(pad, window.innerWidth - pop.offsetWidth - pad);
-        const left = Math.min(Math.max(pad, r.left), maxLeft);
-        const aboveTop = r.top - pop.offsetHeight - pad;
-        const top = aboveTop >= pad ? aboveTop : Math.min(window.innerHeight - pop.offsetHeight - pad, r.bottom + pad);
-        pop.style.left = `${left}px`;
-        pop.style.top = `${top}px`;
-
-        // Click outside to dismiss (no X button).
-        const onDocDown = (e) => {
-            const t = e.target;
-            if (t && (pop.contains(t) || anchorBtn.contains(t))) return;
-            hideSubmitReviewPopover();
-        };
-        // Delay so the opening click doesn't immediately close it.
-        setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
-
-        const cleanup = () => document.removeEventListener('mousedown', onDocDown, true);
-        const observer = new MutationObserver(() => {
-            if (!document.getElementById(SUBMIT_REVIEW_POPOVER_ID)) {
-                cleanup();
-                observer.disconnect();
-            }
-        });
-        observer.observe(document.body, {childList: true, subtree: true});
-
-        submit.addEventListener('click', async () => {
-            if (submit.dataset.ackRunning) return;
-            submit.dataset.ackRunning = 'true';
-            submit.disabled = true;
-            cancel.disabled = true;
-            const origText = submit.textContent;
-            const stopSpin = startBrailleAnimation(frame => {
-                submit.textContent = frame;
-            });
-            try {
-                const rawBody = (typeof getBody === 'function') ? getBody() : '';
-                const body = rawBody && rawBody.trim() ? rawBody : '';
-                await submitPendingReviewViaPatGraphQL(pr, {event: select.value, body});
-                stopSpin('✅');
-                submit.textContent = '✅';
-                _ackPendingReviewActive = false;
-                unmarkCommentButtonsPending();
-                invalidatePRContext();
-                const mainTa = document.querySelector('#new_comment_form textarea#new_comment_field, #new_comment_form textarea[name="comment[body]"]');
-                if (mainTa && body) setTextareaValue(mainTa, '');
-                ackSetTimeout(() => {
-                    hideSubmitReviewPopover();
-                    if (_ackTesting) return;
-                    suppressUnsavedCommentWarningOnce();
-                    location.reload();
-                }, 300);
-            } catch (e) {
-                stopSpin('❌');
-                submit.textContent = origText;
-                submit.disabled = false;
-                cancel.disabled = false;
-                delete submit.dataset.ackRunning;
-                console.warn('ACKtopus: submit review failed:', e?.message || e);
-            }
-        });
-    }
-
     function addSubmitReviewButtonToConversation(root = document) {
         syncPendingReviewState(root, {includeDocument: root === document});
         const existing = document.querySelector('.ack-submit-review-wrap');
@@ -8273,7 +7857,6 @@ Rules:
         if (!isPRConversationPage() || !_ackPendingReviewActive || !hasPendingReviewChanges(root) || !form || !actions || !commentBtn) {
             existing?.remove();
             restoreCommentBtn();
-            hideSubmitReviewPopover();
             return;
         }
 
@@ -8317,14 +7900,7 @@ Rules:
                 const mainTa = form.querySelector('textarea#new_comment_field, textarea[name="comment[body]"]');
                 const rawBody = mainTa?.value || '';
                 const body = rawBody.trim() ? rawBody : '';
-                try {
-                    await submitPendingReviewViaPageData(pr, {event: 'COMMENT', body});
-                } catch (pageDataErr) {
-                    if (!_ackTesting) {
-                        console.warn('ACKtopus: page_data submit review failed, falling back:', pageDataErr?.message || pageDataErr);
-                    }
-                    await submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body});
-                }
+                await submitPendingReview(pr, {event: 'COMMENT', body});
                 stopSpin('✅');
                 submitBtn.textContent = '✅';
                 _ackPendingReviewActive = false;
@@ -16037,7 +15613,6 @@ RULES:
                 document.querySelector('.ack-config-overlay')?.remove();
                 document.querySelectorAll('.ack-commit-explain-panel, .ack-explain-panel').forEach(el => el.remove());
                 document.querySelector('.ack-submit-review-wrap')?.remove();
-                hideSubmitReviewPopover();
 		                lastForcePush = null;
 		                lastForcePushSignature = '';
 		                userAckSha = null;
@@ -16062,7 +15637,6 @@ RULES:
 		            teardownDiffSelectionUI();
 		            document.querySelector('.ack-config-overlay')?.remove();
                     document.querySelector('.ack-submit-review-wrap')?.remove();
-                    hideSubmitReviewPopover();
 		            lastForcePushSignature = '';
 		            clearCommitPatchCache();
 		            lastInjectedPR = null;
@@ -16123,7 +15697,7 @@ RULES:
             `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
             '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, ' +
             '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
-            `#${DIFF_SELECTION_TOOLBAR_ID}, #${DIFF_SELECTION_TOOLTIP_ID}, #ack-submit-review-popover`
+            `#${DIFF_SELECTION_TOOLBAR_ID}, #${DIFF_SELECTION_TOOLTIP_ID}`
         ).forEach(el => el.remove());
         document.querySelectorAll('[data-ack-prefilled]').forEach(el => delete el.dataset.ackPrefilled);
         document.querySelectorAll('[data-ack-quick-processed]').forEach(el => delete el.dataset.ackQuickProcessed);
@@ -23921,9 +23495,7 @@ RULES:
                 ackAssert(host.querySelector('.ack-submit-review-wrap'), 'leaves submit review wrapper');
                 ackAssert(!host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'demotes main Comment button while pending');
                 const fn = _ackSource.slice(_ackSource.indexOf('function addSubmitReviewButtonToConversation'), _ackSource.indexOf('// --- Auto-prefill commit hash in new comments'));
-                ackAssert(fn.includes("submitPendingReviewViaPageData(pr, {event: 'COMMENT', body})"), 'tries page_data submit_review directly from main page');
-                ackAssert(fn.includes("submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body})"), 'falls back to generic pending review submit path');
-                ackAssert(!fn.includes('showSubmitReviewPopover(submitBtn'), 'does not open an extra submit-review popup from main page');
+                ackAssert(fn.includes("submitPendingReview(pr, {event: 'COMMENT', body})"), 'submits the pending review via the native-dialog helper');
             } finally {
                 host.remove();
             }
@@ -24012,111 +23584,6 @@ RULES:
         }
     });
 
-    ackTest('submitPendingReviewViaPatGraphQL prefers REST submit endpoint when pending review id is known', async () => {
-        const origReq = GM_xmlhttpRequest;
-        const origRead = readViewerPendingReviewFromSSR;
-        const seen = [];
-        try {
-            GM_setValue('github_pat', 'ghp_testtoken');
-            readViewerPendingReviewFromSSR = () => ({id: 77, comments: [{threadId: '1'}]});
-            GM_xmlhttpRequest = (opts) => {
-                seen.push({
-                    method: opts.method,
-                    url: opts.url,
-                    auth: opts.headers?.Authorization,
-                    body: opts.data ? JSON.parse(opts.data) : null,
-                });
-                opts.onload?.({
-                    status: 200,
-                    responseText: JSON.stringify({id: 77, state: 'COMMENTED'}),
-                });
-            };
-            const pr = {owner: 'bitcoin', repo: 'bitcoin', pr: '1'};
-            const review = await submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body: 'hi'});
-            ackEq(review.state, 'COMMENTED');
-            ackEq(seen.length, 1);
-            ackEq(seen[0].method, 'POST');
-            ackEq(seen[0].auth, 'token ghp_testtoken');
-            ackAssert(seen[0].url.includes('/repos/bitcoin/bitcoin/pulls/1/reviews/77/events'), 'submits via REST review events endpoint');
-            ackEq(seen[0].body?.event, 'COMMENT');
-            ackEq(seen[0].body?.body, 'hi');
-        } finally {
-            GM_xmlhttpRequest = origReq;
-            readViewerPendingReviewFromSSR = origRead;
-        }
-    });
-
-    ackTest('submitPendingReviewViaPatGraphQL falls back to GraphQL submit using pending review node_id', async () => {
-        const origReq = GM_xmlhttpRequest;
-        const origRead = readViewerPendingReviewFromSSR;
-        const seen = [];
-        try {
-            GM_setValue('github_pat', 'ghp_testtoken');
-            readViewerPendingReviewFromSSR = () => ({id: 77, comments: [{threadId: '1'}]});
-            GM_xmlhttpRequest = (opts) => {
-                seen.push({
-                    method: opts.method,
-                    url: opts.url,
-                    auth: opts.headers?.Authorization,
-                    body: opts.data ? JSON.parse(opts.data) : null,
-                });
-                if (opts.url.includes('/repos/bitcoin/bitcoin/pulls/1/reviews/77/events')) {
-                    return opts.onload?.({
-                        status: 403,
-                        responseText: JSON.stringify({message: 'Resource not accessible by personal access token'}),
-                    });
-                }
-                if (opts.url.includes('/repos/bitcoin/bitcoin/pulls/1/reviews?per_page=100')) {
-                    return opts.onload?.({
-                        status: 200,
-                        responseText: JSON.stringify([{id: 77, node_id: 'PRR_test_node', state: 'PENDING'}]),
-                    });
-                }
-                if (opts.url === 'https://api.github.com/graphql') {
-                    ackAssert(!String(opts.data || '').includes('viewerPendingReview'), 'does not query missing viewerPendingReview field');
-                    return opts.onload?.({
-                        status: 200,
-                        responseText: JSON.stringify({
-                            data: {
-                                submitPullRequestReview: {
-                                    pullRequestReview: {id: 'PRR_test_node', state: 'COMMENTED'},
-                                },
-                            },
-                        }),
-                    });
-                }
-                throw new Error(`unexpected request: ${opts.method} ${opts.url}`);
-            };
-            const pr = {owner: 'bitcoin', repo: 'bitcoin', pr: '1'};
-            const review = await submitPendingReviewViaPatGraphQL(pr, {event: 'COMMENT', body: 'hi'});
-            ackEq(review.state, 'COMMENTED');
-            ackAssert(seen.some(req => req.url.includes('/reviews?per_page=100')), 'fetches pending reviews to get node_id');
-            ackAssert(seen.some(req => req.url === 'https://api.github.com/graphql'), 'falls back to GraphQL mutation');
-        } finally {
-            GM_xmlhttpRequest = origReq;
-            readViewerPendingReviewFromSSR = origRead;
-        }
-    });
-
-    ackTest('submitPendingReviewViaPatGraphQL tries same-origin web submit before native dialog', () => {
-        const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function submitPendingReviewViaPatGraphQL'), source.indexOf('function getGitHubVerifiedFetchNonce'));
-        ackAssert(fn.includes('submitPendingReviewViaWebEvents(pr, {event, body})'), 'tries same-origin web submit fallback');
-        const webIdx = fn.indexOf('submitPendingReviewViaWebEvents(pr, {event, body})');
-        const nativeIdx = fn.indexOf('submitPendingReviewViaNativeDialog(pr, {event, body})');
-        ackAssert(webIdx >= 0 && nativeIdx >= 0 && webIdx < nativeIdx, 'same-origin web submit happens before native dialog fallback');
-    });
-
-    ackTest('submitPendingReviewViaPageData uses verified-fetch submit_review endpoint', () => {
-        const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function submitPendingReviewViaPageData'), source.indexOf('async function submitPendingReviewViaPatGraphQL'));
-        ackAssert(fn.includes('/page_data/submit_review'), 'targets page_data submit_review endpoint');
-        ackAssert(fn.includes("method: 'PUT'"), 'uses PUT');
-        ackAssert(fn.includes("'x-fetch-nonce'"), 'sends verified fetch nonce');
-        ackAssert(fn.includes("'x-github-client-version'"), 'sends client version');
-        ackAssert(fn.includes("JSON.stringify({body: String(body || '')})"), 'sends JSON body only');
-    });
-
     ackTest('openReviewDialog ignores ACKtopus Submit review buttons', () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -24161,9 +23628,10 @@ RULES:
         }
     });
 
-    ackTest('submitPendingReviewViaNativeDialog supports reviewEvent radios and generic dialog textarea', () => {
+    ackTest('submitPendingReview supports reviewEvent radios and generic dialog textarea', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function submitPendingReviewViaNativeDialog'), source.indexOf('async function submitPendingReviewViaWebEvents'));
+        const start = source.indexOf('async function submitPendingReview(pr');
+        const fn = source.slice(start, source.indexOf('function getGitHubVerifiedFetchNonce', start));
         ackAssert(fn.includes('input[name="reviewEvent"]'), 'supports current reviewEvent radios');
         ackAssert(fn.includes("REQUEST_CHANGES: 'request changes'"), 'supports request changes lowercase radio value');
         ackAssert(fn.includes("[...dialog.querySelectorAll('textarea')].find(isVisible)"), 'falls back to generic visible textarea inside dialog');
@@ -25442,7 +24910,7 @@ RULES:
     ackTest('createPendingReviewViaPatGraphQL uses PAT GraphQL helper and official mutation', () => {
         const createFn = _ackSource.slice(
             _ackSource.indexOf('function createPendingReviewViaPatGraphQL'),
-            _ackSource.indexOf('async function submitPendingReviewViaPatGraphQL')
+            _ackSource.indexOf('function isAckOwnedReviewControl')
         );
         ackAssert(createFn.includes('patGraphQL('), 'delegates to PAT GraphQL helper');
         ackAssert(createFn.includes('addPullRequestReview'), 'uses addPullRequestReview mutation');
