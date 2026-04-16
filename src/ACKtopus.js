@@ -2971,7 +2971,7 @@
 
     const LLM_MODELS = {
         claude: 'claude-sonnet-4-6',
-        claude_high_context: 'claude-opus-4-6',
+        claude_high_context: 'claude-opus-4-7',
         openai: 'gpt-5.4',
     };
 
@@ -3002,7 +3002,7 @@
                 'anthropic-dangerous-direct-browser-access': 'true',
             }),
 	            body: (model, system, userContent, {maxTokens = 4096} = {}) => ({
-	                model, max_tokens: maxTokens || 4096, temperature: 0, system,
+	                model, max_tokens: maxTokens || 4096, system,
 	                messages: [{role: 'user', content: userContent}],
 	            }),
             validateBody: (model) => ({model, max_tokens: 1, messages: [{role: 'user', content: 'hi'}]}),
@@ -16867,8 +16867,8 @@ RULES:
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
     });
 
-    ackTest('LLM_MODELS.claude_high_context is claude-opus-4-6', () => {
-        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-6');
+    ackTest('LLM_MODELS.claude_high_context is claude-opus-4-7', () => {
+        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
     });
 
     // --- getFormat rdiff fallback ---
@@ -22163,7 +22163,9 @@ RULES:
         const source = _ackSource;
         const config = source.slice(source.indexOf('const PROVIDER_API'), source.indexOf('// Provider branding'));
         const temps = config.match(/temperature:\s*0/g) || [];
-        ackAssert(temps.length >= 1, `expected temperature: 0 only where supported (found ${temps.length})`);
+        ackEq(temps.length, 0, `expected no explicit temperature overrides for current providers (found ${temps.length})`);
+        const claudeBlock = config.slice(config.indexOf('claude:'), config.indexOf('},', config.indexOf('claude:')) + 2);
+        ackAssert(!/temperature:\s*0/.test(claudeBlock), 'claude requests omit deprecated temperature override');
         const openaiBlock = config.slice(config.indexOf('openai:'), config.indexOf('},', config.indexOf('openai:')) + 2);
         ackAssert(!/temperature:\s*0/.test(openaiBlock), 'openai requests omit unsupported temperature override');
     });
@@ -25785,6 +25787,7 @@ RULES:
 
     ackTest('LLM_MODELS match documented provider models', () => {
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
         ackEq(LLM_MODELS.openai, 'gpt-5.4');
     });
 
