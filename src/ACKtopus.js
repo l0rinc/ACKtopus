@@ -1635,11 +1635,15 @@
         // Conversation page React UI: <review-thread-collapsible data-resolved="true">
         document.querySelectorAll('[data-resolved="true"]').forEach(container => {
             if (container.matches('details')) return;
-            const toggleBtn =
-                container.querySelector('button[data-target="review-thread-collapsible.button"][aria-expanded="false"]')
-                || container.querySelector('.review-thread-show-text');
-            if (!toggleBtn) return;
+            const primaryToggle = container.querySelector('button[data-target="review-thread-collapsible.button"]');
             const body = container.querySelector('[data-target="review-thread-collapsible.body"]');
+            const isCollapsed =
+                primaryToggle
+                    ? primaryToggle.getAttribute('aria-expanded') === 'false'
+                    : !!(body && body.hasAttribute('hidden'));
+            if (!isCollapsed) return;
+            const toggleBtn = primaryToggle || container.querySelector('.review-thread-show-text');
+            if (!toggleBtn) return;
             items.push({
                 el: container,
                 click: () => toggleBtn.click(),
@@ -4440,12 +4444,242 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return {file, line, commitSha, threadRoot: threadEl};
     }
 
+    function getCommentCodeContext(container, threadRoot = null) {
+        const commentRow = container.closest('tr.inline-comments, tr.js-inline-comments-container');
+        const threadEl = threadRoot || getCommentThreadRoot(container) || container;
+        const diffTable = threadEl.querySelector?.('table.diff-table, .js-diff-table');
+        let codeRows = [];
+        let targetRow = null;
+
+        if (commentRow) {
+            const tbody = commentRow.closest('tbody') || diffTable?.querySelector?.('tbody');
+            codeRows = [...(tbody?.querySelectorAll?.('tr:not(.inline-comments):not(.js-inline-comments-container)') || [])];
+            targetRow = commentRow.previousElementSibling;
+        } else if (diffTable) {
+            codeRows = [...diffTable.querySelectorAll('tr')].filter(row =>
+                row.querySelector('[data-line-number]') && row.querySelector('td.blob-code, td.diff-text')
+            );
+            targetRow = codeRows[codeRows.length - 1] || null;
+        }
+
+        if (!codeRows.length || !targetRow) return '';
+
+        const targetIdx = codeRows.indexOf(targetRow);
+        if (targetIdx < 0) return '';
+
+        const getRowLineNumber = (row) => {
+            const codeCell = row.querySelector('td.blob-code, td.diff-text');
+            if (!codeCell) return '';
+            let sibling = codeCell.previousElementSibling;
+            while (sibling) {
+                if (sibling.hasAttribute?.('data-line-number')) {
+                    const val = sibling.getAttribute('data-line-number') || '';
+                    if (val) return val;
+                }
+                sibling = sibling.previousElementSibling;
+            }
+            const nums = [...row.querySelectorAll('[data-line-number]')]
+                .map(el => el.getAttribute('data-line-number') || '')
+                .filter(Boolean);
+            return nums[nums.length - 1] || '';
+        };
+
+        const start = Math.max(0, targetIdx - 3);
+        const end = Math.min(codeRows.length, targetIdx + 2);
+        const lines = [];
+        for (let i = start; i < end; i++) {
+            const row = codeRows[i];
+            const lineNum = getRowLineNumber(row);
+            const codeEl = row.querySelector('.blob-code-inner, .diff-text-cell, code.diff-text')
+                || row.querySelector('td.blob-code, td.diff-text');
+            const rawCode = String(codeEl?.innerText || codeEl?.textContent || '').replace(/\r\n/g, '\n');
+            const parts = rawCode.split('\n');
+            let pendingIndent = '';
+            let code = '';
+            for (const part of parts) {
+                if (!part) continue;
+                if (part.trim().length === 0) {
+                    if (!code && part.length > pendingIndent.length) pendingIndent = part;
+                    continue;
+                }
+                code += (!code ? pendingIndent : '') + part.trimEnd();
+                pendingIndent = '';
+            }
+            if (!code.trim()) continue;
+            lines.push(`${lineNum ? `${lineNum}| ` : ''}${code}`);
+        }
+        return lines.join('\n');
+    }
+
+    function getCommentReactionSummary(container) {
+        const buttons = [...(container.querySelectorAll?.('button[data-reaction-content], button.js-reaction-group-button, .social-reaction-summary-item') || [])];
+        const seen = new Set();
+        const parts = [];
+        for (const btn of buttons) {
+            if (btn.closest('.dropdown-menu, [role="menu"]')) continue;
+            const content = btn.getAttribute('data-reaction-content') || btn.getAttribute('data-reaction-label') || '';
+            const key = content.toLowerCase();
+            if (!key || seen.has(key)) continue;
+            const emoji = btn.querySelector('g-emoji')?.textContent?.trim() || content;
+            const countText =
+                btn.querySelector('.js-discussion-reaction-group-count, .social-reaction-summary-item-count, [class*="count" i]')?.textContent?.trim()
+                || '';
+            const aria = btn.getAttribute('aria-label') || '';
+            const count = parseInt(countText, 10) || parseInt(aria.match(/\((\d+)\)/)?.[1] || '', 10) || 0;
+            if (!count) continue;
+            seen.add(key);
+            parts.push(`${emoji}${count > 1 ? ` x${count}` : ''}`);
+        }
+        return parts.join(' ');
+    }
+
     function formatCommentLocation(file, line, commitSha) {
         if (!file) return '';
         let out = file;
         if (line) out += ':' + line;
         if (commitSha) out += '@' + commitSha;
         return out;
+    }
+
+    function renderBodyMarkdown(bodyEl) {
+        const normalizeText = (text) => String(text || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/[ \t\r\f\v]+/g, ' ');
+
+        const wrapInlineCode = (text) => {
+            const raw = String(text || '');
+            const runs = raw.match(/`+/g) || [];
+            const ticks = '`'.repeat(Math.max(1, ...runs.map(s => s.length)) + 1);
+            return `${ticks}${raw}${ticks}`;
+        };
+
+        const wrapFencedCode = (text, lang = '') => {
+            const raw = String(text || '').replace(/\n+$/, '');
+            const runs = raw.match(/`{3,}/g) || [];
+            const fence = '`'.repeat(Math.max(3, ...runs.map(s => s.length + 1), 3));
+            return `${fence}${lang}\n${raw}\n${fence}`;
+        };
+
+        const blockTags = new Set(['P', 'DIV', 'BLOCKQUOTE', 'PRE', 'UL', 'OL', 'LI', 'TABLE', 'HR']);
+        const hasBlockChildren = (el) => [...(el?.children || [])].some(child => blockTags.has(child.tagName));
+
+        const renderInlineNode = (node) => {
+            if (!node) return '';
+            if (node.nodeType === Node.TEXT_NODE) return normalizeText(node.textContent);
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            const tag = node.tagName.toLowerCase();
+            if (tag === 'br') return '\n';
+            if (tag === 'code' && node.parentElement?.tagName !== 'PRE') return wrapInlineCode(node.textContent);
+            if (tag === 'strong' || tag === 'b') return `**${renderInlineChildren(node)}**`;
+            if (tag === 'em' || tag === 'i') return `*${renderInlineChildren(node)}*`;
+            if (tag === 'del' || tag === 's') return `~~${renderInlineChildren(node)}~~`;
+            if (tag === 'a') {
+                const text = renderInlineChildren(node).trim() || normalizeText(node.textContent).trim();
+                const href = node.getAttribute('href') || '';
+                if (!href || !text) return text;
+                return `[${text}](${new URL(href, location.href).href})`;
+            }
+            if (tag === 'img') {
+                const alt = node.getAttribute('alt') || '';
+                return alt ? `![${alt}](${node.getAttribute('src') || ''})` : '';
+            }
+            if (tag === 'input' && node.getAttribute('type') === 'checkbox') {
+                return node.checked ? '[x] ' : '[ ] ';
+            }
+            if (hasBlockChildren(node)) return renderBlockChildren(node);
+            return renderInlineChildren(node);
+        };
+
+        const renderInlineChildren = (el) => {
+            const raw = [...el.childNodes].map(renderInlineNode).join('');
+            return raw
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n[ \t]+/g, '\n')
+                .replace(/[ \t]{2,}/g, ' ')
+                .trim();
+        };
+
+        const renderList = (el, ordered) => [...el.children]
+            .filter(child => child.tagName === 'LI')
+            .map((li, idx) => {
+                const clone = li.cloneNode(true);
+                clone.querySelectorAll('ul, ol').forEach(n => n.remove());
+                const head = renderBlockChildren(clone).replace(/\n+/g, ' ').trim();
+                const nested = [...li.children]
+                    .filter(child => child.tagName === 'UL' || child.tagName === 'OL')
+                    .map(child => renderBlockNode(child))
+                    .filter(Boolean)
+                    .map(text => text.split('\n').map(line => `  ${line}`).join('\n'))
+                    .join('\n');
+                const prefix = ordered ? `${idx + 1}. ` : '- ';
+                return nested ? `${prefix}${head}\n${nested}` : `${prefix}${head}`;
+            })
+            .join('\n');
+
+        const renderBlockNode = (node) => {
+            if (!node) return '';
+            if (node.nodeType === Node.TEXT_NODE) {
+                const text = normalizeText(node.textContent).trim();
+                return text || '';
+            }
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            const tag = node.tagName.toLowerCase();
+            const snippet = node.getAttribute?.('data-snippet-clipboard-copy-content');
+            if (snippet) {
+                return String(snippet)
+                    .replace(/\r\n/g, '\n')
+                    .replace(/\n+$/, '')
+                    .split('\n')
+                    .map(line => `    ${line}`)
+                    .join('\n');
+            }
+            if (tag === 'blockquote') {
+                const inner = renderBlockChildren(node).trim();
+                if (!inner) return '';
+                return inner.split('\n').map(line => line ? `> ${line}` : '>').join('\n');
+            }
+            if (tag === 'pre') {
+                const codeEl = node.querySelector('code');
+                const lang = (codeEl?.className || '').match(/language-([\w-]+)/)?.[1] || '';
+                return wrapFencedCode(codeEl?.textContent || node.textContent || '', lang);
+            }
+            if (tag === 'ul') return renderList(node, false);
+            if (tag === 'ol') return renderList(node, true);
+            if (tag === 'hr') return '---';
+            if (tag === 'table') return normalizeText(node.textContent).trim();
+            if (tag === 'p' || tag === 'li') return renderInlineChildren(node);
+            if (tag === 'details') return renderBlockChildren(node);
+            if (hasBlockChildren(node)) return renderBlockChildren(node);
+            return renderInlineChildren(node);
+        };
+
+        const renderBlockChildren = (el) => [...el.childNodes]
+            .map(renderBlockNode)
+            .filter(Boolean)
+            .join('\n\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+
+        return renderBlockChildren(bodyEl).trim();
+    }
+
+    function getCommentAnchorGroupKey(comment) {
+        const loc = formatCommentLocation(comment.file, comment.line, comment.commitSha);
+        if (loc) return `anchor:${loc}`;
+        if (comment.threadId) return `thread:${comment.threadId}`;
+        if (comment.permalink) return `permalink:${comment.permalink}`;
+        return `loose:${comment.author}:${comment.date}:${comment.markdown.slice(0, 40)}`;
+    }
+
+    function sortCommentsChronologically(list) {
+        return [...list].sort((a, b) => {
+            const ta = Date.parse(a?.date || '');
+            const tb = Date.parse(b?.date || '');
+            if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+            if (Number.isFinite(ta) && !Number.isFinite(tb)) return -1;
+            if (!Number.isFinite(ta) && Number.isFinite(tb)) return 1;
+            return String(a?.permalink || '').localeCompare(String(b?.permalink || ''));
+        });
     }
 
     // --- Visible Comments Scraper ---
@@ -4459,7 +4693,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!body || seenBodies.has(body)) continue;
             seenBodies.add(body);
-            const markdown = body.innerText?.trim();
+            const markdown = renderBodyMarkdown(body);
             if (!markdown || markdown.length < 3) continue;
 
             // Skip PR body - it's already included as ## Description
@@ -4485,6 +4719,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const threadId = getCommentThreadId(container, threadRoot);
             const {isResolved, isOutdated, isPending} = getCommentThreadFlags(container, threadRoot);
             const {file, line, commitSha} = getCommentLocationInfo(container, threadRoot);
+            const codeContext = getCommentCodeContext(container, threadRoot);
+            const reactions = getCommentReactionSummary(container);
             comments.push({
                 author,
                 date,
@@ -4496,7 +4732,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 isPending,
                 file,
                 line,
-                commitSha
+                commitSha,
+                codeContext,
+                reactions,
             });
         }
         return comments;
@@ -4611,12 +4849,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
                 } else {
                 // Group by thread
-                const threads = new Map(); // threadId -> [comment, ...]
+                const threads = new Map(); // anchor/thread key -> [comment, ...]
                 const general = []; // non-threaded comments
                 for (const c of comments) {
-                    if (c.threadId) {
-                        if (!threads.has(c.threadId)) threads.set(c.threadId, []);
-                        threads.get(c.threadId).push(c);
+                    const groupKey = getCommentAnchorGroupKey(c);
+                    if (groupKey) {
+                        if (!threads.has(groupKey)) threads.set(groupKey, []);
+                        threads.get(groupKey).push(c);
                     } else {
                         general.push(c);
                     }
@@ -4633,15 +4872,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 // General comments first
                 for (const c of general) {
                     const datePart = c.date ? ` (${c.date})` : '';
+                    const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
                     const metaLines = [];
                     if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
                     if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
-                    commentParts.push(
-                        [`**${c.author}**${datePart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n')
-                    );
+                    if (c.reactions) metaLines.push(`* Reactions: ${c.reactions}`);
+                    if (c.codeContext) metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
+                    commentParts.push([`**${c.author}**${datePart}${pendingPart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n'));
                 }
                 // Then threaded comments
-                for (const [tid, thread] of threads) {
+                for (const [tid, rawThread] of threads) {
+                    const thread = sortCommentsChronologically(rawThread);
                     const first = thread[0];
                     let loc = '';
                     if (first.file) {
@@ -4650,11 +4891,19 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         if (first.commitSha) loc += '@' + first.commitSha;
                     }
                     const threadMeta = [];
-                    if (first.threadId) threadMeta.push(`* Thread: ${first.threadId}`);
-                    if (first.permalink) threadMeta.push(`* Permalink: ${first.permalink}`);
+                    const threadIds = [...new Set(thread.map(c => c.threadId).filter(Boolean))];
+                    if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
+                    else if (threadIds.length > 1) threadMeta.push(`* Threads: ${threadIds.join(', ')}`);
+                    const permalinks = [...new Set(thread.map(c => c.permalink).filter(Boolean))];
+                    if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
+                    else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
+                    if (first.codeContext) threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
                     const threadLines = thread.map(c => {
                         const datePart = c.date ? ` (${c.date})` : '';
-                        return `> **${c.author}**${datePart}:\n> ${c.markdown.replace(/\n/g, '\n> ')}`;
+                        const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
+                        const quoted = [`> **${c.author}**${datePart}${pendingPart}${c.reactions ? ` [${c.reactions}]` : ''}:`];
+                        quoted.push(`> ${c.markdown.replace(/\n/g, '\n> ')}`);
+                        return quoted.join('\n');
                     }).join('\n>\n');
                     commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
                 }
@@ -4726,9 +4975,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const threads = new Map();
             const general = [];
             for (const c of comments) {
-                if (c.threadId) {
-                    if (!threads.has(c.threadId)) threads.set(c.threadId, []);
-                    threads.get(c.threadId).push(c);
+                const groupKey = getCommentAnchorGroupKey(c);
+                if (groupKey) {
+                    if (!threads.has(groupKey)) threads.set(groupKey, []);
+                    threads.get(groupKey).push(c);
                 } else {
                     general.push(c);
                 }
@@ -4743,14 +4993,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const commentParts = [];
             for (const c of general) {
                 const datePart = c.date ? ` (${c.date})` : '';
+                const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
                 const metaLines = [];
                 if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
                 if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
-                commentParts.push(
-                    [`**${c.author}**${datePart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n')
-                );
+                if (c.reactions) metaLines.push(`* Reactions: ${c.reactions}`);
+                if (c.codeContext) metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
+                commentParts.push([`${c.author}${datePart}${pendingPart}${fmtLoc(c)}${formatCommentFlags(c)}:`, ...metaLines, c.markdown].join('\n'));
             }
-            for (const [tid, thread] of threads) {
+            for (const [tid, rawThread] of threads) {
+                const thread = sortCommentsChronologically(rawThread);
                 const first = thread[0];
                 let loc = '';
                 if (first.file) {
@@ -4759,11 +5011,19 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     if (first.commitSha) loc += '@' + first.commitSha;
                 }
                 const threadMeta = [];
-                if (first.threadId) threadMeta.push(`* Thread: ${first.threadId}`);
-                if (first.permalink) threadMeta.push(`* Permalink: ${first.permalink}`);
+                const threadIds = [...new Set(thread.map(c => c.threadId).filter(Boolean))];
+                if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
+                else if (threadIds.length > 1) threadMeta.push(`* Threads: ${threadIds.join(', ')}`);
+                const permalinks = [...new Set(thread.map(c => c.permalink).filter(Boolean))];
+                if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
+                else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
+                if (first.codeContext) threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
                 const threadLines = thread.map(c => {
                     const datePart = c.date ? ` (${c.date})` : '';
-                    return `> **${c.author}**${datePart}:\n> ${c.markdown.replace(/\n/g, '\n> ')}`;
+                    const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
+                    const quoted = [`> **${c.author}**${datePart}${pendingPart}${c.reactions ? ` [${c.reactions}]` : ''}:`];
+                    quoted.push(`> ${c.markdown.replace(/\n/g, '\n> ')}`);
+                    return quoted.join('\n');
                 }).join('\n>\n');
                 commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
             }
@@ -8442,7 +8702,7 @@ Rules:
         if (!root) return '';
 
         const body = root.querySelector(MARKDOWN_BODY_SELECTOR);
-        const markdown = body?.innerText?.trim() || '';
+        const markdown = body ? renderBodyMarkdown(body) : '';
         if (!markdown) return '';
 
         const threadRoot = getCommentThreadRoot(root) || root;
@@ -8466,7 +8726,7 @@ Rules:
         for (const bodyEl of threadRoot.querySelectorAll(MARKDOWN_BODY_SELECTOR)) {
             if (!bodyEl || seenBodies.has(bodyEl)) continue;
             seenBodies.add(bodyEl);
-            const text = bodyEl.innerText?.trim();
+            const text = renderBodyMarkdown(bodyEl);
             if (!text || /^nothing to preview$/i.test(text)) continue;
             const commentContainer = bodyEl.closest(COMMENT_CONTAINER_SELECTOR)
                 || bodyEl.closest(WIDE_COMMENT_CONTAINER_SELECTOR)
@@ -19840,8 +20100,8 @@ RULES:
     ackTest('getCollapsedResolved handles modern conversation review-thread-collapsible markup', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function getCollapsedResolved'), source.indexOf('async function showResolved'));
-        ackAssert(fn.includes('button[data-target="review-thread-collapsible.button"][aria-expanded="false"]'),
-            'detects collapsed resolved conversation threads in modern React markup');
+        ackAssert(fn.includes('primaryToggle.getAttribute(\'aria-expanded\') === \'false\''),
+            'counts only collapsed modern resolved conversation threads');
         ackAssert(fn.includes('[data-target="review-thread-collapsible.body"]'),
             'checks the lazily revealed thread body visibility');
         ackAssert(fn.includes(".review-thread-show-text"), 'can fall back to the explicit Show resolved button');
@@ -22045,6 +22305,7 @@ RULES:
         const fn = source.slice(source.indexOf('function gatherVisibleComments'), source.indexOf('function gatherFullPRContext'));
         ackAssert(fn.includes('COMMENT_CONTAINER_SELECTOR'), 'uses COMMENT_CONTAINER_SELECTOR');
         ackAssert(fn.includes('MARKDOWN_BODY_SELECTOR'), 'uses MARKDOWN_BODY_SELECTOR');
+        ackAssert(fn.includes('renderBodyMarkdown(body)'), 'extracts markdown-preserving comment text from rendered DOM');
         ackAssert(fn.includes('getCommentAuthor'), 'extracts author via getCommentAuthor helper');
         ackAssert(fn.includes('seenBodies'), 'deduplicates by tracking seen body elements');
         ackAssert(fn.includes("seenBodies.has(body)"), 'skips already-seen bodies');
@@ -22056,6 +22317,8 @@ RULES:
         ackAssert(fn.includes('getCommentPermalink(container)'), 'captures absolute comment permalink');
         ackAssert(fn.includes('getCommentThreadId(container, threadRoot)'), 'derives stable thread IDs from modern thread wrappers');
         ackAssert(fn.includes('getCommentThreadFlags(container, threadRoot)'), 'captures outdated/pending/resolved thread flags');
+        ackAssert(fn.includes('getCommentCodeContext(container, threadRoot)'), 'captures inline code context for copied review comments');
+        ackAssert(fn.includes('getCommentReactionSummary(container)'), 'captures visible reaction summaries for copied review comments');
     });
 
     ackTest('gatherFullPRContext fetches PR URL, title, description, commits, patch, comments', () => {
@@ -22089,7 +22352,7 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
         ackAssert(fn.includes('fetchIssueCommentsForContext(pr)'), 'issue pages fetch comments from API instead of DOM');
-        ackAssert(fn.includes('const hdr = `**${c.author}**'), 'issue comments are rendered from authoritative API author/date data');
+        ackAssert(fn.includes('const hdr = `${c.author}'), 'issue comments are rendered from authoritative API author/date data');
     });
 
     ackTest('gatherSingleCommitContext focuses on current commit only', () => {
@@ -22134,11 +22397,57 @@ RULES:
     ackTest('gatherFullPRContext groups comments by thread', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
-        ackAssert(fn.includes("threads.set(c.threadId, [])"), 'groups by threadId');
+        ackAssert(fn.includes('getCommentAnchorGroupKey(c)'), 'groups comments by code anchor before falling back to thread id');
+        ackAssert(fn.includes('sortCommentsChronologically'), 'sorts grouped comments chronologically');
         ackAssert(fn.includes('### Thread'), 'uses thread headers');
         ackAssert(fn.includes('formatCommentFlags(first)'), 'labels outdated/pending/resolved thread state');
         ackAssert(fn.includes('Permalink: ${first.permalink}') || fn.includes('Permalink: ${c.permalink}'),
             'includes comment permalink metadata');
+        ackAssert(fn.includes('Permalinks: ${permalinks.join'), 'collapses multiple comment permalinks into thread header metadata');
+        ackAssert(fn.includes('Code context:'), 'includes thread code context when available');
+        ackAssert(fn.includes('Reactions:'), 'includes reaction summary when available');
+        ackAssert(!fn.includes("> * Thread: ${c.threadId}"), 'does not inject per-comment thread metadata into quoted conversation');
+        ackAssert(fn.includes("!c.date && c.isPending ? ' [pending]' : ''"), 'marks pending comments directly in the quoted thread output');
+    });
+
+    ackTest('getCommentCodeContext uses the nearest populated line-number cell for split diffs', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function getCommentCodeContext'), source.indexOf('function getCommentReactionSummary'));
+        ackAssert(fn.includes("let sibling = codeCell.previousElementSibling"), 'walks left from the code cell');
+        ackAssert(fn.includes("if (val) return val"), 'prefers the nearest non-empty adjacent line number');
+        ackAssert(fn.includes('return nums[nums.length - 1] || \'\''), 'falls back to the last populated line number in the row');
+        ackAssert(fn.includes(".blob-code-inner, .diff-text-cell, code.diff-text"), 'prefers the inner code node over the padded table cell wrapper');
+        ackAssert(fn.includes("const parts = rawCode.split('\\\\n')") || fn.includes("const parts = rawCode.split('\\n')"),
+            'splits DOM text into visual fragments');
+        ackAssert(fn.includes("if (!code && part.length > pendingIndent.length) pendingIndent = part"),
+            'keeps indentation fragments without preserving blank spacer lines');
+        ackAssert(!fn.includes('<<<'), 'copied comment code context does not add target markers');
+    });
+
+    ackTest('renderBodyMarkdown preserves blockquotes and inline code', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="markdown-body">
+                <p>Thanks.</p>
+                <blockquote><p>quoted line</p></blockquote>
+                <p>Use <code>CallOneOf</code> here.</p>
+            </div>
+        `;
+        const out = renderBodyMarkdown(host.firstElementChild);
+        ackAssert(out.includes('> quoted line'), 'preserves blockquote marker');
+        ackAssert(out.includes('`CallOneOf`'), 'preserves inline code formatting');
+    });
+
+    ackTest('renderBodyMarkdown preserves GitHub snippet clipboard blocks without spacer lines', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="markdown-body">
+                <div data-snippet-clipboard-copy-content="    it->Seek(seek_key.value_or(uint16_t{0}));\n(IsEmpty already covers SeekToFirst)"></div>
+            </div>
+        `;
+        const out = renderBodyMarkdown(host.firstElementChild);
+        ackAssert(out.includes('    it->Seek(seek_key.value_or(uint16_t{0}));'), 'preserves snippet body exactly');
+        ackAssert(!out.includes('      \n'), 'does not inject spacer-only blank lines from snippet wrapper DOM');
     });
 
     ackTest('getEditFormRequest prefers local edit fragment over unrelated earlier one', () => {
@@ -22267,6 +22576,30 @@ RULES:
             ackAssert(ctx.includes('Original thread comment'), 'includes previous thread comment');
             ackEq((ctx.match(/Follow-up concern/g) || []).length, 1, 'selected comment is not duplicated in thread context');
             ackAssert(ctx.indexOf('## Prior thread context') < ctx.indexOf('## Selected comment'), 'prior thread context keeps original thread order');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('gatherCommentContext preserves rendered markdown formatting', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment-group review-comment" id="discussion_r77">
+                <h3><a class="author" href="/alice">alice</a><a id="discussion_r77-permalink" href="#discussion_r77"><relative-time datetime="2026-03-05T11:00:00Z"></relative-time></a></h3>
+                <div class="markdown-body">
+                    <p>Reply intro.</p>
+                    <blockquote><p>quoted bit</p></blockquote>
+                    <p>Run <code>git diff a..b</code></p>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const ctx = gatherCommentContext(host.querySelector('#discussion_r77'));
+            ackAssert(ctx.includes('> quoted bit'), 'selected comment keeps blockquote markers');
+            ackAssert(ctx.includes('`git diff a..b`'), 'selected comment keeps inline code markers');
         } finally {
             host.remove();
         }
