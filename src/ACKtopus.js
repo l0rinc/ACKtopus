@@ -19,9 +19,9 @@
 // @connect      api.anthropic.com
 // @connect      api.openai.com
 // @connect      keys.openpgp.org
-// @require      https://cdn.jsdelivr.net/npm/openpgp@5.11.2/dist/openpgp.min.js
-// @require      https://cdn.jsdelivr.net/npm/diff@7.0.0/dist/diff.min.js
-// @require      https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js
+// @require      https://cdn.jsdelivr.net/npm/openpgp@6.3.0/dist/openpgp.min.js
+// @require      https://cdn.jsdelivr.net/npm/diff@9.0.0/dist/diff.min.js
+// @require      https://cdn.jsdelivr.net/npm/marked@18.0.0/lib/marked.umd.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -15871,9 +15871,9 @@ RULES:
 // @connect      api.anthropic.com
 // @connect      api.openai.com
 // @connect      keys.openpgp.org
-// @require      https://cdn.jsdelivr.net/npm/openpgp@5.11.2/dist/openpgp.min.js
-// @require      https://cdn.jsdelivr.net/npm/diff@7.0.0/dist/diff.min.js
-// @require      https://cdn.jsdelivr.net/npm/marked@15.0.7/marked.min.js
+// @require      https://cdn.jsdelivr.net/npm/openpgp@6.3.0/dist/openpgp.min.js
+// @require      https://cdn.jsdelivr.net/npm/diff@9.0.0/dist/diff.min.js
+// @require      https://cdn.jsdelivr.net/npm/marked@18.0.0/lib/marked.umd.js
 // @run-at       document-idle
 // ==/UserScript==`;
             return meta + '\n\n' + fnSrc;
@@ -20863,7 +20863,7 @@ RULES:
     ackTest('wordDiff uses jsdiff library (Myers O(ND) algorithm)', () => {
         const source = _ackSource;
         ackAssert(source.includes('Diff.diffWords'), 'delegates to jsdiff diffWords');
-        ackAssert(source.includes('diff@7.0.0'), '@require includes jsdiff');
+        ackAssert(/@require\s+https:\S+diff@\d/.test(source), '@require includes jsdiff');
         // No custom LCS implementation
         ackAssert(!source.includes('Uint16Array(m + 1)'), 'no custom DP matrix');
     });
