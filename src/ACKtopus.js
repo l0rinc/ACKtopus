@@ -2688,6 +2688,17 @@
         _compareActive = true;
         const [, owner, repo, baseSha, headSha] = m;
         console.log('ACKtopus: compare page detected, base:', baseSha.slice(0, 8), 'head:', headSha.slice(0, 8));
+        const statusPopup = makeStatusPopup(`Compare: resolving PR for ${headSha.slice(0, 8)}...`);
+        const setCompareStatus = (text) => {
+            if (statusPopup?.isConnected) statusPopup.textContent = text;
+        };
+        const finishCompareStatus = (text) => {
+            if (!statusPopup?.isConnected) return;
+            statusPopup.textContent = text;
+            setTimeout(() => {
+                try { statusPopup.remove(); } catch (_) {}
+            }, 2200);
+        };
 
         // Helper: gmFetch with timeout (old force-push SHAs can hang)
         function gmFetchTimeout(url, ms = 10000) {
@@ -2746,16 +2757,27 @@
         }
         if (!prNum) {
             console.warn('ACKtopus: compare -- no PR found for', headSha.slice(0, 8), '(referrer:', document.referrer.slice(0, 80) + ')');
+            finishCompareStatus('Compare: no matching PR found');
             _compareActive = false;
             return;
         }
         console.log('ACKtopus: compare -- PR #' + prNum);
+        setCompareStatus(`Compare: fetching files for PR #${prNum}...`);
 
         // Build comprehensive PR file set from multiple sources:
         // 1. pulls/{pr}/files -- current PR files (may differ from old force-push)
         // 2. compare/{baseBranch}...{headSha} -- PR files at the specific compare commit
         // Union of both ensures we match files even if the PR was refactored between pushes.
         const prFileSet = new Set();
+        const normalizeComparePath = (value) => {
+            const raw = String(value || '').trim().replace(/^\/+/, '');
+            if (!raw) return '';
+            try {
+                return decodeURIComponent(raw);
+            } catch (_) {
+                return raw;
+            }
+        };
         const addFiles = (files) => {
             for (const f of files) {
                 prFileSet.add(f.filename);
@@ -2812,10 +2834,13 @@
 
         if (prFileSet.size === 0) {
             console.warn('ACKtopus: compare -- no PR files found, aborting');
+            finishCompareStatus(`Compare: PR #${prNum} has no file list`);
             _compareActive = false;
             return;
         }
         console.log('ACKtopus: compare -- total unique PR file paths:', prFileSet.size);
+        const normalizedPrFileSet = new Set([...prFileSet].map(normalizeComparePath).filter(Boolean));
+        setCompareStatus(`Compare: filtering to ${normalizedPrFileSet.size} PR file paths...`);
 
         // Auto-click "Files changed" tab if not already active
         const filesTab = document.querySelector('a[href="#files_bucket"]')
@@ -2838,6 +2863,7 @@
         const collapsedPaths = new Set();
         const processed = new Set();
         let scrolledToFirstKeptFile = false;
+        let lastStatusUpdate = 0;
 
         function updateCollapseCSS() {
             if (collapsedPaths.size === 0) {
@@ -2862,21 +2888,13 @@
                 if (!path || processed.has(path)) continue;
                 processed.add(path);
 
-                // Match against PR file set: exact, then header text, then basename
-                let isPRFile = prFileSet.has(path);
+                // Match only normalized exact PR paths. Basename fallback is too permissive on huge compares.
+                const normalizedPath = normalizeComparePath(path);
+                let isPRFile = normalizedPrFileSet.has(normalizedPath);
                 if (!isPRFile) {
                     const headerTitle = file.querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')?.textContent?.trim()
                         || file.querySelector('.file-header')?.getAttribute('data-path') || '';
-                    isPRFile = prFileSet.has(headerTitle);
-                    if (!isPRFile) {
-                        const basename = path.split('/').pop();
-                        for (const p of prFileSet) {
-                            if (p.split('/').pop() === basename || p === path || p.endsWith('/' + path) || path.endsWith('/' + p)) {
-                                isPRFile = true;
-                                break;
-                            }
-                        }
-                    }
+                    isPRFile = normalizedPrFileSet.has(normalizeComparePath(headerTitle));
                 }
                 if (isPRFile) {
                     newKept++;
@@ -2885,14 +2903,21 @@
                 }
                 if (unmatched.length < 5) unmatched.push(path);
                 collapsedPaths.add(path);
+                file.dataset.ackCompareHidden = '1';
+                file.style.display = 'none';
                 newCollapsed++;
                 totalCollapsed++;
             }
             if (newCollapsed > 0) updateCollapseCSS();
             if (newCollapsed > 0 || newKept > 0) {
                 console.log('ACKtopus: compare -- batch: +' + newCollapsed + ' collapsed, +' + newKept + ' kept (total: ' + totalCollapsed + '/' + totalKept + ')');
+                const now = Date.now();
+                if (now - lastStatusUpdate > 150 || totalCollapsed + totalKept < 20) {
+                    setCompareStatus(`Compare: kept ${totalKept}, hid ${totalCollapsed}, scanned ${processed.size} files...`);
+                    lastStatusUpdate = now;
+                }
                 if (unmatched.length > 0 && totalCollapsed === newCollapsed) {
-                    console.log('ACKtopus: compare -- PR file set (' + prFileSet.size + '):', [...prFileSet].slice(0, 15).join(', '));
+                    console.log('ACKtopus: compare -- PR file set (' + normalizedPrFileSet.size + '):', [...normalizedPrFileSet].slice(0, 15).join(', '));
                     console.log('ACKtopus: compare -- first unmatched:', unmatched.join(', '));
                 }
             }
@@ -2929,6 +2954,7 @@
                 _compareObserver = null;
             }
             console.log('ACKtopus: compare -- observer done (20s), total:', totalCollapsed, 'collapsed,', totalKept, 'kept');
+            finishCompareStatus(`Compare: done - kept ${totalKept}, hid ${totalCollapsed}`);
         }, 20000);
         _compareObserver = new MutationObserver(() => {
             if (_ackTesting) return;
@@ -20927,10 +20953,18 @@ RULES:
     ackTest('autoCollapseCompareFiles has robust path matching with fallbacks', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function autoCollapseCompareFiles'), source.indexOf('// Try immediately'));
-        ackAssert(fn.includes('prFileSet.has(path)'), 'exact path match first');
+        ackAssert(fn.includes('normalizedPrFileSet.has(normalizedPath)'), 'matches normalized exact file paths first');
         ackAssert(fn.includes('.file-header [title]'), 'falls back to file header title');
-        ackAssert(fn.includes("split('/').pop()"), 'falls back to basename matching');
-        ackAssert(fn.includes("endsWith('/' + path)"), 'handles prefix path discrepancies');
+        ackAssert(fn.includes('normalizeComparePath(headerTitle)'), 'normalizes header-title fallback too');
+        ackAssert(!fn.includes("split('/').pop()"), 'does not use basename matching on huge compares');
+    });
+
+    ackTest('autoCollapseCompareFiles shows popup progress and hides unmatched files immediately', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function autoCollapseCompareFiles'), source.indexOf('// --- LLM Config'));
+        ackAssert(fn.includes('makeStatusPopup'), 'shows bottom-right popup progress while compare files are loading');
+        ackAssert(fn.includes('setCompareStatus'), 'updates popup status during fetch/collapse');
+        ackAssert(fn.includes("file.style.display = 'none'"), 'hides unmatched file cards immediately before CSS catches up');
     });
 
     ackTest('config panel shows GitHub Token before AI provider section', () => {
