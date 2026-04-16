@@ -307,6 +307,14 @@
             fmt: (sha, pr) => `git fetch origin ${sha} && git switch --detach FETCH_HEAD`
         },
         {
+            key: 'parent',
+            hotkey: 'p',
+            emoji: '⏮️',
+            label: 'checkout parent',
+            tip: 'Copy command to fetch and checkout the parent of the first commit in this PR',
+            fmt: (_sha, _pr) => null
+        },
+        {
             key: 'ghco',
             hotkey: 'g',
             emoji: '⬇️',
@@ -936,6 +944,14 @@
         return raw;
     }
 
+    async function getParentCheckoutCommand(pr) {
+        if (!pr) return null;
+        const checkout = await getRecipeCheckoutMeta(pr);
+        const baseSha = String(checkout?.baseSha || '').trim();
+        if (!/^[0-9a-f]{40}$/i.test(baseSha)) return null;
+        return `git fetch origin ${baseSha} && git switch --detach FETCH_HEAD`;
+    }
+
     // Single authoritative textarea setter -- React-compatible via native property
     // descriptor. All code that writes to a textarea value MUST use this helper
     // (or insertIntoTextarea which calls it) to avoid React state desync.
@@ -1099,9 +1115,18 @@
 
     async function copySHA(mainBtn, updateMainLabel) {
         const pr = parsePR();
+        const fmt = getFormat();
+        if (fmt.key === 'parent' && pr) {
+            const text = await getParentCheckoutCommand(pr);
+            if (text) {
+                GM_setClipboard(text);
+                mainBtn.innerHTML = `${CHECK_ICON}`;
+                ackSetTimeout(() => updateMainLabel(), 1500);
+                return;
+            }
+        }
         const immediateSha = getImmediatePRHeadSHA();
         if (immediateSha && pr) {
-            const fmt = getFormat();
             const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
             if (compareFmt && userAckSha && userAckSha.length < 40) {
                 userAckSha = await resolveFullCommitSha(pr, userAckSha);
@@ -1123,7 +1148,6 @@
         await waitForNextPaint();
         try {
             const sha = await fetchSHA();
-            const fmt = getFormat();
             const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
             if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
                 userAckSha = await resolveFullCommitSha(pr, userAckSha);
@@ -1424,6 +1448,21 @@
     function getCollapsedSectionCount() {
         const {minimized, outdated, loadDiffs} = getLoadableElements();
         return minimized.length + outdated.length + loadDiffs.length;
+    }
+
+    function getRevealAllState() {
+        const hiddenCount = getHiddenCount();
+        const {paginationBtns, minimized, outdated, loadDiffs} = getLoadableElements();
+        const resolved = getCollapsedResolved();
+        return {
+            hiddenCount,
+            paginationBtns,
+            minimized,
+            outdated,
+            loadDiffs,
+            resolved,
+            total: hiddenCount + paginationBtns.length + minimized.length + outdated.length + loadDiffs.length + resolved.length,
+        };
     }
 
     function getLoadableElements() {
@@ -14775,6 +14814,77 @@ RULES:
         });
     }
 
+    async function revealAllContext(btn) {
+        if (btn._running) return;
+        btn._running = true;
+        const compact = GM_getValue('compactToolbar', false);
+        const origText = btn.textContent;
+        const stopCompactSpin = compact ? startSpin(btn) : null;
+        const stopAnim = compact ? null : startBrailleAnimation(frame => {
+                const remaining = getRevealAllState().total;
+                btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
+            });
+        const popup = makeStatusPopup('Revealing hidden conversations, resolved threads, and collapsed sections...');
+        const finish = (msg, shortMsg) => {
+            if (stopAnim) stopAnim();
+            if (stopCompactSpin) stopCompactSpin(shortMsg || msg);
+            else btn.textContent = shortMsg || msg;
+            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            setTimeout(() => {
+                btn.textContent = origText;
+                popup.remove();
+                btn._running = false;
+            }, 2000);
+        };
+
+        try {
+            let openedCount = 0;
+            let lastTotal = null;
+            let lastScrolledAt = -10;
+            for (let round = 0; round < 60; round++) {
+                const state = getRevealAllState();
+                if (lastTotal !== null && state.total < lastTotal) {
+                    openedCount += (lastTotal - state.total);
+                }
+                lastTotal = state.total;
+                popup.textContent = state.total > 0
+                    ? `Revealing context... ${state.total} remaining`
+                    : 'Finalizing...';
+                if (state.total === 0) {
+                    finish('Revealed everything needed for context copy', '✅');
+                    return;
+                }
+
+                if (round === 0 || openedCount - lastScrolledAt >= 10) {
+                    const scrollTarget =
+                        state.paginationBtns[0]
+                        || state.resolved[0]?.el
+                        || state.minimized[0]
+                        || state.outdated[0]
+                        || state.loadDiffs[0];
+                    scrollTarget?.scrollIntoView?.({behavior: 'smooth', block: 'center'});
+                    lastScrolledAt = openedCount;
+                }
+
+                state.paginationBtns.forEach(b => b.click());
+                state.resolved.forEach(item => item.click());
+                state.minimized.forEach(h => h.click());
+                state.outdated.forEach(d => d.setAttribute('open', ''));
+                state.loadDiffs.forEach(b => b.click());
+
+                const waitMs = state.paginationBtns.length > 0 ? 1800 : 700;
+                await ackSleep(waitMs);
+            }
+
+            const remaining = getRevealAllState().total;
+            if (remaining === 0) finish('Revealed everything needed for context copy', '✅');
+            else finish(`${remaining} items still appear collapsed`, '❌');
+        } catch (e) {
+            console.error('ACKtopus: reveal all context failed:', e);
+            finish(`Error: ${e.message}`, '❌');
+        }
+    }
+
     function buildContextCopyGroup() {
         const compact = GM_getValue('compactToolbar', false);
         const group = document.createElement('div');
@@ -14876,8 +14986,37 @@ RULES:
             renderItemState();
             menu.appendChild(item);
         }
+
+        const sep = document.createElement('div');
+        Object.assign(sep.style, {borderTop: '1px solid #30363d', margin: '4px 0'});
+        menu.appendChild(sep);
+
+        const revealItem = document.createElement('div');
+        revealItem.dataset.ackRevealAll = 'true';
+        Object.assign(revealItem.style, {
+            padding: '6px 12px', fontSize: '12px', color: '#c9d1d9',
+            cursor: 'pointer', whiteSpace: 'nowrap', background: 'transparent',
+        });
+        const renderRevealItem = () => {
+            const count = getRevealAllState().total;
+            revealItem.textContent = `📂 Reveal all${count > 0 ? ` (${count})` : ''}`;
+            revealItem.style.opacity = count > 0 ? '1' : '0.45';
+            revealItem.style.cursor = count > 0 ? 'pointer' : 'default';
+        };
+        renderRevealItem();
+        revealItem.title = 'Reveal hidden conversations, resolved threads, and collapsed sections before copying context';
+        revealItem.addEventListener('mouseenter', () => revealItem.style.background = '#30363d');
+        revealItem.addEventListener('mouseleave', () => revealItem.style.background = 'transparent');
+        revealItem.addEventListener('click', () => {
+            if (getRevealAllState().total === 0) return;
+            menu.style.display = 'none';
+            revealAllContext(mainBtn);
+        });
+        menu.appendChild(revealItem);
+
         dropBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            renderRevealItem();
             menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
         });
         document.addEventListener('click', () => menu.style.display = 'none');
@@ -15294,7 +15433,6 @@ RULES:
         expandGroup.appendChild(expandMainBtn);
         expandGroup.appendChild(expandDropBtn);
         expandGroup.appendChild(expandMenu);
-        toolbar.appendChild(expandGroup);
 
         // --- 💬 Comment navigator ---
         const commentNavBtn = createBtn(
@@ -16373,6 +16511,7 @@ RULES:
         const keys = SHA_FORMATS.map(f => f.key);
         ackAssert(keys.includes('ack'), 'missing ack');
         ackAssert(keys.includes('fetch'), 'missing fetch');
+        ackAssert(keys.includes('parent'), 'missing parent');
         ackAssert(keys.includes('ghco'), 'missing ghco');
         ackAssert(keys.includes('rdiff'), 'missing rdiff');
         ackAssert(keys.includes('bench'), 'missing bench');
@@ -17563,13 +17702,13 @@ RULES:
     // SHA_FORMATS -- all formats
     // ============================================================================
 
-	    ackTest('SHA_FORMATS has exactly 12 formats', () => {
-	        ackEq(SHA_FORMATS.length, 12);
+	    ackTest('SHA_FORMATS has exactly 13 formats', () => {
+	        ackEq(SHA_FORMATS.length, 13);
 	    });
 
-	    ackTest('SHA_FORMATS keys are ack, fetch, ghco, rdiff, rebasediff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
+	    ackTest('SHA_FORMATS keys are ack, fetch, parent, ghco, rdiff, rebasediff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
 	        const keys = SHA_FORMATS.map(f => f.key);
-	        ackDeepEq(keys, ['ack', 'fetch', 'ghco', 'rdiff', 'rebasediff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
+	        ackDeepEq(keys, ['ack', 'fetch', 'parent', 'ghco', 'rdiff', 'rebasediff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
 	    });
 
     ackTest('all SHA_FORMATS have key, emoji, label, tip, fmt', () => {
@@ -17587,6 +17726,11 @@ RULES:
         const result = f.fmt('abc123def456', {owner: 'bitcoin', repo: 'bitcoin', pr: '100'});
         ackAssert(result.startsWith('git fetch origin abc123def456'), 'starts with git fetch');
         ackAssert(result.includes('git switch --detach FETCH_HEAD'), 'includes switch detach');
+    });
+
+    ackTest('parent format is handled asynchronously via copySHA helper', () => {
+        const f = SHA_FORMATS.find(f => f.key === 'parent');
+        ackEq(f.fmt('abc123', {owner: 'bitcoin', repo: 'bitcoin', pr: '100'}), null, 'parent fmt is resolved asynchronously');
     });
 
     ackTest('ghco format produces gh pr co command with rebase', () => {
@@ -18899,6 +19043,7 @@ RULES:
         const hotkeys = {
             ack: 'a',
             fetch: 's',
+            parent: 'p',
             ghco: 'g',
             rdiff: 'r',
             bench: 'b',
@@ -20112,15 +20257,12 @@ RULES:
         ackAssert(fn.includes('hidden\\s+(?:items|conversations)'), 'counts both hidden items and hidden conversations');
     });
 
-    ackTest('grouped expand dropdown exposes hidden, resolved, and collapsed actions', () => {
+    ackTest('context copy dropdown includes unified reveal-all action', () => {
         const source = _ackSource;
-        const inject = source.slice(source.indexOf('function inject()'));
-        ackAssert(inject.includes("const EXPAND_ACTIONS = ["), 'defines grouped expand actions');
-        ackAssert(inject.includes("label: 'Show hidden'"), 'includes hidden action');
-        ackAssert(inject.includes("label: 'Show resolved'"), 'includes resolved action');
-        ackAssert(inject.includes("label: 'Open collapsed'"), 'includes collapsed action');
-        ackAssert(inject.includes('showCollapsedSections'), 'collapsed action has dedicated runner');
-        ackAssert(inject.includes('GM_setValue(\'expandToolbarAction\''), 'persists selected expand action');
+        const group = source.slice(source.indexOf('function buildContextCopyGroup'), source.indexOf('function buildRobotRecipeGroup'));
+        ackAssert(group.includes('revealAllContext'), 'context copy group exposes reveal-all action');
+        ackAssert(group.includes('📂 Reveal all'), 'reveal-all item has explicit label');
+        ackAssert(group.includes('getRevealAllState().total'), 'reveal-all menu item shows live remaining count');
     });
 
     ackTest('childList observer refreshes toolbar when hidden loaders appear later', () => {
@@ -20142,17 +20284,13 @@ RULES:
         ackAssert(showResolvedFn.includes('startSpin(btn)'), 'uses startSpin overlay in compact');
     });
 
-    ackTest('showHidden promotes main action to resolved or collapsed before disabling', () => {
+    ackTest('revealAllContext shows popup progress and reduces scroll churn', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function showHidden'), source.indexOf('async function showResolved'));
-        ackAssert(fn.includes("finish('✓ all loaded'"), 'has success finish call');
-        // After success, rechecks counts and either promotes to the next action or disables if nothing is left
-        const afterSuccess = fn.slice(fn.indexOf("finish('✓ all loaded'"));
-        ackAssert(afterSuccess.includes('getLoadableElements()'), 'rechecks loadable elements');
-        ackAssert(afterSuccess.includes('getCollapsedResolved()'), 'checks for newly revealed resolved threads');
-        ackAssert(afterSuccess.includes("GM_setValue('expandToolbarAction', 'resolved')"), 'promotes to resolved when available');
-        ackAssert(afterSuccess.includes("GM_setValue('expandToolbarAction', 'collapsed')"), 'promotes to collapsed when available');
-        ackAssert(afterSuccess.includes('btn.disabled = true'), 'still disables button when nothing remains');
+        const fn = source.slice(source.indexOf('async function revealAllContext'), source.indexOf('function buildContextCopyGroup'));
+        ackAssert(fn.includes('makeStatusPopup'), 'shows bottom-right popup progress');
+        ackAssert(fn.includes('openedCount'), 'tracks how many items were opened');
+        ackAssert(fn.includes('openedCount - lastScrolledAt >= 10'), 'only scrolls after substantial progress');
+        ackAssert(fn.includes('state.paginationBtns.length > 0 ? 1800 : 700'), 'wait is shorter when no hidden-page fetch is involved');
     });
 
     ackTest('showResolved disables button after successful completion', () => {
@@ -20704,6 +20842,17 @@ RULES:
         const fn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
         ackAssert(fn.includes("fmt.key === 'rdiff' || fmt.key === 'rebasediff'"), 'special-cases compare commands');
         ackAssert(fn.includes('resolveFullCommitSha(pr, userAckSha)'), 'resolves short last-ACK SHAs before building compare commands');
+    });
+
+    ackTest('copySHA resolves parent checkout command from recipe checkout metadata', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
+        ackAssert(fn.includes("fmt.key === 'parent'"), 'special-cases parent checkout command');
+        ackAssert(fn.includes('getParentCheckoutCommand(pr)'), 'resolves parent checkout command via helper');
+        const helper = source.slice(source.indexOf('async function getParentCheckoutCommand'), source.indexOf('function setTextareaValue'));
+        ackAssert(helper.includes('getRecipeCheckoutMeta(pr)'), 'reuses recipe checkout metadata helper');
+        ackAssert(helper.includes('git fetch origin ${baseSha} && git switch --detach FETCH_HEAD'),
+            'copies a detach checkout command for the series base parent');
     });
 
     ackTest('DOM force push SHA extraction requires 40-char hex in href', () => {
@@ -22424,7 +22573,7 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function gatherFullPRContext'), source.indexOf('function scrollToAndHighlight'));
         ackAssert(fn.includes('fetchIssueCommentsForContext(pr)'), 'issue pages fetch comments from API instead of DOM');
-        ackAssert(fn.includes('const hdr = `${c.author}'), 'issue comments are rendered from authoritative API author/date data');
+        ackAssert(fn.includes('const hdr = `**${c.author}**'), 'issue comments are rendered from authoritative API author/date data');
     });
 
     ackTest('gatherSingleCommitContext focuses on current commit only', () => {
@@ -22518,7 +22667,7 @@ RULES:
             </div>
         `;
         const out = renderBodyMarkdown(host.firstElementChild);
-        ackAssert(out.includes('    it->Seek(seek_key.value_or(uint16_t{0}));'), 'preserves snippet body exactly');
+        ackAssert(out.includes('        it->Seek(seek_key.value_or(uint16_t{0}));'), 'preserves snippet body exactly');
         ackAssert(!out.includes('      \n'), 'does not inject spacer-only blank lines from snippet wrapper DOM');
     });
 
@@ -22795,7 +22944,7 @@ RULES:
         ackAssert(fn.includes("'🔑'"), 'shows key overlay');
     });
 
-    ackTest('toolbar order: context copy group stays with SHA copy before expand/comment/robot', () => {
+    ackTest('toolbar order: context copy group stays with SHA copy before comment/robot', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf('function inject()'));
         const shaIdx = inject.indexOf("toolbar.appendChild(buildSHAGroup())");
@@ -22808,12 +22957,11 @@ RULES:
         ackAssert(shaIdx > -1, 'SHA copy group exists');
         ackAssert(contextGroupIdx > -1, 'context copy group exists');
         ackAssert(shaIdx < contextGroupIdx, 'context copy group sits next to SHA copy group');
-        ackAssert(contextGroupIdx < expandIdx, 'context copy group before expand group');
-        ackAssert(expandIdx < commentIdx, 'expand group before 💬');
+        ackEq(expandIdx, -1, 'separate expand group is no longer appended to the toolbar');
+        ackAssert(contextGroupIdx < commentIdx, 'context copy group before 💬');
         ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
         ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
-        ackAssert(inject.includes("const EXPAND_ACTIONS = ["), 'grouped expand action list exists');
     });
 
     ackTest('context copy helpers delegate to shared clipboard helper', () => {
@@ -22828,6 +22976,9 @@ RULES:
         ackAssert(group.includes("mainBtn.disabled = !enabled"), 'main button disables unavailable action');
         ackAssert(group.includes("getAnalysisMode() === ANALYSIS_MODES.commit"), 'patch action tooltip specializes on commit pages');
         ackAssert(group.includes('currently viewed commit'), 'commit-page patch action says it copies only the viewed commit patch');
+        ackAssert(group.includes('revealAllContext(mainBtn)'), 'context dropdown can reveal all before copying');
+        ackAssert(group.includes("revealItem.dataset.ackRevealAll = 'true'"), 'reveal-all item is rendered as a menu-only action');
+        ackAssert(group.includes('📂 Reveal all'), 'reveal-all label is present in the context menu');
 
         const helper = source.slice(source.indexOf('async function copyContextWith'), source.indexOf('async function copyCommentContext'));
         ackAssert(helper.includes('GM_setClipboard'), 'copies via GM_setClipboard');
@@ -22865,7 +23016,8 @@ RULES:
         const fn = source.slice(source.indexOf('async function gatherSingleCommitPatchContext'), source.indexOf('function scrollToAndHighlight'));
         ackAssert(fn.includes('# Commit patch from PR:'), 'labels copied output as a single commit patch');
         ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
-        ackAssert(!fn.includes('gatherFullPRContext'), 'does not fall back to full PR patch context');
+        ackAssert(!fn.includes('gatherFullPRContext(onProgress, {includePatch: true, includeComments: false})'),
+            'does not fall back to full PR patch context');
         ackAssert(!fn.includes('## Commits ('), 'does not include full PR commit list');
         ackAssert(!fn.includes('## Comments'), 'does not include comments');
     });
@@ -24415,21 +24567,13 @@ RULES:
         ackAssert(source.includes('"verify_repro": "..."'), 'JSON format includes verify_repro');
     });
 
-    ackTest('compact toolbar reduces gap, padding, and hides disabled buttons', () => {
+    ackTest('compact toolbar reduces gap and padding', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf('function inject()'));
         // Toolbar wrapper
         ackAssert(inject.includes("gap: compact ? '2px' : '6px'"), 'toolbar gap reduced in compact');
         ackAssert(inject.includes("padding: compact ? '4px 6px' : '6px 10px'"), 'toolbar padding reduced in compact');
-        // disableBtn keeps buttons visible but disabled
-        const disableFn = inject.slice(inject.indexOf('function disableBtn'), inject.indexOf('function enableBtn'));
-        ackAssert(!disableFn.includes("btn.style.display = 'none'"), 'disableBtn does not hide disabled buttons');
-        ackAssert(disableFn.includes("opacity: '0.35'"), 'disableBtn dims disabled buttons');
-        // enableBtn restores display
-        const enableFn = inject.slice(inject.indexOf('function enableBtn'), inject.indexOf('const EXPAND_ACTIONS'));
-        ackAssert(enableFn.includes("btn.style.display = ''"), 'enableBtn restores display');
-        // Compact padding on grouped expand button + comment nav button
-        ackAssert(inject.includes("if (compact) expandMainBtn.style.padding = '4px 8px'"), 'expand main button compact padding');
+        // Compact padding on comment nav button
         ackAssert(inject.includes("if (compact) commentNavBtn.style.padding = '4px 8px'"), 'commentNavBtn compact padding');
     });
 
