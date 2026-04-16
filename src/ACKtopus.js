@@ -821,6 +821,13 @@
         return m ? {owner: m[1], repo: m[2], pr: m[3]} : null;
     }
 
+    // Pulls the commit SHA out of /commits/<sha>, /commit/<sha>, /changes/<sha>
+    // URLs (7-40 hex chars). Returns '' if the path isn't scoped to a commit.
+    function pathCommitSha(path = location.pathname) {
+        const m = path.match(/\/(?:commits?|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
+        return m ? m[1] : '';
+    }
+
     function getImmediatePRHeadSHA(path = location.pathname) {
         const pr = parsePR(path);
         if (!pr) return '';
@@ -4479,15 +4486,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         if (!commitSha) {
             const commitLink = threadEl.querySelector?.('a[href*="/commit/"], a[href*="/commits/"], a[href*="/changes/"], a.ack-commit-badge');
-            if (commitLink) {
-                const m = commitLink.getAttribute('href')?.match(/\/(?:commit|commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/);
-                if (m) commitSha = m[1].slice(0, 8);
-            }
+            const sha = pathCommitSha(commitLink?.getAttribute('href') || '');
+            if (sha) commitSha = sha.slice(0, 8);
         }
 
         if (!commitSha) {
-            const pathMatch = location.pathname.match(/\/(?:changes|commits|commit)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
-            if (pathMatch) commitSha = pathMatch[1].slice(0, 8);
+            const sha = pathCommitSha();
+            if (sha) commitSha = sha.slice(0, 8);
         }
 
         return {file, line, commitSha, threadRoot: threadEl};
@@ -4968,9 +4973,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     async function gatherSingleCommitContext(onProgress = () => {}) {
         const pr = parsePR();
         if (!pr) return '';
-        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
-        if (!shaMatch) return '';
-        const sha = shaMatch[1];
+        const sha = pathCommitSha();
+        if (!sha) return '';
         const shortSha = sha.slice(0, 8);
         const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
         const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
@@ -5126,9 +5130,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     async function gatherSingleCommitPatchContext(onProgress = () => {}) {
         const pr = parsePR();
         if (!pr) return '';
-        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
-        if (!shaMatch) return '';
-        const sha = shaMatch[1];
+        const sha = pathCommitSha();
+        if (!sha) return '';
         const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
         const parts = [`# Commit patch from PR: ${commitUrl}`];
 
@@ -5846,7 +5849,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (commits.length > 0) {
             if (currentCommitIdx < 0) {
                 // Try to find the currently viewed commit from the URL
-                const urlSha = location.pathname.match(/\/(?:commits?|changes)\/([0-9a-f]{7,40})/)?.[1];
+                const urlSha = pathCommitSha();
                 if (urlSha) {
                     currentCommitIdx = commits.findIndex(c => c.sha.startsWith(urlSha) || urlSha.startsWith(c.sha));
                 }
@@ -5902,9 +5905,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const pr = parsePR();
         if (!pr) return;
         const config = getLLMConfig();
-        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})/);
-        if (!shaMatch) return;
-        const sha = shaMatch[1];
+        const sha = pathCommitSha();
+        if (!sha) return;
 
         const old = document.getElementById('acktopus-analysis');
         if (old) old.remove();
@@ -12127,10 +12129,8 @@ RULES:
             }
             if (!commitSha) {
                 const commitLink = threadEl.querySelector('a[href*="/commit/"]');
-                if (commitLink) {
-                    const m = commitLink.getAttribute('href')?.match(/\/commit\/([0-9a-f]{7,40})/);
-                    if (m) commitSha = m[1].slice(0, 8);
-                }
+                const sha = pathCommitSha(commitLink?.getAttribute('href') || '');
+                if (sha) commitSha = sha.slice(0, 8);
             }
 
             // Fallback: look up comment ID in API review commit map
@@ -13018,18 +13018,8 @@ RULES:
 
 		    function findCommitShaNearSelection(el) {
 		        if (!el) return '';
-		        const parseHref = (href) => {
-	            const h = href || '';
-	            // Common patterns on PR pages:
-	            // - /pull/N/changes/<sha>
-	            // - /pull/N/commits/<sha>
-	            // - /commit/<sha>
-	            const m = h.match(/\/(?:changes|commits|commit)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
-	            return m?.[1] || '';
-	        };
-
 	        const directLink = el.closest?.('a[href]');
-	        const shaDirect = parseHref(directLink?.getAttribute?.('href') || directLink?.href || '');
+	        const shaDirect = pathCommitSha(directLink?.getAttribute?.('href') || directLink?.href || '');
 	        if (shaDirect) return shaDirect;
 
 	        const row = el.closest?.('[data-commit-sha], [data-testid*="commit-row" i], [class*="CommitRow" i], .js-commits-list-item, .commit');
@@ -13038,7 +13028,7 @@ RULES:
 
 	        const links = [...(row?.querySelectorAll?.('a[href]') || [])];
 	        for (const a of links) {
-	            const sha = parseHref(a.getAttribute('href') || a.href || '');
+	            const sha = pathCommitSha(a.getAttribute('href') || a.href || '');
 	            if (sha) return sha;
 	        }
 		        return '';
@@ -13157,11 +13147,10 @@ RULES:
 	        if (!rect) return null;
 
 	        const pr = parsePR();
-	        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})(?:\/|$)/);
 	        const rootEl = range.commonAncestorContainer?.nodeType === 1
 	            ? range.commonAncestorContainer
 	            : range.commonAncestorContainer?.parentElement;
-	        const commitSha = shaMatch?.[1] || findCommitShaNearSelection(rootEl) || '';
+	        const commitSha = pathCommitSha() || findCommitShaNearSelection(rootEl) || '';
                 const isPRDescription = !!rootEl?.closest?.('#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]');
 
 	        const file = startMeta?.fileName || endMeta?.fileName || '';
@@ -14118,9 +14107,8 @@ RULES:
             const provider = getActiveProvider();
             const pr = parsePR();
             if (!pr) return;
-            const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})/);
-            if (!shaMatch) return;
-            const sha = shaMatch[1];
+            const sha = pathCommitSha();
+            if (!sha) return;
             const preCached = GM_getValue(`llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`, null);
             if (!preCached && !isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
@@ -15933,6 +15921,18 @@ RULES:
     ackTest('handles PR with changes path', () => {
         const r = parsePR('/bitcoin/bitcoin/pull/42/changes/abc123');
         ackDeepEq(r, {owner: 'bitcoin', repo: 'bitcoin', pr: '42'});
+    });
+
+    ackTest('pathCommitSha extracts SHA from /commits/, /commit/, /changes/ paths', () => {
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/abc1234def'), 'abc1234def');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/changes/DEADBEEFCAFE'), 'DEADBEEFCAFE');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/commit/0123456789abcdef0123456789abcdef01234567'), '0123456789abcdef0123456789abcdef01234567');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/abc1234def?foo=1'), 'abc1234def');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/abc1234def#diff-xyz'), 'abc1234def');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/abc1234def/nested'), 'abc1234def');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42'), '');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/notahash'), '');
+        ackEq(pathCommitSha('/bitcoin/bitcoin/pull/42/commits/ab'), '', 'too short');
     });
 
     // --- isPRPage ---
