@@ -15855,7 +15855,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.21
+// @version      1.36
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -24793,8 +24793,8 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.21', () => {
-        ackAssert(_ackSource.includes('@version      1.21'), 'version is 1.21');
+    ackTest('version bumped to 1.36', () => {
+        ackAssert(_ackSource.includes('@version      1.36'), 'version is 1.36');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
