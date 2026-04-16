@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.34
+// @version      1.35
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -5036,6 +5036,26 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     async function gatherPatchContext(onProgress = () => {}) {
         return gatherFullPRContext(onProgress, {includePatch: true, includeComments: false});
+    }
+
+    async function gatherSingleCommitPatchContext(onProgress = () => {}) {
+        const pr = parsePR();
+        if (!pr) return '';
+        const shaMatch = location.pathname.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})(?:[/?#]|$)/i);
+        if (!shaMatch) return '';
+        const sha = shaMatch[1];
+        const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
+        const parts = [`# Commit patch from PR: ${commitUrl}`];
+
+        onProgress('Fetching commit patch...');
+        try {
+            const patch = await fetchCommitPatch(pr, sha);
+            if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
+        } catch (_) {
+        }
+
+        onProgress('Done');
+        return parts.join('\n\n');
     }
 
     async function gatherRecipeContext(onProgress = () => {}) {
@@ -14705,9 +14725,13 @@ RULES:
     }
 
     async function copyPatchContext(btn) {
+        const mode = getAnalysisMode();
+        const isCommitPage = mode === ANALYSIS_MODES.commit;
         return copyContextWith(btn, {
-            gather: gatherPatchContext,
-            initialStatus: `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} patch context...`,
+            gather: isCommitPage ? gatherSingleCommitPatchContext : gatherPatchContext,
+            initialStatus: isCommitPage
+                ? 'Gathering commit patch context...'
+                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} patch context...`,
             successLabel: 'Copied',
             errorLabel: 'copy patch context',
         });
@@ -14724,7 +14748,9 @@ RULES:
                 key: 'patch',
                 emoji: '📄',
                 label: 'Patch',
-                tip: 'Copy PR description, commits, and full patch to clipboard',
+                tip: getAnalysisMode() === ANALYSIS_MODES.commit
+                    ? 'Copy only the patch of the currently viewed commit to clipboard'
+                    : 'Copy PR description, commits, and full patch to clipboard',
                 enabled: () => !isIssue,
                 run: (btn) => copyPatchContext(btn),
             },
@@ -15100,7 +15126,7 @@ RULES:
 
             toolbar.appendChild(buildSHAGroup());
         }
-        if (!onCompare && getAnalysisMode() !== ANALYSIS_MODES.commit) {
+        if (!onCompare) {
             toolbar.appendChild(buildContextCopyGroup());
         }
 
@@ -22161,6 +22187,7 @@ RULES:
         const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('function disableBtn'));
         ackAssert(ackSection.includes('if (onPR)'), 'ACK toggle gated behind onPR');
         ackAssert(injectFn.includes("toolbar.appendChild(buildContextCopyGroup())"), 'context copy group is available on toolbar pages, not only PRs');
+        ackAssert(!injectFn.includes("getAnalysisMode() !== ANALYSIS_MODES.commit"), 'context copy group is not hidden on single commit pages');
     });
 
     ackTest('currentInjectContext exposes compare-page mode and compose mode', () => {
@@ -22754,6 +22781,8 @@ RULES:
         ackAssert(group.includes("const isIssue = pageKind() === 'issue'"), 'context split group detects issue pages');
         ackAssert(group.includes("enabled: () => !isIssue"), 'patch action is disabled on issues');
         ackAssert(group.includes("mainBtn.disabled = !enabled"), 'main button disables unavailable action');
+        ackAssert(group.includes("getAnalysisMode() === ANALYSIS_MODES.commit"), 'patch action tooltip specializes on commit pages');
+        ackAssert(group.includes('currently viewed commit'), 'commit-page patch action says it copies only the viewed commit patch');
 
         const helper = source.slice(source.indexOf('async function copyContextWith'), source.indexOf('async function copyCommentContext'));
         ackAssert(helper.includes('GM_setClipboard'), 'copies via GM_setClipboard');
@@ -22773,15 +22802,27 @@ RULES:
 
         const patchFn = source.slice(source.indexOf('async function copyPatchContext'), source.indexOf('function buildContextCopyGroup'));
         ackAssert(patchFn.includes('gatherPatchContext'), 'copyPatchContext gathers patch-only context');
+        ackAssert(patchFn.includes('gatherSingleCommitPatchContext'), 'copyPatchContext can gather patch-only context for a single commit');
         ackAssert(patchFn.includes('patch context'), 'shows patch-specific status text');
+        ackAssert(patchFn.includes('Gathering commit patch context'), 'shows commit-specific patch status text');
     });
 
     ackTest('gatherPatchContext omits comments but keeps patch content', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function gatherPatchContext'), source.indexOf('async function copyContextWith'));
+        const fn = source.slice(source.indexOf('async function gatherPatchContext'), source.indexOf('async function gatherSingleCommitPatchContext'));
         ackAssert(fn.includes('gatherFullPRContext'), 'reuses full PR context helper');
         ackAssert(fn.includes('includePatch: true'), 'keeps patch content');
         ackAssert(fn.includes('includeComments: false'), 'omits conversations');
+    });
+
+    ackTest('gatherSingleCommitPatchContext copies only the viewed commit patch', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherSingleCommitPatchContext'), source.indexOf('function scrollToAndHighlight'));
+        ackAssert(fn.includes('# Commit patch from PR:'), 'labels copied output as a single commit patch');
+        ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
+        ackAssert(!fn.includes('gatherFullPRContext'), 'does not fall back to full PR patch context');
+        ackAssert(!fn.includes('## Commits ('), 'does not include full PR commit list');
+        ackAssert(!fn.includes('## Comments'), 'does not include comments');
     });
 
     ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
