@@ -3130,6 +3130,7 @@ If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages,
 Do not change technical meaning unless it is factually incorrect.
 Do not change quoted text (lines starting with >) in any way. Those are someone else's words -- copy them verbatim.
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
+Do not introduce double hyphens ("--") as punctuation if they were not already present in the original text. Keep the author's normal punctuation style.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
 When a fenced code block has no language (or only a generic one like text/plain), add a language tag only when the language is obvious.
@@ -17692,6 +17693,13 @@ RULES:
     ackTest('proofread instructions preserve quoted text', () => {
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('quoted text'), 'mentions quoted text');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('verbatim'), 'says copy verbatim');
+    });
+
+    ackTest('proofread instructions forbid introducing double hyphens', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('double hyphens ("--")'),
+            'explicitly forbids introducing double hyphens');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes("author's normal punctuation style"),
+            'preserves the author punctuation style');
     });
 
     ackTest('proofread system prompt describes XML segment format for immutable line protection', () => {
