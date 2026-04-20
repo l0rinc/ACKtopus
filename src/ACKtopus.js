@@ -7845,62 +7845,37 @@ Rules:
         const actions =
             form?.querySelector?.('#partial-new-comment-form-actions')
             || form?.querySelector?.('[data-url*="/partials/form_actions"]');
-        const findMainCommentButton = (scope) => [...(scope?.querySelectorAll?.('button[type="submit"]') || [])].find(btn =>
+        const commentBtn = [...(actions?.querySelectorAll?.('button[type="submit"]') || [])].find(btn =>
             !/^comment_and_/i.test(btn.getAttribute('name') || '')
         );
-        const commentBtn = findMainCommentButton(actions);
-
-        const setButtonText = (btn, text) => {
-            if (!btn) return;
-            const label = btn.querySelector?.('.Button-label');
-            if (label) label.textContent = text;
-            else btn.textContent = text;
-        };
-
-        const restoreCommentBtn = () => {
-            const liveCommentBtn =
-                form?.querySelector?.('button[data-ack-submit-orig-class], .ack-submit-review-anchor button[data-ack-submit-orig-class]')
-                || commentBtn
-                || findMainCommentButton(actions)
-                || findMainCommentButton(document.querySelector('#new_comment_form'));
-            if (liveCommentBtn?.dataset?.ackSubmitOrigClass) {
-                liveCommentBtn.className = liveCommentBtn.dataset.ackSubmitOrigClass;
-                delete liveCommentBtn.dataset.ackSubmitOrigClass;
-            }
-            if (liveCommentBtn) {
-                setButtonText(liveCommentBtn, 'Comment');
-                liveCommentBtn.title = '';
-            }
-        };
 
         if (!isPRConversationPage() || !_ackPendingReviewActive || !hasPendingReviewChanges(root) || !form || !actions || !commentBtn) {
             existing?.remove();
-            restoreCommentBtn();
             return;
         }
 
-        if (existing && form.contains(existing) && commentBtn.dataset.ackSubmitOrigClass) return;
+        if (existing && form.contains(existing)) return;
         existing?.remove();
 
         const anchor = commentBtn.closest('.color-bg-subtle, .d-flex, .ButtonGroup-item') || commentBtn.parentElement;
         if (!anchor) return;
 
-        if (!commentBtn.dataset.ackSubmitOrigClass) {
-            commentBtn.dataset.ackSubmitOrigClass = commentBtn.className;
-            commentBtn.classList.remove('btn-primary', 'Button--primary');
-        }
-        setButtonText(commentBtn, 'Comment');
-        commentBtn.title = '';
-
+        // Keep the native Comment button fully intact — primary styling, label,
+        // and click handler — so a regular reply still works even when Submit
+        // review fails. Our button sits beside it as a secondary action, with
+        // btn-primary stripped so Comment remains visually dominant.
         const wrap = document.createElement('div');
         wrap.className = 'color-bg-subtle ml-1 ack-submit-review-wrap ack-submit-review-anchor';
 
         const submitBtn = document.createElement('button');
         submitBtn.type = 'button';
-        submitBtn.className = commentBtn.dataset.ackSubmitOrigClass || commentBtn.className || 'btn';
+        submitBtn.className = (commentBtn.className || 'btn')
+            .replace(/\b(?:btn-primary|Button--primary)\b/g, '')
+            .replace(/\s+/g, ' ')
+            .trim() || 'btn';
         submitBtn.classList.add('ack-submit-review-btn');
         submitBtn.textContent = 'Submit review';
-        submitBtn.title = 'Submit pending review comments, and the main comment if present';
+        submitBtn.title = 'Submit the pending review; Comment still posts a regular reply';
         submitBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -7910,7 +7885,6 @@ Rules:
 
             submitBtn.dataset.ackRunning = '1';
             submitBtn.disabled = true;
-            commentBtn.disabled = true;
             const origText = submitBtn.textContent;
             const stopSpin = startBrailleAnimation(frame => {
                 submitBtn.textContent = frame;
@@ -7935,7 +7909,6 @@ Rules:
                 stopSpin('❌');
                 submitBtn.textContent = origText;
                 submitBtn.disabled = false;
-                commentBtn.disabled = false;
                 delete submitBtn.dataset.ackRunning;
                 console.warn('ACKtopus: submit review failed:', err?.message || err);
             }
@@ -23557,9 +23530,13 @@ RULES:
                 ackAssert(submitBtn, 'injects Submit review button');
                 ackEq(submitBtn.textContent, 'Submit review');
                 ackAssert(host.querySelector('.ack-submit-review-wrap'), 'leaves submit review wrapper');
-                ackAssert(!host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'demotes main Comment button while pending');
+                ackAssert(!submitBtn.classList.contains('btn-primary'), 'Submit review is styled as a secondary action');
+                const commentBtn = host.querySelector('#partial-new-comment-form-actions button[type="submit"]');
+                ackAssert(commentBtn.classList.contains('btn-primary'), 'leaves native Comment button as the primary action');
+                ackEq(commentBtn.textContent.trim(), 'Comment', 'does not relabel the Comment button');
                 const fn = _ackSource.slice(_ackSource.indexOf('function addSubmitReviewButtonToConversation'), _ackSource.indexOf('// --- Auto-prefill commit hash in new comments'));
                 ackAssert(fn.includes("submitPendingReview(pr, {event: 'COMMENT', body})"), 'submits the pending review via the native-dialog helper');
+                ackAssert(!fn.includes("commentBtn.disabled = true"), 'leaves Comment button enabled during submit so a regular reply is always available');
             } finally {
                 host.remove();
             }
@@ -23586,7 +23563,7 @@ RULES:
                 <form class="js-new-comment-form">
                   <textarea id="new_comment_field">hello</textarea>
                   <div id="partial-new-comment-form-actions">
-                    <div class="color-bg-subtle mt-2"><button type="submit" class="btn-primary btn">Submit review</button></div>
+                    <div class="color-bg-subtle mt-2"><button type="submit" class="btn-primary btn" title="original">Comment</button></div>
                   </div>
                 </form>
             `;
@@ -23595,9 +23572,10 @@ RULES:
                 addSubmitReviewButtonToConversation(host);
                 ackAssert(!host.querySelector('.ack-submit-review-btn'), 'does not inject Submit review button');
                 ackAssert(!host.querySelector('.ack-submit-review-wrap'), 'does not leave submit review wrapper');
-                ackAssert(host.querySelector('button[type="submit"]').classList.contains('btn-primary'), 'keeps main Comment button styling unchanged');
-                ackEq(host.querySelector('button[type="submit"]').textContent.trim(), 'Comment', 'restores main button label to Comment');
-                ackEq(host.querySelector('button[type="submit"]').title || '', '', 'clears submit review wording from main button');
+                const commentBtn = host.querySelector('button[type="submit"]');
+                ackAssert(commentBtn.classList.contains('btn-primary'), 'does not touch the native Comment button styling');
+                ackEq(commentBtn.textContent.trim(), 'Comment', 'does not relabel the native Comment button');
+                ackEq(commentBtn.title, 'original', 'does not overwrite the native Comment button title');
             } finally {
                 host.remove();
             }
