@@ -4538,12 +4538,27 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             return nums[nums.length - 1] || '';
         };
 
+        // Classify each row as +/-/space so the copied block is readable as a
+        // real diff. Prefer data-code-marker (modern GitHub), fall back to the
+        // classic blob-code-{addition,deletion,context} class modifiers.
+        const getRowDiffSign = (row) => {
+            const marker = row.querySelector('[data-code-marker]')?.getAttribute('data-code-marker') || '';
+            if (marker === '+' || marker === '-') return marker;
+            if (marker) return ' ';
+            const codeCell = row.querySelector('td.blob-code, td.diff-text');
+            const cls = `${codeCell?.className || ''} ${row.className || ''}`;
+            if (/\b(?:blob-code|diff-text)-addition\b|\bdiff-line-added\b/i.test(cls)) return '+';
+            if (/\b(?:blob-code|diff-text)-deletion\b|\bdiff-line-removed\b/i.test(cls)) return '-';
+            return ' ';
+        };
+
         const start = Math.max(0, targetIdx - 3);
         const end = Math.min(codeRows.length, targetIdx + 2);
         const lines = [];
         for (let i = start; i < end; i++) {
             const row = codeRows[i];
             const lineNum = getRowLineNumber(row);
+            const sign = getRowDiffSign(row);
             const codeEl = row.querySelector('.blob-code-inner, .diff-text-cell, code.diff-text')
                 || row.querySelector('td.blob-code, td.diff-text');
             const rawCode = String(codeEl?.innerText || codeEl?.textContent || '').replace(/\r\n/g, '\n');
@@ -4560,7 +4575,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 pendingIndent = '';
             }
             if (!code.trim()) continue;
-            lines.push(`${lineNum ? `${lineNum}| ` : ''}${code}`);
+            lines.push(`${sign}${lineNum ? `${lineNum}| ` : ''}${code}`);
         }
         return lines.join('\n');
     }
@@ -22253,6 +22268,49 @@ RULES:
         ackAssert(fn.includes("if (!code && part.length > pendingIndent.length) pendingIndent = part"),
             'keeps indentation fragments without preserving blank spacer lines');
         ackAssert(!fn.includes('<<<'), 'copied comment code context does not add target markers');
+        ackAssert(fn.includes('data-code-marker'), 'classifies rows by data-code-marker attribute');
+        ackAssert(fn.includes('blob-code|diff-text)-addition') || fn.includes('blob-code-addition'),
+            'falls back to classic addition classes');
+    });
+
+    ackTest('getCommentCodeContext prefixes diff lines with +/-/space markers', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <table class="diff-table">
+                <tbody>
+                    <tr>
+                        <td data-line-number="64">64</td>
+                        <td data-line-number="64">64</td>
+                        <td class="blob-code blob-code-context"><span class="blob-code-inner">        # Invalid Bech32</span></td>
+                    </tr>
+                    <tr>
+                        <td data-line-number="65">65</td>
+                        <td data-line-number=""></td>
+                        <td class="blob-code blob-code-deletion"><span class="blob-code-inner">        self.check_invalid(BECH32_INVALID_SIZE, "...")</span></td>
+                    </tr>
+                    <tr>
+                        <td data-line-number=""></td>
+                        <td data-line-number="65">65</td>
+                        <td class="blob-code blob-code-addition"><span class="blob-code-inner">        self.check_invalid(BECH32_INVALID_SIZE, '...')</span></td>
+                    </tr>
+                    <tr class="inline-comments">
+                        <td colspan="3">comment row (target)</td>
+                    </tr>
+                </tbody>
+            </table>
+        `;
+        document.body.appendChild(host);
+        try {
+            const commentRow = host.querySelector('tr.inline-comments');
+            const out = getCommentCodeContext(commentRow, host);
+            ackAssert(/^ 64\|.*# Invalid Bech32/m.test(out), 'context row starts with a leading space');
+            ackAssert(/^-65\|.*BECH32_INVALID_SIZE, "/m.test(out), 'deletion row prefixed with -');
+            ackAssert(/^\+65\|.*BECH32_INVALID_SIZE, '/m.test(out), 'addition row prefixed with +');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('renderBodyMarkdown preserves blockquotes and inline code', () => {
