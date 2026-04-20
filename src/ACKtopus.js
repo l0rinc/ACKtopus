@@ -4618,8 +4618,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const wrapInlineCode = (text) => {
             const raw = String(text || '');
             const runs = raw.match(/`+/g) || [];
-            const ticks = '`'.repeat(Math.max(1, ...runs.map(s => s.length)) + 1);
-            return `${ticks}${raw}${ticks}`;
+            const maxRun = runs.length ? Math.max(...runs.map(s => s.length)) : 0;
+            const ticks = '`'.repeat(maxRun + 1);
+            const pad = raw.startsWith('`') || raw.endsWith('`') ? ' ' : '';
+            return `${ticks}${pad}${raw}${pad}${ticks}`;
         };
 
         const wrapFencedCode = (text, lang = '') => {
@@ -22320,11 +22322,15 @@ RULES:
                 <p>Thanks.</p>
                 <blockquote><p>quoted line</p></blockquote>
                 <p>Use <code>CallOneOf</code> here.</p>
+                <p>Use <code>std::string</code> instead.</p>
+                <p>Inner: <code>a\`b</code>.</p>
             </div>
         `;
         const out = renderBodyMarkdown(host.firstElementChild);
         ackAssert(out.includes('> quoted line'), 'preserves blockquote marker');
-        ackAssert(out.includes('`CallOneOf`'), 'preserves inline code formatting');
+        ackAssert(/(?:^|[^`])`CallOneOf`(?:[^`]|$)/.test(out), 'wraps simple identifier in single backticks');
+        ackAssert(/(?:^|[^`])`std::string`(?:[^`]|$)/.test(out), 'does not over-quote typenames');
+        ackAssert(out.includes('``a`b``'), 'escalates to double backticks only when content has a backtick');
     });
 
     ackTest('renderBodyMarkdown preserves GitHub snippet clipboard blocks without spacer lines', () => {
