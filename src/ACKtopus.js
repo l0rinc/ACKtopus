@@ -14427,8 +14427,13 @@ RULES:
                     openedCount += (lastTotal - state.total);
                 }
                 lastTotal = state.total;
+                const phase = state.hiddenCount + state.paginationBtns.length > 0
+                    ? 'hidden conversations'
+                    : state.resolved.length > 0
+                        ? 'resolved threads'
+                        : 'collapsed sections';
                 popup.textContent = state.total > 0
-                    ? `Revealing context... ${state.total} remaining`
+                    ? `Revealing ${phase}... ${state.total} remaining`
                     : 'Finalizing...';
                 if (state.total === 0) {
                     finish('Revealed everything needed for context copy', '✅');
@@ -14446,11 +14451,15 @@ RULES:
                     lastScrolledAt = openedCount;
                 }
 
-                state.paginationBtns.forEach(b => b.click());
-                state.resolved.forEach(item => item.click());
-                state.minimized.forEach(h => h.click());
-                state.outdated.forEach(d => d.setAttribute('open', ''));
-                state.loadDiffs.forEach(b => b.click());
+                if (state.hiddenCount + state.paginationBtns.length > 0) {
+                    state.paginationBtns.forEach(b => b.click());
+                } else if (state.resolved.length > 0) {
+                    state.resolved.forEach(item => item.click());
+                } else {
+                    state.minimized.forEach(h => h.click());
+                    state.outdated.forEach(d => d.setAttribute('open', ''));
+                    state.loadDiffs.forEach(b => b.click());
+                }
 
                 const waitMs = state.paginationBtns.length > 0 ? 1800 : 700;
                 await ackSleep(waitMs);
@@ -19862,7 +19871,7 @@ RULES:
         ackAssert(fn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"), 'refreshes toolbar when hidden conversation loaders appear');
     });
 
-    ackTest('showHidden and showResolved use overlay spinner in compact mode', () => {
+    ackTest('showHidden, showResolved, and revealAll use progress feedback in compact mode', () => {
         const source = _ackSource;
         const showHiddenFn = source.slice(source.indexOf('async function showHidden'), source.indexOf('async function showResolved'));
         ackAssert(showHiddenFn.includes("GM_getValue('compactToolbar'"), 'showHidden checks compact mode');
@@ -19872,6 +19881,11 @@ RULES:
         const showResolvedFn = source.slice(source.indexOf('async function showResolved'), source.indexOf('\n    // --- ACK Panel'));
         ackAssert(showResolvedFn.includes("GM_getValue('compactToolbar'"), 'showResolved checks compact mode');
         ackAssert(showResolvedFn.includes('startSpin(btn)'), 'uses startSpin overlay in compact');
+
+        const revealFn = source.slice(source.indexOf('async function revealAllContext'), source.indexOf('function buildContextCopyGroup'));
+        ackAssert(revealFn.includes('makeStatusPopup'), 'revealAll shows popup progress');
+        ackAssert(revealFn.includes("GM_getValue('compactToolbar'"), 'revealAll checks compact mode');
+        ackAssert(revealFn.includes('startSpin(btn)'), 'revealAll uses startSpin overlay in compact');
     });
 
     ackTest('revealAllContext shows popup progress and reduces scroll churn', () => {
@@ -19881,6 +19895,9 @@ RULES:
         ackAssert(fn.includes('openedCount'), 'tracks how many items were opened');
         ackAssert(fn.includes('openedCount - lastScrolledAt >= 10'), 'only scrolls after substantial progress');
         ackAssert(fn.includes('state.paginationBtns.length > 0 ? 1800 : 700'), 'wait is shorter when no hidden-page fetch is involved');
+        ackAssert(fn.includes("? 'hidden conversations'"), 'reveals hidden conversations first');
+        ackAssert(fn.includes("? 'resolved threads'"), 'then reveals resolved threads');
+        ackAssert(fn.includes('else {\n                    state.minimized.forEach'), 'opens collapsed sections only after hidden and resolved work is done');
     });
 
     ackTest('showResolved disables button after successful completion', () => {
