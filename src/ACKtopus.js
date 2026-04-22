@@ -4840,9 +4840,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     // onProgress(msg) is called with status updates for the UI.
     // opts.includePatch: include full .patch content (default true)
     // opts.includeComments: include visible comments (default true)
+    // opts.includeCommits: include commit list/messages (default true)
     async function gatherFullPRContext(onProgress = () => {
     }, opts = {}) {
-        const {includePatch = true, includeComments = true} = opts;
+        const {includePatch = true, includeComments = true, includeCommits = true} = opts;
         const pr = parsePageContext();
         if (!pr) return '';
         const isIssue = pageKind() === 'issue';
@@ -4875,7 +4876,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (description) parts.push(`## Description\n${description}`);
 
         // 4. Commits with messages (PRs only)
-        if (!isIssue) {
+        if (!isIssue && includeCommits) {
             onProgress('Fetching commits...');
             try {
                 const commits = await gmFetch(
@@ -4987,7 +4988,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.join('\n\n');
     }
 
-    async function gatherSingleCommitContext(onProgress = () => {}) {
+    async function gatherSingleCommitContext(onProgress = () => {}, opts = {}) {
+        const {includePatch = true, includeComments = true} = opts;
         const pr = parsePR();
         if (!pr) return '';
         const sha = pathCommitSha();
@@ -5030,18 +5032,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         if (description) parts.push(`## PR Description\n${description}`);
 
-        onProgress('Fetching commit patch...');
-        try {
-            const patch = await fetchCommitPatch(pr, sha);
-            if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
-        } catch (_) {
+        if (includePatch) {
+            onProgress('Fetching commit patch...');
+            try {
+                const patch = await fetchCommitPatch(pr, sha);
+                if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
+            } catch (_) {
+            }
         }
 
-        onProgress('Gathering commit comments...');
-        const comments = gatherVisibleComments().filter(c =>
-            c.commitSha && (sha.startsWith(c.commitSha) || c.commitSha.startsWith(shortSha))
-        );
-        if (comments.length > 0) {
+        if (includeComments) {
+            onProgress('Gathering commit comments...');
+            const comments = gatherVisibleComments().filter(c =>
+                c.commitSha && (sha.startsWith(c.commitSha) || c.commitSha.startsWith(shortSha))
+            );
+            if (comments.length > 0) {
             const threads = new Map();
             const general = [];
             for (const c of comments) {
@@ -5098,6 +5103,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
             }
             parts.push(`## Visible Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+            }
         }
 
         onProgress('Done');
@@ -5106,6 +5112,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     async function gatherPatchContext(onProgress = () => {}) {
         return gatherFullPRContext(onProgress, {includePatch: true, includeComments: false});
+    }
+
+    async function gatherCommentsContext(onProgress = () => {}) {
+        return gatherFullPRContext(onProgress, {includePatch: false, includeComments: true, includeCommits: false});
+    }
+
+    async function gatherSingleCommitCommentsContext(onProgress = () => {}) {
+        return gatherSingleCommitContext(onProgress, {includePatch: false, includeComments: true});
     }
 
     async function getRecipeCheckoutMeta(pr) {
@@ -14394,6 +14408,19 @@ RULES:
         });
     }
 
+    async function copyCommentsContext(btn) {
+        const mode = getAnalysisMode();
+        const isCommitPage = mode === ANALYSIS_MODES.commit;
+        return copyContextWith(btn, {
+            gather: isCommitPage ? gatherSingleCommitCommentsContext : gatherCommentsContext,
+            initialStatus: isCommitPage
+                ? 'Gathering commit comments context...'
+                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} comments context...`,
+            successLabel: 'Copied',
+            errorLabel: 'copy comments context',
+        });
+    }
+
     async function revealAllContext(btn) {
         if (btn._running) return;
         btn._running = true;
@@ -14490,6 +14517,16 @@ RULES:
                     : 'Copy PR description, commits, and full patch to clipboard',
                 enabled: () => !isIssue,
                 run: (btn) => copyPatchContext(btn),
+            },
+            {
+                key: 'comments',
+                emoji: '💬',
+                label: 'Comments',
+                tip: getAnalysisMode() === ANALYSIS_MODES.commit
+                    ? 'Copy PR description and visible comments for the currently viewed commit, without any patch'
+                    : `Copy ${isIssue ? 'issue' : 'PR'} description and comments, without any patch`,
+                enabled: () => true,
+                run: (btn) => copyCommentsContext(btn),
             },
             {
                 key: 'full',
@@ -22634,12 +22671,14 @@ RULES:
 
         const group = source.slice(source.indexOf('function buildContextCopyGroup'), source.indexOf('async function loadAsyncPRData'));
         ackAssert(group.includes('copyPatchContext'), 'context split group offers patch context copy');
+        ackAssert(group.includes('copyCommentsContext'), 'context split group offers comments-only context copy');
         ackAssert(group.includes('copyPRContext'), 'context split group offers full context copy');
         ackAssert(group.includes("const isIssue = pageKind() === 'issue'"), 'context split group detects issue pages');
         ackAssert(group.includes("enabled: () => !isIssue"), 'patch action is disabled on issues');
         ackAssert(group.includes("mainBtn.disabled = !enabled"), 'main button disables unavailable action');
         ackAssert(group.includes("getAnalysisMode() === ANALYSIS_MODES.commit"), 'patch action tooltip specializes on commit pages');
         ackAssert(group.includes('currently viewed commit'), 'commit-page patch action says it copies only the viewed commit patch');
+        ackAssert(group.includes("label: 'Comments'"), 'comments-only action is present');
         ackAssert(group.includes('revealAllContext(mainBtn)'), 'context dropdown can reveal all before copying');
         ackAssert(group.includes("revealItem.dataset.ackRevealAll = 'true'"), 'reveal-all item is rendered as a menu-only action');
         ackAssert(group.includes('📂 Reveal all'), 'reveal-all label is present in the context menu');
@@ -22665,25 +22704,48 @@ RULES:
         ackAssert(patchFn.includes('gatherSingleCommitPatchContext'), 'copyPatchContext can gather patch-only context for a single commit');
         ackAssert(patchFn.includes('patch context'), 'shows patch-specific status text');
         ackAssert(patchFn.includes('Gathering commit patch context'), 'shows commit-specific patch status text');
+
+        const commentsFn = source.slice(source.indexOf('async function copyCommentsContext'), source.indexOf('async function revealAllContext'));
+        ackAssert(commentsFn.includes('gatherCommentsContext'), 'copyCommentsContext gathers comments-only PR context');
+        ackAssert(commentsFn.includes('gatherSingleCommitCommentsContext'), 'copyCommentsContext can gather comments-only context for a single commit');
+        ackAssert(commentsFn.includes('comments context'), 'shows comments-specific status text');
+        ackAssert(commentsFn.includes('Gathering commit comments context'), 'shows commit-specific comments status text');
     });
 
     ackTest('gatherPatchContext omits comments but keeps patch content', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function gatherPatchContext'), source.indexOf('async function gatherSingleCommitPatchContext'));
+        const fn = source.slice(source.indexOf('async function gatherPatchContext'), source.indexOf('async function gatherCommentsContext'));
         ackAssert(fn.includes('gatherFullPRContext'), 'reuses full PR context helper');
         ackAssert(fn.includes('includePatch: true'), 'keeps patch content');
         ackAssert(fn.includes('includeComments: false'), 'omits conversations');
     });
 
+    ackTest('gatherCommentsContext omits patch but keeps description and comments', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherCommentsContext'), source.indexOf('async function getRecipeCheckoutMeta'));
+        ackAssert(fn.includes('gatherFullPRContext'), 'reuses full PR context helper');
+        ackAssert(fn.includes('includePatch: false'), 'omits patch content');
+        ackAssert(fn.includes('includeComments: true'), 'keeps comments');
+        ackAssert(fn.includes('includeCommits: false'), 'omits commit list for comments-only context');
+    });
+
     ackTest('gatherSingleCommitPatchContext copies only the viewed commit patch', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('async function gatherSingleCommitPatchContext'), source.indexOf('function scrollToAndHighlight'));
+        const fn = source.slice(source.indexOf('async function gatherSingleCommitPatchContext'), source.indexOf('async function gatherRecipeContext'));
         ackAssert(fn.includes('# Commit patch from PR:'), 'labels copied output as a single commit patch');
         ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
         ackAssert(!fn.includes('gatherFullPRContext(onProgress, {includePatch: true, includeComments: false})'),
             'does not fall back to full PR patch context');
         ackAssert(!fn.includes('## Commits ('), 'does not include full PR commit list');
         ackAssert(!fn.includes('## Comments'), 'does not include comments');
+    });
+
+    ackTest('gatherSingleCommitCommentsContext copies only the viewed commit comments without patch', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('async function gatherSingleCommitCommentsContext'), source.indexOf('async function gatherRecipeContext'));
+        ackAssert(fn.includes('gatherSingleCommitContext'), 'reuses single commit context helper');
+        ackAssert(fn.includes('includePatch: false'), 'omits patch content');
+        ackAssert(fn.includes('includeComments: true'), 'keeps visible comments');
     });
 
     ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
