@@ -3126,13 +3126,16 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
-        reimplementation: `Write the smallest possible rebuild brief a coding agent can use to recreate this PR from the base commit and then compare the result against the original PR commit-by-commit.
+        reimplementation: `Write the smallest possible rebuild brief for a coding agent that must start from the base commit, investigate the problem, derive an appropriate solution, and then compare the result against the original PR commit-by-commit.
 
 State the PROBLEM, never the solution. Treat the provided PR context as private research material, not output to be echoed.
+Frame the output as an ideal issue for the target agent: what problem to solve, what constraints and evidence matter, and what review-comment-derived concerns must be accounted for. Do not preselect the current implementation.
 
 STRICT RULES:
 - Your job is not to summarize the implementation. Your job is to emit the minimum commit-by-commit constraints needed to recreate the change and compare the result against the PR.
+- The target agent's job is to discover the solution from the base tree. Instruct it to inspect the existing structure, local contracts, tests, build errors, and behavior before choosing the design.
 - Think at the level of "what must be true after this commit?" not "what code was written?"
+- Do not hard-code the PR's current structure, implementation strategy, or patch shape as the desired answer. Leave room for the target agent to find structural problems, implementation differences, or a better local fit.
 - Do not list files, functions, classes, constants, exact values, or current code structure unless impossible to avoid.
 - If something can be rediscovered from the tree, search, grep, build errors, failing tests, or local reasoning, say how to find it instead of giving the current answer.
 - Prefer "search for the code that...", "identify where...", "derive from existing behavior...", "compare old vs new behavior..." over concrete edit instructions.
@@ -3154,8 +3157,9 @@ STRICT RULES:
 - Never narrate the diff or quote patch text.
 - Use the checkout metadata to emit a short, explicit checkout warning section. That section may name the exact base commit, base branch, head branch, and PR URL only for the purpose of telling the implementer what to start from and what NOT to check out.
 - Be explicit that the implementation must start from the exact base commit on the base branch, and that the PR URL and head branch are comparison targets only and must not be checked out.
+- Review comments are first-class source material. Use them to refine the ideal issue: the target problem, important constraints, likely risks, validation needs, and any gap between the submitted PR and the solution the target agent should rediscover.
 - If review comments reveal a bug, omission, or design flaw in the implemented PR, prefer the corrected target behavior over the literal implementation. Reconstruct the ideal solution, not the flawed artifact.
-- Treat reviewer objections and discovered errors as evidence about what each commit should have accomplished. Keep the same commit count/order, but describe the repaired intent of each step when needed.
+- Treat reviewer objections and discovered errors as evidence about what each commit should have accomplished, but do not convert them into a hard-coded patch recipe. Keep the same commit count/order, but describe the repaired intent of each step when needed.
 - The Steps section must map 1:1 to the original commits, in order. Do not merge commits together and do not split one commit into multiple steps.
 - Be explicit that each numbered step is a separate commit to be created in order, and that every step must be independently buildable/reviewable and should pass on its own before the next step is applied.
 - Keep every step abstract enough that a different implementation is still possible if it satisfies the same goal.
@@ -3167,10 +3171,10 @@ Output exactly:
 A compact warning section naming the exact base commit and base branch to start from, plus the head branch and PR URL that must NOT be checked out. Make clear that the work is a fresh reimplementation from the base commit, not a checkout of the existing PR branch.
 
 ## Goal
-One compact paragraph describing only the essential problem, impact, and target properties needed to reproduce the change. Avoid exact API names, replacement types, and mechanism words unless unavoidable.
+One compact issue-style paragraph describing only the essential problem, impact, target properties, and review-derived constraints needed to rediscover the change. Avoid exact API names, replacement types, and mechanism words unless unavoidable.
 
 ## Steps
-One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, and only the highest-signal test/search direction. State explicitly that the numbered items are separate commits to create in order, and that each one must stand alone and pass on its own. Prefer the most abstract wording that still keeps the commit distinguishable. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
+One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, which review-comment concern matters if any, and only the highest-signal test/search direction. State explicitly that the numbered items are separate commits to create in order, and that each one must stand alone and pass on its own. Prefer the most abstract wording that still keeps the commit distinguishable and lets the target agent discover the structure and implementation. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -5665,7 +5669,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         : '';
                     const system = `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
                     const userContent = recipe === 'reimplementation'
-                        ? `Use the full PR context below as source material. Keep all commit distinctions, but minimize instruction count aggressively. Abstract away concrete symbols, enforcement mechanisms, and rediscoverable low-level details unless they are strictly necessary to distinguish one commit from another.\n\n${fullContext}`
+                        ? `Use the full PR context below as source material. Keep all commit distinctions, but write an issue-style rebuild brief for a target coding agent that must discover the solution from the base tree. Do not hard-code current structure or implementation details; leave room for the target agent to identify structural problems, implementation differences, or a better local fit. Incorporate review comments as evidence for the ideal issue, target constraints, risks, and validation needs. Minimize instruction count aggressively. Abstract away concrete symbols, enforcement mechanisms, and rediscoverable low-level details unless they are strictly necessary to distinguish one commit from another.\n\n${fullContext}`
                         : `Use the full PR context below.\n\n${fullContext}`;
                     const result = await callLLM(provider, system, userContent, {
                         modelOverride: getHighContextModelOverride(provider),
@@ -24413,6 +24417,9 @@ RULES:
 
     ackTest('reimplementation prompt prefers abstract rediscovery over low-level edit listings', () => {
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Your job is not to summarize the implementation'), 'reimplementation prompt is explicit about its meta task');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Frame the output as an ideal issue'), 'reimplementation prompt frames the brief as an ideal issue');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes("The target agent's job is to discover the solution from the base tree"), 'reimplementation prompt tells the target agent to discover the solution');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes("Do not hard-code the PR's current structure"), 'reimplementation prompt avoids hard-coding the current implementation');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('what must be true after this commit'), 'reimplementation prompt frames output in postconditions');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('smallest possible rebuild brief'), 'reimplementation prompt optimizes for minimal rebuild brief');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Do not list files, functions, classes, constants, exact values'), 'reimplementation prompt forbids low-level listings');
@@ -24440,6 +24447,8 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer the most abstract wording that still keeps the commit distinguishable'), 'reimplementation output explicitly prefers maximum abstraction consistent with comparability');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('no unnecessary concrete API/mechanism names'), 'reimplementation output forbids unnecessary concrete names');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('no subsystem-bucket enumeration for broad mechanical passes'), 'reimplementation output forbids broad subsystem enumeration');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Review comments are first-class source material'), 'reimplementation prompt explicitly considers PR review comments');
+        ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('which review-comment concern matters if any'), 'reimplementation steps incorporate review-comment concerns when relevant');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('prefer the corrected target behavior over the literal implementation'), 'reimplementation prompt prefers ideal behavior when comments reveal flaws');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('Keep the same commit count/order, but describe the repaired intent of each step'), 'reimplementation prompt repairs flawed commits without changing step count/order');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation.includes('recreate each commit and compare it to the PR'), 'reimplementation prompt centers reimplementation and comparison workflow');
@@ -24449,6 +24458,9 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(fn.includes('Keep all commit distinctions'), 'reimplementation user prompt preserves per-commit distinctions');
+        ackAssert(fn.includes('must discover the solution from the base tree'), 'reimplementation user prompt focuses the target agent on discovery');
+        ackAssert(fn.includes('Do not hard-code current structure or implementation details'), 'reimplementation user prompt avoids hard-coding the submitted implementation');
+        ackAssert(fn.includes('Incorporate review comments as evidence for the ideal issue'), 'reimplementation user prompt makes review comments part of ideal issue shaping');
         ackAssert(fn.includes('minimize instruction count aggressively'), 'reimplementation user prompt enforces minimal instructions');
         ackAssert(fn.includes('Abstract away concrete symbols, enforcement mechanisms'), 'reimplementation user prompt suppresses mechanism-shaped output');
         ackAssert(fn.includes('modelOverride: getHighContextModelOverride(provider)'), 'reimplementation recipe uses high-context Claude override');
