@@ -4049,8 +4049,51 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     // --- Diff Fetching ---
 
+    function stripDeletedFileBodiesFromPatch(patchText) {
+        const input = String(patchText || '').replace(/\r\n/g, '\n');
+        if (!input) return '';
+        const lines = input.split('\n');
+        const out = [];
+        let inFile = false;
+        let deletedFile = false;
+        let skippingDeletedBody = false;
+        let insertedPlaceholder = false;
+
+        for (const line of lines) {
+            if (line.startsWith('diff --git ')) {
+                inFile = true;
+                deletedFile = false;
+                skippingDeletedBody = false;
+                insertedPlaceholder = false;
+                out.push(line);
+                continue;
+            }
+            if (!inFile) {
+                out.push(line);
+                continue;
+            }
+            if (!deletedFile && (line.startsWith('deleted file mode ') || line === '+++ /dev/null')) {
+                deletedFile = true;
+                out.push(line);
+                continue;
+            }
+            if (deletedFile && (line.startsWith('@@ ') || line === 'GIT binary patch' || line.startsWith('Binary files '))) {
+                if (!insertedPlaceholder) {
+                    out.push('@@ deleted file contents omitted @@');
+                    insertedPlaceholder = true;
+                }
+                skippingDeletedBody = true;
+                continue;
+            }
+            if (skippingDeletedBody) continue;
+            out.push(line);
+        }
+        return out.join('\n');
+    }
+
     function fetchPatch(pr) {
-        return gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`);
+        return gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`)
+            .then(stripDeletedFileBodiesFromPatch);
     }
 
     // Shared context helper: fetches diff, commit messages, PR description.
@@ -4223,7 +4266,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 	            _commitPatchCache.set(key, cached);
 	            return cached;
 	        }
-	        const p = gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
+	        const p = gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`)
+                .then(stripDeletedFileBodiesFromPatch);
 	        const wrapped = p.catch((e) => {
 	            _commitPatchCache.delete(key);
 	            throw e;
@@ -21763,15 +21807,44 @@ RULES:
 
     // --- Fetch and LLM unification ---
 
+    ackTest('stripDeletedFileBodiesFromPatch removes deleted-file bodies but keeps headers', () => {
+        const patch = [
+            'From 123 Mon Sep 17 00:00:00 2001',
+            'diff --git a/src/keep.cpp b/src/keep.cpp',
+            'index 111..222 100644',
+            '--- a/src/keep.cpp',
+            '+++ b/src/keep.cpp',
+            '@@ -1 +1 @@',
+            '-old',
+            '+new',
+            'diff --git a/src/delete.cpp b/src/delete.cpp',
+            'deleted file mode 100644',
+            'index abcdef..000000',
+            '--- a/src/delete.cpp',
+            '+++ /dev/null',
+            '@@ -1,3 +0,0 @@',
+            '-line one',
+            '-line two',
+            '',
+        ].join('\n');
+        const out = stripDeletedFileBodiesFromPatch(patch);
+        ackAssert(out.includes('deleted file mode 100644'), 'keeps deleted-file header');
+        ackAssert(out.includes('@@ deleted file contents omitted @@'), 'adds placeholder for omitted deleted-file body');
+        ackAssert(!out.includes('-line one'), 'omits deleted file content lines');
+        ackAssert(out.includes('+new'), 'keeps non-deleted file hunks intact');
+    });
+
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchRawFile, fetchCommitPatch', () => {
         const source = _ackSource;
         ackAssert(source.includes('function gmFetchText(url)'), 'gmFetchText defined');
         const fetchPatch = source.slice(source.indexOf('function fetchPatch'), source.indexOf('function categorizePRFiles'));
         ackAssert(fetchPatch.includes('gmFetchText('), 'fetchPatch uses gmFetchText');
+        ackAssert(fetchPatch.includes('stripDeletedFileBodiesFromPatch'), 'fetchPatch strips deleted-file bodies');
         const fetchRaw = source.slice(source.indexOf('function fetchRawFile'), source.indexOf('async function fetchPRFileCategories'));
         ackAssert(fetchRaw.includes('gmFetchText('), 'fetchRawFile uses gmFetchText');
         const fetchCommit = source.slice(source.indexOf('function fetchCommitPatch'), source.indexOf('marked.use('));
         ackAssert(fetchCommit.includes('gmFetchText('), 'fetchCommitPatch uses gmFetchText');
+        ackAssert(fetchCommit.includes('stripDeletedFileBodiesFromPatch'), 'fetchCommitPatch strips deleted-file bodies');
     });
 
     ackTest('no standalone GM_xmlhttpRequest GET wrappers outside shared GET helpers', () => {
