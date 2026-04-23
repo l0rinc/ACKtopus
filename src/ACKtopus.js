@@ -5995,6 +5995,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }));
     }
 
+    function countDiffLines(oldText, newText) {
+        const countLines = (text) => {
+            const normalized = String(text || '').replace(/\r\n/g, '\n');
+            if (!normalized) return 0;
+            const parts = normalized.split('\n');
+            if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+            return Math.max(1, parts.length);
+        };
+        let added = 0;
+        let removed = 0;
+        for (const part of Diff.diffLines(oldText, newText)) {
+            if (part.added) added += countLines(part.value);
+            else if (part.removed) removed += countLines(part.value);
+        }
+        return {added, removed};
+    }
+
     function renderInlineProofreadResult(original, corrected) {
         const diff = wordDiff(original, corrected);
         const hasChanges = diff.some(d => d.type !== 'same');
@@ -6031,6 +6048,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const diff = wordDiff(original, corrected);
         const hasChanges = diff.some(d => d.type !== 'same');
         if (!hasChanges) return Promise.resolve({action: 'unchanged', text: corrected});
+        const lineCounts = countDiffLines(original, corrected);
 
         return new Promise(resolve => {
             const overlay = document.createElement('div');
@@ -6048,6 +6066,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             heading.textContent = 'Proofreading changes - click diffs to revert';
             Object.assign(heading.style, {fontWeight: '600', fontSize: '14px', marginBottom: '12px'});
             dialog.appendChild(heading);
+
+            const summary = document.createElement('div');
+            summary.innerHTML = `<span style="color:#3fb950;font-weight:600">+${lineCounts.added}</span> <span style="color:#f85149;font-weight:600">-${lineCounts.removed}</span>`;
+            Object.assign(summary.style, {fontSize: '12px', margin: '-4px 0 12px 0', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace'});
+            dialog.appendChild(summary);
 
             const diffEl = document.createElement('div');
             Object.assign(diffEl.style, {fontFamily: 'monospace', whiteSpace: 'pre-wrap', fontSize: '12px'});
@@ -16390,6 +16413,11 @@ RULES:
         ackAssert(d.some(e => e.type === 'add' && e.text === 'added'));
     });
 
+    ackTest('countDiffLines summarizes added and removed line counts', () => {
+        const counts = countDiffLines('one\ntwo\n', 'one\nthree\nfour\n');
+        ackDeepEq(counts, {added: 2, removed: 1}, 'counts added and removed lines separately');
+    });
+
     // --- hasUnsavedCommentText ---
 
     ackTest('hasUnsavedCommentText returns false when no textareas have content', () => {
@@ -17586,6 +17614,9 @@ RULES:
         ackAssert(source.includes("'Accept'"), 'has Accept button');
         ackAssert(source.includes("action: 'edit'"), 'Accept resolves with action edit');
         ackAssert(source.includes("action: false"), 'Reject resolves with action false');
+        const fn = source.slice(source.indexOf('function showDiffDialog'), source.indexOf('function proofread'));
+        ackAssert(fn.includes('countDiffLines(original, corrected)'), 'computes line-based diff counts');
+        ackAssert(fn.includes("+${lineCounts.added}") && fn.includes("-${lineCounts.removed}"), 'renders + and - line counts in the dialog');
     });
 
     ackTest('renderInlineProofreadResult builds inline Diff and Result blocks', () => {
