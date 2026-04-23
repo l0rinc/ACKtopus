@@ -7365,39 +7365,30 @@ Rules:
                 attempts: 3,
                 transientStatuses: [502, 503, 504],
             });
-	        // GitHub's verified-fetch calls use credentials:"omit" and rely on
-	        // x-fetch-nonce for auth. Matching that avoids occasional 404s when
-	        // cookies are sent from a userscript context.
+	        // Try session cookies first: in current GitHub rollouts this is what
+	        // succeeds; credentials:"omit" + nonce-only auth started returning 404
+	        // consistently and only worked as the last-ditch fallback, producing
+	        // two visible failed requests before the real one landed.
 	        const changesReferrer = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes`;
 	        let resp = await doCreateReviewFetch({
 	            ...baseInit(nonce, clientVersion),
-	            credentials: 'omit',
-	            // GitHub's request comes from the Files/Changes app; setting the referrer
-	            // to `/changes` matches that behavior even when we trigger from
-	            // the Conversation tab.
+	            credentials: 'same-origin',
 	            referrer: changesReferrer,
-	        }, 'create_review_comment verified-fetch');
-	        // If the nonce/clientVersion were stale (Turbo cached head) or scoped
-	        // to a different surface, refresh from /changes and retry once.
+	        }, 'create_review_comment same-origin');
+	        // If session cookies were rejected, refresh the verified-fetch meta
+	        // from /changes and retry with the pure nonce-auth variant GitHub's
+	        // own React app uses.
 	        if (!resp.ok && (resp.status === 404 || resp.status === 422)) {
 	            const meta = await fetchVerifiedFetchMetaFromChanges(pr, true);
-	            if (meta.nonce && meta.clientVersion && (meta.nonce !== nonce || meta.clientVersion !== clientVersion)) {
+	            if (meta.nonce && meta.clientVersion) {
 	                nonce = meta.nonce;
 	                clientVersion = meta.clientVersion;
-	                resp = await doCreateReviewFetch({
-	                    ...baseInit(nonce, clientVersion),
-	                    credentials: 'omit',
-	                    referrer: changesReferrer,
-	                }, 'create_review_comment refreshed verified-fetch');
 	            }
-	        }
-	        // Fallback: some GitHub surfaces/A-B tests behave differently with verified-fetch.
-	        // If we got a 404, try once more with session cookies + current page referrer.
-	        if (!resp.ok && resp.status === 404) {
 	            resp = await doCreateReviewFetch({
 	                ...baseInit(nonce, clientVersion),
-	                credentials: 'same-origin',
-	            }, 'create_review_comment same-origin fallback');
+	                credentials: 'omit',
+	                referrer: changesReferrer,
+	            }, 'create_review_comment verified-fetch fallback');
 	        }
 
         let json = null;
