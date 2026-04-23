@@ -2867,6 +2867,8 @@
             styleEl.textContent = rules.join('\n');
         }
 
+        let lastActivityAt = Date.now();
+
         function collapseNewFiles() {
             const fileEls = document.querySelectorAll('[data-tagsearch-path]');
             if (fileEls.length === 0) return false;
@@ -2900,6 +2902,7 @@
             }
             if (newCollapsed > 0) updateCollapseCSS();
             if (newCollapsed > 0 || newKept > 0) {
+                lastActivityAt = Date.now();
                 console.log('ACKtopus: compare -- batch: +' + newCollapsed + ' collapsed, +' + newKept + ' kept (total: ' + totalCollapsed + '/' + totalKept + ')');
                 const now = Date.now();
                 if (now - lastStatusUpdate > 150 || totalCollapsed + totalKept < 20) {
@@ -2934,18 +2937,33 @@
         collapseNewFiles();
         scrollToFirstKeptFile();
 
-        // Keep watching for progressively loaded file diffs
+        // Keep watching for progressively loaded file diffs. Huge compares
+        // (300+ files) stream in well past any fixed-size window, so use an
+        // idle-based timeout instead of a hard 20-second cap: stop once no
+        // new file has arrived for 10 consecutive seconds, with a 2-minute
+        // absolute ceiling so we don't observe forever on a pathological page.
         if (_compareObserver) _compareObserver.disconnect();
         console.log('ACKtopus: compare -- watching for progressive file loading...');
         let debounceTimer = null;
-        const timeout = setTimeout(() => {
-            if (_compareObserver) {
-                _compareObserver.disconnect();
-                _compareObserver = null;
-            }
-            console.log('ACKtopus: compare -- observer done (20s), total:', totalCollapsed, 'collapsed,', totalKept, 'kept');
+        let idleCheck = null;
+        const startedAt = Date.now();
+        const IDLE_MS = 10000;
+        const HARD_MAX_MS = 120000;
+        const stopWatching = (reason) => {
+            if (!_compareObserver) return;
+            _compareObserver.disconnect();
+            _compareObserver = null;
+            if (idleCheck) { clearInterval(idleCheck); idleCheck = null; }
+            if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+            const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+            console.log('ACKtopus: compare -- observer done (' + reason + ', ' + elapsedS + 's), total:', totalCollapsed, 'collapsed,', totalKept, 'kept');
             finishCompareStatus(`Compare: done - kept ${totalKept}, hid ${totalCollapsed}`);
-        }, 20000);
+        };
+        idleCheck = setInterval(() => {
+            const now = Date.now();
+            if (now - startedAt >= HARD_MAX_MS) return stopWatching(`${HARD_MAX_MS / 1000}s max`);
+            if (now - lastActivityAt >= IDLE_MS) return stopWatching(`idle ${IDLE_MS / 1000}s`);
+        }, 1000);
         _compareObserver = new MutationObserver(() => {
             if (_ackTesting) return;
             if (debounceTimer) clearTimeout(debounceTimer);
