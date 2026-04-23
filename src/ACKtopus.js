@@ -446,7 +446,7 @@
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_SELECTOR = '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
-    const EXTENDED_COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_SELECTOR + ', [data-testid="comment-body-content"], .js-comment, .js-line-comments, .inline-comment-form-container';
+    const EXTENDED_COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_SELECTOR + ', .js-comment, .js-line-comments, .inline-comment-form-container';
     const WIDE_COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_SELECTOR + ', .js-discussion, .timeline-comment-group, .js-timeline-item, [id^="issue-"]';
     const MARKDOWN_BODY_SELECTOR = '.markdown-body, .comment-body, .js-comment-body, [data-testid="markdown-body"]';
     const COMMENT_THREAD_SELECTOR = '.js-line-comments, [data-testid="review-thread"], .review-thread-component, .inline-comments, details[data-resolved], .js-resolvable-timeline-thread-container';
@@ -867,18 +867,6 @@
             onClick.call(this, e);
         });
         return btn;
-    }
-
-    function setButtonActive(btn, active) {
-        if (active) {
-            btn.dataset.active = '1';
-            btn.style.background = '#0d419d';
-            btn.style.borderColor = '#1f6feb';
-        } else {
-            delete btn.dataset.active;
-            btn.style.background = '#21262d';
-            btn.style.borderColor = '#444c56';
-        }
     }
 
     async function fetchSHA() {
@@ -1946,28 +1934,6 @@
                 });
             };
             run();
-        });
-    }
-
-    function gmPost(url, body) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'POST', url,
-                headers: {...ghApiHeaders(), 'Content-Type': 'application/json'},
-                data: JSON.stringify(body),
-                onload: r => {
-                    if (r.status >= 200 && r.status < 300) {
-                        try {
-                            resolve(JSON.parse(r.responseText));
-                        } catch (e) {
-                            reject(new Error(`JSON parse failed: ${r.responseText.slice(0, 120)}`));
-                        }
-                    } else {
-                        reject(new Error(`HTTP ${r.status} for POST ${url}: ${r.responseText.slice(0, 120)}`));
-                    }
-                },
-                onerror: reject,
-            });
         });
     }
 
@@ -4191,19 +4157,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         _prContextKey = '';
     }
 
+    function wrapPromptBlock(label, content) {
+        const body = String(content || '').trimEnd();
+        if (!body) return '';
+        return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
+    }
+
     // Build a context block from PR data, respecting a character budget.
     // Returns a string to append to the user prompt.
     function buildContextBlock(ctx, {maxDiff = 90000, maxCommits = 15000, maxDesc = 7000} = {}) {
-        const wrap = (label, content) => {
-            const body = String(content || '').trimEnd();
-            if (!body) return '';
-            return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-        };
         const parts = [];
-        if (ctx.description) parts.push(wrap('PR DESCRIPTION', ctx.description.slice(0, maxDesc)));
-        if (ctx.commitMessages) parts.push(wrap('COMMIT MESSAGES', ctx.commitMessages.slice(0, maxCommits)));
+        if (ctx.description) parts.push(wrapPromptBlock('PR DESCRIPTION', ctx.description.slice(0, maxDesc)));
+        if (ctx.commitMessages) parts.push(wrapPromptBlock('COMMIT MESSAGES', ctx.commitMessages.slice(0, maxCommits)));
         if (ctx.diff && ctx.diff.length <= maxDiff) {
-            parts.push(wrap('FULL PR DIFF', ctx.diff.slice(0, maxDiff)));
+            parts.push(wrapPromptBlock('FULL PR DIFF', ctx.diff.slice(0, maxDiff)));
         } else if (ctx.diff) {
             parts.push(`(PR diff too large: ${ctx.diff.length} chars, omitted -- commit messages provided above)`);
         }
@@ -6319,28 +6286,22 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             hasCommitMessages: !!ctx?.commitMessages,
             hasDiff: !!ctx?.diff,
         });
-        const wrap = (label, content) => {
-            const body = String(content || '').trimEnd();
-            if (!body) return '';
-            return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-        };
-
         // Build context string for the proofreading prompt
         let proofreadContext = '';
         if (isPRBody) {
             // PR body: full diff + commit messages for fact-checking
             const parts = [];
-            if (ctx.commitMessages) parts.push(wrap('Commit messages', ctx.commitMessages.slice(0, 15000)));
-            if (ctx.diff) parts.push(wrap('Diff', ctx.diff.slice(0, 120000)));
+            if (ctx.commitMessages) parts.push(wrapPromptBlock('Commit messages', ctx.commitMessages.slice(0, 15000)));
+            if (ctx.diff) parts.push(wrapPromptBlock('Diff', ctx.diff.slice(0, 120000)));
             if (parts.length) {
                 proofreadContext = '\n\nThe following is the actual PR diff and commit messages. Flag any claims in the description that are inaccurate -- renamed files, removed/changed variables, obsolete function names, incorrect behavior descriptions, etc.\n\n' + parts.join('\n\n');
             }
         } else {
             // Regular comment: include PR description, commit messages, diff, and thread context
             const parts = [];
-            if (ctx.description) parts.push(wrap('PR description', ctx.description.slice(0, 8000)));
-            if (ctx.commitMessages) parts.push(wrap('Commit messages', ctx.commitMessages.slice(0, 10000)));
-            if (ctx.diff) parts.push(wrap('Diff (for fact-checking)', ctx.diff.slice(0, 50000)));
+            if (ctx.description) parts.push(wrapPromptBlock('PR description', ctx.description.slice(0, 8000)));
+            if (ctx.commitMessages) parts.push(wrapPromptBlock('Commit messages', ctx.commitMessages.slice(0, 10000)));
+            if (ctx.diff) parts.push(wrapPromptBlock('Diff (for fact-checking)', ctx.diff.slice(0, 50000)));
 
             // Thread context: gather sibling comments in the same thread
             const containerSelectors = EXTENDED_COMMENT_CONTAINER_SELECTOR;
@@ -6354,7 +6315,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                             const sibAuthor = getCommentAuthor(sib) || '?';
                             threadParts.push(`${sibAuthor}: ${sib.innerText.trim()}`);
                         }
-                    parts.push(wrap('Thread context', threadParts.join('\n---\n').slice(0, 5000)));
+                    parts.push(wrapPromptBlock('Thread context', threadParts.join('\n---\n').slice(0, 5000)));
                 }
             }
 
@@ -6378,7 +6339,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         lines.push(`${lineNum.padStart(4)}| ${code}${i === targetIdx ? ' <<<' : ''}`);
                     }
                     if (lines.length) {
-                        parts.push(wrap(`Code context${fileName ? ` (${fileName})` : ''}`, lines.join('\n')));
+                        parts.push(wrapPromptBlock(`Code context${fileName ? ` (${fileName})` : ''}`, lines.join('\n')));
                     }
                 }
             }
@@ -7057,37 +7018,6 @@ Rules:
                         const json = JSON.parse(resp.responseText);
                         if (json.errors?.length) return reject(new Error(json.errors.map(e => e.message).join('; ')));
                         resolve(json);
-                    } catch (e) {
-                        reject(e);
-                    }
-                },
-                onerror(e) {
-                    reject(new Error(e?.error || 'network error'));
-                },
-            });
-        });
-    }
-
-    async function patApiJson(method, url, body) {
-        const auth = patAuthHeaderValue();
-        if (!auth) throw new Error('no PAT configured');
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method,
-                url,
-                headers: {
-                    ...ghApiHeaders(),
-                    'Content-Type': 'application/json',
-                    'X-GitHub-Api-Version': '2022-11-28',
-                },
-                data: body === undefined ? undefined : JSON.stringify(body),
-                onload(resp) {
-                    try {
-                        if (resp.status < 200 || resp.status >= 300) {
-                            const msg = resp.responseText?.slice?.(0, 240) || '';
-                            return reject(new Error(`HTTP ${resp.status}: ${msg}`));
-                        }
-                        resolve(resp.responseText ? JSON.parse(resp.responseText) : null);
                     } catch (e) {
                         reject(e);
                     }
@@ -9318,11 +9248,6 @@ Rules:
             const author = getCommentAuthor(bodyEl || container) || 'someone';
 
             const normalizeInlineWhitespace = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-            const wrap = (label, content) => {
-                const body = String(content || '').trimEnd();
-                if (!body) return '';
-                return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-            };
 
             let system, user;
             let prForBody = null;
@@ -9337,9 +9262,9 @@ Rules:
                 system = `${SYSTEM_BASE}\n\nYou are helping a Bitcoin Core reviewer understand a PR before starting their review. Structure your response outside-in:\n1. First, briefly explain the subsystem/area being changed (what it does in the project, why it exists)\n2. Then the problem being addressed (why change is needed)\n3. Then the approach taken (how the solution works)\n4. Finally, areas needing careful review (consensus, memory safety, thread safety, etc)\n\nBe concise: 4-8 sentences, then optionally a brief list of key files changed.`;
                 const parts = [];
                 if (prTitle) parts.push(`PR: "${prTitle}"`);
-                parts.push(wrap('PR DESCRIPTION', `by ${author}\n${commentText}`));
-                if (ctx.commitMessages) parts.push(wrap('COMMIT MESSAGES', ctx.commitMessages.slice(0, 15000)));
-                if (ctx.diff) parts.push(wrap('FULL PR DIFF', ctx.diff.slice(0, 120000)));
+                parts.push(wrapPromptBlock('PR DESCRIPTION', `by ${author}\n${commentText}`));
+                if (ctx.commitMessages) parts.push(wrapPromptBlock('COMMIT MESSAGES', ctx.commitMessages.slice(0, 15000)));
+                if (ctx.diff) parts.push(wrapPromptBlock('FULL PR DIFF', ctx.diff.slice(0, 120000)));
                 user = parts.filter(Boolean).join('\n\n');
             } else {
                 // --- Determine if this is an inline code comment or a general comment ---
@@ -9990,18 +9915,13 @@ Rules:
         try {
             const ctx = await fetchPRContext(pr);
             const parts = [];
-            const wrap = (label, content) => {
-                const body = String(content || '').trimEnd();
-                if (!body) return '';
-                return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-            };
             const draftBody = document.querySelector('textarea[name="pull_request[body]"], textarea#pull_request_body')?.value?.trim() || '';
             const pageCommits = parseCommitsFromPage().map(c => `${c.sha.slice(0, 8)} ${c.msg}`).join('\n');
-            if (ctx.description || draftBody) parts.push(wrap('PR description', (ctx.description || draftBody).slice(0, 8000)));
-            if (ctx.commitMessages || pageCommits) parts.push(wrap('Commit messages', (ctx.commitMessages || pageCommits).slice(0, 12000)));
+            if (ctx.description || draftBody) parts.push(wrapPromptBlock('PR description', (ctx.description || draftBody).slice(0, 8000)));
+            if (ctx.commitMessages || pageCommits) parts.push(wrapPromptBlock('Commit messages', (ctx.commitMessages || pageCommits).slice(0, 12000)));
             if (generateTitle) {
                 const comparePatch = await fetchComparePatchForDraftPR();
-                if (comparePatch) parts.push(wrap('Compare patch', comparePatch.slice(0, 120000)));
+                if (comparePatch) parts.push(wrapPromptBlock('Compare patch', comparePatch.slice(0, 120000)));
             }
             const ctxBlock = parts.length
                 ? `\n\nContext (for understanding only; do NOT include extra explanation):\n\n${parts.join('\n\n')}`
@@ -12649,11 +12569,6 @@ RULES:
 
     async function fetchAllPRDiscussionForPrecompute(pr) {
         if (!pr) return '';
-        const wrap = (label, content) => {
-            const body = String(content || '').trimEnd();
-            if (!body) return '';
-            return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-        };
         const fetchPaged = async (urlForPage, maxPages = 10) => {
             const out = [];
             for (let page = 1; page <= maxPages; page++) {
@@ -12691,9 +12606,9 @@ RULES:
             }).join('\n\n---\n\n');
 
             return [
-                wrap(`ISSUE COMMENTS (API, ${issueComments.length})`, issueText),
-                wrap(`PR REVIEWS (API, ${reviews.length})`, reviewText),
-                wrap(`INLINE REVIEW COMMENTS (API, ${inlineComments.length})`, inlineText),
+                wrapPromptBlock(`ISSUE COMMENTS (API, ${issueComments.length})`, issueText),
+                wrapPromptBlock(`PR REVIEWS (API, ${reviews.length})`, reviewText),
+                wrapPromptBlock(`INLINE REVIEW COMMENTS (API, ${inlineComments.length})`, inlineText),
             ].filter(Boolean).join('\n\n');
         } catch (e) {
             console.warn('ACKtopus: precompute discussion context failed:', e?.message || e);
@@ -12847,11 +12762,6 @@ RULES:
             }));
             if (commits.length === 0) return;
 
-            const wrap = (label, content) => {
-                const body = String(content || '').trimEnd();
-                if (!body) return '';
-                return `------ BEGIN ${label} ------\n${body}\n------ END ${label} ------`;
-            };
             const [ctx, pageContext, apiDiscussion] = await Promise.all([
                 fetchPRContext(pr),
                 gatherFullPRContext(() => {
@@ -12859,12 +12769,12 @@ RULES:
                 fetchAllPRDiscussionForPrecompute(pr),
             ]);
             const contextParts = [];
-            if (prBodyText) contextParts.push(wrap('PR DESCRIPTION COMMENT (MAIN THREAD)', `by ${prAuthor || '?'}\n${prBodyText}`));
+            if (prBodyText) contextParts.push(wrapPromptBlock('PR DESCRIPTION COMMENT (MAIN THREAD)', `by ${prAuthor || '?'}\n${prBodyText}`));
             if (ctx.title) contextParts.push(`PR: "${ctx.title}"`);
-            if (ctx.description) contextParts.push(wrap('PR DESCRIPTION (API)', ctx.description));
-            if (ctx.commitMessages) contextParts.push(wrap('COMMIT MESSAGES (API)', ctx.commitMessages));
+            if (ctx.description) contextParts.push(wrapPromptBlock('PR DESCRIPTION (API)', ctx.description));
+            if (ctx.commitMessages) contextParts.push(wrapPromptBlock('COMMIT MESSAGES (API)', ctx.commitMessages));
             if (apiDiscussion) contextParts.push(apiDiscussion);
-            if (pageContext) contextParts.push(wrap('FULL PR CONTEXT SNAPSHOT', pageContext));
+            if (pageContext) contextParts.push(wrapPromptBlock('FULL PR CONTEXT SNAPSHOT', pageContext));
             const fullContext = contextParts.filter(Boolean).join('\n\n');
 
             await Promise.all([
@@ -20434,8 +20344,8 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('async function explainComment'), source.indexOf('function addQuickCommentActions'));
         ackAssert(fn.includes('fetchPRContext'), 'PR body uses shared context helper');
-        ackAssert(fn.includes("wrap('FULL PR DIFF'"), 'includes full PR diff');
-        ackAssert(fn.includes("wrap('COMMIT MESSAGES'"), 'includes commit messages');
+        ackAssert(fn.includes("wrapPromptBlock('FULL PR DIFF'"), 'includes full PR diff');
+        ackAssert(fn.includes("wrapPromptBlock('COMMIT MESSAGES'"), 'includes commit messages');
     });
 
     ackTest('explainComment: toggle-off comes before provider check', () => {
@@ -20864,6 +20774,11 @@ RULES:
     ackTest('buildContextBlock returns empty string for empty context', () => {
         const result = buildContextBlock({diff: '', commitMessages: '', description: ''});
         ackEq(result, '');
+    });
+
+    ackTest('wrapPromptBlock trims empty content and preserves labels', () => {
+        ackEq(wrapPromptBlock('EMPTY', '   \n'), '');
+        ackEq(wrapPromptBlock('LABEL', 'body\n'), '------ BEGIN LABEL ------\nbody\n------ END LABEL ------');
     });
 
     ackTest('buildContextBlock includes description and commits', () => {
@@ -23237,7 +23152,7 @@ RULES:
 
     ackTest('toolbar settings and provider buttons cannot submit forms', () => {
         const source = _ackSource;
-        const create = source.slice(source.indexOf('function createBtn'), source.indexOf('function setButtonActive'));
+        const create = source.slice(source.indexOf('function createBtn'), source.indexOf('async function fetchSHA'));
         ackAssert(create.includes("btn.type = 'button'"), 'createBtn uses type=button');
         ackAssert(create.includes('e.preventDefault()'), 'createBtn prevents default click');
         ackAssert(create.includes('e.stopPropagation()'), 'createBtn stops click propagation');
@@ -25290,14 +25205,13 @@ RULES:
             <div class="review-comment" data-kind="review"></div>
             <div class="js-comment-container" data-kind="js-container"></div>
             <div class="TimelineActivityThreadItem" data-kind="activity-thread"></div>
-            <div data-testid="comment-body-content" data-kind="react-comment-body"></div>
             <div class="js-comment" data-kind="js-comment"></div>
             <div class="js-line-comments" data-kind="line-comments"></div>
             <div class="inline-comment-form-container" data-kind="inline-form"></div>
         `;
         const matched = qsa(root, EXTENDED_COMMENT_CONTAINER_SELECTOR);
         const kinds = new Set(matched.map(el => el.getAttribute('data-kind')).filter(Boolean));
-        ackEq(kinds.size, 8, `expected all selector variants to match exactly once, got: ${Array.from(kinds).join(', ')}`);
+        ackEq(kinds.size, 7, `expected all selector variants to match exactly once, got: ${Array.from(kinds).join(', ')}`);
     });
 
     // --- callLLM cache key behavior ---

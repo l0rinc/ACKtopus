@@ -2,9 +2,10 @@
   "name": "ACKtopus",
   "version": "1.38.0",
   "description": "",
-  "main": "dist/index.js",
   "scripts": {
-    "build": "tsc"
+    "check": "node --check src/ACKtopus.js",
+    "build": "tsc",
+    "test": "node --check src/ACKtopus.js && tsc"
   },
   "dependencies": {},
   "devDependencies": {

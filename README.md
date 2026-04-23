@@ -250,3 +250,9 @@ Makes reacting faster by reducing clicks (for example: hover to open the picker 
 
 On compare-style views, ACKtopus can collapse files that are unrelated to the PR so the diff stays focused on what you’re reviewing.
 After collapsing unrelated files, it also scrolls to the first remaining open file.
+
+## Development checks
+
+- `pnpm run check` runs a Node syntax check over the userscript.
+- `pnpm run build` runs TypeScript over the JavaScript source without emitting files.
+- The in-browser self-test runner is available from ACKtopus settings on GitHub pages and covers DOM-dependent behavior against the live page.
