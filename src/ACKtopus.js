@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.37
+// @version      1.38
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -10983,6 +10983,21 @@ Rules:
     // react. Clicking the trigger itself applies 👍 directly.
     // Pure DOM — no API calls, no PAT needed, uses GitHub's own session.
     function autoOpenReactionPopup(root = document) {
+        // Skip buttons that represent an already-applied reaction, not the
+        // "add reaction" smiley trigger. The classic-UI markers
+        // (data-reaction-content / js-reaction-group-button) miss modern
+        // React-UI reaction buttons, so also detect by embedded <g-emoji>
+        // and by aria-labels that describe a specific existing reaction.
+        const isExistingReactionButton = (el) => {
+            if (!el) return false;
+            if (el.hasAttribute?.('data-reaction-content')) return true;
+            if (el.classList?.contains?.('js-reaction-group-button')) return true;
+            if (el.querySelector?.('g-emoji, .emoji')) return true;
+            const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+            if (/\breacted with\b|\byou reacted\b|\busers? reacted\b|\bpeople reacted\b/.test(aria)) return true;
+            return false;
+        };
+
         // Classic UI: <details> with reaction classes
         const triggers = [];
         qsa(root,
@@ -10994,10 +11009,14 @@ Rules:
             const dd = s.closest('details');
             if (dd && !triggers.some(t => t.el === dd)) triggers.push({el: dd, type: 'details'});
         });
-        // React UI: standalone button with reaction aria-label or smiley icon
+        // React UI: standalone button with reaction aria-label or smiley icon.
+        // Filter out existing reaction emoji buttons up front so we don't
+        // attach hover/click handlers to them.
         qsa(root, 'button[aria-label*="reaction" i], button[aria-label*="react" i]').forEach(btn => {
-            if (!btn.closest('details') && !triggers.some(t => t.el === btn))
-                triggers.push({el: btn, type: 'button'});
+            if (btn.closest('details')) return;
+            if (isExistingReactionButton(btn)) return;
+            if (triggers.some(t => t.el === btn)) return;
+            triggers.push({el: btn, type: 'button'});
         });
         qsa(root, '.octicon-smiley').forEach(icon => {
             const btn = icon.closest('button, summary');
@@ -11006,13 +11025,11 @@ Rules:
         });
 
         for (const {el: trigger, type} of triggers) {
+            // Re-check in case a details/summary entry somehow resolved to an
+            // existing reaction button.
+            if (isExistingReactionButton(trigger)) continue;
             if (trigger.dataset.ackReactionHover) continue;
             trigger.dataset.ackReactionHover = 'true';
-
-            // Skip existing reaction emoji buttons (they have data-reaction-content).
-            // We only want the "add reaction" smiley trigger.
-            if (trigger.hasAttribute('data-reaction-content')) continue;
-            if (trigger.classList.contains('js-reaction-group-button')) continue;
 
             const openTarget = type === 'details' ? (trigger.querySelector('summary') || trigger) : trigger;
 
@@ -15928,7 +15945,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.37
+// @version      1.38
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -18879,9 +18896,38 @@ RULES:
         ackAssert(fn.includes('mouseleave'), 'adds mouseleave to cancel timer');
         ackAssert(fn.includes('clearTimeout'), 'cancels timer on mouseleave');
         ackAssert(fn.includes('ackReactionHover'), 'guards against double-processing');
-        // Excludes existing reaction emoji buttons
+        // Excludes existing reaction emoji buttons (classic + React UI)
         ackAssert(fn.includes('data-reaction-content'), 'skips buttons with data-reaction-content');
         ackAssert(fn.includes('js-reaction-group-button'), 'skips reaction group buttons');
+        ackAssert(fn.includes('g-emoji'), 'skips React-UI buttons that embed a g-emoji');
+        ackAssert(fn.includes('reacted with'), 'skips buttons whose aria-label describes an existing reaction');
+    });
+
+    ackTest('autoOpenReactionPopup does not attach handlers to React-UI existing reaction buttons', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="reactions">
+                <button id="existing" aria-label="1 user reacted with 👍 emoji"><g-emoji>👍</g-emoji> 1</button>
+                <button id="trigger" aria-label="Add your reaction"><svg class="octicon-smiley"></svg></button>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            autoOpenReactionPopup(host);
+            const existing = host.querySelector('#existing');
+            const trigger = host.querySelector('#trigger');
+            ackAssert(!existing.dataset.ackReactionHover, 'existing reaction button is not marked as a hover target');
+            ackAssert(trigger.dataset.ackReactionHover === 'true', 'add-reaction trigger is marked as a hover target');
+            let existingClicks = 0;
+            existing.addEventListener('click', () => existingClicks++);
+            existing.dispatchEvent(new MouseEvent('mouseenter', {bubbles: false}));
+            existing.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+            ackEq(existingClicks, 1, 'hovering/clicking the existing reaction follows native behavior, no extra click is synthesized');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('autoOpenReactionPopup handles both Classic details and React button', () => {
@@ -24998,8 +25044,8 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.37', () => {
-        ackAssert(_ackSource.includes('@version      1.37'), 'version is 1.37');
+    ackTest('version bumped to 1.38', () => {
+        ackAssert(_ackSource.includes('@version      1.38'), 'version is 1.38');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
