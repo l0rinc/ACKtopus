@@ -4615,15 +4615,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             .replace(/\u00a0/g, ' ')
             .replace(/[ \t\r\f\v]+/g, ' ');
 
-        const wrapInlineCode = (text) => {
-            const raw = String(text || '');
-            const runs = raw.match(/`+/g) || [];
-            const maxRun = runs.length ? Math.max(...runs.map(s => s.length)) : 0;
-            const ticks = '`'.repeat(maxRun + 1);
-            const pad = raw.startsWith('`') || raw.endsWith('`') ? ' ' : '';
-            return `${ticks}${pad}${raw}${pad}${ticks}`;
-        };
-
         const wrapFencedCode = (text, lang = '') => {
             const raw = String(text || '').replace(/\n+$/, '');
             const runs = raw.match(/`{3,}/g) || [];
@@ -4640,7 +4631,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (node.nodeType !== Node.ELEMENT_NODE) return '';
             const tag = node.tagName.toLowerCase();
             if (tag === 'br') return '\n';
-            if (tag === 'code' && node.parentElement?.tagName !== 'PRE') return wrapInlineCode(node.textContent);
+            if (tag === 'code' && node.parentElement?.tagName !== 'PRE') return normalizeText(node.textContent);
             if (tag === 'strong' || tag === 'b') return `**${renderInlineChildren(node)}**`;
             if (tag === 'em' || tag === 'i') return `*${renderInlineChildren(node)}*`;
             if (tag === 'del' || tag === 's') return `~~${renderInlineChildren(node)}~~`;
@@ -22373,22 +22364,19 @@ RULES:
         }
     });
 
-    ackTest('renderBodyMarkdown preserves blockquotes and inline code', () => {
+    ackTest('renderBodyMarkdown preserves blockquotes without adding inline backticks', () => {
         const host = document.createElement('div');
         host.innerHTML = `
             <div class="markdown-body">
                 <p>Thanks.</p>
                 <blockquote><p>quoted line</p></blockquote>
                 <p>Use <code>CallOneOf</code> here.</p>
-                <p>Use <code>std::string</code> instead.</p>
-                <p>Inner: <code>a\`b</code>.</p>
             </div>
         `;
         const out = renderBodyMarkdown(host.firstElementChild);
         ackAssert(out.includes('> quoted line'), 'preserves blockquote marker');
-        ackAssert(/(?:^|[^`])`CallOneOf`(?:[^`]|$)/.test(out), 'wraps simple identifier in single backticks');
-        ackAssert(/(?:^|[^`])`std::string`(?:[^`]|$)/.test(out), 'does not over-quote typenames');
-        ackAssert(out.includes('``a`b``'), 'escalates to double backticks only when content has a backtick');
+        ackAssert(out.includes('Use CallOneOf here.'), 'preserves inline code text without adding markdown backticks');
+        ackAssert(!out.includes('`CallOneOf`'), 'does not add inline backticks');
     });
 
     ackTest('renderBodyMarkdown preserves GitHub snippet clipboard blocks without spacer lines', () => {
@@ -22552,7 +22540,8 @@ RULES:
         try {
             const ctx = gatherCommentContext(host.querySelector('#discussion_r77'));
             ackAssert(ctx.includes('> quoted bit'), 'selected comment keeps blockquote markers');
-            ackAssert(ctx.includes('`git diff a..b`'), 'selected comment keeps inline code markers');
+            ackAssert(ctx.includes('Run git diff a..b'), 'selected comment keeps inline code text');
+            ackAssert(!ctx.includes('`git diff a..b`'), 'selected comment does not add inline backticks');
         } finally {
             host.remove();
         }
