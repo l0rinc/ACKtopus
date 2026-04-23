@@ -2891,6 +2891,11 @@
                 if (isPRFile) {
                     newKept++;
                     totalKept++;
+                    // Large compares ship the kept diffs as deferred
+                    // <include-fragment> placeholders. Auto-click the
+                    // "Load diff" button so we don't leave the user with
+                    // a wall of closed PR files to click through.
+                    openCompareFileIfCollapsed(file);
                     continue;
                 }
                 if (unmatched.length < 5) unmatched.push(path);
@@ -11006,11 +11011,18 @@ Rules:
         // (data-reaction-content / js-reaction-group-button) miss modern
         // React-UI reaction buttons, so also detect by embedded <g-emoji>
         // and by aria-labels that describe a specific existing reaction.
+        // IMPORTANT: only do the g-emoji structural check on <button>
+        // elements — <details> reaction popovers *contain* emoji buttons
+        // in their popup, so a descendant g-emoji would false-positive
+        // every add-reaction trigger.
         const isExistingReactionButton = (el) => {
             if (!el) return false;
             if (el.hasAttribute?.('data-reaction-content')) return true;
             if (el.classList?.contains?.('js-reaction-group-button')) return true;
-            if (el.querySelector?.('g-emoji, .emoji')) return true;
+            if (el.tagName === 'BUTTON'
+                && el.querySelector?.(':scope > g-emoji, :scope > .emoji, :scope > * > g-emoji, :scope > * > .emoji')) {
+                return true;
+            }
             const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
             if (/\breacted with\b|\byou reacted\b|\busers? reacted\b|\bpeople reacted\b/.test(aria)) return true;
             return false;
@@ -18948,6 +18960,32 @@ RULES:
         }
     });
 
+    ackTest('autoOpenReactionPopup still marks classic <details> reaction popovers that nest emoji buttons', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        // Classic-UI reaction popover: the <details> wrapper *contains*
+        // g-emoji elements inside its popup menu, but it's still the
+        // add-reaction trigger, not an existing reaction button.
+        host.innerHTML = `
+            <details class="js-reaction-popover-container">
+                <summary aria-label="Add your reaction"><svg class="octicon-smiley"></svg></summary>
+                <div class="reaction-popover">
+                    <button data-reaction-content="+1"><g-emoji>👍</g-emoji></button>
+                    <button data-reaction-content="heart"><g-emoji>❤️</g-emoji></button>
+                </div>
+            </details>
+        `;
+        document.body.appendChild(host);
+        try {
+            autoOpenReactionPopup(host);
+            const details = host.querySelector('details');
+            ackAssert(details.dataset.ackReactionHover === 'true', 'classic <details> popover still gets hover marker even though it nests g-emoji inside its popup');
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('autoOpenReactionPopup handles both Classic details and React button', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function autoOpenReactionPopup'), source.indexOf('\n    // --- Reaction Avatar'));
@@ -22369,7 +22407,7 @@ RULES:
         ackAssert(fn.includes("const isIssue = pageKind() === 'issue'"), 'detects issue pages');
         ackAssert(fn.includes("const itemRoute = isIssue ? 'issues' : 'pull'"), 'uses issue route for copied URL');
         ackAssert(fn.includes("https://api.github.com/repos/${pr.owner}/${pr.repo}/${isIssue ? 'issues' : 'pulls'}/${pr.pr}"), 'uses issue API endpoint for title/description');
-        ackAssert(fn.includes('if (!isIssue) {'), 'guards commits section for PRs only');
+        ackAssert(fn.includes('if (!isIssue && includeCommits)'), 'guards commits section for PRs only');
         ackAssert(fn.includes('if (!isIssue && includePatch)'), 'guards patch section for PRs only');
     });
 
