@@ -2951,7 +2951,7 @@
     const LLM_MODELS = {
         claude: 'claude-sonnet-4-6',
         claude_high_context: 'claude-opus-4-7',
-        openai: 'gpt-5.4',
+        openai: 'gpt-5.5',
     };
 
     function getHighContextModelOverride(provider) {
@@ -16484,8 +16484,8 @@ RULES:
 
     // --- LLM Models ---
 
-    ackTest('LLM_MODELS.openai is gpt-5.4', () => {
-        ackEq(LLM_MODELS.openai, 'gpt-5.4');
+    ackTest('LLM_MODELS.openai is gpt-5.5', () => {
+        ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
 
     ackTest('LLM_MODELS.claude is claude-sonnet-4-6', () => {
@@ -25489,7 +25489,7 @@ RULES:
     ackTest('LLM_MODELS match documented provider models', () => {
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
-        ackEq(LLM_MODELS.openai, 'gpt-5.4');
+        ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
 
     // --- escapeHTML behavioral tests ---
