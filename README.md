@@ -1,6 +1,6 @@
 <h1><img src="screenshots/acktopus-logo.svg" alt="ACKtopus" width="28" height="28"> ACKtopus</h1>
 
-ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a small floating toolbar and a handful of review helpers on pull requests and issues (optimized for Bitcoin Core-style review).
+ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a floating review toolbar, context-copy tools, LLM review recipes, proofreading, pending-review helpers, and queue/navigation shortcuts on GitHub pull requests and issues (optimized for Bitcoin Core-style review).
 
 ## Highlights
 
@@ -112,27 +112,33 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 
 ## What it helps with
 
-- Copying ACK-style messages for the current PR head commit
-- Copying PR, commit, or comment context to your clipboard
-- Navigating long PR discussions quickly
-- Expanding/collapsing hidden or resolved sections in bulk
-- Leaving comments on single-commit views with a clear “this comment is about *this* commit” prefix
-- Quick actions on comments and selections (explain, proofread, edit, delete, fact-check, simplify)
+- Tracking ACK/Concept ACK/NACK signals and jumping back to the source comments
+- Copying ACKs, checkout commands, range-diffs, local pre-push range-diffs, and focused test/format commands
+- Copying PR, issue, commit, patch, comment, and visible discussion context to the clipboard
+- Revealing hidden conversations, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
+- Navigating long PRs by comment, file, and commit
+- Reviewing with LLM chat, rebuild briefs, maintainer summaries, commit lightbulbs, selection helpers, and cached PR infographics
+- Proofreading comments, PR descriptions, selected prose, and draft PR text with a diff preview before applying changes
+- Starting/submitting pending GitHub reviews from the Conversation tab
+- Keeping a personal PR review queue
 
 ## Toolbar (top-right)
 
 ### 👥 ACK panel
 
-Shows detected ACKs/Concept ACKs/NACKs (and similar signals) and lets you jump to the comment that contained them.
+Shows detected ACKs/Concept ACKs/Approach ACKs/NACKs/Stale ACKs and lets you jump to the comment that contained them. Repository members are highlighted, configured maintainers get stronger highlighting, and PGP-signed ACK details can show verification badges when a key is available.
 
 ### SHA / ACK copy
 
 Copies useful snippets based on the PR head commit, such as:
 
-- `ACK <sha>` / `Concept ACK <sha>`
-- Checkout helpers (`git fetch …`, `gh pr co …`)
-- Range-diff / rebase-diff helpers (useful after force-pushes and before pushing local rewrites)
-- Convenience commands for benchmarks/tests/fuzz/functional tests when relevant files are involved
+- `ACK <sha>`
+- `git fetch ... && git switch --detach FETCH_HEAD`
+- checkout-parent and `gh pr co ... && git pull --rebase upstream <base>` helpers
+- `git range-diff` from your last ACK or the latest force-push
+- rebase-both-sides-and-diff commands for cleaner force-push comparisons
+- pre-push `git range-diff "$BASE..@{u}" "$BASE..HEAD"` for comparing the pushed tracking branch with local `HEAD`
+- benchmark, unit-test, fuzz, and functional-test commands when changed files make those targets discoverable
 
 These buttons always **copy to your clipboard** (they never insert text into a comment box).
 
@@ -146,54 +152,64 @@ If the PR changes C/C++ files, additional per-PR helpers appear:
 
 These three commands are generated with the PR’s exact changed C/C++ file paths already filled in, so they are ready to run as-is.
 
-### 📦 Show hidden
+### 📦 / 📂 / 🪟 Expand dropdown
 
-Expands content that GitHub often hides behind extra clicks, such as:
+The expand control can run three related actions:
 
-- “Load more…” comment pagination
-- Minimized/outdated blocks
-- “Load diff” buttons for large diffs
+- **Show hidden**: loads hidden conversation/comment pagination
+- **Show resolved**: expands resolved review threads
+- **Open collapsed**: opens minimized comments, outdated sections, and “Load diff” buttons for large diffs
 
-### 📂 Show resolved
-
-Expands resolved review threads so you can scan discussions without opening them one-by-one.
+The context-copy dropdown also has **Reveal all**, which walks through hidden conversations, resolved threads, collapsed sections, and deferred diffs before copying.
 
 ### 💬 Comment navigation
 
-Jumps between comments in chronological order so you can quickly review conversations.
+Jumps between comments by date on PR pages, and between visible files on compare pages. Hold **Shift** to reverse direction. The delayed Ctrl hotkey chooser exposes this as **Ctrl+N** after the chooser is armed.
 
 ### 📎 Context copy
 
-Copies the PR’s context (title/description, commits, diff, and visible comments) to your clipboard for sharing or pasting into an LLM.
+Copies page context to your clipboard for sharing or pasting into an LLM. The dropdown supports:
+
+- **Patch**: PR description, commits, and patch
+- **Comments**: description plus visible comments, without the patch
+- **Full**: URL, title, description, commits, patch, and visible comments
+- **Reveal all**: expands hidden/resolved/collapsed content before copying
+
 On single-commit pages like `/changes/<sha>` and `/commits/<sha>`, the same button copies **commit-only** context instead: the parent PR metadata/description, the current commit patch, and visible comments tied to that commit.
 Each comment’s `...` menu also gets a **Copy comment context** action, which copies just that comment plus its surrounding thread and location metadata (file, line, commit, author, permalink).
 
-### 🤖 Chat
+### 🤖 Robot recipes / Chat
 
-Opens an assistant panel that can:
+Opens a robot panel backed by the active Claude or ChatGPT provider. The dropdown supports:
 
-- Summarize a PR or a single commit
-- Explain a single commit with high-level pseudocode and performance/simplification notes
-- Explain a specific comment in context
-- Proofread text before you post it
+- **Chat**: ask about the page, use `/find ...` to navigate visible comments/code, or use `/quiz` for high-leverage review questions
+- **Rebuild brief**: generate an issue-style brief for recreating the PR from the base commit without hard-coding the current implementation
+- **Maintainer view**: summarize mergeability, unresolved threads, reviewer positions, and suggested maintainer focus
+- **Infographic**: generate a cached OpenAI PR infographic for a high-level visual overview
 
-For explain/proofread/fact-check flows, ACKtopus includes PR-level context (description, commit messages, diff) with larger context windows to improve response quality.
+Chat answers can cite visible comments/code with clickable `[ref:N]` links. For explain/proofread/fact-check flows, ACKtopus includes PR-level context (description, commit messages, diff) with larger context windows to improve response quality. Rebuild briefs also show the exact generated system/user prompt in a collapsible section so it can be inspected or reused directly.
+
+The infographic flow first asks OpenAI to distill the PR into a sparse visual prompt, then calls OpenAI image generation (`gpt-image-2`) for a landscape technical infographic. The image prompt carries the source PR URL for reference and asks for the single overall concept the image should communicate, so the output compresses the PR rather than listing details. Results are cached per PR head/model/image settings/prompt version and can be reopened, downloaded, or inspected by copying the generated image prompt. The exact image prompt is always shown in a collapsible section when available, including the organization-verification fallback path so it can be pasted into `gpt-image-2` manually.
 
 The **main PR description lightbulb** is treated specially: after generating the high-level overview, it also precomputes commit lightbulb caches (commits view + single-commit view) using richer PR context (including discussion/replies), so those views can open their lightbulb panels immediately from cache.
 
 ### ☑️ Queue
 
-Keeps a simple personal list of PRs you want to come back to.
+Keeps a personal list of PRs you want to come back to. You can add the current PR, search GitHub by PR number or text, open queued PRs in a new tab, reorder entries, remove entries, and see the queue count on the toolbar. The delayed Ctrl hotkey chooser exposes this as **Ctrl+L**.
 
 ### Settings
 
-Lets you configure optional tokens/keys and tweak behavior (for example, compact toolbar mode). Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
+Lets you configure the optional GitHub PAT, Claude/OpenAI API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. The toolbar background toggles compact mode. Shift-clicking the settings logo clears caches. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
 
 ## In-page review helpers
 
 ### Commit prefix on single-commit views
 
 On single-commit pages like `/changes/<sha>` and `/commits/<sha>`, when you open a new inline comment box (new thread), ACKtopus pre-fills it with a commit link prefix. This makes it obvious which revision the comment refers to (especially helpful after rebases/force-pushes).
+
+### Commit navigation and lightbulbs
+
+On PR conversation, commits-list, single-commit, and changes views, ACKtopus adds floating commit navigation that shows commit messages and position and supports the delayed **Ctrl+J/K** shortcuts. Commit lightbulbs generate structured review aids with summary, context, why-it-matters, high-level pseudocode, verification notes, performance/simplification notes, concerns, message checks, and dependency notes.
 
 ### Explain / Chat / Fact check on selections
 
@@ -224,15 +240,16 @@ If it has text, that text is used as the review summary while submitting the pen
 
 ACKtopus adds small action buttons on comments to speed up common tasks:
 
-- **Explain**: summarize/explain the comment in context
+- **Explain**: summarize/explain the comment or PR body in context
+- **Expected author reply**: simulate the likely author response for your own pending/review comments
 - **Proofread**: improve clarity/grammar without changing meaning while preserving intentional paragraph spacing/blank lines (available while editing; it won’t auto-edit a closed comment). When clearly useful, it can also convert `Note`/`Tip`/`Important`/`Warning`/`Caution` lead-ins (with or without `:`) to GitHub alerts, upgrade generic collapsible summaries, and preserve/update code-fence languages suggested by the proofread result.
 - **Edit / Delete**: shortcuts to GitHub’s native actions (in delete confirmations, **Enter deletes** and **Escape cancels**)
 
-When editing an existing comment, clicking **Update comment** without changing the text is treated as **Cancel** (no server update), so the comment content stays byte-for-byte unchanged. For comment editing, ACKtopus prefers the nearby native `edit_form` fragment when it is already available, and otherwise falls back to it when GitHub’s action menu is slow or incomplete.
+Inline review comments also get a quick link back to the Changes tab when ACKtopus can identify the review comment id, and pending comments get a readable “just now (pending)” timestamp. When editing an existing comment, clicking **Update comment** without changing the text is treated as **Cancel** (no server update), so the comment content stays byte-for-byte unchanged. For comment editing, ACKtopus prefers the nearby native `edit_form` fragment when it is already available, and otherwise falls back to it when GitHub’s action menu is slow or incomplete.
 
 ### PR creation proofreading
 
-On compare-based **new PR** pages, ACKtopus also adds proofreading to the draft title and body editors, so you can clean up the PR before it is created.
+On compare-based **new PR** pages, ACKtopus adds proofreading to the draft title and body editors. If the draft body is empty, the proofread flow can generate a short two-paragraph PR description from the draft title, commit messages, and compare patch.
 
 ### Wrap selection in collapsible details
 
@@ -245,6 +262,10 @@ Keeps the comment formatting toolbar accessible while editing longer comments.
 ### Faster reactions
 
 Makes reacting faster by reducing clicks (for example: hover to open the picker and quick cycling on click).
+
+### PGP signature badges
+
+ACKtopus scans visible comment details blocks for cleartext PGP signatures, fetches keys from `keys.openpgp.org`, verifies signatures with `openpgp.js`, caches results, and marks valid, invalid, or failed checks inline.
 
 ### Focused compare/diff views
 
