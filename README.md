@@ -131,7 +131,7 @@ Copies useful snippets based on the PR head commit, such as:
 
 - `ACK <sha>` / `Concept ACK <sha>`
 - Checkout helpers (`git fetch …`, `gh pr co …`)
-- Range-diff / rebase-diff helpers (useful after force-pushes)
+- Range-diff / rebase-diff helpers (useful after force-pushes and before pushing local rewrites)
 - Convenience commands for benchmarks/tests/fuzz/functional tests when relevant files are involved
 
 These buttons always **copy to your clipboard** (they never insert text into a comment box).

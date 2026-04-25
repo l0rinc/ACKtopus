@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.39
+// @version      1.40
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -346,6 +346,16 @@
                 const f = lastForcePush.fromFull || lastForcePush.from;
                 const t = lastForcePush.toFull || lastForcePush.to;
                 return `B=${f} A=${t} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
+            }
+        },
+        {
+            key: 'pushrdiff',
+            emoji: '📤',
+            label: 'pre-push range-diff',
+            tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
+            fmt: () => {
+                const base = shellQuote(getReviewBaseBranch());
+                return `BASE_BRANCH=${base} && git fetch && git fetch upstream "$BASE_BRANCH" && BASE=$(git rev-parse FETCH_HEAD) && git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"`;
             }
         },
         {
@@ -15876,7 +15886,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.39
+// @version      1.40
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -16147,6 +16157,7 @@ RULES:
         ackAssert(keys.includes('parent'), 'missing parent');
         ackAssert(keys.includes('ghco'), 'missing ghco');
         ackAssert(keys.includes('rdiff'), 'missing rdiff');
+        ackAssert(keys.includes('pushrdiff'), 'missing pushrdiff');
         ackAssert(keys.includes('bench'), 'missing bench');
         ackAssert(keys.includes('test'), 'missing test');
         ackAssert(keys.includes('fuzz'), 'missing fuzz');
@@ -16574,6 +16585,20 @@ RULES:
         } finally {
             getReviewBaseBranch = origBase;
             userAckSha = origAck;
+        }
+    });
+
+    ackTest('pushrdiff command compares pushed tracking branch with local HEAD', () => {
+        const f = SHA_FORMATS.find(f => f.key === 'pushrdiff');
+        const origBase = getReviewBaseBranch;
+        try {
+            getReviewBaseBranch = () => 'main';
+            const cmd = f.fmt();
+            ackAssert(cmd.includes("BASE_BRANCH='main'"), 'captures the dynamic review base branch');
+            ackAssert(cmd.includes('git fetch && git fetch upstream "$BASE_BRANCH"'), 'fetches tracking remote and upstream base');
+            ackAssert(cmd.includes('git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"'), 'compares pushed upstream branch to local HEAD');
+        } finally {
+            getReviewBaseBranch = origBase;
         }
     });
 
@@ -17340,13 +17365,13 @@ RULES:
     // SHA_FORMATS -- all formats
     // ============================================================================
 
-	    ackTest('SHA_FORMATS has exactly 13 formats', () => {
-	        ackEq(SHA_FORMATS.length, 13);
+	    ackTest('SHA_FORMATS has exactly 14 formats', () => {
+	        ackEq(SHA_FORMATS.length, 14);
 	    });
 
-	    ackTest('SHA_FORMATS keys are ack, fetch, parent, ghco, rdiff, rebasediff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
+	    ackTest('SHA_FORMATS keys are ack, fetch, parent, ghco, rdiff, rebasediff, pushrdiff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu', () => {
 	        const keys = SHA_FORMATS.map(f => f.key);
-	        ackDeepEq(keys, ['ack', 'fetch', 'parent', 'ghco', 'rdiff', 'rebasediff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
+	        ackDeepEq(keys, ['ack', 'fetch', 'parent', 'ghco', 'rdiff', 'rebasediff', 'pushrdiff', 'bench', 'test', 'fuzz', 'functional', 'formatdiff', 'tidydiff', 'iwyu']);
 	    });
 
     ackTest('all SHA_FORMATS have key, emoji, label, tip, fmt', () => {
@@ -25011,8 +25036,8 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.39', () => {
-        ackAssert(_ackSource.includes('@version      1.39'), 'version is 1.39');
+    ackTest('version bumped to 1.40', () => {
+        ackAssert(_ackSource.includes('@version      1.40'), 'version is 1.40');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
