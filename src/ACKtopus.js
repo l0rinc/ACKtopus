@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.44
+// @version      1.45
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3209,7 +3209,7 @@
     const OPENAI_IMAGE_QUALITY = 'medium';
     const OPENAI_IMAGE_FORMAT = 'webp';
     const OPENAI_ORG_VERIFY_URL = 'https://platform.openai.com/settings/organization/general';
-    const PR_INFOGRAPHIC_PROMPT_VERSION = 3;
+    const PR_INFOGRAPHIC_PROMPT_VERSION = 4;
 
     function getHighContextModelOverride(provider) {
         if (provider === 'claude') return LLM_MODELS.claude_high_context;
@@ -3518,10 +3518,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return `llm_infographic_${pr.owner}_${pr.repo}_${pr.pr}_`;
     }
 
-    function prInfographicCacheKey(pr, headSha) {
+    function prInfographicCacheKey(pr, headSha, scope = 'pr') {
         const version = `v${PR_INFOGRAPHIC_PROMPT_VERSION}`;
-        const sha = /^[0-9a-f]{40}$/i.test(String(headSha || '')) ? headSha : 'unknown';
-        return `${prInfographicCachePrefix(pr)}${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${version}_${sha}`;
+        const sha = /^[0-9a-f]{7,40}$/i.test(String(headSha || '')) ? String(headSha).toLowerCase() : 'unknown';
+        const scopeKey = scope === 'commit' ? 'commit' : 'pr';
+        return `${prInfographicCachePrefix(pr)}${scopeKey}_${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${version}_${sha}`;
     }
 
     function normalizeInfographicCacheValue(value) {
@@ -3531,17 +3532,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return null;
     }
 
-    function getInfographicCache(pr, headSha) {
+    function getInfographicCache(pr, headSha, scope = 'pr') {
         if (!getLLMConfig().cacheEnabled) return null;
-        const key = prInfographicCacheKey(pr, headSha);
+        const key = prInfographicCacheKey(pr, headSha, scope);
         const cached = normalizeInfographicCacheValue(GM_getValue(key, null));
         if (cached) recordCacheTimestamp(key);
         return cached;
     }
 
-    function setInfographicCache(pr, headSha, value) {
+    function setInfographicCache(pr, headSha, value, scope = 'pr') {
         if (!getLLMConfig().cacheEnabled) return;
-        const key = prInfographicCacheKey(pr, headSha);
+        const key = prInfographicCacheKey(pr, headSha, scope);
         GM_setValue(key, value);
         recordCacheTimestamp(key);
     }
@@ -5898,41 +5899,94 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             .trim();
     }
 
-    function ensureInfographicPromptReferences(prompt, prUrl) {
+    function ensureInfographicPromptReferences(prompt, prUrl, sourceUrl = '') {
         const text = String(prompt || '').trim();
         const url = String(prUrl || '').trim();
-        if (!url || text.includes(url)) return text;
-        return `Source PR URL (context only, do not render as image text): ${url}\n\n${text}`;
+        const source = String(sourceUrl || '').trim();
+        const refs = [];
+        if (url && !text.includes(url)) refs.push(`Source PR URL (context only, do not render as image text): ${url}`);
+        if (source && source !== url && !text.includes(source)) {
+            refs.push(`Source page URL (context only, do not render as image text): ${source}`);
+        }
+        if (!refs.length) return text;
+        return `${refs.join('\n')}\n\n${text}`;
     }
 
-    async function buildInfographicImagePrompt(fullContext, prUrl = '') {
-        const system = `You are a technical visual editor for code review.
-Your task is to turn source-grounded pull request context into one prompt for an image-generation model.
+    function buildInfographicTarget(pr, ctx = {}, path = location.pathname) {
+        const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
+        const commitSha = pathCommitSha(path);
+        if (commitSha) {
+            const viewKind = path.includes('/changes/') ? 'changes' : 'commits';
+            return {
+                scope: 'commit',
+                cacheSha: commitSha,
+                prUrl,
+                sourceUrl: `${prUrl}/${viewKind}/${commitSha}`,
+                label: '🖼️ OpenAI commit infographic',
+                sourceLabel: `current commit ${commitSha.slice(0, 8)}`,
+            };
+        }
+        return {
+            scope: 'pr',
+            cacheSha: ctx?.headSha || getImmediatePRHeadSHA() || '',
+            prUrl,
+            sourceUrl: prUrl,
+            label: '🖼️ OpenAI PR infographic',
+            sourceLabel: 'full PR',
+        };
+    }
 
-Goal: compress the PR into one landscape infographic that gives reviewers the overall concept and high-level purpose at elevator-pitch speed.
+    async function gatherInfographicContext(target, onProgress = () => {}) {
+        if (target?.scope === 'commit') {
+            return gatherSingleCommitContext(onProgress, { includePatch: true, includeComments: true });
+        }
+        return gatherRecipeContext(onProgress);
+    }
+
+    async function buildInfographicImagePrompt(fullContext, prUrl = '', target = {}) {
+        const scopeLabel = target?.scope === 'commit' ? 'current commit' : 'full PR';
+        const sourceUrl = target?.sourceUrl || prUrl;
+        const system = `You are a technical visual editor for code review.
+Your task is to turn source-grounded PR or commit context into one prompt for an image-generation model.
+
+Goal: compress the supplied ${scopeLabel} context into one landscape infographic that gives reviewers the overall concept and high-level purpose at elevator-pitch speed.
 
 Rules:
 - Ground every claim in the supplied context. If the purpose, flow, risk, or test story is unclear, keep the label generic or omit it.
-- Before describing layout, identify the single overall concept the image should communicate. The concept should explain the PR's main idea, not list files or commits.
-- Prefer a visual structure over prose: before/after, request -> processing -> validation, data flow, stack/layer diagram, or risk/test map, whichever best fits the PR.
+- Before describing layout, identify the single overall concept the image should communicate. The concept should explain the ${scopeLabel}'s main idea, not list files or commits.
+- Spend the most visual space on the most important, complicated, risky, or hard-to-explain parts. It is better to explain one difficult mechanism well than to cover every routine edit.
+- If the source is scoped to one commit, make the infographic about that commit; use PR-level context only to explain why the commit matters.
+- Prefer a visual structure over prose: before/after, request -> processing -> validation, data flow, stack/layer diagram, or risk/test map, whichever best fits the review target.
 - Every visual block must explain what it represents with a short readable label and a tiny callout. Do not rely on emojis, icons, arrows, or abstract lines without explanatory text.
 - Keep literal text sparse but explanatory: at most 10 labels/callouts, each 1 to 6 words, and at most 55 words total inside the image.
 - Put exact labels in double quotes so the image model knows what text to render.
 - Do not request code snippets, commit hashes, long file lists, tiny captions, watermarks, logos, emojis, or decorative clutter.
 - Include enough layout direction that a generated image can be useful on the first try.`;
         const context = truncateMiddle(fullContext, 180000);
-        const prReference = prUrl ? `\n\nSource PR URL to carry into the final prompt for reference (do not render it as image text): ${prUrl}` : '';
-        const user = `${wrapPromptBlock('PR SOURCE MATERIAL', context)}${prReference}
+        const sourceRefs = [
+            `Target scope: ${scopeLabel}.`,
+            prUrl ? `Source PR URL to carry into the final prompt for reference (do not render it as image text): ${prUrl}` : '',
+            sourceUrl && sourceUrl !== prUrl
+                ? `Source page URL to carry into the final prompt for reference (do not render it as image text): ${sourceUrl}`
+                : '',
+        ]
+            .filter(Boolean)
+            .join('\n');
+        const user = `${wrapPromptBlock(`${scopeLabel.toUpperCase()} SOURCE MATERIAL`, context)}
+
+${sourceRefs}
 
 Write only the final image-generation prompt. It should be 250 to 500 words, concise but visually specific.
 The prompt must explicitly include:
 - the source PR URL as context only, with instructions not to render it as image text,
-- an "Overall concept to communicate" sentence that compresses the PR into the one idea reviewers should understand first.
+- the source page URL when provided as context only, with instructions not to render it as image text,
+- an "Overall concept to communicate" sentence that compresses the review target into the one idea reviewers should understand first.
+- a "Most important/risky parts to visualize" sentence that tells the image model which complicated or hard-to-explain elements deserve the most space.
 
 The prompt must ask for:
 - a clean 1536x1024 landscape technical infographic,
 - a one-line title,
-- 3 to 5 visual blocks or lanes showing the PR's main flow or before/after,
+- 3 to 5 visual blocks or lanes showing the ${scopeLabel}'s main flow or before/after,
 - a short explanation attached to each block so the image communicates meaning instead of just shapes, emojis, or connector lines,
 - 2 to 3 compact risk/test callouts,
 - large readable text and high contrast,
@@ -5943,7 +5997,7 @@ The prompt must ask for:
         });
         const prompt = cleanInfographicImagePrompt(raw);
         if (!prompt) throw new Error('OpenAI did not return an image prompt');
-        return ensureInfographicPromptReferences(prompt, prUrl).slice(0, 30000);
+        return ensureInfographicPromptReferences(prompt, prUrl, sourceUrl).slice(0, 30000);
     }
 
     function formatLLMPromptPreview(system, userContent) {
@@ -6748,7 +6802,8 @@ The prompt must ask for:
                 body.innerHTML = '';
                 const img = document.createElement('img');
                 img.src = dataUrl;
-                img.alt = 'PR infographic';
+                const imageScope = result.scope === 'commit' ? 'commit' : 'PR';
+                img.alt = `${imageScope} infographic`;
                 Object.assign(img.style, {
                     display: 'block',
                     width: '100%',
@@ -6770,7 +6825,7 @@ The prompt must ask for:
                     renderButton('Download', 'Download generated infographic', () => {
                         const a = document.createElement('a');
                         a.href = blobUrl;
-                        a.download = `acktopus-pr-infographic.${OPENAI_IMAGE_FORMAT}`;
+                        a.download = `acktopus-${imageScope.toLowerCase()}-infographic.${OPENAI_IMAGE_FORMAT}`;
                         a.click();
                     }),
                 );
@@ -7070,32 +7125,34 @@ The prompt must ask for:
         panel.style.maxWidth = '760px';
         wrapper.appendChild(panel);
 
-        const card = addInfographicCard(panel, '🖼️ OpenAI PR infographic', PROVIDER_META.openai.color);
+        const initialTarget = buildInfographicTarget(pr);
+        const card = addInfographicCard(panel, initialTarget.label, PROVIDER_META.openai.color);
         let prompt = '';
 
         try {
-            card.setStatus('Reading PR head...');
+            card.setStatus('Reading PR metadata...');
             const ctx = await fetchPRContext(pr);
-            const headSha = ctx.headSha || getImmediatePRHeadSHA() || '';
-            const cached = getInfographicCache(pr, headSha);
+            const target = buildInfographicTarget(pr, ctx);
+            const cached = getInfographicCache(pr, target.cacheSha, target.scope);
             if (cached) {
                 card.resolve(cached, { cached: true });
                 return;
             }
 
-            card.setStatus('Gathering PR context...');
-            const fullContext = await gatherRecipeContext((msg) => card.setStatus(msg));
+            card.setStatus(`Gathering ${target.sourceLabel} context...`);
+            const fullContext = await gatherInfographicContext(target, (msg) => card.setStatus(msg));
             card.setStatus('Designing visual brief...');
-            const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
-            prompt = await buildInfographicImagePrompt(fullContext, prUrl);
+            prompt = await buildInfographicImagePrompt(fullContext, target.prUrl, target);
             card.setStatus(`Generating image with ${OPENAI_IMAGE_MODEL}...`);
             const result = await callOpenAIImage(prompt);
             const enriched = {
                 ...result,
                 prompt,
-                headSha,
+                scope: target.scope,
+                headSha: target.cacheSha,
+                sourceUrl: target.sourceUrl,
             };
-            setInfographicCache(pr, headSha, enriched);
+            setInfographicCache(pr, target.cacheSha, enriched, target.scope);
             card.resolve(enriched);
         } catch (e) {
             card.reject(e, { prompt });
@@ -17952,7 +18009,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.44
+// @version      1.45
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28044,20 +28101,30 @@ RULES:
         ackAssert(fn.includes('runAnalysis(wrapper, action.key)'), 'dispatches selected recipe through runAnalysis');
     });
 
-    ackTest('infographic recipe uses OpenAI image API with PR-head cache', () => {
+    ackTest('infographic recipe uses OpenAI image API with PR-head or commit cache', () => {
         const source = _ackSource;
         ackAssert(source.includes("const OPENAI_IMAGE_MODEL = 'gpt-image-2'"), 'uses gpt-image-2');
         ackAssert(!source.includes('const OPENAI_IMAGE_' + 'FALLBACK_MODELS'), 'does not use older image model fallbacks');
         ackAssert(source.includes('OPENAI_ORG_VERIFY_URL'), 'links organization verification');
-        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 3'), 'bumps infographic cache for prompt content');
+        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 4'), 'bumps infographic cache for prompt content');
         const promptBuilder = source.slice(
             source.indexOf('async function buildInfographicImagePrompt'),
             source.indexOf('function formatLLMPromptPreview'),
         );
         ackAssert(promptBuilder.includes('Source PR URL'), 'image prompt carries source PR URL');
+        ackAssert(promptBuilder.includes('Source page URL'), 'image prompt can carry current page URL');
+        ackAssert(promptBuilder.includes('current commit'), 'image prompt supports commit-scoped source material');
         ackAssert(
             promptBuilder.includes('Overall concept to communicate'),
             'image prompt asks for compressed overall concept',
+        );
+        ackAssert(
+            promptBuilder.includes('most important, complicated, risky, or hard-to-explain parts'),
+            'image prompt prioritizes complicated risky concepts',
+        );
+        ackAssert(
+            promptBuilder.includes('Most important/risky parts to visualize'),
+            'image prompt asks image model where to spend visual space',
         );
         ackAssert(promptBuilder.includes('Do not rely on emojis'), 'image prompt avoids emoji-only diagrams');
         ackAssert(
@@ -28083,8 +28150,19 @@ RULES:
             source.indexOf('function getCache'),
         );
         ackAssert(cache.includes('headSha'), 'cache key includes PR head sha');
+        ackAssert(cache.includes('scope = ' + "'pr'"), 'cache helpers default to PR scope');
+        ackAssert(cache.includes("scope === 'commit' ? 'commit' : 'pr'"), 'cache key separates commit scope');
         ackAssert(cache.includes('PR_INFOGRAPHIC_PROMPT_VERSION'), 'cache key includes prompt version');
         ackAssert(cache.includes('OPENAI_IMAGE_MODEL'), 'cache key includes image model');
+        const targetHelper = source.slice(
+            source.indexOf('function buildInfographicTarget'),
+            source.indexOf('async function buildInfographicImagePrompt'),
+        );
+        ackAssert(targetHelper.includes('pathCommitSha'), 'infographic target detects commit views');
+        ackAssert(targetHelper.includes("scope: 'commit'"), 'infographic target can be commit-scoped');
+        ackAssert(targetHelper.includes("label: '🖼️ OpenAI commit infographic'"), 'commit infographic has commit label');
+        ackAssert(targetHelper.includes('gatherSingleCommitContext'), 'commit infographic gathers current commit context');
+        ackAssert(targetHelper.includes('gatherRecipeContext'), 'PR infographic gathers full PR context');
         const runner = source.slice(
             source.indexOf('async function runPRInfographic'),
             source.indexOf('// --- Chat Dispatcher'),
@@ -28094,11 +28172,14 @@ RULES:
             'requires OpenAI key independent of active provider',
         );
         ackAssert(runner.includes('buildInfographicImagePrompt'), 'uses text model to create image prompt');
-        ackAssert(runner.includes('const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`'), 'passes PR URL to image prompt builder');
+        ackAssert(runner.includes('buildInfographicTarget(pr, ctx)'), 'builds PR/commit infographic target');
+        ackAssert(runner.includes('getInfographicCache(pr, target.cacheSha, target.scope)'), 'reads scope-specific cache');
+        ackAssert(runner.includes('gatherInfographicContext(target'), 'gathers PR or commit context');
+        ackAssert(runner.includes('buildInfographicImagePrompt(fullContext, target.prUrl, target)'), 'passes PR URL and target to image prompt builder');
         ackAssert(runner.includes("let prompt = ''"), 'keeps image prompt available for error fallback');
         ackAssert(runner.includes('callOpenAIImage(prompt)'), 'generates image from the visual prompt');
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
-        ackAssert(runner.includes('setInfographicCache'), 'stores generated image in PR cache');
+        ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
         const card = source.slice(source.indexOf('function addInfographicCard'), source.indexOf('function addErrorDiv'));
         ackAssert(card.includes('addPromptDetails(body, `Manual ${result.model || OPENAI_IMAGE_MODEL} prompt`'), 'shows prompt with successful infographic');
         ackAssert(card.includes('addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt'), 'shows manual prompt fallback on errors');
@@ -29145,9 +29226,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.44', () => {
+    ackTest('version bumped to 1.45', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.44' || _ackSource.includes('@version      1.44'), 'version is 1.44');
+        ackAssert(versionFromMeta === '1.45' || _ackSource.includes('@version      1.45'), 'version is 1.45');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {

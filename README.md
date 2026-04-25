@@ -117,7 +117,7 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Copying PR, issue, commit, patch, comment, and visible discussion context to the clipboard
 - Revealing hidden conversations, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
 - Navigating long PRs by comment, file, and commit
-- Reviewing with LLM chat, rebuild briefs, maintainer summaries, commit lightbulbs, selection helpers, and cached PR infographics
+- Reviewing with LLM chat, rebuild briefs, maintainer summaries, commit lightbulbs, selection helpers, and cached PR/commit infographics
 - Proofreading comments, PR descriptions, selected prose, and draft PR text with a diff preview before applying changes
 - Starting/submitting pending GitHub reviews from the Conversation tab
 - Keeping a personal PR review queue
@@ -185,11 +185,11 @@ Opens a robot panel backed by the active Claude or ChatGPT provider. The dropdow
 - **Chat**: ask about the page, use `/find ...` to navigate visible comments/code, or use `/quiz` for high-leverage review questions
 - **Rebuild brief**: generate an issue-style brief for recreating the PR from the base commit without hard-coding the current implementation
 - **Maintainer view**: summarize mergeability, unresolved threads, reviewer positions, and suggested maintainer focus
-- **Infographic**: generate a cached OpenAI PR infographic for a high-level visual overview
+- **Infographic**: generate a cached OpenAI PR or current-commit infographic for a high-level visual overview
 
 Chat answers can cite visible comments/code with clickable `[ref:N]` links. For explain/proofread/fact-check flows, ACKtopus includes PR-level context (description, commit messages, diff) with larger context windows to improve response quality. Rebuild briefs also show the exact generated system/user prompt in a collapsible section so it can be inspected or reused directly.
 
-The infographic flow first asks OpenAI to distill the PR into a sparse visual prompt, then calls OpenAI image generation (`gpt-image-2`) for a landscape technical infographic. The image prompt carries the source PR URL for reference and asks for the single overall concept the image should communicate, so the output compresses the PR rather than listing details. Results are cached per PR head/model/image settings/prompt version and can be reopened, downloaded, or inspected by copying the generated image prompt. The exact image prompt is always shown in a collapsible section when available, including the organization-verification fallback path so it can be pasted into `gpt-image-2` manually.
+The infographic flow first asks OpenAI to distill the source into a sparse visual prompt, then calls OpenAI image generation (`gpt-image-2`) for a landscape technical infographic. On normal PR pages it summarizes the full PR; on `/changes/<sha>` and `/commits/<sha>` it focuses on the current commit, using PR context only to explain why that commit matters. The image prompt carries the source PR URL and current page URL for reference, asks for the single overall concept the image should communicate, and prioritizes the most complicated, important, risky, or hard-to-explain parts so the output compresses the review target rather than listing details. Results are cached per PR head or commit SHA/model/image settings/prompt version and can be reopened, downloaded, or inspected by copying the generated image prompt. The exact image prompt is always shown in a collapsible section when available, including the organization-verification fallback path so it can be pasted into `gpt-image-2` manually.
 
 The **main PR description lightbulb** is treated specially: after generating the high-level overview, it also precomputes commit lightbulb caches (commits view + single-commit view) using richer PR context (including discussion/replies), so those views can open their lightbulb panels immediately from cache.
 
