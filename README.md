@@ -209,7 +209,7 @@ On single-commit pages like `/changes/<sha>` and `/commits/<sha>`, when you open
 
 ### Commit navigation and lightbulbs
 
-On PR conversation, commits-list, single-commit, and changes views, ACKtopus adds floating commit navigation that shows commit messages and position and supports the delayed **Ctrl+J/K** shortcuts. Commit lightbulbs generate structured review aids with summary, context, why-it-matters, high-level pseudocode, verification notes, performance/simplification notes, concerns, message checks, and dependency notes.
+On PR conversation, commits-list, single-commit, and changes views, ACKtopus adds floating commit navigation that shows commit messages and position and supports the delayed **Ctrl+J/K** shortcuts. For larger commit stacks, clicking the middle commit chooser opens a searchable commit list; typing filters by SHA, position, or message, and **Esc** or outside click closes it. Commit lightbulbs generate structured review aids with summary, context, why-it-matters, high-level pseudocode, verification notes, performance/simplification notes, concerns, message checks, and dependency notes.
 
 ### Explain / Chat / Fact check on selections
 

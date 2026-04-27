@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.45
+// @version      1.46
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17568,10 +17568,59 @@ RULES:
                 padding: '6px',
                 zIndex: '99999',
             });
+            const jumpSearch = document.createElement('input');
+            jumpSearch.type = 'search';
+            jumpSearch.placeholder = 'Search commits...';
+            jumpSearch.setAttribute('aria-label', 'Search commits');
+            Object.assign(jumpSearch.style, {
+                display: 'block',
+                width: '100%',
+                boxSizing: 'border-box',
+                margin: '0 0 6px',
+                padding: '6px 8px',
+                fontSize: '12px',
+                color: '#c9d1d9',
+                background: '#0d1117',
+                border: '1px solid #57606a',
+                borderRadius: '6px',
+                outline: 'none',
+                position: 'sticky',
+                top: '0',
+                zIndex: '1',
+            });
+            const emptyJumpSearch = document.createElement('div');
+            emptyJumpSearch.textContent = 'No matching commits';
+            Object.assign(emptyJumpSearch.style, {
+                display: 'none',
+                padding: '8px',
+                color: '#8b949e',
+                fontSize: '12px',
+                textAlign: 'center',
+            });
+            const jumpItems = [];
+            const filterJumpItems = () => {
+                const query = jumpSearch.value.trim().toLowerCase();
+                let visible = 0;
+                for (const item of jumpItems) {
+                    const matches = !query || item.dataset.ackSearch.includes(query);
+                    item.style.display = matches ? 'block' : 'none';
+                    if (matches) visible++;
+                }
+                emptyJumpSearch.style.display = visible ? 'none' : 'block';
+            };
+            jumpSearch.addEventListener('focus', () => {
+                jumpSearch.style.borderColor = '#58a6ff';
+            });
+            jumpSearch.addEventListener('blur', () => {
+                jumpSearch.style.borderColor = '#57606a';
+            });
+            jumpSearch.addEventListener('input', filterJumpItems);
             commits.forEach((commit, idx) => {
                 const item = document.createElement('a');
                 item.href = commitHref(commit);
                 item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
+                item.dataset.ackSearch =
+                    `${commit.sha} ${idx + 1}/${commits.length} ${commitLine(commit)}`.toLowerCase();
                 Object.assign(item.style, {
                     display: 'block',
                     padding: '6px 8px',
@@ -17595,7 +17644,43 @@ RULES:
                         e.preventDefault();
                     }
                 });
+                jumpItems.push(item);
                 jumpMenu.appendChild(item);
+            });
+            jumpMenu.prepend(jumpSearch);
+            jumpMenu.appendChild(emptyJumpSearch);
+            const closeJumpMenu = () => {
+                jumpDetails.removeAttribute('open');
+            };
+            const onJumpOutsidePointer = (e) => {
+                if (!jumpDetails.contains(e.target)) closeJumpMenu();
+            };
+            const onJumpKeydown = (e) => {
+                if (e.key !== 'Escape') return;
+                e.preventDefault();
+                e.stopPropagation();
+                closeJumpMenu();
+                jumpSummary.focus();
+            };
+            const removeJumpCloseListeners = () => {
+                document.removeEventListener('pointerdown', onJumpOutsidePointer, true);
+                document.removeEventListener('keydown', onJumpKeydown, true);
+            };
+            jumpDetails.addEventListener('toggle', () => {
+                if (jumpDetails.open) {
+                    window.setTimeout(() => {
+                        if (!jumpDetails.open) return;
+                        jumpMenu.scrollTop = 0;
+                        jumpSearch.focus();
+                        jumpSearch.select();
+                        document.addEventListener('pointerdown', onJumpOutsidePointer, true);
+                        document.addEventListener('keydown', onJumpKeydown, true);
+                    }, 0);
+                } else {
+                    removeJumpCloseListeners();
+                    jumpSearch.value = '';
+                    filterJumpItems();
+                }
             });
             jumpDetails.appendChild(jumpSummary);
             jumpDetails.appendChild(jumpMenu);
@@ -18009,7 +18094,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.45
+// @version      1.46
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -29120,6 +29205,31 @@ RULES:
         );
     });
 
+    ackTest('floating commit nav jump dropdown is searchable and dismissible', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function _addFloatingCommitNavInner'),
+            source.indexOf('function isPRPage'),
+        );
+        ackAssert(fn.includes("const jumpSearch = document.createElement('input')"), 'creates search input');
+        ackAssert(fn.includes("jumpSearch.type = 'search'"), 'uses search input type');
+        ackAssert(fn.includes('jumpSearch.focus()'), 'focuses search when chooser opens');
+        ackAssert(fn.includes('filterJumpItems'), 'filters dropdown items');
+        ackAssert(fn.includes('item.dataset.ackSearch'), 'stores searchable commit text');
+        ackAssert(fn.includes('.toLowerCase()'), 'filters case-insensitively');
+        ackAssert(fn.includes("e.key !== 'Escape'"), 'handles Escape key');
+        ackAssert(fn.includes("jumpDetails.removeAttribute('open')"), 'closes chooser by removing open attribute');
+        ackAssert(fn.includes('!jumpDetails.contains(e.target)'), 'detects outside clicks');
+        ackAssert(
+            fn.includes("document.addEventListener('pointerdown', onJumpOutsidePointer, true)"),
+            'closes on outside pointer',
+        );
+        ackAssert(
+            fn.includes("document.removeEventListener('pointerdown', onJumpOutsidePointer, true)"),
+            'removes outside listener',
+        );
+    });
+
     ackTest('navigateCommit wraps around circularly', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -29226,9 +29336,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.45', () => {
+    ackTest('version bumped to 1.46', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.45' || _ackSource.includes('@version      1.45'), 'version is 1.45');
+        ackAssert(versionFromMeta === '1.46' || _ackSource.includes('@version      1.46'), 'version is 1.46');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
