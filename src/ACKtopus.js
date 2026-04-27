@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.46
+// @version      1.47
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17598,6 +17598,38 @@ RULES:
                 textAlign: 'center',
             });
             const jumpItems = [];
+            let activeJumpIdx = -1;
+            const visibleJumpItems = () => jumpItems.filter((item) => item.style.display !== 'none');
+            const paintJumpItem = (item) => {
+                const idx = Number(item.dataset.ackIndex || '-1');
+                const isCurrent = idx === currentIdx;
+                const isActive = idx === activeJumpIdx;
+                item.style.background = isActive ? '#30363d' : isCurrent ? '#1f2937' : 'transparent';
+                item.style.fontWeight = isCurrent || isActive ? '600' : '400';
+                item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+            };
+            const setActiveJumpItem = (idx, { scroll = false } = {}) => {
+                activeJumpIdx = idx;
+                for (const item of jumpItems) paintJumpItem(item);
+                const active = jumpItems.find((item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx);
+                if (scroll && active) active.scrollIntoView({ block: 'nearest' });
+            };
+            const moveActiveJumpItem = (dir) => {
+                const visible = visibleJumpItems();
+                if (!visible.length) return;
+                const curVisibleIdx = visible.findIndex(
+                    (item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+                );
+                const nextVisibleIdx =
+                    curVisibleIdx === -1 ? (dir > 0 ? 0 : visible.length - 1) : (curVisibleIdx + dir + visible.length) % visible.length;
+                setActiveJumpItem(Number(visible[nextVisibleIdx].dataset.ackIndex || '-1'), { scroll: true });
+            };
+            const openActiveJumpItem = () => {
+                const active = jumpItems.find(
+                    (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+                );
+                if (active) active.click();
+            };
             const filterJumpItems = () => {
                 const query = jumpSearch.value.trim().toLowerCase();
                 let visible = 0;
@@ -17605,8 +17637,16 @@ RULES:
                     const matches = !query || item.dataset.ackSearch.includes(query);
                     item.style.display = matches ? 'block' : 'none';
                     if (matches) visible++;
+                    paintJumpItem(item);
                 }
                 emptyJumpSearch.style.display = visible ? 'none' : 'block';
+                const activeStillVisible = jumpItems.some(
+                    (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+                );
+                if (!activeStillVisible) {
+                    const firstVisible = visibleJumpItems()[0] || null;
+                    setActiveJumpItem(firstVisible ? Number(firstVisible.dataset.ackIndex || '-1') : -1);
+                }
             };
             jumpSearch.addEventListener('focus', () => {
                 jumpSearch.style.borderColor = '#58a6ff';
@@ -17615,12 +17655,26 @@ RULES:
                 jumpSearch.style.borderColor = '#57606a';
             });
             jumpSearch.addEventListener('input', filterJumpItems);
+            jumpSearch.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    moveActiveJumpItem(1);
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    moveActiveJumpItem(-1);
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    openActiveJumpItem();
+                }
+            });
             commits.forEach((commit, idx) => {
                 const item = document.createElement('a');
                 item.href = commitHref(commit);
                 item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
                 item.dataset.ackSearch =
                     `${commit.sha} ${idx + 1}/${commits.length} ${commitLine(commit)}`.toLowerCase();
+                item.dataset.ackIndex = String(idx);
+                item.setAttribute('role', 'option');
                 Object.assign(item.style, {
                     display: 'block',
                     padding: '6px 8px',
@@ -17633,10 +17687,10 @@ RULES:
                     fontWeight: idx === currentIdx ? '600' : '400',
                 });
                 item.addEventListener('mouseenter', () => {
-                    item.style.background = idx === currentIdx ? '#263244' : '#21262d';
+                    setActiveJumpItem(idx);
                 });
                 item.addEventListener('mouseleave', () => {
-                    item.style.background = idx === currentIdx ? '#1f2937' : 'transparent';
+                    paintJumpItem(item);
                 });
                 item.addEventListener('click', (e) => {
                     jumpDetails.removeAttribute('open');
@@ -17647,6 +17701,7 @@ RULES:
                 jumpItems.push(item);
                 jumpMenu.appendChild(item);
             });
+            jumpMenu.setAttribute('role', 'listbox');
             jumpMenu.prepend(jumpSearch);
             jumpMenu.appendChild(emptyJumpSearch);
             const closeJumpMenu = () => {
@@ -17679,9 +17734,11 @@ RULES:
                 } else {
                     removeJumpCloseListeners();
                     jumpSearch.value = '';
+                    activeJumpIdx = currentIdx >= 0 ? currentIdx : 0;
                     filterJumpItems();
                 }
             });
+            setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0);
             jumpDetails.appendChild(jumpSummary);
             jumpDetails.appendChild(jumpMenu);
             bar.appendChild(jumpDetails);
@@ -18094,7 +18151,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.46
+// @version      1.47
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -29217,6 +29274,15 @@ RULES:
         ackAssert(fn.includes('filterJumpItems'), 'filters dropdown items');
         ackAssert(fn.includes('item.dataset.ackSearch'), 'stores searchable commit text');
         ackAssert(fn.includes('.toLowerCase()'), 'filters case-insensitively');
+        ackAssert(fn.includes('setActiveJumpItem'), 'tracks active jump item');
+        ackAssert(fn.includes('visibleJumpItems'), 'navigates only visible filtered rows');
+        ackAssert(fn.includes("e.key === 'ArrowDown'"), 'handles ArrowDown selection');
+        ackAssert(fn.includes("e.key === 'ArrowUp'"), 'handles ArrowUp selection');
+        ackAssert(fn.includes("e.key === 'Enter'"), 'handles Enter activation');
+        ackAssert(fn.includes('openActiveJumpItem'), 'opens active row on Enter');
+        ackAssert(fn.includes('active.click()'), 'reuses row click behavior for Enter');
+        ackAssert(fn.includes("item.setAttribute('role', 'option')"), 'marks rows as options');
+        ackAssert(fn.includes("jumpMenu.setAttribute('role', 'listbox')"), 'marks menu as listbox');
         ackAssert(fn.includes("e.key !== 'Escape'"), 'handles Escape key');
         ackAssert(fn.includes("jumpDetails.removeAttribute('open')"), 'closes chooser by removing open attribute');
         ackAssert(fn.includes('!jumpDetails.contains(e.target)'), 'detects outside clicks');
@@ -29336,9 +29402,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.46', () => {
+    ackTest('version bumped to 1.47', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.46' || _ackSource.includes('@version      1.46'), 'version is 1.46');
+        ackAssert(versionFromMeta === '1.47' || _ackSource.includes('@version      1.47'), 'version is 1.47');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
