@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.47
+// @version      1.49
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3362,36 +3362,52 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
-        reimplementation: `Write a compact rebuild brief for a coding agent that must start from the base commit, investigate the problem, implement a fresh solution, and compare the result against the original PR commit-by-commit.
+        reimplementation: `Write one self-contained, outcome-focused local reproducer prompt for a coding agent.
 
 # Goal
-Produce an ideal issue, not an implementation summary. Describe the problem, impact, constraints, available evidence, and review-comment-derived concerns that should guide a fresh reimplementation. Keep the brief outcome-first: what must be true after each commit, why it matters, and how to validate it.
+Produce a prompt whose target artifact is useful PR-review evidence, not a step-by-step imitation recipe. The target agent should end with an independently rediscovered local implementation from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a self-contained audio-guide walkthrough.
 
 # Success criteria
-- The target agent can recreate the commit stack from the base tree without checking out the PR branch.
-- The brief preserves the original commit count and order; each numbered step is one separate commit that stands alone and should pass on its own.
-- Steps are abstract enough that a different implementation is acceptable if it satisfies the same invariant.
-- Review comments are first-class source material. If they reveal a bug, omission, or design flaw, state the corrected target behavior rather than the flawed implementation.
-- Every detail helps the implementer rediscover the change or later compare it to the PR.
+- The prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, review-comment concerns, and validation evidence.
+- The first artifact is an abstract issue, not an implementation recipe: an independently justified implementation that satisfies the target behavior before seeing the submitted PR implementation.
+- The no-peek and approval rules are guardrails. The target agent must not inspect the PR branch, PR patch, files tab, changed-file list, or submitted implementation until the user approves moving to the comparison phase.
+- The actual-PR artifact is a reviewable split where useful: tests that pass before code changes, low-risk cleanup, high-risk behavior, refactors, code moves, and mechanical changes are separated when doing so improves reviewability.
+- Split commit messages are prefixed with their original commit ordinal, preserve author wording where possible, and explain the problem and result each commit proves.
+- The split stack has a squash-equivalence check: squashing the split PR commits should represent the original PR changes, except for later suggestion commits.
+- The comparison artifact is a small set of meaningful differences: each valid difference becomes a separate suggestion commit with a review-comment-style message, and cases where the original PR is better are reported locally instead of forced into empty commits.
+- Suggestion commit messages include GitHub code URLs that prove the claim.
+- The final audio-guide artifact assumes the listener's LLM has internet/GitHub access but no local repository access. It must use GitHub links, start without jargon, then go deeper through every commit and meaningful line.
 
 # Constraints
-- Treat the provided PR context as private research material. Never narrate, quote, or summarize the submitted patch.
-- Do not hard-code the PR's current structure, patch shape, exact enforcement mechanism, or current values. Leave room for the target agent to find structural problems, implementation differences, or a better local fit.
-- Avoid file lists, subsystem-bucket sweeps, parenthetical symbol lists, concrete API/type/helper/macro names, assertion facilities, include churn, or control-flow rewrites unless a detail is strictly necessary to distinguish one commit from another.
-- Prefer invariants, failure modes, target properties, affected behavior surfaces, and validation signals over fix verbs or line-level edit instructions.
-- When a detail can be rediscovered from the tree, build errors, tests, search, or behavior comparison, say how to find it instead of giving the answer.
-- Before finalizing, redact unnecessary concrete names and mechanism words. If the step still distinguishes the commit and remains implementable, keep the abstract version.
+- Treat the provided PR context as private source material for prompt construction. Do not copy the submitted patch shape into the no-peek phase.
+- Do not leak concrete helpers, file lists, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, or implementation-shaped fix verbs into Phase 1 unless a detail is strictly required to define the externally visible target.
+- Leave room for the local agent to discover a different valid design and then compare it honestly against the PR author's design.
+- Review comments are evidence for target behavior, risks, and validation needs. If they reveal a flaw, describe the corrected target behavior rather than the flawed current implementation.
+- Require grounded claims. The local agent may use code, tests, build errors, logs, range-diffs, review comments, or GitHub URLs as evidence, but must mark missing evidence instead of guessing.
+- Do not tell the local agent to push. Keep history changes local and ask before destructive or remote-affecting operations.
 
-Output exactly:
+Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
 
-## Checkout
-A compact warning section naming the exact base commit and base branch to start from, plus the head branch and PR URL that must NOT be checked out. Make clear that the work is a fresh reimplementation from the base commit, not a checkout of the existing PR branch.
+## Mission
+A compact description of the review outcome, PR URL/base metadata, expected artifacts, and acceptance criteria.
 
-## Goal
-One compact issue-style paragraph describing only the essential problem, impact, target properties, and review-derived constraints needed to rediscover the change. Avoid exact API names, replacement types, and mechanism words unless unavoidable.
+## Hard Rules
+No-peek rules, approval gates, grounding requirements, commit hygiene, and stop rules.
 
-## Steps
-One numbered item per original commit, in order. Each item must be a short requirements-style paragraph describing that commit's subproblem, why it exists, what invariant or target property it establishes, which behavior surface it affects, which review-comment concern matters if any, and only the highest-signal test/search direction. State explicitly that the numbered items are separate commits to create in order, and that each one must stand alone and pass on its own. Prefer the most abstract wording that still keeps the commit distinguishable and lets the target agent discover the structure and implementation. No low-level edit plan, no file list, no copied values, no illustrative examples, no exact enforcement mechanism unless unavoidable, no implementation-shaped fix verbs, no unnecessary concrete API/mechanism names, and no subsystem-bucket enumeration for broad mechanical passes.`,
+## Phase 1 - No-Peek Reproducer
+The expected local result: an independently discovered implementation and tests that satisfy the problem, target invariants, review-derived risks, and validation evidence while avoiding implementation leakage. It should require the agent to stop for approval once this artifact is coherent.
+
+## Phase 2 - Split The Actual PR
+The expected PR-split result: a smaller reviewable stack, split by concern where useful, with original-ordinal commit-message prefixes, accurate author wording where useful, and proof that the split squashes back to the actual PR.
+
+## Phase 3 - Rebase And Suggest
+The expected comparison result: the local implementation replayed on top of the split PR, with each meaningful remaining difference represented as an evidence-backed suggestion commit, and with better original-PR choices reported instead of manufactured commits.
+
+## Phase 4 - Audio Guide
+The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. It must explain every commit and meaningful line progressively from first principles to deeper technical detail.
+
+## Final Checks
+A short checklist that verifies no Phase 1 implementation leakage, approval gates, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -4036,7 +4052,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             '💡 Commit review aid (💡 button: pseudocode, concerns, message check)',
             DEFAULT_INSTRUCTIONS.pseudocode,
         );
-        addInstruction('reimplementation', '🧬 Rebuild brief recipe', DEFAULT_INSTRUCTIONS.reimplementation);
+        addInstruction('reimplementation', '🧬 Reproducer recipe', DEFAULT_INSTRUCTIONS.reimplementation);
         addInstruction('maintainer_summary', '🧭 Maintainer summary recipe', DEFAULT_INSTRUCTIONS.maintainer_summary);
         addInstruction('proofread', '✏️ Proofread', DEFAULT_INSTRUCTIONS.proofread);
 
@@ -6062,7 +6078,7 @@ The prompt must ask for:
 
         const titleMap = {
             chat: 'Chat',
-            reimplementation: 'Rebuild brief',
+            reimplementation: 'Reproducer',
             maintainer_summary: 'Maintainer view',
         };
 
@@ -6349,8 +6365,8 @@ The prompt must ask for:
                     sendAsConversation: false,
                 },
                 reimplementation: {
-                    label: 'Rebuild brief',
-                    userText: 'Generate the rebuild brief now.',
+                    label: 'Reproducer',
+                    userText: 'Generate the local reproducer prompt now.',
                     sendAsConversation: false,
                 },
                 maintainer_summary: {
@@ -6497,8 +6513,8 @@ The prompt must ask for:
                                   getLLMConfig().instructions.maintainer_summary ||
                                   DEFAULT_INSTRUCTIONS.maintainer_summary
                               ).trim();
-                    // Rebuild briefs are copied out for downstream agents — no [ref:N] citations.
-                    // Maintainer summaries stay on the page — keep citations for navigation.
+                    // Reproducer prompts are copied out for downstream agents - no [ref:N] citations.
+                    // Maintainer summaries stay on the page - keep citations for navigation.
                     const citationInstructions =
                         recipe !== 'reimplementation' && chatPageIndex.length
                             ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
@@ -6507,13 +6523,13 @@ The prompt must ask for:
                     const sourceContext = wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext);
                     const userContent =
                         recipe === 'reimplementation'
-                            ? `${sourceContext}\n\nNow write an issue-style rebuild brief for a target coding agent that must discover the solution from the base tree. Keep all commit distinctions. Do not hard-code current structure or implementation details; leave room for the target agent to identify structural problems, implementation differences, or a better local fit. Incorporate review comments as evidence for the ideal issue, target constraints, risks, and validation needs. Minimize instruction count aggressively. Abstract away concrete symbols, enforcement mechanisms, and rediscoverable low-level details unless they are strictly necessary to distinguish one commit from another. Before finalizing, verify that every step is grounded in the source context and satisfies the requested output format.`
+                            ? `${sourceContext}\n\nNow write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, and satisfies the requested output format.`
                             : `${sourceContext}\n\nNow write the maintainer-facing PR status summary using only the source context. If the source context does not establish a claim, say what evidence is missing instead of guessing.`;
                     const generatedPrompt =
                         recipe === 'reimplementation' ? formatLLMPromptPreview(system, userContent) : '';
                     if (generatedPrompt) {
                         assistantMsg._ackPromptDetails = {
-                            title: 'Generated rebuild prompt',
+                            title: 'Generated reproducer prompt',
                             prompt: generatedPrompt,
                         };
                     }
@@ -6525,7 +6541,7 @@ The prompt must ask for:
                     stopSpin();
                     const trimmed = result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    if (generatedPrompt) setAssistantPromptDetails(assistantMsg, 'Generated rebuild prompt', generatedPrompt);
+                    if (generatedPrompt) setAssistantPromptDetails(assistantMsg, 'Generated reproducer prompt', generatedPrompt);
                     history.push({ role: 'assistant', content: trimmed });
                     messages.scrollTop = messages.scrollHeight;
                 } else {
@@ -16649,8 +16665,8 @@ RULES:
             {
                 key: 'reimplementation',
                 emoji: '🧬',
-                label: 'Rebuild brief',
-                tip: 'Generate a minimal brief another coding agent can use to recreate the PR from the base commit only',
+                label: 'Reproducer',
+                tip: 'Generate a gated local agent prompt for no-peek reimplementation, PR splitting, suggestions, and audio guide',
             },
             {
                 key: 'maintainer_summary',
@@ -18151,7 +18167,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.47
+// @version      1.49
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28237,6 +28253,7 @@ RULES:
         const fn = source.slice(source.indexOf('function buildRobotRecipeGroup'), source.indexOf('function inject()'));
         ackAssert(fn.includes("key: 'chat'"), 'has chat action');
         ackAssert(fn.includes("key: 'reimplementation'"), 'has reimplementation action');
+        ackAssert(fn.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
         ackAssert(fn.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(fn.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
@@ -28343,6 +28360,7 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(fn.includes('reimplementation: {'), 'defines reimplementation recipe');
+        ackAssert(fn.includes("reimplementation: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
         ackAssert(fn.includes('maintainer_summary: {'), 'defines maintainer summary recipe');
         ackAssert(fn.includes('titleMap = {'), 'defines panel titles for robot actions');
         ackAssert(
@@ -28361,106 +28379,51 @@ RULES:
         ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
     });
 
-    ackTest('reimplementation prompt prefers abstract rediscovery over low-level edit listings', () => {
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('Produce an ideal issue, not an implementation summary'),
-            'reimplementation prompt is explicit about its meta task',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('# Goal'),
-            'reimplementation prompt has structured goal section',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('# Success criteria'),
-            'reimplementation prompt has success criteria',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('# Constraints'),
-            'reimplementation prompt has constraint section',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('outcome-first'),
-            'reimplementation prompt frames output in postconditions',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('without checking out the PR branch'),
-            'reimplementation prompt tells the target agent to start from base',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes("Do not hard-code the PR's current structure"),
-            'reimplementation prompt avoids hard-coding the current implementation',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('When a detail can be rediscovered'),
-            'reimplementation prompt prefers search/discovery guidance',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('Prefer invariants, failure modes, target properties'),
-            'reimplementation prompt prefers properties over fix verbs',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('Avoid file lists, subsystem-bucket sweeps'),
-            'reimplementation prompt forbids broad low-level listings',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('redact unnecessary concrete names and mechanism words'),
-            'reimplementation prompt explicitly asks for abstraction pass',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('each numbered step is one separate commit'),
-            'reimplementation prompt says steps are separate commits',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('stands alone and should pass on its own'),
-            'reimplementation prompt says each step should pass independently',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('One numbered item per original commit, in order'),
-            'reimplementation output requires one step per commit',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('requirements-style paragraph'),
-            'reimplementation output uses requirements-style steps',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes(
-                'Prefer the most abstract wording that still keeps the commit distinguishable',
-            ),
-            'reimplementation output explicitly prefers maximum abstraction consistent with comparability',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('no unnecessary concrete API/mechanism names'),
-            'reimplementation output forbids unnecessary concrete names',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes(
-                'no subsystem-bucket enumeration for broad mechanical passes',
-            ),
-            'reimplementation output forbids broad subsystem enumeration',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('Review comments are first-class source material'),
-            'reimplementation prompt explicitly considers PR review comments',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('which review-comment concern matters if any'),
-            'reimplementation steps incorporate review-comment concerns when relevant',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes(
-                'state the corrected target behavior rather than the flawed implementation',
-            ),
-            'reimplementation prompt prefers ideal behavior when comments reveal flaws',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes(
-                'compare the result against the original PR commit-by-commit',
-            ),
-            'reimplementation prompt centers reimplementation and comparison workflow',
-        );
+    ackTest('reimplementation prompt builds one gated local reproducer workflow', () => {
+        const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
+        ackAssert(prompt.includes('outcome-focused'), 'prompt is outcome-focused');
+        ackAssert(prompt.includes('target artifact'), 'prompt focuses on artifacts');
+        ackAssert(prompt.includes('local reproducer prompt'), 'prompt is a local reproducer prompt');
+        ackAssert(prompt.includes('independently rediscovered'), 'starts from independent rediscovery');
+        ackAssert(prompt.includes('base tree'), 'starts from base tree');
+        ackAssert(prompt.includes('submitted PR implementation'), 'guards submitted implementation');
+        ackAssert(prompt.includes('approval gates'), 'requires approval gates');
+        ackAssert(prompt.includes('split the actual PR'), 'includes actual PR splitting phase');
+        ackAssert(prompt.includes('tests that pass before code changes'), 'separates tests-before-code');
+        ackAssert(prompt.includes('low-risk cleanup'), 'separates low-risk cleanup');
+        ackAssert(prompt.includes('high-risk behavior'), 'separates high-risk behavior');
+        ackAssert(prompt.includes('code moves'), 'separates code moves');
+        ackAssert(prompt.includes('original commit ordinal'), 'prefixes split commits by original ordinal');
+        ackAssert(prompt.includes('squash-equivalence check'), 'requires squash equivalence');
+        ackAssert(prompt.includes('suggestion commit'), 'adds suggestion commits');
+        ackAssert(prompt.includes('GitHub code URLs'), 'requires GitHub evidence URLs');
+        ackAssert(prompt.includes('original PR is better'), 'admits when the PR is better');
+        ackAssert(prompt.includes('audio-guide walkthrough'), 'includes audio guide workflow');
+        ackAssert(prompt.includes('internet/GitHub access'), 'audio guide assumes online access');
+        ackAssert(prompt.includes('no local repository access'), 'audio guide assumes no local repo');
     });
 
-    ackTest('reimplementation user prompt keeps full context but asks for aggressive abstraction', () => {
+    ackTest('reimplementation prompt keeps Phase 1 abstract and non-prescriptive', () => {
+        const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
+        ackAssert(
+            prompt.includes('abstract issue') && prompt.includes('implementation recipe'),
+            'Phase 1 is abstract',
+        );
+        ackAssert(prompt.includes('desired behavior'), 'uses desired behavior');
+        ackAssert(prompt.includes('invariants'), 'uses invariants');
+        ackAssert(prompt.includes('failure modes'), 'uses failure modes');
+        ackAssert(prompt.includes('review-comment concerns'), 'uses review comments as evidence');
+        ackAssert(prompt.includes('concrete helpers'), 'forbids concrete helpers');
+        ackAssert(prompt.includes('file lists'), 'forbids file lists');
+        ackAssert(prompt.includes('replacement mechanisms'), 'forbids replacement mechanisms');
+        ackAssert(prompt.includes('control-flow structure'), 'forbids control-flow structure');
+        ackAssert(prompt.includes('implementation-shaped fix verbs'), 'forbids implementation-shaped verbs');
+        ackAssert(prompt.includes('different valid design'), 'leaves room for alternate design');
+        ackAssert(prompt.includes('corrected target behavior'), 'uses corrected behavior from review comments');
+        ackAssert(prompt.includes('must mark missing evidence instead of guessing'), 'prevents hallucinated claims');
+    });
+
+    ackTest('reimplementation user prompt generates the inspectable reproducer prompt', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(
@@ -28468,33 +28431,27 @@ RULES:
             'recipe prompt wraps long source context',
         );
         ackAssert(fn.includes('sourceContext}\\n\\nNow write'), 'recipe prompt puts source material before final task');
+        ackAssert(fn.includes('one outcome-focused local reproducer prompt'), 'generates one combined prompt');
+        ackAssert(fn.includes('artifact') && fn.includes('acceptance criteria'), 'prompt focuses on outcomes');
+        ackAssert(fn.includes('no-peek local implementation'), 'keeps first phase no-peek');
+        ackAssert(fn.includes('reviewable split of the actual PR after approval'), 'includes split phase');
         ackAssert(
-            fn.includes('Keep all commit distinctions'),
-            'reimplementation user prompt preserves per-commit distinctions',
+            fn.includes('rebase') &&
+                fn.includes('local reimplementation') &&
+                fn.includes('suggestion commits'),
+            'includes suggestion rebase',
         );
+        ackAssert(fn.includes('verbose audio-guide walkthrough with GitHub links'), 'includes audio-guide output');
+        ackAssert(fn.includes('Phase 1 must stay abstract'), 'keeps first phase abstract');
+        ackAssert(fn.includes('do not hard-code current structure'), 'forbids current structure');
+        ackAssert(fn.includes('changed files'), 'forbids changed-file leakage');
+        ackAssert(fn.includes('concrete helpers'), 'forbids helper leakage');
+        ackAssert(fn.includes('patch shape'), 'forbids patch-shape leakage');
+        ackAssert(fn.includes('split ordinal commit-message prefixes'), 'requires ordinal prefixes');
+        ackAssert(fn.includes('GitHub URL evidence requirements'), 'requires GitHub URL evidence');
         ackAssert(
-            fn.includes('must discover the solution from the base tree'),
-            'reimplementation user prompt focuses the target agent on discovery',
-        );
-        ackAssert(
-            fn.includes('Do not hard-code current structure or implementation details'),
-            'reimplementation user prompt avoids hard-coding the submitted implementation',
-        );
-        ackAssert(
-            fn.includes('Incorporate review comments as evidence for the ideal issue'),
-            'reimplementation user prompt makes review comments part of ideal issue shaping',
-        );
-        ackAssert(
-            fn.toLowerCase().includes('minimize instruction count aggressively'),
-            'reimplementation user prompt enforces minimal instructions',
-        );
-        ackAssert(
-            fn.includes('Abstract away concrete symbols, enforcement mechanisms'),
-            'reimplementation user prompt suppresses mechanism-shaped output',
-        );
-        ackAssert(
-            fn.includes('verify that every step is grounded in the source context'),
-            'reimplementation user prompt requires final grounding check',
+            fn.includes('does not leak implementation details into Phase 1'),
+            'requires final no-leak check',
         );
         ackAssert(
             fn.includes('formatLLMPromptPreview(system, userContent)'),
@@ -28505,7 +28462,7 @@ RULES:
             'reimplementation prompt is retained for error display',
         );
         ackAssert(
-            fn.includes("setAssistantPromptDetails(assistantMsg, 'Generated rebuild prompt', generatedPrompt)"),
+            fn.includes("setAssistantPromptDetails(assistantMsg, 'Generated reproducer prompt', generatedPrompt)"),
             'reimplementation prompt is shown after successful result',
         );
         ackAssert(
@@ -28544,19 +28501,15 @@ RULES:
         ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
     });
 
-    ackTest('reimplementation output format includes checkout warning section', () => {
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('## Checkout'),
-            'reimplementation output requires checkout section',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('must NOT be checked out'),
-            'checkout section forbids checking out PR/head branch',
-        );
-        ackAssert(
-            DEFAULT_INSTRUCTIONS.reimplementation.includes('fresh reimplementation from the base commit'),
-            'checkout section says to reimplement from base commit',
-        );
+    ackTest('reimplementation output format includes all reproducer phases', () => {
+        const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
+        ackAssert(prompt.includes('## Mission'), 'output includes mission section');
+        ackAssert(prompt.includes('## Hard Rules'), 'output includes hard rules');
+        ackAssert(prompt.includes('## Phase 1 - No-Peek Reproducer'), 'output includes no-peek reproducer phase');
+        ackAssert(prompt.includes('## Phase 2 - Split The Actual PR'), 'output includes PR split phase');
+        ackAssert(prompt.includes('## Phase 3 - Rebase And Suggest'), 'output includes rebase/suggest phase');
+        ackAssert(prompt.includes('## Phase 4 - Audio Guide'), 'output includes audio guide phase');
+        ackAssert(prompt.includes('## Final Checks'), 'output includes final checks');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
@@ -29402,9 +29355,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.47', () => {
+    ackTest('version bumped to 1.49', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.47' || _ackSource.includes('@version      1.47'), 'version is 1.47');
+        ackAssert(versionFromMeta === '1.49' || _ackSource.includes('@version      1.49'), 'version is 1.49');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
