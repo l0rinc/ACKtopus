@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.51
+// @version      1.52
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -75,9 +75,11 @@
     ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
+    let lastForcePushRange = null;
     let lastForcePushSignature = '';
     let userAckSha = null; // SHA from current user's last ACK (set async)
     let prFileCategories = null; // { bench: [], test: [], fuzz: [], functional: [], cpp: [] } -- set async
+    const FORCE_PUSH_BURST_WINDOW_MS = 15 * 60 * 1000;
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -344,9 +346,10 @@
                 if (userAckSha && sha) {
                     return `B=${userAckSha} A=${sha} && git fetch origin $B $A && git range-diff --creation-factor=95 $B...$A`;
                 }
-                if (!lastForcePush) return null;
-                const f = lastForcePush.fromFull || lastForcePush.from;
-                const t = lastForcePush.toFull || lastForcePush.to;
+                const range = lastForcePushRange || lastForcePush;
+                if (!range) return null;
+                const f = range.fromFull || range.from;
+                const t = range.toFull || range.to;
                 return `B=${f} A=${t} && git fetch origin $B $A && git range-diff --creation-factor=95 $B...$A`;
             },
         },
@@ -363,9 +366,10 @@
                 if (userAckSha && sha) {
                     return `B=${userAckSha} A=${sha} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
                 }
-                if (!lastForcePush) return null;
-                const f = lastForcePush.fromFull || lastForcePush.from;
-                const t = lastForcePush.toFull || lastForcePush.to;
+                const range = lastForcePushRange || lastForcePush;
+                if (!range) return null;
+                const f = range.fromFull || range.from;
+                const t = range.toFull || range.to;
                 return `B=${f} A=${t} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
             },
         },
@@ -2698,6 +2702,12 @@
         document.querySelectorAll('.TimelineItem, .js-timeline-item').forEach((item) => {
             const text = item.textContent;
             if (!/force[- ]?pushed/i.test(text)) return;
+            const actor = item.querySelector('.author')?.textContent?.trim() || '';
+            const branch = item.querySelector('.commit-ref .css-truncate-target')?.textContent?.trim() || '';
+            const createdAt =
+                item.querySelector('relative-time[datetime], time-ago[datetime], time[datetime]')?.getAttribute('datetime') ||
+                '';
+            const timeMs = Date.parse(createdAt);
             const links = [...item.querySelectorAll('a[href*="/commit/"], code a')];
             if (links.length >= 2) {
                 const fromLink = links[links.length - 2];
@@ -2707,7 +2717,16 @@
                 if (/^[0-9a-f]{7,40}$/.test(fromSha) && /^[0-9a-f]{7,40}$/.test(toSha)) {
                     const fromFull = fromLink.href?.match(/\/commit\/([0-9a-f]{40})/)?.[1];
                     const toFull = toLink.href?.match(/\/commit\/([0-9a-f]{40})/)?.[1];
-                    pushes.push({ from: fromSha, to: toSha, fromFull: fromFull || fromSha, toFull: toFull || toSha });
+                    pushes.push({
+                        from: fromSha,
+                        to: toSha,
+                        fromFull: fromFull || fromSha,
+                        toFull: toFull || toSha,
+                        actor,
+                        branch,
+                        createdAt,
+                        timeMs: Number.isFinite(timeMs) ? timeMs : null,
+                    });
                 }
             }
         });
@@ -2724,12 +2743,21 @@
             const pushes = [];
             for (const e of events) {
                 if (e.event !== 'head_ref_force_pushed') continue;
-                if (e.before && e.after) {
+                const before = e.before?.sha || e.before;
+                const after = e.after?.sha || e.after;
+                if (before && after) {
+                    const beforeSha = String(before);
+                    const afterSha = String(after);
+                    const timeMs = Date.parse(e.created_at || '');
                     pushes.push({
-                        from: e.before.sha?.slice(0, 7) || e.before,
-                        to: e.after.sha?.slice(0, 7) || e.after,
-                        fromFull: e.before.sha || e.before,
-                        toFull: e.after.sha || e.after,
+                        from: beforeSha.slice(0, 7),
+                        to: afterSha.slice(0, 7),
+                        fromFull: beforeSha,
+                        toFull: afterSha,
+                        actor: e.actor?.login || '',
+                        branch: e.head_ref || '',
+                        createdAt: e.created_at || '',
+                        timeMs: Number.isFinite(timeMs) ? timeMs : null,
                     });
                 }
             }
@@ -2738,6 +2766,40 @@
             console.warn('ACKtopus: timeline fetch failed', e);
         }
         return [];
+    }
+
+    function forcePushRangeEndpoint(push, side) {
+        return side === 'from' ? push?.fromFull || push?.from || '' : push?.toFull || push?.to || '';
+    }
+
+    function isSameForcePushBurst(previous, next) {
+        if (!previous || !next) return false;
+        const prevTo = forcePushRangeEndpoint(previous, 'to');
+        const nextFrom = forcePushRangeEndpoint(next, 'from');
+        if (!prevTo || !nextFrom || prevTo !== nextFrom) return false;
+        if (previous.actor && next.actor && previous.actor !== next.actor) return false;
+        if (previous.branch && next.branch && previous.branch !== next.branch) return false;
+        if (!Number.isFinite(previous.timeMs) || !Number.isFinite(next.timeMs)) return false;
+        const gap = next.timeMs - previous.timeMs;
+        return gap >= 0 && gap <= FORCE_PUSH_BURST_WINDOW_MS;
+    }
+
+    function getForcePushRange(pushes) {
+        if (!pushes?.length) return null;
+        let firstIndex = pushes.length - 1;
+        for (let i = pushes.length - 2; i >= 0; --i) {
+            if (!isSameForcePushBurst(pushes[i], pushes[i + 1])) break;
+            firstIndex = i;
+        }
+        const first = pushes[firstIndex];
+        const last = pushes[pushes.length - 1];
+        return {
+            from: first.from,
+            to: last.to,
+            fromFull: forcePushRangeEndpoint(first, 'from'),
+            toFull: forcePushRangeEndpoint(last, 'to'),
+            count: pushes.length - firstIndex,
+        };
     }
 
     function forcePushSignature(pushes) {
@@ -16962,6 +17024,7 @@ RULES:
         lastForcePushSignature = forcePushSignature(pushes);
         if (pushes.length > 0) {
             lastForcePush = pushes[pushes.length - 1];
+            lastForcePushRange = getForcePushRange(pushes);
             invalidatePRContext();
             commitListCache.clear();
             if (pr) {
@@ -17937,11 +18000,14 @@ RULES:
         if (!sig) return false;
         if (!lastForcePushSignature) {
             lastForcePushSignature = sig;
+            lastForcePush = pushes[pushes.length - 1] || null;
+            lastForcePushRange = getForcePushRange(pushes);
             return false;
         }
         if (sig === lastForcePushSignature) return false;
         lastForcePushSignature = sig;
         lastForcePush = pushes[pushes.length - 1] || null;
+        lastForcePushRange = getForcePushRange(pushes);
         refreshToolbarForLiveUpdate('force-push');
         return true;
     }
@@ -17977,6 +18043,7 @@ RULES:
                 document.querySelectorAll('.ack-commit-explain-panel, .ack-explain-panel').forEach((el) => el.remove());
                 document.querySelector('.ack-submit-review-wrap')?.remove();
                 lastForcePush = null;
+                lastForcePushRange = null;
                 lastForcePushSignature = '';
                 userAckSha = null;
                 prFileCategories = null;
@@ -18000,6 +18067,7 @@ RULES:
             teardownDiffSelectionUI();
             document.querySelector('.ack-config-overlay')?.remove();
             document.querySelector('.ack-submit-review-wrap')?.remove();
+            lastForcePushRange = null;
             lastForcePushSignature = '';
             clearCommitPatchCache();
             lastInjectedPR = null;
@@ -18080,6 +18148,7 @@ RULES:
         document.querySelectorAll('.ack-changes-link').forEach((el) => el.remove());
         _ackPendingReviewActive = false;
         lastForcePush = null;
+        lastForcePushRange = null;
         lastForcePushSignature = '';
         userAckSha = null;
         prFileCategories = null;
@@ -18233,7 +18302,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.51
+// @version      1.52
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -18880,6 +18949,74 @@ RULES:
         ackAssert(rdiffFmt.includes('$B...$A'), 'uses variables in range-diff');
         ackAssert(!rdiffFmt.includes('${f}...${t}'), 'no raw SHA duplication in range-diff');
         ackAssert(!rdiffFmt.includes('.slice('), 'uses full hashes, no truncation');
+    });
+
+    ackTest('force-push range groups only the latest quick author burst', () => {
+        const pushes = [
+            {
+                fromFull: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                toFull: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                actor: 'achow101',
+                branch: 'wallet-bench-setups',
+                timeMs: Date.parse('2026-04-28T18:35:47Z'),
+            },
+            {
+                fromFull: 'dddddddddddddddddddddddddddddddddddddddd',
+                toFull: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                actor: 'achow101',
+                branch: 'wallet-bench-setups',
+                timeMs: Date.parse('2026-04-29T21:53:56Z'),
+            },
+            {
+                fromFull: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                toFull: 'ffffffffffffffffffffffffffffffffffffffff',
+                actor: 'achow101',
+                branch: 'wallet-bench-setups',
+                timeMs: Date.parse('2026-04-29T21:55:28Z'),
+            },
+        ];
+        const range = getForcePushRange(pushes);
+        ackEq(range.fromFull, 'dddddddddddddddddddddddddddddddddddddddd', 'range starts before burst');
+        ackEq(range.toFull, 'ffffffffffffffffffffffffffffffffffffffff', 'range ends at latest push');
+        ackEq(range.count, 2, 'only quick adjacent pushes are grouped');
+    });
+
+    ackTest('force-push range does not group unrelated pushes', () => {
+        const pushes = [
+            {
+                fromFull: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                toFull: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                actor: 'achow101',
+                branch: 'wallet-bench-setups',
+                timeMs: Date.parse('2026-04-29T20:00:00Z'),
+            },
+            {
+                fromFull: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                toFull: 'cccccccccccccccccccccccccccccccccccccccc',
+                actor: 'achow101',
+                branch: 'wallet-bench-setups',
+                timeMs: Date.parse('2026-04-29T21:00:00Z'),
+            },
+        ];
+        const range = getForcePushRange(pushes);
+        ackEq(range.fromFull, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'old push is outside burst window');
+        ackEq(range.toFull, 'cccccccccccccccccccccccccccccccccccccccc', 'latest push remains the target');
+        ackEq(range.count, 1, 'only the latest push is used');
+    });
+
+    ackTest('rdiff uses grouped force-push range when available', () => {
+        const rdiff = SHA_FORMATS.find((f) => f.key === 'rdiff');
+        lastForcePush = {
+            fromFull: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+            toFull: 'ffffffffffffffffffffffffffffffffffffffff',
+        };
+        lastForcePushRange = {
+            fromFull: 'dddddddddddddddddddddddddddddddddddddddd',
+            toFull: 'ffffffffffffffffffffffffffffffffffffffff',
+        };
+        const cmd = rdiff.fmt();
+        ackAssert(cmd.includes('B=dddddddddddddddddddddddddddddddddddddddd'), 'starts at grouped burst base');
+        ackAssert(cmd.includes('A=ffffffffffffffffffffffffffffffffffffffff'), 'ends at latest push');
     });
 
     ackTest('rdiff prefers userAckSha over lastForcePush', () => {
@@ -23677,6 +23814,13 @@ RULES:
     ackTest('DOM force push SHA extraction requires 40-char hex in href', () => {
         const source = _ackSource;
         ackAssert(source.includes('[0-9a-f]{40}'), 'requires exactly 40 hex chars for full SHA');
+        const parser = source.slice(
+            source.indexOf('function parseForcePushesFromPage'),
+            source.indexOf('async function parseForcePushesFromAPI'),
+        );
+        ackAssert(parser.includes("item.querySelector('.author')"), 'captures force-push author');
+        ackAssert(parser.includes(".commit-ref .css-truncate-target"), 'captures force-push branch');
+        ackAssert(parser.includes('relative-time[datetime]'), 'captures force-push timestamp');
     });
 
     ackTest('enhanceForcePushLinks adds badge and stores PR in sessionStorage', () => {
@@ -29500,9 +29644,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.51', () => {
+    ackTest('version bumped to 1.52', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.51' || _ackSource.includes('@version      1.51'), 'version is 1.51');
+        ackAssert(versionFromMeta === '1.52' || _ackSource.includes('@version      1.52'), 'version is 1.52');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -30664,6 +30808,7 @@ RULES:
         // Snapshot mutable global state that live GitHub sessions may have already populated.
         const stateSnapshot = {
             lastForcePush,
+            lastForcePushRange,
             lastForcePushSignature,
             userAckSha,
             prFileCategories,
@@ -30734,6 +30879,7 @@ RULES:
         const resetUnitState = () => {
             // Keep unit tests independent from live session state.
             lastForcePush = null;
+            lastForcePushRange = null;
             lastForcePushSignature = '';
             userAckSha = null;
             prFileCategories = null;
@@ -30781,6 +30927,7 @@ RULES:
             _ackTesting = false;
             // Restore mutable globals.
             lastForcePush = stateSnapshot.lastForcePush;
+            lastForcePushRange = stateSnapshot.lastForcePushRange;
             lastForcePushSignature = stateSnapshot.lastForcePushSignature;
             userAckSha = stateSnapshot.userAckSha;
             prFileCategories = stateSnapshot.prFileCategories;

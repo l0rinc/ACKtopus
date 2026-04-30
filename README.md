@@ -135,8 +135,8 @@ Copies useful snippets based on the PR head commit, such as:
 - `ACK <sha>`
 - `git fetch ... && git switch --detach FETCH_HEAD`
 - checkout-parent and `gh pr co ... && git pull --rebase "$REMOTE" <base>` helpers, with `upstream`/`origin` remote fallback
-- `git range-diff` from your last ACK or the latest force-push
-- rebase-both-sides-and-diff commands for cleaner force-push comparisons
+- `git range-diff` from your last ACK or the latest quick force-push burst
+- rebase-both-sides-and-diff commands for cleaner force-push burst comparisons
 - pre-push `git range-diff "$BASE..@{u}" "$BASE..HEAD"` for comparing the pushed tracking branch with local `HEAD`
 - benchmark, unit-test, fuzz, and functional-test commands when changed files make those targets discoverable
 
