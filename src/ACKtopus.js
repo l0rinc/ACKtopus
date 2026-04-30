@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.54
+// @version      1.55
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3485,11 +3485,12 @@ A short checklist that verifies no Phase 1 implementation leakage, approval gate
         audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
 
 # Goal
-Produce a prompt whose target artifact is a thorough audio-guide walkthrough for a clean external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
+Produce a prompt for a local coding agent that has the project checked out. That local agent must do the investigation itself and produce a ready-to-use audio-guide handoff document for a simpler external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
 
 # Success criteria
 - The prompt tells the target agent that the current changes represent a PR the user is reviewing.
 - The target artifact is a verbose explanation, not a patch dump, review comment dump, or PR summary.
+- The target local agent does the research and writes the handoff document; the external audio LLM is only the later consumer of that document.
 - The target agent must inspect the current branch, each pending commit, relevant base/head metadata, PR comments, review threads, range-diffs, tests, and docs needed to understand the change.
 - The target agent must identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply.
 - The walkthrough must start from first principles with minimal jargon, then progressively go deeper until the user can ask an external audio-enabled LLM precise questions about every commit and meaningful line.
@@ -3500,6 +3501,7 @@ Produce a prompt whose target artifact is a thorough audio-guide walkthrough for
 
 # Constraints
 - Keep the prompt focused on the outcome: a complete handoff guide for an external LLM with internet/GitHub access but no local repository access.
+- Do not make the external audio LLM responsible for source investigation. The local agent must gather and explain the needed information before the audio conversation starts.
 - The generated prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
 - Do not ask the target agent to post anything, push anything, or rewrite history.
 - Do not ask for a terse summary. The purpose is maximum usable context for follow-up questioning.
@@ -3519,7 +3521,7 @@ Tell the target agent what to inspect locally: current branch, pending commits, 
 List the difficult or risky areas the target agent must investigate, derived from the source PR context and review comments.
 
 ## Walkthrough Requirements
-Define the final guide structure: high-level story, glossary, commit-by-commit walkthrough, meaningful-line walkthrough, risk/test discussion, reviewer-comment map, and question-ready talking points.
+Define the local agent's final handoff document structure: high-level story, glossary, commit-by-commit walkthrough, meaningful-line walkthrough, risk/test discussion, reviewer-comment map, and question-ready talking points for the external audio LLM.
 
 ## Link Requirements
 Require GitHub URLs for commits, files/lines, review threads, related PRs/issues, and any claim that would otherwise be hard to verify.
@@ -6600,7 +6602,7 @@ The prompt must ask for:
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated audio guide prompt',
                     finalTask:
-                        `Now write one outcome-focused audio-guide handoff prompt for a target coding agent. The target agent must produce a thorough description of the current PR changes and each pending commit so I can chat with an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to fully understand the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs. Based on the PR comments, identify the most difficult, risky, subtle, or disputed areas and require extra investigation there. Require GitHub links for further lookup. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.`,
+                        `Now write one outcome-focused audio-guide handoff prompt for a target local coding agent that has the project checked out. The target agent must investigate the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs itself, then produce a ready-to-use handoff document for an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before writing the handoff. Require GitHub links for further lookup. Do not ask the external audio LLM to do the source investigation; the local agent's output must already contain the context needed for the audio conversation. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.`,
                 },
                 maintainer_summary: {
                     label: 'Maintainer summary',
@@ -18374,7 +18376,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.54
+// @version      1.55
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28881,6 +28883,10 @@ RULES:
         ackAssert(prompt.includes('handoff prompt'), 'prompt writes a handoff prompt');
         ackAssert(prompt.includes('local coding agent'), 'targets a local coding agent');
         ackAssert(prompt.includes('clean external LLM'), 'targets a clean external LLM');
+        ackAssert(prompt.includes('has the project checked out'), 'local agent has the project checkout');
+        ackAssert(prompt.includes('does the research'), 'local agent does the research');
+        ackAssert(prompt.includes('ready-to-use audio-guide handoff document'), 'target output is a handoff document');
+        ackAssert(prompt.includes('only the later consumer'), 'external audio LLM is only the consumer');
         ackAssert(prompt.includes('PR the user is reviewing'), 'states this is a reviewed PR');
         ackAssert(prompt.includes('current changes'), 'covers current changes');
         ackAssert(prompt.includes('every pending commit'), 'covers each pending commit');
@@ -28919,6 +28925,10 @@ RULES:
         );
         ackAssert(fn.includes('external audio-enabled LLM'), 'audio guide recipe targets external audio LLM');
         ackAssert(fn.includes('no local source access'), 'audio guide recipe includes no-local-source constraint');
+        ackAssert(fn.includes('target local coding agent'), 'audio guide recipe targets local agent');
+        ackAssert(fn.includes('has the project checked out'), 'audio guide recipe assumes a project checkout');
+        ackAssert(fn.includes('ready-to-use handoff document'), 'audio guide recipe asks for a complete handoff');
+        ackAssert(fn.includes('Do not ask the external audio LLM to do the source investigation'), 'local agent investigates first');
         ackAssert(fn.includes('raw patch, raw comments'), 'audio guide recipe excludes raw source dumps');
         ackAssert(fn.includes('promptDetailsTitle'), 'prompt recipes can name their prompt preview');
         ackAssert(fn.includes('formatLLMPromptPreview(system, userContent)'), 'audio guide prompt is inspectable');
@@ -29778,9 +29788,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.54', () => {
+    ackTest('version bumped to 1.55', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.54' || _ackSource.includes('@version      1.54'), 'version is 1.54');
+        ackAssert(versionFromMeta === '1.55' || _ackSource.includes('@version      1.55'), 'version is 1.55');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
