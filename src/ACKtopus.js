@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.50
+// @version      1.51
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -6081,6 +6081,11 @@ The prompt must ask for:
         return `${wrapPromptBlock('SYSTEM PROMPT', system)}\n\n${wrapPromptBlock('USER PROMPT', userContent)}`;
     }
 
+    function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
+        if (recipe === 'reimplementation') return extraInstr;
+        return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
+    }
+
     function scrollToAndHighlight(el) {
         if (!el) return;
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -6580,7 +6585,7 @@ The prompt must ask for:
                         recipe !== 'reimplementation' && chatPageIndex.length
                             ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
                             : '';
-                    const system = `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
+                    const system = getRecipeSystemPrompt(recipe, extraInstr, citationInstructions);
                     const sourceContext = wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext);
                     const userContent =
                         recipe === 'reimplementation'
@@ -18228,7 +18233,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.50
+// @version      1.51
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28550,6 +28555,22 @@ RULES:
     ackTest('reimplementation user prompt generates the inspectable reproducer prompt', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const recipeSystem = source.slice(
+            source.indexOf('function getRecipeSystemPrompt'),
+            source.indexOf('function scrollToAndHighlight'),
+        );
+        ackAssert(
+            recipeSystem.includes("if (recipe === 'reimplementation') return extraInstr"),
+            'reproducer prompt preview excludes the generic review system prompt',
+        );
+        ackAssert(
+            recipeSystem.includes('return `${SYSTEM_BASE}\\n\\n${extraInstr}${citationInstructions}`'),
+            'non-reproducer recipes keep the generic review system prompt',
+        );
+        ackAssert(
+            fn.includes('getRecipeSystemPrompt(recipe, extraInstr, citationInstructions)'),
+            'recipe prompt uses the recipe-specific system prompt',
+        );
         ackAssert(
             fn.includes("wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext)"),
             'recipe prompt wraps long source context',
@@ -29479,9 +29500,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.50', () => {
+    ackTest('version bumped to 1.51', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.50' || _ackSource.includes('@version      1.50'), 'version is 1.50');
+        ackAssert(versionFromMeta === '1.51' || _ackSource.includes('@version      1.51'), 'version is 1.51');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
