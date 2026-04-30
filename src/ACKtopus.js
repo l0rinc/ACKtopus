@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.52
+// @version      1.53
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3449,7 +3449,7 @@ Produce a prompt whose target artifact is useful PR-review evidence, not a step-
 - The split stack has a squash-equivalence check: squashing the split PR commits should represent the original PR changes, except for later suggestion commits.
 - The comparison artifact is a small set of meaningful differences: each valid difference becomes a separate suggestion commit with a review-comment-style message, and cases where the original PR is better are reported locally instead of forced into empty commits.
 - Suggestion commit messages include GitHub code URLs that prove the claim.
-- The final audio-guide artifact assumes the listener's LLM has internet/GitHub access but no local repository access. It must use GitHub links, start without jargon, then go deeper through every commit and meaningful line.
+- The final audio-guide artifact follows the standalone audio-guide handoff contract: it assumes the listener's LLM has internet/GitHub access but no local repository access, uses GitHub links, avoids dumping the patch or raw comments, starts without jargon, then goes deeper through every commit and meaningful line.
 
 # Constraints
 - Treat the provided PR context as private source material for prompt construction. Do not copy the submitted patch shape into the no-peek phase.
@@ -3477,10 +3477,56 @@ The expected PR-split result: a smaller reviewable stack, split by concern where
 The expected comparison result: the local implementation replayed on top of the split PR, with each meaningful remaining difference represented as an evidence-backed suggestion commit, and with better original-PR choices reported instead of manufactured commits.
 
 ## Phase 4 - Audio Guide
-The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. It must explain every commit and meaningful line progressively from first principles to deeper technical detail.
+The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. Use the standalone audio-guide handoff contract: explain every commit and meaningful line progressively from first principles to deeper technical detail, sprinkle GitHub links for further lookup, cover the PR-comment-derived hard parts, and do not include the raw patch or raw comments.
 
 ## Final Checks
 A short checklist that verifies no Phase 1 implementation leakage, approval gates, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
+        audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
+
+# Goal
+Produce a prompt whose target artifact is a thorough audio-guide walkthrough for a clean external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
+
+# Success criteria
+- The prompt tells the target agent that the current changes represent a PR the user is reviewing.
+- The target artifact is a verbose explanation, not a patch dump, review comment dump, or PR summary.
+- The target agent must inspect the current branch, each pending commit, relevant base/head metadata, PR comments, review threads, range-diffs, tests, and docs needed to understand the change.
+- The target agent must identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply.
+- The walkthrough must start from first principles with minimal jargon, then progressively go deeper until the user can ask an external audio-enabled LLM precise questions about every commit and meaningful line.
+- The walkthrough must explain each pending commit: what problem it addresses, what behavior changes, what invariants it relies on, what tests or evidence support it, and why the implementation is shaped that way.
+- The walkthrough must include GitHub links for further lookup: PR URL, commit URLs, file/line URLs, important review threads, and related issues or PRs when the source context supports them.
+- The walkthrough must not include the full patch, raw PR comments, or raw review threads. The user will supply those separately if needed.
+- The target agent must mark missing evidence instead of guessing.
+
+# Constraints
+- Keep the prompt focused on the outcome: a complete handoff guide for an external LLM with internet/GitHub access but no local repository access.
+- Do not ask the target agent to post anything, push anything, or rewrite history.
+- Do not ask for a terse summary. The purpose is maximum usable context for follow-up questioning.
+- Prefer plain-language explanations first, then deeper technical detail.
+- Use author/reviewer wording where it helps preserve intent, but do not paste long comments verbatim.
+- Press the target agent to spend extra effort on PR-comment-derived hard parts, surprising design choices, benchmark/performance claims, test gaps, correctness risks, and places where reviewers disagreed or asked for clarification.
+
+Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
+
+## Mission
+Explain the PR-review handoff goal, PR URL/base metadata, and the expected audio-guide artifact.
+
+## Source Work
+Tell the target agent what to inspect locally: current branch, pending commits, commit messages, diffs, tests, docs, PR comments, review threads, range-diffs, and GitHub links.
+
+## Focus Areas
+List the difficult or risky areas the target agent must investigate, derived from the source PR context and review comments.
+
+## Walkthrough Requirements
+Define the final guide structure: high-level story, glossary, commit-by-commit walkthrough, meaningful-line walkthrough, risk/test discussion, reviewer-comment map, and question-ready talking points.
+
+## Link Requirements
+Require GitHub URLs for commits, files/lines, review threads, related PRs/issues, and any claim that would otherwise be hard to verify.
+
+## Exclusions
+State that the final guide must not include the raw patch, raw PR comments, or raw review-thread dump because the user will supply them separately.
+
+## Final Checks
+Verify complete commit coverage, hard-part coverage, grounded claims, useful GitHub links, no raw patch/comment dump, and enough detail for an external audio-enabled LLM with no local repo access.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -3572,6 +3618,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 commit: GM_getValue(`llm_instr_${active}_commit`, ''),
                 pseudocode: GM_getValue(`llm_instr_${active}_pseudocode`, ''),
                 reimplementation: GM_getValue(`llm_instr_${active}_reimplementation`, ''),
+                audio_walkthrough: GM_getValue(`llm_instr_${active}_audio_walkthrough`, ''),
                 maintainer_summary: GM_getValue(`llm_instr_${active}_maintainer_summary`, ''),
                 proofread: GM_getValue(`llm_instr_${active}_proofread`, ''),
             },
@@ -4126,6 +4173,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             DEFAULT_INSTRUCTIONS.pseudocode,
         );
         addInstruction('reimplementation', '🧬 Reproducer recipe', DEFAULT_INSTRUCTIONS.reimplementation);
+        addInstruction('audio_walkthrough', '🎧 Audio guide recipe', DEFAULT_INSTRUCTIONS.audio_walkthrough);
         addInstruction('maintainer_summary', '🧭 Maintainer summary recipe', DEFAULT_INSTRUCTIONS.maintainer_summary);
         addInstruction('proofread', '✏️ Proofread', DEFAULT_INSTRUCTIONS.proofread);
 
@@ -6144,7 +6192,7 @@ The prompt must ask for:
     }
 
     function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
-        if (recipe === 'reimplementation') return extraInstr;
+        if (recipe === 'reimplementation' || recipe === 'audio_walkthrough') return extraInstr;
         return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
     }
 
@@ -6207,6 +6255,7 @@ The prompt must ask for:
         const titleMap = {
             chat: 'Chat',
             reimplementation: 'Reproducer',
+            audio_walkthrough: 'Audio guide',
             maintainer_summary: 'Maintainer view',
         };
 
@@ -6496,11 +6545,27 @@ The prompt must ask for:
                     label: 'Reproducer',
                     userText: 'Generate the local reproducer prompt now.',
                     sendAsConversation: false,
+                    fullPRContext: true,
+                    promptDetailsTitle: 'Generated reproducer prompt',
+                    finalTask:
+                        'Now write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. For Phase 4, use the standalone audio-guide handoff contract: enough context for an external audio-enabled LLM with no local repository access, GitHub links for further lookup, PR-comment-derived hard-part coverage, and no raw patch/comment dump. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, and satisfies the requested output format.',
+                },
+                audio_walkthrough: {
+                    label: 'Audio guide',
+                    userText: 'Generate the audio-guide handoff prompt now.',
+                    sendAsConversation: false,
+                    fullPRContext: true,
+                    promptDetailsTitle: 'Generated audio guide prompt',
+                    finalTask:
+                        'Now write one outcome-focused audio-guide handoff prompt for a target coding agent. The target agent must produce a thorough description of the current PR changes and each pending commit so I can chat with an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to fully understand the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs. Based on the PR comments, identify the most difficult, risky, subtle, or disputed areas and require extra investigation there. Require GitHub links for further lookup. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.',
                 },
                 maintainer_summary: {
                     label: 'Maintainer summary',
                     userText: 'Generate the maintainer-facing PR status summary now.',
                     sendAsConversation: false,
+                    fullPRContext: true,
+                    finalTask:
+                        'Now write the maintainer-facing PR status summary using only the source context. If the source context does not establish a claim, say what evidence is missing instead of guessing.',
                 },
             };
             const recipeCfg = recipe ? recipeMap[recipe] : null;
@@ -6627,37 +6692,26 @@ The prompt must ask for:
                     const summary = `Found ${matches.length} match${matches.length > 1 ? 'es' : ''}.`;
                     history.push({ role: 'assistant', content: summary });
                     messages.scrollTop = messages.scrollHeight;
-                } else if (recipe === 'reimplementation' || recipe === 'maintainer_summary') {
+                } else if (recipeCfg?.fullPRContext) {
                     if (!parsePR()) throw new Error('this recipe is only available on pull request pages');
                     const fullContext = await gatherRecipeContext((msg) => {
                         setAssistantText(assistantMsg, msg);
                     });
-                    const extraInstr =
-                        recipe === 'reimplementation'
-                            ? (
-                                  getLLMConfig().instructions.reimplementation || DEFAULT_INSTRUCTIONS.reimplementation
-                              ).trim()
-                            : (
-                                  getLLMConfig().instructions.maintainer_summary ||
-                                  DEFAULT_INSTRUCTIONS.maintainer_summary
-                              ).trim();
-                    // Reproducer prompts are copied out for downstream agents - no [ref:N] citations.
+                    const extraInstr = (getLLMConfig().instructions[recipe] || DEFAULT_INSTRUCTIONS[recipe]).trim();
+                    const isPromptRecipe = recipe === 'reimplementation' || recipe === 'audio_walkthrough';
+                    // Reproducer/audio prompts are copied out for downstream agents - no [ref:N] citations.
                     // Maintainer summaries stay on the page - keep citations for navigation.
                     const citationInstructions =
-                        recipe !== 'reimplementation' && chatPageIndex.length
+                        !isPromptRecipe && chatPageIndex.length
                             ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
                             : '';
                     const system = getRecipeSystemPrompt(recipe, extraInstr, citationInstructions);
                     const sourceContext = wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext);
-                    const userContent =
-                        recipe === 'reimplementation'
-                            ? `${sourceContext}\n\nNow write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, and satisfies the requested output format.`
-                            : `${sourceContext}\n\nNow write the maintainer-facing PR status summary using only the source context. If the source context does not establish a claim, say what evidence is missing instead of guessing.`;
-                    const generatedPrompt =
-                        recipe === 'reimplementation' ? formatLLMPromptPreview(system, userContent) : '';
+                    const userContent = `${sourceContext}\n\n${recipeCfg.finalTask}`;
+                    const generatedPrompt = isPromptRecipe ? formatLLMPromptPreview(system, userContent) : '';
                     if (generatedPrompt) {
                         assistantMsg._ackPromptDetails = {
-                            title: 'Generated reproducer prompt',
+                            title: recipeCfg.promptDetailsTitle,
                             prompt: generatedPrompt,
                         };
                     }
@@ -6669,7 +6723,7 @@ The prompt must ask for:
                     stopSpin();
                     const trimmed = result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    if (generatedPrompt) setAssistantPromptDetails(assistantMsg, 'Generated reproducer prompt', generatedPrompt);
+                    if (generatedPrompt) setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt);
                     history.push({ role: 'assistant', content: trimmed });
                     messages.scrollTop = messages.scrollHeight;
                 } else {
@@ -16797,6 +16851,12 @@ RULES:
                 tip: 'Generate a gated local agent prompt for no-peek reimplementation, PR splitting, suggestions, and audio guide',
             },
             {
+                key: 'audio_walkthrough',
+                emoji: '🎧',
+                label: 'Audio guide',
+                tip: 'Generate a clean-agent handoff prompt for a detailed external LLM walkthrough',
+            },
+            {
                 key: 'maintainer_summary',
                 emoji: '🧭',
                 label: 'Maintainer view',
@@ -18302,7 +18362,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.52
+// @version      1.53
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20099,6 +20159,7 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.commits, 'has commits instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.commit, 'has commit instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation, 'has reimplementation recipe instructions');
+        ackAssert(DEFAULT_INSTRUCTIONS.audio_walkthrough, 'has audio guide recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.maintainer_summary, 'has maintainer summary recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread, 'has proofread instructions');
     });
@@ -24503,6 +24564,10 @@ RULES:
             'config panel exposes reimplementation recipe instructions',
         );
         ackAssert(
+            configFn.includes("addInstruction('audio_walkthrough'"),
+            'config panel exposes audio guide recipe instructions',
+        );
+        ackAssert(
             configFn.includes("addInstruction('maintainer_summary'"),
             'config panel exposes maintainer summary recipe instructions',
         );
@@ -24515,6 +24580,10 @@ RULES:
         ackAssert(
             cfgFn.includes('llm_instr_${active}_reimplementation'),
             'getLLMConfig loads reimplementation recipe instructions',
+        );
+        ackAssert(
+            cfgFn.includes('llm_instr_${active}_audio_walkthrough'),
+            'getLLMConfig loads audio guide recipe instructions',
         );
         ackAssert(
             cfgFn.includes('llm_instr_${active}_maintainer_summary'),
@@ -28527,6 +28596,8 @@ RULES:
         ackAssert(fn.includes("key: 'chat'"), 'has chat action');
         ackAssert(fn.includes("key: 'reimplementation'"), 'has reimplementation action');
         ackAssert(fn.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
+        ackAssert(fn.includes("key: 'audio_walkthrough'"), 'has audio guide action');
+        ackAssert(fn.includes("label: 'Audio guide'"), 'audio guide action is labeled');
         ackAssert(fn.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(fn.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
@@ -28634,6 +28705,8 @@ RULES:
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
         ackAssert(fn.includes('reimplementation: {'), 'defines reimplementation recipe');
         ackAssert(fn.includes("reimplementation: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
+        ackAssert(fn.includes('audio_walkthrough: {'), 'defines audio guide recipe');
+        ackAssert(fn.includes("audio_walkthrough: 'Audio guide'"), 'titles audio guide recipe');
         ackAssert(fn.includes('maintainer_summary: {'), 'defines maintainer summary recipe');
         ackAssert(fn.includes('titleMap = {'), 'defines panel titles for robot actions');
         ackAssert(
@@ -28641,14 +28714,12 @@ RULES:
             'updates panel title for selected robot action',
         );
         ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses full recipe context');
+        ackAssert(fn.includes('fullPRContext: true'), 'full-context recipes opt into PR context');
         ackAssert(
-            fn.includes('DEFAULT_INSTRUCTIONS.reimplementation'),
-            'reimplementation recipe uses configurable instructions',
+            fn.includes('DEFAULT_INSTRUCTIONS[recipe]'),
+            'full-context recipe instructions are selected by recipe key',
         );
-        ackAssert(
-            fn.includes('DEFAULT_INSTRUCTIONS.maintainer_summary'),
-            'maintainer summary uses configurable instructions',
-        );
+        ackAssert(fn.includes('Generated audio guide prompt'), 'audio guide prompt is inspectable');
         ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
     });
 
@@ -28672,6 +28743,7 @@ RULES:
         ackAssert(prompt.includes('GitHub code URLs'), 'requires GitHub evidence URLs');
         ackAssert(prompt.includes('original PR is better'), 'admits when the PR is better');
         ackAssert(prompt.includes('audio-guide walkthrough'), 'includes audio guide workflow');
+        ackAssert(prompt.includes('standalone audio-guide handoff contract'), 'uses standalone audio guide contract');
         ackAssert(prompt.includes('internet/GitHub access'), 'audio guide assumes online access');
         ackAssert(prompt.includes('no local repository access'), 'audio guide assumes no local repo');
     });
@@ -28704,12 +28776,12 @@ RULES:
             source.indexOf('function scrollToAndHighlight'),
         );
         ackAssert(
-            recipeSystem.includes("if (recipe === 'reimplementation') return extraInstr"),
+            recipeSystem.includes("recipe === 'reimplementation'"),
             'reproducer prompt preview excludes the generic review system prompt',
         );
         ackAssert(
             recipeSystem.includes('return `${SYSTEM_BASE}\\n\\n${extraInstr}${citationInstructions}`'),
-            'non-reproducer recipes keep the generic review system prompt',
+            'non-prompt recipes keep the generic review system prompt',
         );
         ackAssert(
             fn.includes('getRecipeSystemPrompt(recipe, extraInstr, citationInstructions)'),
@@ -28719,7 +28791,7 @@ RULES:
             fn.includes("wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext)"),
             'recipe prompt wraps long source context',
         );
-        ackAssert(fn.includes('sourceContext}\\n\\nNow write'), 'recipe prompt puts source material before final task');
+        ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
         ackAssert(fn.includes('one outcome-focused local reproducer prompt'), 'generates one combined prompt');
         ackAssert(fn.includes('artifact') && fn.includes('acceptance criteria'), 'prompt focuses on outcomes');
         ackAssert(fn.includes('no-peek local implementation'), 'keeps first phase no-peek');
@@ -28751,8 +28823,8 @@ RULES:
             'reimplementation prompt is retained for error display',
         );
         ackAssert(
-            fn.includes("setAssistantPromptDetails(assistantMsg, 'Generated reproducer prompt', generatedPrompt)"),
-            'reimplementation prompt is shown after successful result',
+            fn.includes('setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt)'),
+            'prompt recipe preview is shown after successful result',
         );
         ackAssert(
             fn.includes('modelOverride: getHighContextModelOverride(provider)'),
@@ -28799,6 +28871,53 @@ RULES:
         ackAssert(prompt.includes('## Phase 3 - Rebase And Suggest'), 'output includes rebase/suggest phase');
         ackAssert(prompt.includes('## Phase 4 - Audio Guide'), 'output includes audio guide phase');
         ackAssert(prompt.includes('## Final Checks'), 'output includes final checks');
+    });
+
+    ackTest('audio guide prompt builds a clean-agent handoff workflow', () => {
+        const prompt = DEFAULT_INSTRUCTIONS.audio_walkthrough;
+        ackAssert(prompt.includes('handoff prompt'), 'prompt writes a handoff prompt');
+        ackAssert(prompt.includes('local coding agent'), 'targets a local coding agent');
+        ackAssert(prompt.includes('clean external LLM'), 'targets a clean external LLM');
+        ackAssert(prompt.includes('PR the user is reviewing'), 'states this is a reviewed PR');
+        ackAssert(prompt.includes('current changes'), 'covers current changes');
+        ackAssert(prompt.includes('every pending commit'), 'covers each pending commit');
+        ackAssert(prompt.includes('no local source access'), 'external LLM has no local source');
+        ackAssert(prompt.includes('PR comments'), 'uses PR comments');
+        ackAssert(prompt.includes('review threads'), 'uses review threads');
+        ackAssert(prompt.includes('difficult, risky, subtle, or disputed areas'), 'focuses hard parts');
+        ackAssert(prompt.includes('GitHub links'), 'requires GitHub links');
+        ackAssert(prompt.includes('must not include the full patch'), 'forbids patch dump');
+        ackAssert(prompt.includes('raw PR comments'), 'forbids comment dump');
+        ackAssert(prompt.includes('The user will supply those separately'), 'expects separate source attachments');
+        ackAssert(prompt.includes('## Focus Areas'), 'has focus areas section');
+        ackAssert(prompt.includes('## Walkthrough Requirements'), 'has walkthrough requirements section');
+        ackAssert(prompt.includes('## Link Requirements'), 'has link requirements section');
+    });
+
+    ackTest('audio guide recipe generates an inspectable prompt', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const recipeSystem = source.slice(
+            source.indexOf('function getRecipeSystemPrompt'),
+            source.indexOf('function scrollToAndHighlight'),
+        );
+        ackAssert(
+            recipeSystem.includes("recipe === 'audio_walkthrough'"),
+            'audio guide prompt preview excludes the generic review system prompt',
+        );
+        ackAssert(
+            fn.includes('Generate the audio-guide handoff prompt now.'),
+            'audio guide recipe has a user-facing trigger',
+        );
+        ackAssert(
+            fn.includes('Now write one outcome-focused audio-guide handoff prompt'),
+            'audio guide recipe asks for the handoff prompt',
+        );
+        ackAssert(fn.includes('external audio-enabled LLM'), 'audio guide recipe targets external audio LLM');
+        ackAssert(fn.includes('no local source access'), 'audio guide recipe includes no-local-source constraint');
+        ackAssert(fn.includes('raw patch, raw comments'), 'audio guide recipe excludes raw source dumps');
+        ackAssert(fn.includes('promptDetailsTitle'), 'prompt recipes can name their prompt preview');
+        ackAssert(fn.includes('formatLLMPromptPreview(system, userContent)'), 'audio guide prompt is inspectable');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
@@ -29644,9 +29763,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.52', () => {
+    ackTest('version bumped to 1.53', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.52' || _ackSource.includes('@version      1.52'), 'version is 1.52');
+        ackAssert(versionFromMeta === '1.53' || _ackSource.includes('@version      1.53'), 'version is 1.53');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
