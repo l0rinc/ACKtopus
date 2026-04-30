@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.49
+// @version      1.50
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -81,6 +81,17 @@
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
+    }
+
+    function shellQuoteIfNeeded(arg) {
+        const text = String(arg);
+        return /^[A-Za-z0-9._/:@%+=,-]+$/.test(text) ? text : shellQuote(text);
+    }
+
+    function preferredRemoteCommand(preferred = 'upstream', fallback = 'origin') {
+        const preferredArg = shellQuoteIfNeeded(preferred);
+        const fallbackArg = shellQuoteIfNeeded(fallback);
+        return `REMOTE=$(git remote | grep -qx ${preferredArg} && echo ${preferredArg} || echo ${fallbackArg})`;
     }
 
     // Deterministic markdown post-processor used after proofreading:
@@ -320,7 +331,7 @@
             tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
             fmt: (sha, pr) => {
                 const base = getReviewBaseBranch();
-                return `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase upstream ${shellQuote(base)}`;
+                return `${preferredRemoteCommand()} && gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase "$REMOTE" ${shellQuoteIfNeeded(base)}`;
             },
         },
         {
@@ -5293,6 +5304,34 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
         const blockTags = new Set(['P', 'DIV', 'BLOCKQUOTE', 'PRE', 'UL', 'OL', 'LI', 'TABLE', 'HR']);
         const hasBlockChildren = (el) => [...(el?.children || [])].some((child) => blockTags.has(child.tagName));
+        const isSuggestionLike = (el) =>
+            !!(
+                el?.closest?.('.suggested-change, .js-suggested-change, [data-suggested-change]') ||
+                el?.querySelector?.('.blob-code-addition, .blob-code-deletion')
+            );
+        const renderSuggestedDiff = (el) => {
+            const rows = [...(el?.querySelectorAll?.('tr') || [])];
+            const lines = [];
+            for (const row of rows) {
+                const codeCell = row.querySelector(
+                    '.blob-code-addition, .blob-code-deletion, .blob-code-context, .blob-code',
+                );
+                if (!codeCell) continue;
+                const code = String(codeCell.textContent || '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/\r/g, '')
+                    .replace(/\n/g, '')
+                    .replace(/[ \t]+$/g, '');
+                const className = `${row.className || ''} ${codeCell.className || ''}`;
+                const prefix = /\bblob-code-addition\b/.test(className)
+                    ? '+'
+                    : /\bblob-code-deletion\b/.test(className)
+                      ? '-'
+                      : ' ';
+                lines.push(`${prefix}${code}`);
+            }
+            return lines.length ? wrapFencedCode(lines.join('\n'), 'diff') : '';
+        };
 
         const renderInlineNode = (node) => {
             if (!node) return '';
@@ -5363,6 +5402,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const tag = node.tagName.toLowerCase();
             const snippet = node.getAttribute?.('data-snippet-clipboard-copy-content');
             if (snippet) {
+                if (isSuggestionLike(node)) return '';
                 return String(snippet)
                     .replace(/\r\n/g, '\n')
                     .replace(/\n+$/, '')
@@ -5383,10 +5423,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 const lang = (codeEl?.className || '').match(/language-([\w-]+)/)?.[1] || '';
                 return wrapFencedCode(codeEl?.textContent || node.textContent || '', lang);
             }
+            const suggestedDiff = renderSuggestedDiff(node);
+            if (suggestedDiff) return suggestedDiff;
             if (tag === 'ul') return renderList(node, false);
             if (tag === 'ol') return renderList(node, true);
             if (tag === 'hr') return '---';
-            if (tag === 'table') return normalizeText(node.textContent).trim();
+            if (tag === 'table')
+                return [...node.querySelectorAll('tr')]
+                    .map((row) => normalizeText(row.textContent).trim())
+                    .filter(Boolean)
+                    .join('\n');
             if (tag === 'p' || tag === 'li') return renderInlineChildren(node);
             if (tag === 'details') return renderBlockChildren(node);
             if (hasBlockChildren(node)) return renderBlockChildren(node);
@@ -5423,12 +5469,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
     }
 
+    function getCommentIdentityKey(comment) {
+        if (comment?.permalink) return `permalink:${comment.permalink}`;
+        const markdown = String(comment?.markdown || '').replace(/\s+/g, ' ').trim();
+        if (!markdown) return '';
+        const loc = formatCommentLocation(comment?.file, comment?.line, comment?.commitSha);
+        return ['fallback', comment?.threadId || loc || '', comment?.author || '', comment?.date || '', markdown].join(
+            ':',
+        );
+    }
+
     // --- Visible Comments Scraper ---
     // Gathers all currently visible comments from the page (including resolved-but-open threads).
     // Returns array of { author, date, markdown, threadId, isResolved, file?, line? }
     function gatherVisibleComments() {
         const comments = [];
         const seenBodies = new Set(); // deduplicate nested container matches
+        const seenCommentKeys = new Set(); // deduplicate duplicate DOM renderings of the same comment
         const containers = document.querySelectorAll(COMMENT_CONTAINER_SELECTOR);
         for (const container of containers) {
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
@@ -5462,7 +5519,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
             const codeContext = getCommentCodeContext(container, threadRoot);
             const reactions = getCommentReactionSummary(container);
-            comments.push({
+            const comment = {
                 author,
                 date,
                 markdown,
@@ -5476,7 +5533,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 commitSha,
                 codeContext,
                 reactions,
-            });
+            };
+            const identityKey = getCommentIdentityKey(comment);
+            if (identityKey && seenCommentKeys.has(identityKey)) continue;
+            if (identityKey) seenCommentKeys.add(identityKey);
+            comments.push(comment);
         }
         return comments;
     }
@@ -18167,7 +18228,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.49
+// @version      1.50
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -18474,7 +18535,9 @@ RULES:
             const result = ghco.fmt('abc', pr);
             ackAssert(result.includes('github.com/bitcoin/bitcoin/pull/123'));
             ackAssert(result.includes('--force'));
-            ackAssert(result.includes("git pull --rebase upstream 'main'"));
+            ackAssert(result.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'));
+            ackAssert(result.includes('git pull --rebase "$REMOTE" main'));
+            ackAssert(!result.includes("'main'"), 'does not quote simple branch names');
         } finally {
             getReviewBaseBranch = origBase;
         }
@@ -19809,7 +19872,9 @@ RULES:
             ackAssert(result.includes('gh pr co'), 'has gh pr co');
             ackAssert(result.includes('https://github.com/bitcoin/bitcoin/pull/42'), 'has full PR URL');
             ackAssert(result.includes('--force'), 'has --force flag');
-            ackAssert(result.includes("&& git pull --rebase upstream 'main'"), 'has rebase');
+            ackAssert(result.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'), 'sets remote fallback');
+            ackAssert(result.includes('&& git pull --rebase "$REMOTE" main'), 'has rebase');
+            ackAssert(!result.includes("'main'"), 'does not quote simple branch names');
         } finally {
             getReviewBaseBranch = origBase;
         }
@@ -23356,14 +23421,13 @@ RULES:
         ackAssert(cfg.includes('setTimeout(runSelfTests, 50)'), 'auto-runs tests shortly after panel opens');
     });
 
-    ackTest('ghco format uses review base branch via upstream remote', () => {
+    ackTest('ghco format uses review base branch via upstream/origin remote fallback', () => {
         const source = _ackSource;
         const section = source.slice(source.indexOf("key: 'ghco'"), source.indexOf("key: 'rdiff'"));
         ackAssert(section.includes('getReviewBaseBranch()'), 'reads the review base branch dynamically');
-        ackAssert(
-            section.includes('git pull --rebase upstream ${shellQuote(base)}'),
-            'uses upstream remote with the dynamic base branch',
-        );
+        ackAssert(section.includes('preferredRemoteCommand()'), 'uses upstream/origin remote fallback');
+        ackAssert(section.includes('git pull --rebase "$REMOTE"'), 'uses chosen remote for rebase');
+        ackAssert(section.includes('shellQuoteIfNeeded(base)'), 'quotes base branch only when needed');
         ackAssert(!section.includes('origin master'), 'does not hardcode origin/master');
     });
 
@@ -25801,6 +25865,8 @@ RULES:
         ackAssert(fn.includes('getCommentAuthor'), 'extracts author via getCommentAuthor helper');
         ackAssert(fn.includes('seenBodies'), 'deduplicates by tracking seen body elements');
         ackAssert(fn.includes('seenBodies.has(body)'), 'skips already-seen bodies');
+        ackAssert(fn.includes('seenCommentKeys'), 'deduplicates duplicate rendered copies by comment identity');
+        ackAssert(fn.includes('getCommentIdentityKey(comment)'), 'uses logical comment identity after extraction');
         ackAssert(fn.includes('#issue-'), 'skips PR body by permalink');
         ackAssert(fn.includes('issue-body'), 'skips PR body by ID');
         ackAssert(fn.includes('nothing to preview'), 'skips preview placeholders');
@@ -25822,6 +25888,64 @@ RULES:
         ackAssert(
             fn.includes('getCommentReactionSummary(container)'),
             'captures visible reaction summaries for copied review comments',
+        );
+    });
+
+    ackTest('gatherVisibleComments deduplicates repeated rendered comments by permalink', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+          <div class="timeline-comment">
+            <a class="author" href="/alice">alice</a>
+            <a id="discussion_r1-permalink" href="#discussion_r1"><relative-time datetime="2026-04-10T01:48:24Z"></relative-time></a>
+            <div class="markdown-body"><p>Suggested change</p><p>Use setup here.</p></div>
+          </div>
+          <div class="timeline-comment">
+            <a class="author" href="/alice">alice</a>
+            <a id="discussion_r1-copy-permalink" href="#discussion_r1"><relative-time datetime="2026-04-10T01:48:24Z"></relative-time></a>
+            <div class="markdown-body"><p>Suggested change</p><p>Use setup here.</p></div>
+          </div>
+        `;
+        document.body.appendChild(host);
+        const origQuerySelectorAll = document.querySelectorAll;
+        document.querySelectorAll = (sel) => {
+            if (sel === COMMENT_CONTAINER_SELECTOR) return host.querySelectorAll(sel);
+            return origQuerySelectorAll.call(document, sel);
+        };
+        try {
+            const comments = gatherVisibleComments();
+            ackEq(comments.length, 1, 'duplicate DOM copies with same permalink collapse to one comment');
+            ackEq(comments[0].permalink, `${location.href.split('#')[0]}#discussion_r1`, 'keeps canonical permalink');
+        } finally {
+            document.querySelectorAll = origQuerySelectorAll;
+            host.remove();
+        }
+    });
+
+    ackTest('renderBodyMarkdown preserves GitHub suggested-change blocks as diff fences', () => {
+        const body = document.createElement('div');
+        body.className = 'markdown-body';
+        body.innerHTML = `
+          <p>Suggested change</p>
+          <div class="suggested-change">
+            <table>
+              <tr><td class="blob-code blob-code-deletion">bench.setup([&] {</td></tr>
+              <tr><td class="blob-code blob-code-addition">bench.epochIterations(1).setup([&] {</td></tr>
+            </table>
+            <button data-snippet-clipboard-copy-content="bench.epochIterations(1).setup([&] {">Copy</button>
+          </div>
+          <p>here and elsewhere</p>
+        `;
+        const rendered = renderBodyMarkdown(body);
+        ackAssert(rendered.includes('Suggested change'), 'keeps suggestion label');
+        ackAssert(rendered.includes('```diff'), 'renders suggestion as diff fence');
+        ackAssert(rendered.includes('-bench.setup([&] {'), 'keeps deleted line');
+        ackAssert(rendered.includes('+bench.epochIterations(1).setup([&] {'), 'keeps added line');
+        ackEq(
+            (rendered.match(/bench\\.epochIterations\\(1\\)\\.setup/g) || []).length,
+            1,
+            'does not duplicate clipboard snippet text',
         );
     });
 
@@ -29355,9 +29479,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.49', () => {
+    ackTest('version bumped to 1.50', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.49' || _ackSource.includes('@version      1.49'), 'version is 1.49');
+        ackAssert(versionFromMeta === '1.50' || _ackSource.includes('@version      1.50'), 'version is 1.50');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
