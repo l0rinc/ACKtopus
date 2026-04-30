@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.53
+// @version      1.54
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -80,6 +80,7 @@
     let userAckSha = null; // SHA from current user's last ACK (set async)
     let prFileCategories = null; // { bench: [], test: [], fuzz: [], functional: [], cpp: [] } -- set async
     const FORCE_PUSH_BURST_WINDOW_MS = 15 * 60 * 1000;
+    const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -3477,7 +3478,7 @@ The expected PR-split result: a smaller reviewable stack, split by concern where
 The expected comparison result: the local implementation replayed on top of the split PR, with each meaningful remaining difference represented as an evidence-backed suggestion commit, and with better original-PR choices reported instead of manufactured commits.
 
 ## Phase 4 - Audio Guide
-The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. Use the standalone audio-guide handoff contract: explain every commit and meaningful line progressively from first principles to deeper technical detail, sprinkle GitHub links for further lookup, cover the PR-comment-derived hard parts, and do not include the raw patch or raw comments.
+The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. Use the standalone audio-guide handoff contract: explain every commit and meaningful line progressively from first principles to deeper technical detail, sprinkle GitHub links for further lookup, cover the PR-comment-derived hard parts, and do not include the raw patch or raw comments. The audio-guide prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
 
 ## Final Checks
 A short checklist that verifies no Phase 1 implementation leakage, approval gates, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
@@ -3499,6 +3500,7 @@ Produce a prompt whose target artifact is a thorough audio-guide walkthrough for
 
 # Constraints
 - Keep the prompt focused on the outcome: a complete handoff guide for an external LLM with internet/GitHub access but no local repository access.
+- The generated prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
 - Do not ask the target agent to post anything, push anything, or rewrite history.
 - Do not ask for a terse summary. The purpose is maximum usable context for follow-up questioning.
 - Prefer plain-language explanations first, then deeper technical detail.
@@ -3526,7 +3528,7 @@ Require GitHub URLs for commits, files/lines, review threads, related PRs/issues
 State that the final guide must not include the raw patch, raw PR comments, or raw review-thread dump because the user will supply them separately.
 
 ## Final Checks
-Verify complete commit coverage, hard-part coverage, grounded claims, useful GitHub links, no raw patch/comment dump, and enough detail for an external audio-enabled LLM with no local repo access.`,
+Verify complete commit coverage, hard-part coverage, grounded claims, useful GitHub links, no raw patch/comment dump, enough detail for an external audio-enabled LLM with no local repo access, and the exact final OK-only line.`,
         maintainer_summary: `You are producing a compact maintainer-facing status summary for a GitHub PR.
 The audience is a maintainer or author who wants to understand whether the PR looks mergeable, what is still unresolved, and what each reviewer currently seems to think.
 
@@ -6191,6 +6193,12 @@ The prompt must ask for:
         return `${wrapPromptBlock('SYSTEM PROMPT', system)}\n\n${wrapPromptBlock('USER PROMPT', userContent)}`;
     }
 
+    function ensureAudioGuideReadyGate(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return AUDIO_GUIDE_READY_GATE;
+        return trimmed.endsWith(AUDIO_GUIDE_READY_GATE) ? trimmed : `${trimmed}\n\n${AUDIO_GUIDE_READY_GATE}`;
+    }
+
     function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
         if (recipe === 'reimplementation' || recipe === 'audio_walkthrough') return extraInstr;
         return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
@@ -6557,7 +6565,7 @@ The prompt must ask for:
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated audio guide prompt',
                     finalTask:
-                        'Now write one outcome-focused audio-guide handoff prompt for a target coding agent. The target agent must produce a thorough description of the current PR changes and each pending commit so I can chat with an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to fully understand the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs. Based on the PR comments, identify the most difficult, risky, subtle, or disputed areas and require extra investigation there. Require GitHub links for further lookup. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.',
+                        `Now write one outcome-focused audio-guide handoff prompt for a target coding agent. The target agent must produce a thorough description of the current PR changes and each pending commit so I can chat with an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to fully understand the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs. Based on the PR comments, identify the most difficult, risky, subtle, or disputed areas and require extra investigation there. Require GitHub links for further lookup. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.`,
                 },
                 maintainer_summary: {
                     label: 'Maintainer summary',
@@ -6721,7 +6729,7 @@ The prompt must ask for:
                         maxTokens: getHighContextMaxTokens(provider),
                     });
                     stopSpin();
-                    const trimmed = result.trim();
+                    const trimmed = recipe === 'audio_walkthrough' ? ensureAudioGuideReadyGate(result) : result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     if (generatedPrompt) setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt);
                     history.push({ role: 'assistant', content: trimmed });
@@ -18362,7 +18370,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.53
+// @version      1.54
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28746,6 +28754,7 @@ RULES:
         ackAssert(prompt.includes('standalone audio-guide handoff contract'), 'uses standalone audio guide contract');
         ackAssert(prompt.includes('internet/GitHub access'), 'audio guide assumes online access');
         ackAssert(prompt.includes('no local repository access'), 'audio guide assumes no local repo');
+        ackAssert(prompt.includes(AUDIO_GUIDE_READY_GATE), 'reproducer audio phase keeps final OK-only gate');
     });
 
     ackTest('reimplementation prompt keeps Phase 1 abstract and non-prescriptive', () => {
@@ -28889,6 +28898,7 @@ RULES:
         ackAssert(prompt.includes('must not include the full patch'), 'forbids patch dump');
         ackAssert(prompt.includes('raw PR comments'), 'forbids comment dump');
         ackAssert(prompt.includes('The user will supply those separately'), 'expects separate source attachments');
+        ackAssert(prompt.includes(AUDIO_GUIDE_READY_GATE), 'requires final OK-only audio gate');
         ackAssert(prompt.includes('## Focus Areas'), 'has focus areas section');
         ackAssert(prompt.includes('## Walkthrough Requirements'), 'has walkthrough requirements section');
         ackAssert(prompt.includes('## Link Requirements'), 'has link requirements section');
@@ -28918,6 +28928,17 @@ RULES:
         ackAssert(fn.includes('raw patch, raw comments'), 'audio guide recipe excludes raw source dumps');
         ackAssert(fn.includes('promptDetailsTitle'), 'prompt recipes can name their prompt preview');
         ackAssert(fn.includes('formatLLMPromptPreview(system, userContent)'), 'audio guide prompt is inspectable');
+        ackAssert(fn.includes('ensureAudioGuideReadyGate(result)'), 'audio guide output gets final OK-only gate');
+        ackEq(
+            ensureAudioGuideReadyGate('handoff body'),
+            `handoff body\n\n${AUDIO_GUIDE_READY_GATE}`,
+            'appends missing final OK-only gate',
+        );
+        ackEq(
+            ensureAudioGuideReadyGate(`handoff body\n\n${AUDIO_GUIDE_READY_GATE}`),
+            `handoff body\n\n${AUDIO_GUIDE_READY_GATE}`,
+            'does not duplicate final OK-only gate',
+        );
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
@@ -29763,9 +29784,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.53', () => {
+    ackTest('version bumped to 1.54', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.53' || _ackSource.includes('@version      1.53'), 'version is 1.53');
+        ackAssert(versionFromMeta === '1.54' || _ackSource.includes('@version      1.54'), 'version is 1.54');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
