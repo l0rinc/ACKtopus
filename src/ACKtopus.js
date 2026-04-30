@@ -3573,6 +3573,52 @@ When a fenced code block has no language (or only a generic one like text/plain)
 Return only the corrected text. If nothing needs fixing, return the original text unchanged.`,
     };
 
+    const CONFIG_INSTRUCTION_DEFS = Object.freeze([
+        { key: 'chat', label: '🤖 Chat' },
+        { key: 'pr', label: '🔍 Full PR analysis' },
+        { key: 'commits', label: '📋 Commits list' },
+        { key: 'commit', label: '🔬 Single commit annotation' },
+        { key: 'pseudocode', label: '💡 Commit review aid (💡 button: pseudocode, concerns, message check)' },
+        { key: 'reimplementation', label: '🧬 Reproducer recipe' },
+        { key: 'audio_walkthrough', label: '🎧 Audio guide recipe' },
+        { key: 'maintainer_summary', label: '🧭 Maintainer summary recipe' },
+        { key: 'proofread', label: '✏️ Proofread' },
+    ]);
+    const LLM_INSTRUCTION_KEYS = CONFIG_INSTRUCTION_DEFS.map(({ key }) => key);
+    const PROMPT_RECIPE_KEYS = new Set(['reimplementation', 'audio_walkthrough']);
+    const ROBOT_RECIPE_ACTIONS = Object.freeze([
+        {
+            key: 'chat',
+            emoji: '🤖',
+            label: 'Chat',
+            tip: 'Open an LLM chat about this page, using cached analyses as context',
+        },
+        {
+            key: 'reimplementation',
+            emoji: '🧬',
+            label: 'Reproducer',
+            tip: 'Generate a gated local agent prompt for no-peek reimplementation, PR splitting, suggestions, and audio guide',
+        },
+        {
+            key: 'audio_walkthrough',
+            emoji: '🎧',
+            label: 'Audio guide',
+            tip: 'Generate a clean-agent handoff prompt for a detailed external LLM walkthrough',
+        },
+        {
+            key: 'maintainer_summary',
+            emoji: '🧭',
+            label: 'Maintainer view',
+            tip: 'Generate a compact maintainer-facing status summary with unresolved items and reviewer positions',
+        },
+        {
+            key: 'infographic',
+            emoji: '🖼️',
+            label: 'Infographic',
+            tip: 'Generate a visual PR overview with OpenAI image generation',
+        },
+    ]);
+
     const SYSTEM_BASE = `You are an expert Bitcoin Core reviewer (C++20 and related build, test, and tooling).
 	Be skeptical. Assume subtle bugs exist until proven otherwise.
 	Prioritize consensus safety, determinism, and security. Consider worst-case behavior and DoS angles.
@@ -3607,23 +3653,29 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return ANALYSIS_MODES.pr;
     }
 
+    function getProviderInstructions(active) {
+        const instructions = {};
+        for (const key of LLM_INSTRUCTION_KEYS) {
+            instructions[key] = GM_getValue(`llm_instr_${active}_${key}`, '');
+        }
+        return instructions;
+    }
+
+    function isPromptRecipe(recipe) {
+        return PROMPT_RECIPE_KEYS.has(recipe);
+    }
+
+    function getRobotRecipeTitle(recipe) {
+        return ROBOT_RECIPE_ACTIONS.find(({ key }) => key === recipe)?.label || 'Chat';
+    }
+
     function getLLMConfig() {
         const active = getActiveProvider();
         return {
             claude: { key: GM_getValue('llm_claude_key', ''), model: LLM_MODELS.claude },
             openai: { key: GM_getValue('llm_openai_key', ''), model: LLM_MODELS.openai },
             active,
-            instructions: {
-                chat: GM_getValue(`llm_instr_${active}_chat`, ''),
-                pr: GM_getValue(`llm_instr_${active}_pr`, ''),
-                commits: GM_getValue(`llm_instr_${active}_commits`, ''),
-                commit: GM_getValue(`llm_instr_${active}_commit`, ''),
-                pseudocode: GM_getValue(`llm_instr_${active}_pseudocode`, ''),
-                reimplementation: GM_getValue(`llm_instr_${active}_reimplementation`, ''),
-                audio_walkthrough: GM_getValue(`llm_instr_${active}_audio_walkthrough`, ''),
-                maintainer_summary: GM_getValue(`llm_instr_${active}_maintainer_summary`, ''),
-                proofread: GM_getValue(`llm_instr_${active}_proofread`, ''),
-            },
+            instructions: getProviderInstructions(active),
             includeFullPatch: GM_getValue('llm_include_patch', true),
             cacheEnabled: GM_getValue('llm_cache_enabled', true),
         };
@@ -4165,19 +4217,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             panel.appendChild(ta);
         }
 
-        addInstruction('chat', '🤖 Chat', DEFAULT_INSTRUCTIONS.chat);
-        addInstruction('pr', '🔍 Full PR analysis', DEFAULT_INSTRUCTIONS.pr);
-        addInstruction('commits', '📋 Commits list', DEFAULT_INSTRUCTIONS.commits);
-        addInstruction('commit', '🔬 Single commit annotation', DEFAULT_INSTRUCTIONS.commit);
-        addInstruction(
-            'pseudocode',
-            '💡 Commit review aid (💡 button: pseudocode, concerns, message check)',
-            DEFAULT_INSTRUCTIONS.pseudocode,
-        );
-        addInstruction('reimplementation', '🧬 Reproducer recipe', DEFAULT_INSTRUCTIONS.reimplementation);
-        addInstruction('audio_walkthrough', '🎧 Audio guide recipe', DEFAULT_INSTRUCTIONS.audio_walkthrough);
-        addInstruction('maintainer_summary', '🧭 Maintainer summary recipe', DEFAULT_INSTRUCTIONS.maintainer_summary);
-        addInstruction('proofread', '✏️ Proofread', DEFAULT_INSTRUCTIONS.proofread);
+        for (const { key, label } of CONFIG_INSTRUCTION_DEFS) {
+            addInstruction(key, label, DEFAULT_INSTRUCTIONS[key]);
+        }
 
         // --- Options ---
         sep();
@@ -6200,7 +6242,7 @@ The prompt must ask for:
     }
 
     function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
-        if (recipe === 'reimplementation' || recipe === 'audio_walkthrough') return extraInstr;
+        if (isPromptRecipe(recipe)) return extraInstr;
         return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
     }
 
@@ -6260,13 +6302,6 @@ The prompt must ask for:
             resize: 'vertical',
         });
 
-        const titleMap = {
-            chat: 'Chat',
-            reimplementation: 'Reproducer',
-            audio_walkthrough: 'Audio guide',
-            maintainer_summary: 'Maintainer view',
-        };
-
         const header = document.createElement('div');
         Object.assign(header.style, {
             display: 'flex',
@@ -6279,7 +6314,7 @@ The prompt must ask for:
         });
 
         const title = document.createElement('div');
-        title.textContent = `🤖 ${titleMap[initialRecipe] || 'Chat'}`;
+        title.textContent = `🤖 ${getRobotRecipeTitle(initialRecipe)}`;
         Object.assign(title.style, {
             color: '#c9d1d9',
             fontSize: '12px',
@@ -6577,7 +6612,7 @@ The prompt must ask for:
                 },
             };
             const recipeCfg = recipe ? recipeMap[recipe] : null;
-            title.textContent = `🤖 ${titleMap[recipe] || titleMap.chat}`;
+            title.textContent = `🤖 ${getRobotRecipeTitle(recipe)}`;
             const text = recipeCfg ? recipeCfg.userText : input.value.trim();
             if (recipeCfg?.sendAsConversation === false && recipeCfg.userText === '') return;
             if (!recipeCfg && !text) return;
@@ -6706,17 +6741,17 @@ The prompt must ask for:
                         setAssistantText(assistantMsg, msg);
                     });
                     const extraInstr = (getLLMConfig().instructions[recipe] || DEFAULT_INSTRUCTIONS[recipe]).trim();
-                    const isPromptRecipe = recipe === 'reimplementation' || recipe === 'audio_walkthrough';
+                    const promptRecipe = isPromptRecipe(recipe);
                     // Reproducer/audio prompts are copied out for downstream agents - no [ref:N] citations.
                     // Maintainer summaries stay on the page - keep citations for navigation.
                     const citationInstructions =
-                        !isPromptRecipe && chatPageIndex.length
+                        !promptRecipe && chatPageIndex.length
                             ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
                             : '';
                     const system = getRecipeSystemPrompt(recipe, extraInstr, citationInstructions);
                     const sourceContext = wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext);
                     const userContent = `${sourceContext}\n\n${recipeCfg.finalTask}`;
-                    const generatedPrompt = isPromptRecipe ? formatLLMPromptPreview(system, userContent) : '';
+                    const generatedPrompt = promptRecipe ? formatLLMPromptPreview(system, userContent) : '';
                     if (generatedPrompt) {
                         assistantMsg._ackPromptDetails = {
                             title: recipeCfg.promptDetailsTitle,
@@ -16845,38 +16880,7 @@ RULES:
         const group = document.createElement('div');
         Object.assign(group.style, { display: 'flex', position: 'relative' });
 
-        const actions = [
-            {
-                key: 'chat',
-                emoji: '🤖',
-                label: 'Chat',
-                tip: 'Open an LLM chat about this page, using cached analyses as context',
-            },
-            {
-                key: 'reimplementation',
-                emoji: '🧬',
-                label: 'Reproducer',
-                tip: 'Generate a gated local agent prompt for no-peek reimplementation, PR splitting, suggestions, and audio guide',
-            },
-            {
-                key: 'audio_walkthrough',
-                emoji: '🎧',
-                label: 'Audio guide',
-                tip: 'Generate a clean-agent handoff prompt for a detailed external LLM walkthrough',
-            },
-            {
-                key: 'maintainer_summary',
-                emoji: '🧭',
-                label: 'Maintainer view',
-                tip: 'Generate a compact maintainer-facing status summary with unresolved items and reviewer positions',
-            },
-            {
-                key: 'infographic',
-                emoji: '🖼️',
-                label: 'Infographic',
-                tip: 'Generate a visual PR overview with OpenAI image generation',
-            },
-        ];
+        const actions = ROBOT_RECIPE_ACTIONS;
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
 
@@ -24566,37 +24570,24 @@ RULES:
     ackTest('config panel exposes robot recipe instructions and getLLMConfig loads them', () => {
         const source = _ackSource;
         const configFn = source.slice(source.indexOf('function buildConfigPanel'), source.indexOf('function addUsage'));
-        ackAssert(configFn.includes("addInstruction('chat'"), 'config panel exposes chat instructions');
-        ackAssert(
-            configFn.includes("addInstruction('reimplementation'"),
-            'config panel exposes reimplementation recipe instructions',
-        );
-        ackAssert(
-            configFn.includes("addInstruction('audio_walkthrough'"),
-            'config panel exposes audio guide recipe instructions',
-        );
-        ackAssert(
-            configFn.includes("addInstruction('maintainer_summary'"),
-            'config panel exposes maintainer summary recipe instructions',
-        );
+        ackAssert(configFn.includes('CONFIG_INSTRUCTION_DEFS'), 'config panel uses instruction metadata');
+        ackAssert(configFn.includes('addInstruction(key, label, DEFAULT_INSTRUCTIONS[key])'), 'metadata drives fields');
 
-        const cfgFn = source.slice(
-            source.indexOf('function getLLMConfig'),
-            source.indexOf('function isProviderAvailable'),
+        const instructionDefs = source.slice(
+            source.indexOf('const CONFIG_INSTRUCTION_DEFS'),
+            source.indexOf('const SYSTEM_BASE'),
         );
-        ackAssert(cfgFn.includes('llm_instr_${active}_chat'), 'getLLMConfig loads chat instructions');
-        ackAssert(
-            cfgFn.includes('llm_instr_${active}_reimplementation'),
-            'getLLMConfig loads reimplementation recipe instructions',
+        ackAssert(instructionDefs.includes("key: 'chat'"), 'instruction metadata includes chat');
+        ackAssert(instructionDefs.includes("key: 'reimplementation'"), 'instruction metadata includes reimplementation');
+        ackAssert(instructionDefs.includes("key: 'audio_walkthrough'"), 'instruction metadata includes audio guide');
+        ackAssert(instructionDefs.includes("key: 'maintainer_summary'"), 'instruction metadata includes maintainer summary');
+
+        const instructionLoader = source.slice(
+            source.indexOf('function getProviderInstructions'),
+            source.indexOf('function isPromptRecipe'),
         );
-        ackAssert(
-            cfgFn.includes('llm_instr_${active}_audio_walkthrough'),
-            'getLLMConfig loads audio guide recipe instructions',
-        );
-        ackAssert(
-            cfgFn.includes('llm_instr_${active}_maintainer_summary'),
-            'getLLMConfig loads maintainer summary recipe instructions',
-        );
+        ackAssert(instructionLoader.includes('LLM_INSTRUCTION_KEYS'), 'getLLMConfig loads all instruction metadata keys');
+        ackAssert(instructionLoader.includes('llm_instr_${active}_${key}'), 'instruction storage key is generated');
     });
 
     ackTest('selection helpers use active provider/model (no separate settings)', () => {
@@ -28601,13 +28592,15 @@ RULES:
     ackTest('robot recipe group offers chat and predefined recipes', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildRobotRecipeGroup'), source.indexOf('function inject()'));
-        ackAssert(fn.includes("key: 'chat'"), 'has chat action');
-        ackAssert(fn.includes("key: 'reimplementation'"), 'has reimplementation action');
-        ackAssert(fn.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
-        ackAssert(fn.includes("key: 'audio_walkthrough'"), 'has audio guide action');
-        ackAssert(fn.includes("label: 'Audio guide'"), 'audio guide action is labeled');
-        ackAssert(fn.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
-        ackAssert(fn.includes("key: 'infographic'"), 'has infographic action');
+        const actions = source.slice(source.indexOf('const ROBOT_RECIPE_ACTIONS'), source.indexOf('const SYSTEM_BASE'));
+        ackAssert(fn.includes('ROBOT_RECIPE_ACTIONS'), 'robot recipe group uses shared action metadata');
+        ackAssert(actions.includes("key: 'chat'"), 'has chat action');
+        ackAssert(actions.includes("key: 'reimplementation'"), 'has reimplementation action');
+        ackAssert(actions.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
+        ackAssert(actions.includes("key: 'audio_walkthrough'"), 'has audio guide action');
+        ackAssert(actions.includes("label: 'Audio guide'"), 'audio guide action is labeled');
+        ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
+        ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
         ackAssert(fn.includes('runAnalysis(wrapper, action.key)'), 'dispatches selected recipe through runAnalysis');
     });
@@ -28708,17 +28701,18 @@ RULES:
         );
     });
 
-    ackTest('chat panel recipe mode supports reimplementation and maintainer summary prompts', () => {
+    ackTest('chat panel recipe mode supports full-context robot prompts', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const robotActions = source.slice(source.indexOf('const ROBOT_RECIPE_ACTIONS'), source.indexOf('const SYSTEM_BASE'));
         ackAssert(fn.includes('reimplementation: {'), 'defines reimplementation recipe');
-        ackAssert(fn.includes("reimplementation: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
+        ackAssert(robotActions.includes("label: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
         ackAssert(fn.includes('audio_walkthrough: {'), 'defines audio guide recipe');
-        ackAssert(fn.includes("audio_walkthrough: 'Audio guide'"), 'titles audio guide recipe');
+        ackAssert(robotActions.includes("label: 'Audio guide'"), 'titles audio guide recipe');
         ackAssert(fn.includes('maintainer_summary: {'), 'defines maintainer summary recipe');
-        ackAssert(fn.includes('titleMap = {'), 'defines panel titles for robot actions');
+        ackAssert(fn.includes('getRobotRecipeTitle'), 'uses shared robot action titles');
         ackAssert(
-            fn.includes('title.textContent = `🤖 ${titleMap[recipe] || titleMap.chat}`'),
+            fn.includes('title.textContent = `🤖 ${getRobotRecipeTitle(recipe)}`'),
             'updates panel title for selected robot action',
         );
         ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses full recipe context');
@@ -28785,7 +28779,7 @@ RULES:
             source.indexOf('function scrollToAndHighlight'),
         );
         ackAssert(
-            recipeSystem.includes("recipe === 'reimplementation'"),
+            recipeSystem.includes('isPromptRecipe(recipe)'),
             'reproducer prompt preview excludes the generic review system prompt',
         );
         ackAssert(
@@ -28912,7 +28906,7 @@ RULES:
             source.indexOf('function scrollToAndHighlight'),
         );
         ackAssert(
-            recipeSystem.includes("recipe === 'audio_walkthrough'"),
+            recipeSystem.includes('isPromptRecipe(recipe)'),
             'audio guide prompt preview excludes the generic review system prompt',
         );
         ackAssert(
