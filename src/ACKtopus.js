@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.56
+// @version      1.57
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3274,7 +3274,7 @@
     // --- LLM Config & Analysis ---
 
     const LLM_MODELS = {
-        claude: 'claude-sonnet-4-6',
+        claude: 'claude-sonnet-4-7',
         claude_high_context: 'claude-opus-4-7',
         openai: 'gpt-5.5',
     };
@@ -18422,7 +18422,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.56
+// @version      1.57
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -19036,8 +19036,8 @@ RULES:
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
 
-    ackTest('LLM_MODELS.claude is claude-sonnet-4-6', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+    ackTest('LLM_MODELS.claude is claude-sonnet-4-7', () => {
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-7');
     });
 
     ackTest('LLM_MODELS.claude_high_context is claude-opus-4-7', () => {
@@ -29856,9 +29856,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.56', () => {
+    ackTest('version bumped to 1.57', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.56' || _ackSource.includes('@version      1.56'), 'version is 1.56');
+        ackAssert(versionFromMeta === '1.57' || _ackSource.includes('@version      1.57'), 'version is 1.57');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -30394,7 +30394,7 @@ RULES:
     });
 
     ackTest('LLM_MODELS match documented provider models', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-7');
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
