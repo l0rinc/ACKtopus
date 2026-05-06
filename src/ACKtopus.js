@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.55
+// @version      1.56
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3283,7 +3283,7 @@
     const OPENAI_IMAGE_QUALITY = 'medium';
     const OPENAI_IMAGE_FORMAT = 'webp';
     const OPENAI_ORG_VERIFY_URL = 'https://platform.openai.com/settings/organization/general';
-    const PR_INFOGRAPHIC_PROMPT_VERSION = 4;
+    const PR_INFOGRAPHIC_PROMPT_VERSION = 5;
 
     function getHighContextModelOverride(provider) {
         if (provider === 'claude') return LLM_MODELS.claude_high_context;
@@ -6182,14 +6182,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const system = `You are a technical visual editor for code review.
 Your task is to turn source-grounded PR or commit context into one prompt for an image-generation model.
 
-Goal: compress the supplied ${scopeLabel} context into one landscape infographic that gives reviewers the overall concept and high-level purpose at elevator-pitch speed.
+Goal: compress the supplied ${scopeLabel} context into one landscape technical brief that gives reviewers the overall concept, high-level purpose, and key technical details at elevator-pitch speed.
 
 Rules:
 - Ground every claim in the supplied context. If the purpose, flow, risk, or test story is unclear, keep the label generic or omit it.
 - Before describing layout, identify the single overall concept the image should communicate. The concept should explain the ${scopeLabel}'s main idea, not list files or commits.
+- Include technical details at a high level: name the important mechanism, state/data flow, invariant, API boundary, performance claim, compatibility concern, or test signal when the source supports it.
 - Spend the most visual space on the most important, complicated, risky, or hard-to-explain parts. It is better to explain one difficult mechanism well than to cover every routine edit.
 - If the source is scoped to one commit, make the infographic about that commit; use PR-level context only to explain why the commit matters.
 - Prefer a visual structure over prose: before/after, request -> processing -> validation, data flow, stack/layer diagram, or risk/test map, whichever best fits the review target.
+- Use visual elements for relationships that are hard to explain in text: ownership/lifetime, data movement, control flow, before/after topology, dependency direction, risk surface, or benchmark/test coverage.
+- Use text for the opposite: exact terms, invariants, constraints, outcomes, and caveats that are hard to draw accurately.
 - Every visual block must explain what it represents with a short readable label and a tiny callout. Do not rely on emojis, icons, arrows, or abstract lines without explanatory text.
 - Keep literal text sparse but explanatory: at most 10 labels/callouts, each 1 to 6 words, and at most 55 words total inside the image.
 - Put exact labels in double quotes so the image model knows what text to render.
@@ -6215,12 +6218,16 @@ The prompt must explicitly include:
 - the source page URL when provided as context only, with instructions not to render it as image text,
 - an "Overall concept to communicate" sentence that compresses the review target into the one idea reviewers should understand first.
 - a "Most important/risky parts to visualize" sentence that tells the image model which complicated or hard-to-explain elements deserve the most space.
+- a "Technical details to preserve" sentence that names the important mechanism, invariant, data/control flow, API boundary, performance claim, or test signal at a high level.
+- a "What text must explain" sentence for details that should be written because they are hard to render visually.
 
 The prompt must ask for:
-- a clean 1536x1024 landscape technical infographic,
+- a clean 1536x1024 landscape technical visual brief,
 - a one-line title,
 - 3 to 5 visual blocks or lanes showing the ${scopeLabel}'s main flow or before/after,
-- a short explanation attached to each block so the image communicates meaning instead of just shapes, emojis, or connector lines,
+- a short explanation attached to each block so every image section communicates meaning instead of just shapes, emojis, or connector lines,
+- visual emphasis on the parts that are hard to explain in prose,
+- text callouts for exact technical details that are hard to draw,
 - 2 to 3 compact risk/test callouts,
 - large readable text and high contrast,
 - restrained colors suitable for a software review document.`;
@@ -7006,13 +7013,49 @@ The prompt must ask for:
         renderHeaderFrame(BRAILLE_START_FRAME);
         Object.assign(header.style, { fontWeight: '600', fontSize: '12px', color, marginBottom: '8px' });
         card.appendChild(header);
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.textContent = '✕';
+        closeBtn.title = 'Close infographic';
+        closeBtn.setAttribute('aria-label', 'Close infographic');
+        Object.assign(closeBtn.style, {
+            position: 'absolute',
+            top: '8px',
+            right: '8px',
+            padding: '0 5px',
+            fontSize: '12px',
+            lineHeight: '1.4',
+            background: 'transparent',
+            color: '#8b949e',
+            border: '1px solid transparent',
+            borderRadius: '4px',
+            cursor: 'pointer',
+        });
+        closeBtn.addEventListener('mouseenter', () => {
+            closeBtn.style.color = '#c9d1d9';
+            closeBtn.style.borderColor = '#30363d';
+        });
+        closeBtn.addEventListener('mouseleave', () => {
+            closeBtn.style.color = '#8b949e';
+            closeBtn.style.borderColor = 'transparent';
+        });
+        card.appendChild(closeBtn);
         const body = document.createElement('div');
         Object.assign(body.style, { fontSize: '12px', color: '#c9d1d9', lineHeight: '1.5' });
         body.textContent = 'Preparing infographic...';
         card.appendChild(body);
         panel.appendChild(card);
         const stopSpin = startBrailleAnimation(renderHeaderFrame);
+        let activeBlobUrl = '';
+        let closed = false;
+        closeBtn.addEventListener('click', () => {
+            closed = true;
+            stopSpin();
+            if (activeBlobUrl) URL.revokeObjectURL(activeBlobUrl);
+            card.remove();
+        });
         const setStatus = (text) => {
+            if (closed) return;
             body.textContent = text;
         };
         const renderButton = (text, title, onClick) => {
@@ -7037,10 +7080,12 @@ The prompt must ask for:
         return {
             setStatus,
             resolve: (result, { cached = false } = {}) => {
+                if (closed) return;
                 stopSpin();
                 const mimeType = result.mimeType || `image/${OPENAI_IMAGE_FORMAT}`;
                 const dataUrl = `data:${mimeType};base64,${result.b64}`;
                 const blobUrl = base64ToBlobUrl(result.b64, mimeType);
+                activeBlobUrl = blobUrl;
                 header.innerHTML = `${label}${cached ? ' (cached)' : ''}`;
                 body.innerHTML = '';
                 const img = document.createElement('img');
@@ -7091,6 +7136,7 @@ The prompt must ask for:
                 body.appendChild(meta);
             },
             reject: (err, { prompt = '' } = {}) => {
+                if (closed) return;
                 stopSpin();
                 header.innerHTML = `${label} ✗`;
                 renderProviderError(body, err);
@@ -18376,7 +18422,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.55
+// @version      1.56
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28612,7 +28658,7 @@ RULES:
         ackAssert(source.includes("const OPENAI_IMAGE_MODEL = 'gpt-image-2'"), 'uses gpt-image-2');
         ackAssert(!source.includes('const OPENAI_IMAGE_' + 'FALLBACK_MODELS'), 'does not use older image model fallbacks');
         ackAssert(source.includes('OPENAI_ORG_VERIFY_URL'), 'links organization verification');
-        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 4'), 'bumps infographic cache for prompt content');
+        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 5'), 'bumps infographic cache for prompt content');
         const promptBuilder = source.slice(
             source.indexOf('async function buildInfographicImagePrompt'),
             source.indexOf('function formatLLMPromptPreview'),
@@ -28629,6 +28675,22 @@ RULES:
             'image prompt prioritizes complicated risky concepts',
         );
         ackAssert(
+            promptBuilder.includes('key technical details'),
+            'image prompt keeps high-level technical details',
+        );
+        ackAssert(
+            promptBuilder.includes('Technical details to preserve'),
+            'image prompt asks for technical detail preservation',
+        );
+        ackAssert(
+            promptBuilder.includes('Use visual elements for relationships that are hard to explain in text'),
+            'image prompt uses visuals for hard-to-explain relationships',
+        );
+        ackAssert(
+            promptBuilder.includes('Use text for the opposite'),
+            'image prompt uses text for hard-to-draw details',
+        );
+        ackAssert(
             promptBuilder.includes('Most important/risky parts to visualize'),
             'image prompt asks image model where to spend visual space',
         );
@@ -28637,6 +28699,7 @@ RULES:
             promptBuilder.includes('a short explanation attached to each block'),
             'image prompt asks each visual block to explain meaning',
         );
+        ackAssert(promptBuilder.includes('landscape technical visual brief'), 'image prompt frames output as visual brief');
         const imageCall = source.slice(
             source.indexOf('function requestOpenAIImage'),
             source.indexOf('// --- Diff Fetching ---'),
@@ -28687,6 +28750,11 @@ RULES:
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
         ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
         const card = source.slice(source.indexOf('function addInfographicCard'), source.indexOf('function addErrorDiv'));
+        ackAssert(card.includes("closeBtn.title = 'Close infographic'"), 'infographic card has close button');
+        ackAssert(card.includes('closed = true'), 'infographic close marks card closed');
+        ackAssert(card.includes('if (closed) return'), 'infographic close prevents late render');
+        ackAssert(card.includes('card.remove()'), 'infographic close button removes card');
+        ackAssert(card.includes('URL.revokeObjectURL(activeBlobUrl)'), 'infographic close button releases blob URL');
         ackAssert(card.includes('addPromptDetails(body, `Manual ${result.model || OPENAI_IMAGE_MODEL} prompt`'), 'shows prompt with successful infographic');
         ackAssert(card.includes('addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt'), 'shows manual prompt fallback on errors');
         const configHelper = source.slice(
@@ -29788,9 +29856,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.55', () => {
+    ackTest('version bumped to 1.56', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.55' || _ackSource.includes('@version      1.55'), 'version is 1.55');
+        ackAssert(versionFromMeta === '1.56' || _ackSource.includes('@version      1.56'), 'version is 1.56');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
