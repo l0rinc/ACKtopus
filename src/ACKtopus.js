@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.57
+// @version      1.58
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -81,6 +81,7 @@
     let prFileCategories = null; // { bench: [], test: [], fuzz: [], functional: [], cpp: [] } -- set async
     const FORCE_PUSH_BURST_WINDOW_MS = 15 * 60 * 1000;
     const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
+    const RECIPE_CONTEXT_MAX_CHARS = 160000;
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -3451,6 +3452,7 @@ Produce a prompt whose target artifact is useful PR-review evidence, not a step-
 - The comparison artifact is a small set of meaningful differences: each valid difference becomes a separate suggestion commit with a review-comment-style message, and cases where the original PR is better are reported locally instead of forced into empty commits.
 - Suggestion commit messages include GitHub code URLs that prove the claim.
 - The final audio-guide artifact follows the standalone audio-guide handoff contract: it assumes the listener's LLM has internet/GitHub access but no local repository access, uses GitHub links, avoids dumping the patch or raw comments, starts without jargon, then goes deeper through every commit and meaningful line.
+- The prompt remains usable when the pasted source context is truncated or incomplete because the PR has many commits or does not fit the context window. The target local agent must treat supplied source as an index, fetch missing commits, diffs, review threads, comments, CI logs, and file details from GitHub/local git only in the phase where that evidence is allowed, and mark missing evidence instead of guessing.
 
 # Constraints
 - Treat the provided PR context as private source material for prompt construction. Do not copy the submitted patch shape into the no-peek phase.
@@ -3458,6 +3460,7 @@ Produce a prompt whose target artifact is useful PR-review evidence, not a step-
 - Leave room for the local agent to discover a different valid design and then compare it honestly against the PR author's design.
 - Review comments are evidence for target behavior, risks, and validation needs. If they reveal a flaw, describe the corrected target behavior rather than the flawed current implementation.
 - Require grounded claims. The local agent may use code, tests, build errors, logs, range-diffs, review comments, or GitHub URLs as evidence, but must mark missing evidence instead of guessing.
+- If ACKtopus source material says it was truncated or if commit/comment/diff coverage is incomplete, require the target agent to build a retrieval plan from the PR URL and checkout metadata. The plan must preserve Phase 1 no-peek restrictions and defer submitted-implementation retrieval until the approval gate.
 - Do not tell the local agent to push. Keep history changes local and ask before destructive or remote-affecting operations.
 
 Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
@@ -3466,7 +3469,7 @@ Output exactly one prompt, ready to paste into a local coding agent. The prompt 
 A compact description of the review outcome, PR URL/base metadata, expected artifacts, and acceptance criteria.
 
 ## Hard Rules
-No-peek rules, approval gates, grounding requirements, commit hygiene, and stop rules.
+No-peek rules, approval gates, context-window fallback rules, grounding requirements, commit hygiene, and stop rules.
 
 ## Phase 1 - No-Peek Reproducer
 The expected local result: an independently discovered implementation and tests that satisfy the problem, target invariants, review-derived risks, and validation evidence while avoiding implementation leakage. It should require the agent to stop for approval once this artifact is coherent.
@@ -3481,7 +3484,7 @@ The expected comparison result: the local implementation replayed on top of the 
 The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. Use the standalone audio-guide handoff contract: explain every commit and meaningful line progressively from first principles to deeper technical detail, sprinkle GitHub links for further lookup, cover the PR-comment-derived hard parts, and do not include the raw patch or raw comments. The audio-guide prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
 
 ## Final Checks
-A short checklist that verifies no Phase 1 implementation leakage, approval gates, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
+A short checklist that verifies no Phase 1 implementation leakage, approval gates, truncated/incomplete context handling, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
         audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
 
 # Goal
@@ -5773,9 +5776,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!isIssue && includeCommits) {
             onProgress('Fetching commits...');
             try {
-                const commits = await gmFetch(
-                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=100`,
-                );
+                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
                 if (commits.length > 0) {
                     const commitLines = commits
                         .map((c) => `### ${c.sha.slice(0, 12)}\n${c.commit?.message || '(no message)'}`)
@@ -6111,8 +6112,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (checkout.prUrl) meta.push(`PR URL: \`${checkout.prUrl}\``);
         } catch (_) {}
         const context = await gatherFullPRContext(onProgress, { includePatch: true, includeComments: true });
-        if (!meta.length) return context;
-        return `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}`;
+        const source = meta.length ? `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}` : context;
+        return formatOversizedRecipeContext(source, RECIPE_CONTEXT_MAX_CHARS);
     }
 
     function truncateMiddle(text, maxChars) {
@@ -6121,6 +6122,18 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const head = Math.floor(maxChars * 0.65);
         const tail = maxChars - head;
         return s.slice(0, head) + `\n\n...[TRUNCATED ${s.length - maxChars} chars]...\n\n` + s.slice(-tail);
+    }
+
+    function formatOversizedRecipeContext(context, maxChars = RECIPE_CONTEXT_MAX_CHARS) {
+        const text = String(context || '');
+        if (text.length <= maxChars) return text;
+        const notice = [
+            '## Context Size Notice',
+            `ACKtopus gathered ${text.length} characters, which may exceed the model context window.`,
+            'The source material below is truncated. Treat it as an index of PR metadata, concerns, and evidence to ground the prompt, not as complete PR evidence.',
+            'The target local agent must fetch any missing commits, diffs, file lists, review threads, comments, CI logs, and code details from GitHub or local git at the phase where that evidence is allowed. Preserve Phase 1 no-peek restrictions and do not infer absent implementation details from this truncated source.',
+        ].join('\n');
+        return `${notice}\n\n${truncateMiddle(text, maxChars)}`;
     }
 
     function cleanInfographicImagePrompt(text) {
@@ -6600,7 +6613,7 @@ The prompt must ask for:
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. For Phase 4, use the standalone audio-guide handoff contract: enough context for an external audio-enabled LLM with no local repository access, GitHub links for further lookup, PR-comment-derived hard-part coverage, and no raw patch/comment dump. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, and satisfies the requested output format.',
+                        'Now write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. If the supplied PR context is truncated or incomplete because the PR is too large, the generated prompt must tell the target agent to treat the source as an index, fetch missing commits, diffs, comments, and code details from GitHub/local git only at the phase where that evidence is allowed, preserve the Phase 1 no-peek rules, and mark missing evidence instead of guessing. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. For Phase 4, use the standalone audio-guide handoff contract: enough context for an external audio-enabled LLM with no local repository access, GitHub links for further lookup, PR-comment-derived hard-part coverage, and no raw patch/comment dump. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, handles truncated/incomplete source context, and satisfies the requested output format.',
                 },
                 audio_walkthrough: {
                     label: 'Audio guide',
@@ -17619,29 +17632,39 @@ RULES:
         if (commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
 
         // Try API first via GM_xmlhttpRequest (bypasses CSP)
-        const apiResult = await new Promise((resolve) => {
-            const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100`;
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url,
-                headers: ghApiHeaders(),
-                onload: (r) => {
-                    if (r.status >= 200 && r.status < 300) {
-                        try {
-                            resolve(JSON.parse(r.responseText));
-                            return;
-                        } catch {}
-                    }
-                    console.warn(`ACKtopus: commits API returned ${r.status}, falling back to HTML scrape`);
-                    resolve(null);
-                },
-                onerror: () => {
-                    resolve(null);
-                },
+        const apiResult = [];
+        let apiFailed = false;
+        for (let pageNum = 1; pageNum <= 20; pageNum++) {
+            const batch = await new Promise((resolve) => {
+                const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100&page=${pageNum}`;
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    headers: ghApiHeaders(),
+                    onload: (r) => {
+                        if (r.status >= 200 && r.status < 300) {
+                            try {
+                                resolve(JSON.parse(r.responseText));
+                                return;
+                            } catch {}
+                        }
+                        console.warn(`ACKtopus: commits API returned ${r.status}, falling back to HTML scrape`);
+                        resolve(null);
+                    },
+                    onerror: () => {
+                        resolve(null);
+                    },
+                });
             });
-        });
+            if (!Array.isArray(batch)) {
+                apiFailed = true;
+                break;
+            }
+            apiResult.push(...batch);
+            if (batch.length < 100) break;
+        }
 
-        if (apiResult?.length) {
+        if (apiResult.length && !apiFailed) {
             commitListCache.set(cacheKey, apiResult);
             return apiResult;
         }
@@ -18422,7 +18445,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.57
+// @version      1.58
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26230,6 +26253,7 @@ RULES:
         ackAssert(fn.includes('## Comments'), 'includes comments section');
         ackAssert(fn.includes('gatherVisibleComments'), 'uses gatherVisibleComments');
         ackAssert(fn.includes('fetchPatch(pr)'), 'fetches .patch');
+        ackAssert(fn.includes('fetchCommitList(pr.owner, pr.repo, pr.pr)'), 'uses paginated commit helper');
         ackAssert(fn.includes('onProgress'), 'calls progress callback');
         ackAssert(fn.includes('includePatch'), 'respects includePatch option');
     });
@@ -27037,9 +27061,12 @@ RULES:
         const source = _ackSource;
         const commitListFn = source.slice(
             source.indexOf('async function fetchCommitList'),
-            source.indexOf('async function fetchCommitList') + 800,
+            source.indexOf('async function fetchCommitList') + 1400,
         );
         ackAssert(commitListFn.includes('ghApiHeaders()'), 'fetchCommitList uses ghApiHeaders');
+        ackAssert(commitListFn.includes('pageNum <= 20'), 'fetchCommitList paginates large PR commit lists');
+        ackAssert(commitListFn.includes('page=${pageNum}'), 'fetchCommitList requests explicit API pages');
+        ackAssert(commitListFn.includes('apiResult.push(...batch)'), 'fetchCommitList appends each API page');
         const fileCatFn = source.slice(
             source.indexOf('async function fetchPRFileCategories'),
             source.indexOf('async function fetchPRFileCategories') + 600,
@@ -28818,6 +28845,10 @@ RULES:
         ackAssert(prompt.includes('standalone audio-guide handoff contract'), 'uses standalone audio guide contract');
         ackAssert(prompt.includes('internet/GitHub access'), 'audio guide assumes online access');
         ackAssert(prompt.includes('no local repository access'), 'audio guide assumes no local repo');
+        ackAssert(prompt.includes('context window'), 'handles context-window overflow');
+        ackAssert(prompt.includes('source as an index'), 'treats truncated context as an index');
+        ackAssert(prompt.includes('missing commits, diffs, review threads'), 'requires fetching missing source data');
+        ackAssert(prompt.includes('phase where that evidence is allowed'), 'keeps source retrieval behind gates');
         ackAssert(prompt.includes(AUDIO_GUIDE_READY_GATE), 'reproducer audio phase keeps final OK-only gate');
     });
 
@@ -28839,6 +28870,7 @@ RULES:
         ackAssert(prompt.includes('different valid design'), 'leaves room for alternate design');
         ackAssert(prompt.includes('corrected target behavior'), 'uses corrected behavior from review comments');
         ackAssert(prompt.includes('must mark missing evidence instead of guessing'), 'prevents hallucinated claims');
+        ackAssert(prompt.includes('preserve Phase 1 no-peek restrictions'), 'keeps retrieval plan no-peek safe');
     });
 
     ackTest('reimplementation user prompt generates the inspectable reproducer prompt', () => {
@@ -28881,6 +28913,10 @@ RULES:
         ackAssert(fn.includes('changed files'), 'forbids changed-file leakage');
         ackAssert(fn.includes('concrete helpers'), 'forbids helper leakage');
         ackAssert(fn.includes('patch shape'), 'forbids patch-shape leakage');
+        ackAssert(fn.includes('truncated or incomplete'), 'requires oversized-context fallback');
+        ackAssert(fn.includes('treat the source as an index'), 'uses source as an index for huge PRs');
+        ackAssert(fn.includes('fetch missing commits, diffs, comments'), 'fetches missing evidence when allowed');
+        ackAssert(fn.includes('mark missing evidence instead of guessing'), 'forbids guessing around omitted source');
         ackAssert(fn.includes('split ordinal commit-message prefixes'), 'requires ordinal prefixes');
         ackAssert(fn.includes('GitHub URL evidence requirements'), 'requires GitHub URL evidence');
         ackAssert(
@@ -28933,6 +28969,21 @@ RULES:
         ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
         ackAssert(fn.includes('includePatch: true'), 'recipe context keeps raw patch details');
         ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
+        ackAssert(fn.includes('formatOversizedRecipeContext'), 'bounds oversized recipe context');
+        ackAssert(fn.includes('RECIPE_CONTEXT_MAX_CHARS'), 'uses recipe context limit');
+    });
+
+    ackTest('oversized recipe context is marked as truncated source index', () => {
+        const small = 'short context';
+        ackEq(formatOversizedRecipeContext(small, 100), small, 'small context is unchanged');
+        const large = 'a'.repeat(140);
+        const formatted = formatOversizedRecipeContext(large, 80);
+        ackAssert(formatted.includes('## Context Size Notice'), 'adds context size notice');
+        ackAssert(formatted.includes('truncated'), 'marks truncation');
+        ackAssert(formatted.includes('index of PR metadata'), 'describes source as index');
+        ackAssert(formatted.includes('fetch any missing commits, diffs'), 'requires missing source retrieval');
+        ackAssert(formatted.includes('Preserve Phase 1 no-peek restrictions'), 'keeps no-peek gate');
+        ackAssert(formatted.includes('[TRUNCATED'), 'uses middle truncation marker');
     });
 
     ackTest('reimplementation output format includes all reproducer phases', () => {
@@ -29856,9 +29907,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.57', () => {
+    ackTest('version bumped to 1.58', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.57' || _ackSource.includes('@version      1.57'), 'version is 1.57');
+        ackAssert(versionFromMeta === '1.58' || _ackSource.includes('@version      1.58'), 'version is 1.58');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
