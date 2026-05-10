@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.58
+// @version      1.59
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -318,6 +318,14 @@
             label: 'git fetch & switch',
             tip: 'Copy command to fetch and checkout this PR locally',
             fmt: (sha, pr) => `git fetch origin ${sha} && git switch --detach FETCH_HEAD`,
+        },
+        {
+            key: 'hashes',
+            hotkey: 'h',
+            emoji: '🔢',
+            label: 'commit hashes',
+            tip: 'Copy all PR commit hashes, oldest first, separated by spaces',
+            fmt: (_sha, _pr) => null,
         },
         {
             key: 'parent',
@@ -1003,6 +1011,16 @@
         return `git fetch origin ${baseSha} && git switch --detach FETCH_HEAD`;
     }
 
+    function commitHashFromEntry(commit) {
+        return String(commit?.sha || commit?.oid || '').trim();
+    }
+
+    async function getPRCommitHashesClipboardText(pr) {
+        if (!pr) return '';
+        const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+        return commits.map(commitHashFromEntry).filter(Boolean).join(' ');
+    }
+
     // Single authoritative textarea setter -- React-compatible via native property
     // descriptor. All code that writes to a textarea value MUST use this helper
     // (or insertIntoTextarea which calls it) to avoid React state desync.
@@ -1176,30 +1194,6 @@
     async function copySHA(mainBtn, updateMainLabel) {
         const pr = parsePR();
         const fmt = getFormat();
-        if (fmt.key === 'parent' && pr) {
-            const text = await getParentCheckoutCommand(pr);
-            if (text) {
-                GM_setClipboard(text);
-                mainBtn.innerHTML = `${CHECK_ICON}`;
-                ackSetTimeout(() => updateMainLabel(), 1500);
-                return;
-            }
-        }
-        const immediateSha = getImmediatePRHeadSHA();
-        if (immediateSha && pr) {
-            const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
-            if (compareFmt && userAckSha && userAckSha.length < 40) {
-                userAckSha = await resolveFullCommitSha(pr, userAckSha);
-            }
-            const text = fmt.fmt(immediateSha, pr);
-            if (text) {
-                GM_setClipboard(text);
-                mainBtn.innerHTML = `${CHECK_ICON}`;
-                ackSetTimeout(() => updateMainLabel(), 1500);
-                return;
-            }
-        }
-
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation((frame) => {
@@ -1207,22 +1201,36 @@
         });
         await waitForNextPaint();
         try {
-            const sha = await fetchSHA();
-            const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
-            if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
-                userAckSha = await resolveFullCommitSha(pr, userAckSha);
+            let text = null;
+            if (fmt.key === 'parent' && pr) {
+                text = await getParentCheckoutCommand(pr);
+            } else if (fmt.key === 'hashes' && pr) {
+                text = await getPRCommitHashesClipboardText(pr);
+            } else {
+                const immediateSha = getImmediatePRHeadSHA();
+                const sha = immediateSha || (await fetchSHA());
+                const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
+                if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
+                    userAckSha = await resolveFullCommitSha(pr, userAckSha);
+                }
+                text = sha && pr ? fmt.fmt(sha, pr) : null;
             }
-            const text = sha && pr ? fmt.fmt(sha, pr) : null;
             stopSpin();
             if (text) {
                 // Clipboard-only: never auto-insert into any active text field.
                 GM_setClipboard(text);
                 mainBtn.innerHTML = `${CHECK_ICON}`;
-            } else if (getFormat().key === 'rdiff') {
+            } else if (fmt.key === 'rdiff') {
                 mainBtn.textContent = '✗ no force-push';
+            } else if (fmt.key === 'hashes') {
+                mainBtn.textContent = '✗ no commits';
             } else {
                 mainBtn.textContent = '✗ not found';
             }
+        } catch (e) {
+            stopSpin();
+            mainBtn.textContent = '✗ error';
+            console.error('ACKtopus: copy SHA format failed:', e);
         } finally {
             ackSetTimeout(() => {
                 delete mainBtn.dataset.ackCopyBusy;
@@ -18445,7 +18453,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.58
+// @version      1.59
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -18722,6 +18730,7 @@ RULES:
         const keys = SHA_FORMATS.map((f) => f.key);
         ackAssert(keys.includes('ack'), 'missing ack');
         ackAssert(keys.includes('fetch'), 'missing fetch');
+        ackAssert(keys.includes('hashes'), 'missing hashes');
         ackAssert(keys.includes('parent'), 'missing parent');
         ackAssert(keys.includes('ghco'), 'missing ghco');
         ackAssert(keys.includes('rdiff'), 'missing rdiff');
@@ -18741,6 +18750,25 @@ RULES:
         const fetch = SHA_FORMATS.find((f) => f.key === 'fetch');
         const result = fetch.fmt('abc123', {});
         ackEq(result, 'git fetch origin abc123 && git switch --detach FETCH_HEAD');
+    });
+
+    ackTest('commit hashes helper preserves PR commit order', async () => {
+        const origFetchCommitList = fetchCommitList;
+        fetchCommitList = async () => [
+            { sha: '1111111111111111111111111111111111111111' },
+            { oid: '2222222222222222222222222222222222222222' },
+            { sha: '3333333333333333333333333333333333333333' },
+        ];
+        try {
+            const text = await getPRCommitHashesClipboardText({ owner: 'bitcoin', repo: 'bitcoin', pr: '1' });
+            ackEq(
+                text,
+                '1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333',
+                'hashes are space-separated oldest first',
+            );
+        } finally {
+            fetchCommitList = origFetchCommitList;
+        }
     });
 
     ackTest('ghco format includes PR URL and rebase', () => {
@@ -19700,6 +19728,23 @@ RULES:
         ackAssert(!fn.includes('execCommand('), 'does not use execCommand for insertion');
     });
 
+    ackTest('commit hashes copy format lives in SHA clipboard group', () => {
+        const source = _ackSource;
+        const helper = source.slice(
+            source.indexOf('async function getPRCommitHashesClipboardText'),
+            source.indexOf('async function copySHA'),
+        );
+        ackAssert(helper.includes('fetchCommitList(pr.owner, pr.repo, pr.pr)'), 'fetches PR commit list');
+        ackAssert(helper.includes('map(commitHashFromEntry).filter(Boolean).join'), 'joins hashes with spaces');
+        const copyFn = source.slice(source.indexOf('async function copySHA'), source.indexOf('function buildSHAGroup'));
+        ackAssert(copyFn.includes("fmt.key === 'hashes'"), 'copySHA handles hashes format');
+        ackAssert(copyFn.includes('getPRCommitHashesClipboardText(pr)'), 'copySHA uses hash-list helper');
+        ackAssert(copyFn.includes('GM_setClipboard(text)'), 'writes hashes to clipboard');
+        ackAssert(SHA_FORMATS.some((f) => f.key === 'hashes'), 'hashes appears in SHA_FORMATS dropdown');
+        ackAssert(!source.includes('buildCommit' + 'HashesButton'), 'does not add a separate hashes toolbar button');
+        ackAssert(!source.includes('copyCommit' + 'Hashes'), 'does not keep separate hashes copy path');
+    });
+
     ackTest('buildSHAGroup has no textarea-insertion mode (no focus listeners, no paste icon)', () => {
         const source = _ackSource;
         const start = source.indexOf('function buildSHAGroup');
@@ -20095,17 +20140,18 @@ RULES:
     // SHA_FORMATS -- all formats
     // ============================================================================
 
-    ackTest('SHA_FORMATS has exactly 14 formats', () => {
-        ackEq(SHA_FORMATS.length, 14);
+    ackTest('SHA_FORMATS has exactly 15 formats', () => {
+        ackEq(SHA_FORMATS.length, 15);
     });
 
     ackTest(
-        'SHA_FORMATS keys are ack, fetch, parent, ghco, rdiff, rebasediff, pushrdiff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu',
+        'SHA_FORMATS keys are ack, fetch, hashes, parent, ghco, rdiff, rebasediff, pushrdiff, bench, test, fuzz, functional, formatdiff, tidydiff, iwyu',
         () => {
             const keys = SHA_FORMATS.map((f) => f.key);
             ackDeepEq(keys, [
                 'ack',
                 'fetch',
+                'hashes',
                 'parent',
                 'ghco',
                 'rdiff',
@@ -29907,9 +29953,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.58', () => {
+    ackTest('version bumped to 1.59', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.58' || _ackSource.includes('@version      1.58'), 'version is 1.58');
+        ackAssert(versionFromMeta === '1.59' || _ackSource.includes('@version      1.59'), 'version is 1.59');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
