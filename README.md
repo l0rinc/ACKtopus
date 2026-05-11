@@ -196,7 +196,7 @@ The infographic flow first asks OpenAI to distill the source into a semantic-com
 
 The **main PR description lightbulb** is treated specially: after generating the high-level overview, it also precomputes commit lightbulb caches (commits view + single-commit view) using richer PR context (including discussion/replies), so those views can open their lightbulb panels immediately from cache.
 
-When GitHub fails to resolve an old review-comment permalink like `#discussion_r...` on the PR conversation page, ACKtopus detects the missing hash target and opens the corresponding Changes-tab anchor (`/changes#r...`) so the inline diff path can reveal the comment.
+When GitHub fails to resolve an old review-comment permalink like `#discussion_r...` on a large PR conversation page, ACKtopus keeps the conversation view open, expands hidden/resolved/collapsed sections, and scrolls to the comment once GitHub renders it.
 
 ### ☑️ Queue
 

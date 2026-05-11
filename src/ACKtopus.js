@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.63
+// @version      1.64
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2211,23 +2211,11 @@
 
     let reviewCommentHashNavigationKey = '';
     let reviewCommentHashNavigationTimer = null;
+    let reviewCommentHashRevealActive = false;
 
     function reviewCommentDiscussionHashId(hash = location.hash) {
         const match = String(hash || '').match(/^#discussion_r(\d+)$/);
         return match ? match[1] : '';
-    }
-
-    function reviewCommentChangesHash(id) {
-        return `#r${id}`;
-    }
-
-    function buildReviewCommentChangesUrl(pr, id) {
-        return `/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes${reviewCommentChangesHash(id)}`;
-    }
-
-    function isPRChangesOrFilesPath(pathname, pr) {
-        const prefix = `/${pr.owner}/${pr.repo}/pull/${pr.pr}/`;
-        return pathname === `${prefix}changes` || pathname === `${prefix}files`;
     }
 
     function findReviewCommentHashTarget(id) {
@@ -2250,11 +2238,41 @@
     function navigateToReviewCommentHashTarget(id) {
         const target =
             navigateToFragment(`${location.pathname}${location.search}#discussion_r${id}`) ||
-            navigateToFragment(`${location.pathname}${location.search}${reviewCommentChangesHash(id)}`) ||
             findReviewCommentHashTarget(id);
         if (!target) return null;
         scrollToAndHighlight(target);
         return target;
+    }
+
+    function getReviewCommentRevealState() {
+        const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+        const resolved = getCollapsedResolved();
+        return {
+            paginationBtns,
+            minimized,
+            outdated,
+            loadDiffs,
+            resolved,
+            total: paginationBtns.length + minimized.length + outdated.length + loadDiffs.length + resolved.length,
+        };
+    }
+
+    function openReviewCommentRevealState(state) {
+        state.paginationBtns.forEach((b) => b.click());
+        state.resolved.forEach((item) => item.click());
+        state.minimized.forEach((h) => h.click());
+        state.outdated.forEach((d) => d.setAttribute('open', ''));
+        state.loadDiffs.forEach((b) => b.click());
+    }
+
+    function scrollToReviewCommentRevealWork(state) {
+        const target =
+            state.paginationBtns[0] ||
+            state.resolved[0]?.el ||
+            state.minimized[0] ||
+            state.outdated[0] ||
+            state.loadDiffs[0];
+        target?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
     }
 
     async function handleReviewCommentHashNavigation(reason = '') {
@@ -2267,28 +2285,45 @@
         if (reviewCommentHashNavigationKey === key) return false;
         reviewCommentHashNavigationKey = key;
 
+        let popup = null;
+        reviewCommentHashRevealActive = true;
         try {
             const startedAt = location.href;
-            for (let attempt = 0; attempt < 8; attempt++) {
+            for (let attempt = 0; attempt < 80; attempt++) {
                 if (location.href !== startedAt) return false;
                 const target = navigateToReviewCommentHashTarget(id);
-                if (target) return true;
-                if (await ackSleep(250)) return false;
+                if (target) {
+                    if (popup) popup.textContent = 'Opened linked review comment';
+                    if (popup) setTimeout(() => popup.remove(), 1200);
+                    return true;
+                }
+
+                const state = getReviewCommentRevealState();
+                if (state.total === 0) {
+                    if (!popup) popup = makeStatusPopup('Waiting for GitHub to render linked review comment...');
+                    popup.textContent = 'Waiting for GitHub to render linked review comment...';
+                    if (await ackSleep(500)) return false;
+                    continue;
+                }
+
+                if (!popup) popup = makeStatusPopup('Opening collapsed sections to find linked review comment...');
+                popup.textContent = `Opening collapsed sections to find linked review comment... ${state.total} remaining`;
+                if (attempt === 0 || attempt % 4 === 0) scrollToReviewCommentRevealWork(state);
+                openReviewCommentRevealState(state);
+                if (await ackSleep(state.paginationBtns.length > 0 ? 1800 : 700)) return false;
             }
 
-            if (location.href !== startedAt) return false;
-            const nextHash = reviewCommentChangesHash(id);
-            if (isPRChangesOrFilesPath(location.pathname, pr)) {
-                console.log(`ACKtopus: rewriting stale review-comment hash after ${reason || 'navigation'}: ${nextHash}`);
-                location.hash = nextHash;
-                return true;
-            }
-
-            const nextUrl = buildReviewCommentChangesUrl(pr, id);
-            console.log(`ACKtopus: opening review-comment changes path after ${reason || 'navigation'}: ${nextUrl}`);
-            location.assign(nextUrl);
-            return true;
+            if (popup) popup.textContent = 'Could not find linked review comment after opening collapsed sections';
+            if (popup) setTimeout(() => popup.remove(), 2500);
+            console.warn(`ACKtopus: could not find review-comment hash target after ${reason || 'navigation'}: #discussion_r${id}`);
+            return false;
         } finally {
+            reviewCommentHashRevealActive = false;
+            if (popup?.isConnected) {
+                setTimeout(() => {
+                    if (popup?.isConnected) popup.remove();
+                }, 2500);
+            }
             ackSetTimeout(() => {
                 if (reviewCommentHashNavigationKey === key) reviewCommentHashNavigationKey = '';
             }, 5000);
@@ -2302,6 +2337,26 @@
             reviewCommentHashNavigationTimer = null;
             void handleReviewCommentHashNavigation(reason);
         }, 500);
+    }
+
+    function shouldSuppressHiddenConversationRefresh() {
+        return reviewCommentHashRevealActive || !!reviewCommentDiscussionHashId();
+    }
+
+    function schedulePostHashRevealToolbarRefresh(reason = 'hidden-conversations') {
+        ackSetTimeout(() => {
+            if (shouldSuppressHiddenConversationRefresh()) return;
+            refreshToolbarForLiveUpdate(reason);
+        }, 1500);
+    }
+
+    function resetReviewCommentHashNavigation() {
+        reviewCommentHashNavigationKey = '';
+        reviewCommentHashRevealActive = false;
+        if (reviewCommentHashNavigationTimer) {
+            ackClearTimeout(reviewCommentHashNavigationTimer);
+            reviewCommentHashNavigationTimer = null;
+        }
     }
 
     function findUserAcks(username) {
@@ -10962,7 +11017,11 @@ Rules:
                     ),
                 );
             if (hiddenLoadersChanged) {
-                refreshToolbarForLiveUpdate('hidden-conversations');
+                if (shouldSuppressHiddenConversationRefresh()) {
+                    schedulePostHashRevealToolbarRefresh('hidden-conversations');
+                } else {
+                    refreshToolbarForLiveUpdate('hidden-conversations');
+                }
                 return;
             }
             if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
@@ -18490,6 +18549,7 @@ RULES:
                 invalidatePRContext();
                 resetCommentNav();
                 resetCompareFileNav();
+                resetReviewCommentHashNavigation();
             }
             inject();
             normalizeUnreadTimelineUrls();
@@ -18508,6 +18568,7 @@ RULES:
             lastForcePushRange = null;
             lastForcePushSignature = '';
             clearCommitPatchCache();
+            resetReviewCommentHashNavigation();
             lastInjectedPR = null;
             lastInjectedPath = null;
         }
@@ -18744,7 +18805,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.63
+// @version      1.64
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -21470,31 +21531,22 @@ RULES:
         ackEq(hash, '#issuecomment-123', 'hash extracted correctly');
     });
 
-    ackTest('review comment hash fallback maps discussion anchors to changes anchors', () => {
-        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '31212' };
+    ackTest('review comment hash navigation expands conversation content in place', () => {
         ackEq(reviewCommentDiscussionHashId('#discussion_r1854105033'), '1854105033');
         ackEq(reviewCommentDiscussionHashId('#r1854105033'), '');
-        ackEq(reviewCommentChangesHash('1854105033'), '#r1854105033');
-        ackEq(
-            buildReviewCommentChangesUrl(pr, '1854105033'),
-            '/bitcoin/bitcoin/pull/31212/changes#r1854105033',
-        );
-        ackAssert(isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212/changes', pr), 'changes path detected');
-        ackAssert(isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212/files', pr), 'files path detected');
-        ackAssert(!isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212', pr), 'conversation path is not changes/files');
-    });
-
-    ackTest('review comment hash fallback is wired into URL navigation', () => {
         const source = _ackSource;
         const helper = source.slice(
             source.indexOf('async function handleReviewCommentHashNavigation'),
             source.indexOf('\n    function findUserAcks'),
         );
-        ackAssert(helper.includes('buildReviewCommentChangesUrl(pr, id)'), 'opens changes anchor fallback');
-        ackAssert(helper.includes('location.assign(nextUrl)'), 'uses browser navigation for missing discussion anchors');
+        ackAssert(helper.includes('getReviewCommentRevealState()'), 'uses local reveal state');
+        ackAssert(helper.includes('openReviewCommentRevealState(state)'), 'opens collapsed content in the current view');
+        ackAssert(!helper.includes('location.assign'), 'does not switch to the changes/files view');
+        ackAssert(!helper.includes('buildReviewCommentChangesUrl'), 'does not build a redirect URL');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('initial load')"), 'runs on initial load');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('hashchange')"), 'runs on hash changes');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
+        ackAssert(source.includes('shouldSuppressHiddenConversationRefresh()'), 'suppresses toolbar refresh churn during hash reveal');
     });
 
     // ============================================================================
@@ -30363,9 +30415,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.63', () => {
+    ackTest('version bumped to 1.64', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.63' || _ackSource.includes('@version      1.63'), 'version is 1.63');
+        ackAssert(versionFromMeta === '1.64' || _ackSource.includes('@version      1.64'), 'version is 1.64');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -31795,13 +31847,13 @@ RULES:
         scrollToAndHighlight,
         linkifyRefs,
         reviewCommentDiscussionHashId,
-        reviewCommentChangesHash,
-        buildReviewCommentChangesUrl,
-        isPRChangesOrFilesPath,
         findReviewCommentHashTarget,
         navigateToReviewCommentHashTarget,
+        getReviewCommentRevealState,
+        openReviewCommentRevealState,
         handleReviewCommentHashNavigation,
         scheduleReviewCommentHashNavigation,
+        shouldSuppressHiddenConversationRefresh,
         waitForEl,
         clickWithRetry,
         waitForElement,
