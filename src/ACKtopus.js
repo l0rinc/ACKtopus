@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.64
+// @version      1.65
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2343,13 +2343,6 @@
         return reviewCommentHashRevealActive || !!reviewCommentDiscussionHashId();
     }
 
-    function schedulePostHashRevealToolbarRefresh(reason = 'hidden-conversations') {
-        ackSetTimeout(() => {
-            if (shouldSuppressHiddenConversationRefresh()) return;
-            refreshToolbarForLiveUpdate(reason);
-        }, 1500);
-    }
-
     function resetReviewCommentHashNavigation() {
         reviewCommentHashNavigationKey = '';
         reviewCommentHashRevealActive = false;
@@ -3438,13 +3431,13 @@
         openai: 'gpt-5.5',
     };
     const OPENAI_IMAGE_MODEL = 'gpt-image-2';
-    const OPENAI_IMAGE_SIZE = '1536x1024';
+    const OPENAI_IMAGE_SIZE = '2048x1152';
     const OPENAI_IMAGE_QUALITY = 'high';
     const OPENAI_IMAGE_FORMAT = 'png';
     const OPENAI_IMAGE_BACKGROUND = 'opaque';
     const OPENAI_IMAGE_MODERATION = 'low';
     const OPENAI_ORG_VERIFY_URL = 'https://platform.openai.com/settings/organization/general';
-    const PR_INFOGRAPHIC_PROMPT_VERSION = 6;
+    const PR_INFOGRAPHIC_PROMPT_VERSION = 7;
 
     function getHighContextModelOverride(provider) {
         if (provider === 'claude') return LLM_MODELS.claude_high_context;
@@ -3600,13 +3593,13 @@ INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performan
         reimplementation: `Write one self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
 # Goal
-Produce a prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reinvent a local implementation, add focused tests where appropriate, commit the result locally, and stop before seeing any submitted implementation.
+Produce a local reproducer prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reinvent a local implementation, add focused tests where appropriate, commit the result locally, and stop before seeing any submitted implementation.
 
 # Success criteria
 - The generated prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, review-comment concerns, and validation evidence.
 - The generated prompt is an abstract issue, not an implementation recipe. It must let the target agent discover the design from the repository.
 - The target agent must not inspect the PR branch, PR patch, files tab, changed-file list, submitted implementation, or PR-specific changed files until the user explicitly approves a later comparison prompt.
-- The generated prompt must not include existing code, patch snippets, code blocks, commit lists, commit messages, concrete helper names, concrete changed-file lists, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, or implementation-shaped fix verbs unless a detail is strictly required to define externally visible behavior.
+- The generated prompt must not include existing code, patch snippets, code blocks, commit lists, commit messages, concrete helpers, concrete helper names, concrete changed-file lists, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, or implementation-shaped fix verbs unless a detail is strictly required to define externally visible behavior.
 - Review comments are only evidence for desired behavior, risks, failures, and validation needs. If a comment reveals a flaw, describe the corrected target behavior, not the submitted code shape.
 - The target artifact is a coherent local branch with reviewable commits, focused tests or clear verification evidence, an explanation of the independently chosen design, and explicit uncertainty.
 - The target agent must stop after the local result is coherent and ask the user before inspecting, splitting, rebasing, or comparing against the actual PR.
@@ -3697,7 +3690,7 @@ A short checklist that verifies split/squash equivalence, grounded GitHub URLs, 
         audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
 
 # Goal
-Produce a prompt for a local coding agent that has the project checked out. That local agent must do the investigation itself and produce a ready-to-use audio-guide handoff document for a simpler external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
+Produce a prompt for a local coding agent that has the project checked out. That local agent must do the investigation itself and produce a ready-to-use audio-guide handoff document for a clean external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
 
 # Success criteria
 - The prompt tells the target agent that the current changes represent a PR the user is reviewing.
@@ -6479,7 +6472,7 @@ Goal: create text-first semantic compression for the supplied ${scopeLabel}. The
 Rules:
 - Ground every claim in the supplied context. If the purpose, flow, risk, or test story is unclear, keep the label generic or omit it.
 - Before describing layout, identify the single overall concept the image should communicate. The concept should explain the ${scopeLabel}'s main idea, not list files or commits.
-- Include technical details at a high level: name the important mechanism, state/data flow, invariant, API boundary, performance claim, compatibility concern, or test signal when the source supports it.
+- Include key technical details at a high level: name the important mechanism, state/data flow, invariant, API boundary, performance claim, compatibility concern, or test signal when the source supports it.
 - Classify the best visual grammar before describing the scene: threshold curve, sequence diagram, ownership/dependency map, before/after data path, state machine, benchmark/evidence plot, or scenario matrix.
 - Use PR cover-card framing for a full PR and commit review-card framing for a commit. Useful card fields are Problem, Change, Invariant, Blast radius, Best visual, and Test hook, but only render the fields that help the image.
 - Spend the most visual space on the most important, complicated, risky, or hard-to-explain parts. It is better to explain one difficult mechanism well than to cover every routine edit.
@@ -6519,7 +6512,7 @@ The prompt must explicitly include:
 - an "Evidence/test surface" sentence that says what the reviewer should be able to falsify or verify from the visual and supplied context.
 
 The prompt must ask for:
-- a clean 1536x1024 landscape technical visual brief,
+- a clean 2048x1152 16:9 landscape technical visual brief,
 - a one-line title,
 - ${target?.scope === 'commit' ? '2 to 3 compact visual blocks or lanes for the commit card' : '3 to 5 visual blocks or lanes for the PR cover card'},
 - a short explanation attached to each block so every image section communicates meaning instead of just shapes, emojis, or connector lines,
@@ -6935,7 +6928,7 @@ The prompt must ask for:
                     },
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write one outcome-focused no-peek local reproducer prompt for a target coding agent. The target outcome is only an independently rediscovered local implementation derived from the base tree, with focused tests or verification and a stop point asking the user whether to continue to the separate actual-PR comparison/suggestion prompt. Do not include the submitted implementation, existing code, patch snippets, code blocks, commit lists, commit messages, changed-file lists, concrete helpers, exact algorithms, control-flow shape, exact values, assertion choices, include churn, or implementation-shaped fix verbs. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, review-comment concerns, validation signals, and no-peek-safe metadata needed for the agent to discover the design itself. If supplied context is truncated or incomplete because the PR is too large, tell the target agent to treat it as an index of problem evidence, fetch only no-peek-safe missing metadata before approval, and mark missing evidence instead of guessing. Include explicit approval and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, contains no existing code or implementation details, handles truncated/incomplete source context, and satisfies the requested output format.',
+                        'Now write one outcome-focused no-peek local reproducer prompt for a target coding agent. Center the prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is only an independently rediscovered local implementation derived from the base tree, with focused tests or verification and a stop point asking the user whether to continue to the separate actual-PR comparison/suggestion prompt. Do not include the submitted implementation, existing code, patch snippets, code blocks, commit lists, commit messages, changed-file lists, concrete helpers, exact algorithms, control-flow shape, exact values, assertion choices, include churn, or implementation-shaped fix verbs. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, review-comment concerns, validation signals, and no-peek-safe metadata needed for the agent to discover the design itself. If supplied context is truncated or incomplete because the PR is too large, tell the target agent to treat it as an index of problem evidence, fetch only no-peek-safe missing metadata before approval, and mark missing evidence instead of guessing. Include explicit approval and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, contains no existing code or implementation details, handles truncated/incomplete source context, and satisfies the requested output format.',
                 },
                 suggestion_stack: {
                     label: 'Suggestions',
@@ -11017,9 +11010,7 @@ Rules:
                     ),
                 );
             if (hiddenLoadersChanged) {
-                if (shouldSuppressHiddenConversationRefresh()) {
-                    schedulePostHashRevealToolbarRefresh('hidden-conversations');
-                } else {
+                if (!shouldSuppressHiddenConversationRefresh()) {
                     refreshToolbarForLiveUpdate('hidden-conversations');
                 }
                 return;
@@ -18805,7 +18796,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.64
+// @version      1.65
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -21547,6 +21538,7 @@ RULES:
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('hashchange')"), 'runs on hash changes');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
         ackAssert(source.includes('shouldSuppressHiddenConversationRefresh()'), 'suppresses toolbar refresh churn during hash reveal');
+        ackAssert(!source.includes('schedulePostHashRevealToolbarRefresh'), 'does not schedule delayed toolbar rebuild after hash reveal');
     });
 
     // ============================================================================
@@ -23577,12 +23569,16 @@ RULES:
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('const hiddenLoadersChanged'),
-            source.indexOf('if (hiddenLoadersChanged)') + 220,
+            source.indexOf('if (ctx.onPR && hadRemovals)'),
         );
         ackAssert(fn.includes('hiddenLoadersChanged'), 'detects hidden loader mutations');
         ackAssert(
             fn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
             'refreshes toolbar when hidden conversation loaders appear',
+        );
+        ackAssert(
+            fn.includes('!shouldSuppressHiddenConversationRefresh()'),
+            'skips toolbar refresh while a review-comment hash reveal is active',
         );
     });
 
@@ -23794,17 +23790,17 @@ RULES:
     });
 
     ackTest('extractCleartextMessage correctly extracts PGP cleartext block', () => {
-        const source = _ackSource;
-        ackAssert(source.includes('function extractCleartextMessage'), 'function exists');
-        const fn = source.slice(
-            source.indexOf('function extractCleartextMessage'),
-            source.indexOf('function getCommentId'),
-        );
-        // Must find both markers
-        ackAssert(fn.includes('BEGIN PGP SIGNED MESSAGE'), 'looks for signed message begin');
-        ackAssert(fn.includes('END PGP SIGNATURE'), 'looks for signature end');
-        // Returns null when not found
-        ackAssert(fn.includes('return null'), 'returns null when markers missing');
+        const block = [
+            '-----BEGIN PGP SIGNED MESSAGE-----',
+            'Hash: SHA512',
+            '',
+            'ACK 00000000',
+            '-----BEGIN PGP SIGNATURE-----',
+            'abc',
+            '-----END PGP SIGNATURE-----',
+        ].join('\n');
+        ackEq(extractCleartextMessage(`intro\n${block}\noutro`), block, 'extracts exact cleartext block');
+        ackEq(extractCleartextMessage('ACK without signature markers'), null, 'returns null when markers missing');
     });
 
     ackTest('fetchPGPKey uses GM_xmlhttpRequest to bypass CSP, with caching', () => {
@@ -26649,7 +26645,7 @@ RULES:
         ackAssert(rendered.includes('-bench.setup([&] {'), 'keeps deleted line');
         ackAssert(rendered.includes('+bench.epochIterations(1).setup([&] {'), 'keeps added line');
         ackEq(
-            (rendered.match(/bench\\.epochIterations\\(1\\)\\.setup/g) || []).length,
+            (rendered.match(/bench\.epochIterations\(1\)\.setup/g) || []).length,
             1,
             'does not duplicate clipboard snippet text',
         );
@@ -27479,7 +27475,7 @@ RULES:
         const source = _ackSource;
         const commitListFn = source.slice(
             source.indexOf('async function fetchCommitList'),
-            source.indexOf('async function fetchCommitList') + 1400,
+            source.indexOf('async function _addFloatingCommitNavInner'),
         );
         ackAssert(commitListFn.includes('ghApiHeaders()'), 'fetchCommitList uses ghApiHeaders');
         ackAssert(commitListFn.includes('pageNum <= 20'), 'fetchCommitList paginates large PR commit lists');
@@ -29109,7 +29105,7 @@ RULES:
         ackAssert(source.includes("const OPENAI_IMAGE_FORMAT = 'png'"), 'uses lossless png output');
         ackAssert(source.includes("const OPENAI_IMAGE_BACKGROUND = 'opaque'"), 'requests supported opaque background');
         ackAssert(source.includes("const OPENAI_IMAGE_MODERATION = 'low'"), 'uses lower moderation strictness for technical prompts');
-        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 6'), 'bumps infographic cache for prompt content');
+        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 7'), 'bumps infographic cache for prompt content');
         const promptBuilder = source.slice(
             source.indexOf('async function buildInfographicImagePrompt'),
             source.indexOf('function formatLLMPromptPreview'),
@@ -30149,11 +30145,15 @@ RULES:
 
     ackTest('pseudocode instruction is exposed in config panel', () => {
         const source = _ackSource;
+        const instructionDefs = source.slice(
+            source.indexOf('const CONFIG_INSTRUCTION_DEFS'),
+            source.indexOf('const LLM_INSTRUCTION_KEYS'),
+        );
         ackAssert(
-            sourceIncludesLoose(source, "addInstruction('pseudocode'"),
+            instructionDefs.includes("key: 'pseudocode'"),
             'config panel has pseudocode instruction',
         );
-        ackAssert(source.includes('llm_instr_${active}_pseudocode'), 'getLLMConfig reads pseudocode from storage');
+        ackAssert(source.includes('llm_instr_${active}_${key}'), 'getLLMConfig reads pseudocode from storage');
     });
 
     ackTest('single commit explain uses batch lightbulb with structured output', () => {
@@ -30415,9 +30415,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.64', () => {
+    ackTest('version bumped to 1.65', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.64' || _ackSource.includes('@version      1.64'), 'version is 1.64');
+        ackAssert(versionFromMeta === '1.65' || _ackSource.includes('@version      1.65'), 'version is 1.65');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
