@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.60
+// @version      1.61
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3447,54 +3447,103 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
-        reimplementation: `Write one self-contained, outcome-focused local reproducer prompt for a coding agent.
+        reimplementation: `Write one self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
 # Goal
-Produce a prompt whose target artifact is useful PR-review evidence, not a step-by-step imitation recipe. The target agent should end with an independently rediscovered local implementation from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a self-contained audio-guide walkthrough.
+Produce a prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reinvent a local implementation, add focused tests where appropriate, commit the result locally, and stop before seeing any submitted implementation.
 
 # Success criteria
-- The prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, review-comment concerns, and validation evidence.
-- The first artifact is an abstract issue, not an implementation recipe: an independently justified implementation that satisfies the target behavior before seeing the submitted PR implementation.
-- The no-peek and approval rules are guardrails. The target agent must not inspect the PR branch, PR patch, files tab, changed-file list, or submitted implementation until the user approves moving to the comparison phase.
-- The actual-PR artifact is a reviewable split where useful: tests that pass before code changes, low-risk cleanup, high-risk behavior, refactors, code moves, and mechanical changes are separated when doing so improves reviewability.
-- Split commit messages are prefixed with their original commit ordinal, preserve author wording where possible, and explain the problem and result each commit proves.
-- The split stack has a squash-equivalence check: squashing the split PR commits should represent the original PR changes, except for later suggestion commits.
-- The comparison artifact is a small set of meaningful differences: each valid difference becomes a separate suggestion commit with a review-comment-style message, and cases where the original PR is better are reported locally instead of forced into empty commits.
-- Suggestion commit messages include GitHub code URLs that prove the claim.
-- The final audio-guide artifact follows the standalone audio-guide handoff contract: it assumes the listener's LLM has internet/GitHub access but no local repository access, uses GitHub links, avoids dumping the patch or raw comments, starts without jargon, then goes deeper through every commit and meaningful line.
-- The prompt remains usable when the pasted source context is truncated or incomplete because the PR has many commits or does not fit the context window. The target local agent must treat supplied source as an index, fetch missing commits, diffs, review threads, comments, CI logs, and file details from GitHub/local git only in the phase where that evidence is allowed, and mark missing evidence instead of guessing.
+- The generated prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, review-comment concerns, and validation evidence.
+- The generated prompt is an abstract issue, not an implementation recipe. It must let the target agent discover the design from the repository.
+- The target agent must not inspect the PR branch, PR patch, files tab, changed-file list, submitted implementation, or PR-specific changed files until the user explicitly approves a later comparison prompt.
+- The generated prompt must not include existing code, patch snippets, code blocks, commit lists, commit messages, concrete helper names, concrete changed-file lists, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, or implementation-shaped fix verbs unless a detail is strictly required to define externally visible behavior.
+- Review comments are only evidence for desired behavior, risks, failures, and validation needs. If a comment reveals a flaw, describe the corrected target behavior, not the submitted code shape.
+- The target artifact is a coherent local branch with reviewable commits, focused tests or clear verification evidence, an explanation of the independently chosen design, and explicit uncertainty.
+- The target agent must stop after the local result is coherent and ask the user before inspecting, splitting, rebasing, or comparing against the actual PR.
+- The prompt remains usable when the pasted source context is truncated or incomplete because the PR has many commits or does not fit the context window. The target local agent must treat supplied source as an index of problem evidence, fetch only no-peek-safe missing metadata, and mark missing evidence instead of guessing.
 
 # Constraints
 - Treat the provided PR context as private source material for prompt construction. Do not copy the submitted patch shape into the no-peek phase.
-- Do not leak concrete helpers, file lists, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, or implementation-shaped fix verbs into Phase 1 unless a detail is strictly required to define the externally visible target.
-- Leave room for the local agent to discover a different valid design and then compare it honestly against the PR author's design.
-- Review comments are evidence for target behavior, risks, and validation needs. If they reveal a flaw, describe the corrected target behavior rather than the flawed current implementation.
+- If the source material contains code, patch snippets, suggested-change blocks, or existing implementation details, convert them into behavior, invariant, risk, or validation language, or omit them.
+- Do not include raw patch, code excerpts, file-by-file implementation maps, commit lists, commit messages, commit-by-commit implementation recipes, or code comments from the submitted PR in the generated no-peek prompt.
+- Leave room for the local agent to discover a different valid design.
 - Require grounded claims. The local agent may use code, tests, build errors, logs, range-diffs, review comments, or GitHub URLs as evidence, but must mark missing evidence instead of guessing.
-- If ACKtopus source material says it was truncated or if commit/comment/diff coverage is incomplete, require the target agent to build a retrieval plan from the PR URL and checkout metadata. The plan must preserve Phase 1 no-peek restrictions and defer submitted-implementation retrieval until the approval gate.
+- If ACKtopus source material says it was truncated or if commit/comment coverage is incomplete, require the target agent to build a no-peek-safe retrieval plan from the PR URL and checkout metadata. It may fetch base metadata, issue text, discussion, CI logs, docs, and related public evidence, but must not fetch or inspect the submitted implementation until a later prompt.
 - Do not tell the local agent to push. Keep history changes local and ask before destructive or remote-affecting operations.
 
 Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
 
 ## Mission
-A compact description of the review outcome, PR URL/base metadata, expected artifacts, and acceptance criteria.
+A compact description of the independent local reproducer outcome, PR URL/base metadata, expected local artifacts, and acceptance criteria.
 
 ## Hard Rules
-No-peek rules, approval gates, context-window fallback rules, grounding requirements, commit hygiene, and stop rules.
+No-peek rules, code-leakage rules, approval gate, context-window fallback rules, grounding requirements, commit hygiene, and stop rules.
 
-## Phase 1 - No-Peek Reproducer
-The expected local result: an independently discovered implementation and tests that satisfy the problem, target invariants, review-derived risks, and validation evidence while avoiding implementation leakage. It should require the agent to stop for approval once this artifact is coherent.
+## No-Peek Reproducer
+The expected local result: an independently discovered implementation and tests that satisfy the high-level problem, target invariants, review-derived risks, and validation evidence while avoiding all submitted-implementation leakage.
 
-## Phase 2 - Split The Actual PR
-The expected PR-split result: a smaller reviewable stack, split by concern where useful, with original-ordinal commit-message prefixes, accurate author wording where useful, and proof that the split squashes back to the actual PR.
+## Local Commit Expectations
+How to keep the local branch reviewable: tests that document existing behavior before a refactor should come first, real reproducers should live with fixes, each commit should compile or clearly explain why it cannot, and commit messages should explain the problem and result.
 
-## Phase 3 - Rebase And Suggest
-The expected comparison result: the local implementation replayed on top of the split PR, with each meaningful remaining difference represented as an evidence-backed suggestion commit, and with better original-PR choices reported instead of manufactured commits.
+## Verification And Evidence
+The checks, tests, logs, benchmarks, or manual validation the target agent should produce, plus how to report missing evidence without guessing.
 
-## Phase 4 - Audio Guide
-The expected handover result: a verbose walkthrough for an external audio-enabled LLM with internet/GitHub access but no local repo access. Use the standalone audio-guide handoff contract: explain every commit and meaningful line progressively from first principles to deeper technical detail, sprinkle GitHub links for further lookup, cover the PR-comment-derived hard parts, and do not include the raw patch or raw comments. The audio-guide prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
+## Stop Point
+The required final report: branch name, base, head, commit list, what was implemented, why this design was chosen, exact verification, uncertainty, and a question asking whether the user is ready for the separate actual-PR comparison/suggestion prompt.
 
 ## Final Checks
-A short checklist that verifies no Phase 1 implementation leakage, approval gates, truncated/incomplete context handling, grounded claims, split/squash equivalence, suggestion commit evidence URLs, and audio-guide completeness.`,
+A short checklist that verifies no existing code or implementation details leaked into the generated prompt, no-peek rules are clear, truncated/incomplete context is handled, claims are grounded, and the stop point is explicit.`,
+        suggestion_stack: `Write one self-contained, outcome-focused follow-up prompt for a local coding agent.
+
+# Goal
+Produce a prompt for the step after the no-peek local reproducer exists and the user has approved inspecting the actual PR. The target agent should inspect the submitted PR, split the actual PR if useful, rebase or replay the local rediscovery branch on top of the actual PR, and add only meaningful review suggestions as focused local commits.
+
+# Success criteria
+- The generated prompt assumes there is already a local no-peek reproducer branch or patch.
+- The generated prompt makes clear that peeking at the actual PR is now allowed, but only for comparison and suggestion work.
+- The target agent must identify the actual PR base/head, the local reproducer base/head, and the exact branch relationship before rewriting history.
+- The actual PR should be split into smaller reviewable commits when that improves reviewability: tests that pass before code changes, low-risk cleanup, high-risk behavior, refactors, code moves, mechanical changes, and build wiring should be separated where useful.
+- Split commit messages should preserve author wording where useful, use original-ordinal prefixes such as 1.1 or 2.1, and explain the problem and result each commit proves.
+- The target agent must verify split/squash equivalence: squashing the split actual-PR commits should represent the original submitted PR before suggestion commits are added.
+- The local no-peek work should be rebased or replayed on top of the split actual PR.
+- Each meaningful remaining local difference should become one suggestion commit only when it is a valid, evidence-backed review suggestion.
+- Each suggestion commit must contain the smallest possible patch that satisfies the suggestion in the commit message.
+- Suggestion commit messages must be phrased like actual PR code review comments: concrete problem first, why it matters, smallest suggested change, and exact GitHub code/review URLs proving the claim.
+- When the original PR's solution is better, the target agent must say so locally instead of manufacturing an empty, forced, or invalid suggestion commit.
+- Low-importance but valid suggestions may remain separate; the user can filter them.
+
+# Constraints
+- Do not tell the local agent to push. Keep all history changes local.
+- Do not add broad redesigns, cleanup, or style churn that is not required by a specific suggestion.
+- Do not hide uncertainty behind confident prose. Separate evidence from inference.
+- Do not claim the PR is wrong unless the local diff, tests, logs, comments, or GitHub URLs support that claim.
+- Ask before destructive or remote-affecting operations.
+
+Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
+
+## Mission
+A compact description of the approved comparison/suggestion outcome, PR URL/base metadata, local reproducer branch requirement, expected artifacts, and acceptance criteria.
+
+## Required Inputs
+Ask for the local reproducer branch or patch if it is not obvious, plus any user-approved actual PR branch or URL.
+
+## Hard Rules
+Grounding, local-only history changes, squash-equivalence proof, smallest-possible suggestion patches, code-review-style commit messages, no forced commits, and stop rules.
+
+## Step 1 - Inspect And Split The Actual PR
+The expected actual-PR result: a smaller reviewable stack where useful, original-ordinal commit-message prefixes, accurate author wording where useful, and proof that the split squashes back to the submitted PR.
+
+## Step 2 - Rebase The Local Reproducer
+The expected comparison base: the no-peek local implementation replayed on top of the split actual PR, with exact range-diff or diff commands recorded.
+
+## Step 3 - Add Suggestion Commits
+The expected suggestion stack: one small commit per meaningful difference, with the commit patch satisfying the review-comment-style commit message and GitHub URLs proving the claim. Better original-PR choices must be reported locally instead of turned into commits.
+
+## Step 4 - Report And Stop
+The required final report: branch shape, split PR commits, suggestion commits, discarded differences, cases where the original PR was better, exact verification, and open questions for the user.
+
+## Final Checks
+A short checklist that verifies split/squash equivalence, grounded GitHub URLs, smallest-possible suggestion patches, no manufactured commits, no pushed changes, and a clean final branch report.`,
         audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
 
 # Goal
@@ -3595,12 +3644,13 @@ Return only the corrected text. If nothing needs fixing, return the original tex
         { key: 'commit', label: '🔬 Single commit annotation' },
         { key: 'pseudocode', label: '💡 Commit review aid (💡 button: pseudocode, concerns, message check)' },
         { key: 'reimplementation', label: '🧬 Reproducer recipe' },
+        { key: 'suggestion_stack', label: '🧩 Suggestion stack recipe' },
         { key: 'audio_walkthrough', label: '🎧 Audio guide recipe' },
         { key: 'maintainer_summary', label: '🧭 Maintainer summary recipe' },
         { key: 'proofread', label: '✏️ Proofread' },
     ]);
     const LLM_INSTRUCTION_KEYS = CONFIG_INSTRUCTION_DEFS.map(({ key }) => key);
-    const PROMPT_RECIPE_KEYS = new Set(['reimplementation', 'audio_walkthrough']);
+    const PROMPT_RECIPE_KEYS = new Set(['reimplementation', 'suggestion_stack', 'audio_walkthrough']);
     const ROBOT_RECIPE_ACTIONS = Object.freeze([
         {
             key: 'chat',
@@ -3612,7 +3662,13 @@ Return only the corrected text. If nothing needs fixing, return the original tex
             key: 'reimplementation',
             emoji: '🧬',
             label: 'Reproducer',
-            tip: 'Generate a gated local agent prompt for no-peek reimplementation, PR splitting, suggestions, and audio guide',
+            tip: 'Generate a no-peek local agent prompt for independent reimplementation only',
+        },
+        {
+            key: 'suggestion_stack',
+            emoji: '🧩',
+            label: 'Suggestions',
+            tip: 'Generate the follow-up prompt for PR splitting, rebase, and suggestion commits',
         },
         {
             key: 'audio_walkthrough',
@@ -5778,8 +5834,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     // opts.includePatch: include full .patch content (default true)
     // opts.includeComments: include visible comments (default true)
     // opts.includeCommits: include commit list/messages (default true)
+    // opts.includeCommentCodeContext: include nearby copied code context in comments (default true)
     async function gatherFullPRContext(onProgress = () => {}, opts = {}) {
-        const { includePatch = true, includeComments = true, includeCommits = true } = opts;
+        const {
+            includePatch = true,
+            includeComments = true,
+            includeCommits = true,
+            includeCommentCodeContext = true,
+        } = opts;
         const pr = parsePageContext();
         if (!pr) return '';
         const isIssue = pageKind() === 'issue';
@@ -5890,7 +5952,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
                         if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
                         if (c.reactions) metaLines.push(`* Reactions: ${c.reactions}`);
-                        if (c.codeContext) metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
+                        if (includeCommentCodeContext && c.codeContext)
+                            metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
                         commentParts.push(
                             [
                                 `**${c.author}**${datePart}${pendingPart}${fmtLoc(c)}${formatCommentFlags(c)}:`,
@@ -5916,7 +5979,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         const permalinks = [...new Set(thread.map((c) => c.permalink).filter(Boolean))];
                         if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
                         else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
-                        if (first.codeContext) threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
+                        if (includeCommentCodeContext && first.codeContext)
+                            threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
                         const threadLines = thread
                             .map((c) => {
                                 const datePart = c.date ? ` (${c.date})` : '';
@@ -6144,7 +6208,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.join('\n\n');
     }
 
-    async function gatherRecipeContext(onProgress = () => {}) {
+    function stripFencedBlocksForNoPeekPrompt(context) {
+        return String(context || '').replace(
+            /```[\s\S]*?```/g,
+            '[fenced source block omitted from no-peek prompt context]',
+        );
+    }
+
+    async function gatherRecipeContext(onProgress = () => {}, opts = {}) {
+        const {
+            includePatch = true,
+            includeComments = true,
+            includeCommits = true,
+            includeCommentCodeContext = true,
+            stripFencedBlocks = false,
+        } = opts;
         const pr = parsePR();
         if (!pr) return '';
         let meta = [];
@@ -6156,8 +6234,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (checkout.headRef) meta.push(`Head branch: \`${checkout.headRef}\``);
             if (checkout.prUrl) meta.push(`PR URL: \`${checkout.prUrl}\``);
         } catch (_) {}
-        const context = await gatherFullPRContext(onProgress, { includePatch: true, includeComments: true });
-        const source = meta.length ? `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}` : context;
+        const context = await gatherFullPRContext(onProgress, {
+            includePatch,
+            includeComments,
+            includeCommits,
+            includeCommentCodeContext,
+        });
+        let source = meta.length ? `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}` : context;
+        if (stripFencedBlocks) source = stripFencedBlocksForNoPeekPrompt(source);
         return formatOversizedRecipeContext(source, RECIPE_CONTEXT_MAX_CHARS);
     }
 
@@ -6176,7 +6260,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             '## Context Size Notice',
             `ACKtopus gathered ${text.length} characters, which may exceed the model context window.`,
             'The source material below is truncated. Treat it as an index of PR metadata, concerns, and evidence to ground the prompt, not as complete PR evidence.',
-            'The target local agent must fetch any missing commits, diffs, file lists, review threads, comments, CI logs, and code details from GitHub or local git at the phase where that evidence is allowed. Preserve Phase 1 no-peek restrictions and do not infer absent implementation details from this truncated source.',
+            'The target local agent must fetch any missing commits, diffs, file lists, review threads, comments, CI logs, and code details from GitHub or local git only when the generated prompt allows that evidence. Preserve no-peek restrictions for reproducer prompts and do not infer absent implementation details from this truncated source.',
         ].join('\n');
         return `${notice}\n\n${truncateMiddle(text, maxChars)}`;
     }
@@ -6661,9 +6745,26 @@ The prompt must ask for:
                     userText: 'Generate the local reproducer prompt now.',
                     sendAsConversation: false,
                     fullPRContext: true,
+                    sourceContextLabel: 'PR ISSUE SOURCE MATERIAL (PATCH AND CODE BLOCKS OMITTED)',
+                    contextOptions: {
+                        includePatch: false,
+                        includeComments: true,
+                        includeCommits: false,
+                        includeCommentCodeContext: false,
+                        stripFencedBlocks: true,
+                    },
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write one outcome-focused local reproducer prompt for a target coding agent. Center each phase on the artifact that should exist when it is done and the acceptance criteria for that artifact, not on a command script. The target outcomes are: a no-peek local implementation derived from the base tree, a reviewable split of the actual PR after approval, evidence-backed suggestion commits for meaningful differences, and a verbose audio-guide walkthrough with GitHub links. Phase 1 must stay abstract: do not hard-code current structure, changed files, concrete helpers, patch shape, exact mechanisms, or rediscoverable low-level details. Preserve only the problem, invariants, behavior surfaces, risks, review-comment concerns, and validation signals needed for the agent to discover the design itself. If the supplied PR context is truncated or incomplete because the PR is too large, the generated prompt must tell the target agent to treat the source as an index, fetch missing commits, diffs, comments, and code details from GitHub/local git only at the phase where that evidence is allowed, preserve the Phase 1 no-peek rules, and mark missing evidence instead of guessing. Include explicit approval gates as guardrails, plus squash-equivalence checks, split ordinal commit-message prefixes, GitHub URL evidence requirements, and stop rules. For Phase 4, use the standalone audio-guide handoff contract: enough context for an external audio-enabled LLM with no local repository access, GitHub links for further lookup, PR-comment-derived hard-part coverage, and no raw patch/comment dump. Before finalizing, verify that the generated prompt is grounded in the source context, does not leak implementation details into Phase 1, handles truncated/incomplete source context, and satisfies the requested output format.',
+                        'Now write one outcome-focused no-peek local reproducer prompt for a target coding agent. The target outcome is only an independently rediscovered local implementation derived from the base tree, with focused tests or verification and a stop point asking the user whether to continue to the separate actual-PR comparison/suggestion prompt. Do not include the submitted implementation, existing code, patch snippets, code blocks, commit lists, commit messages, changed-file lists, concrete helpers, exact algorithms, control-flow shape, exact values, assertion choices, include churn, or implementation-shaped fix verbs. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, review-comment concerns, validation signals, and no-peek-safe metadata needed for the agent to discover the design itself. If supplied context is truncated or incomplete because the PR is too large, tell the target agent to treat it as an index of problem evidence, fetch only no-peek-safe missing metadata before approval, and mark missing evidence instead of guessing. Include explicit approval and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, contains no existing code or implementation details, handles truncated/incomplete source context, and satisfies the requested output format.',
+                },
+                suggestion_stack: {
+                    label: 'Suggestions',
+                    userText: 'Generate the suggestion-stack prompt now.',
+                    sendAsConversation: false,
+                    fullPRContext: true,
+                    promptDetailsTitle: 'Generated suggestion-stack prompt',
+                    finalTask:
+                        'Now write one outcome-focused follow-up prompt for a target local coding agent. This prompt is for after the no-peek local reproducer exists and the user has approved inspecting the actual PR. The target agent should inspect the submitted PR, split the actual PR into reviewable commits where useful, prove split/squash equivalence, rebase or replay the local rediscovery work on top of the split PR, and add only meaningful differences as local suggestion commits. Each suggestion commit message must be phrased like an actual PR code review comment: concrete problem first, why it matters, smallest suggested change, and exact GitHub code or review URLs proving the claim. Each suggestion commit patch must be the smallest possible change that satisfies the suggestion in the commit message. If the original PR is better, the agent should report that locally instead of manufacturing an empty, forced, or invalid commit. Before finalizing, verify that the generated prompt is grounded in the source context, asks for required branch inputs when missing, requires split/squash equivalence, requires evidence-backed GitHub URLs, and keeps all changes local.',
                 },
                 audio_walkthrough: {
                     label: 'Audio guide',
@@ -6811,7 +6912,7 @@ The prompt must ask for:
                     if (!parsePR()) throw new Error('this recipe is only available on pull request pages');
                     const fullContext = await gatherRecipeContext((msg) => {
                         setAssistantText(assistantMsg, msg);
-                    });
+                    }, recipeCfg.contextOptions || {});
                     const extraInstr = (getLLMConfig().instructions[recipe] || DEFAULT_INSTRUCTIONS[recipe]).trim();
                     const promptRecipe = isPromptRecipe(recipe);
                     // Reproducer/audio prompts are copied out for downstream agents - no [ref:N] citations.
@@ -6821,7 +6922,10 @@ The prompt must ask for:
                             ? `\n\nIMPORTANT: When you mention a specific comment or thread that still matters, cite it with [ref:N] markers so the user can navigate to it.`
                             : '';
                     const system = getRecipeSystemPrompt(recipe, extraInstr, citationInstructions);
-                    const sourceContext = wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext);
+                    const sourceContext = wrapPromptBlock(
+                        recipeCfg.sourceContextLabel || 'FULL PR CONTEXT SOURCE MATERIAL',
+                        fullContext,
+                    );
                     const userContent = `${sourceContext}\n\n${recipeCfg.finalTask}`;
                     const generatedPrompt = promptRecipe ? formatLLMPromptPreview(system, userContent) : '';
                     if (generatedPrompt) {
@@ -18495,7 +18599,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.60
+// @version      1.61
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20330,6 +20434,7 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.commits, 'has commits instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.commit, 'has commit instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.reimplementation, 'has reimplementation recipe instructions');
+        ackAssert(DEFAULT_INSTRUCTIONS.suggestion_stack, 'has suggestion stack recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.audio_walkthrough, 'has audio guide recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.maintainer_summary, 'has maintainer summary recipe instructions');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread, 'has proofread instructions');
@@ -24738,6 +24843,7 @@ RULES:
         );
         ackAssert(instructionDefs.includes("key: 'chat'"), 'instruction metadata includes chat');
         ackAssert(instructionDefs.includes("key: 'reimplementation'"), 'instruction metadata includes reimplementation');
+        ackAssert(instructionDefs.includes("key: 'suggestion_stack'"), 'instruction metadata includes suggestion stack');
         ackAssert(instructionDefs.includes("key: 'audio_walkthrough'"), 'instruction metadata includes audio guide');
         ackAssert(instructionDefs.includes("key: 'maintainer_summary'"), 'instruction metadata includes maintainer summary');
 
@@ -28760,6 +28866,8 @@ RULES:
         ackAssert(actions.includes("key: 'chat'"), 'has chat action');
         ackAssert(actions.includes("key: 'reimplementation'"), 'has reimplementation action');
         ackAssert(actions.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
+        ackAssert(actions.includes("key: 'suggestion_stack'"), 'has suggestion stack action');
+        ackAssert(actions.includes("label: 'Suggestions'"), 'suggestion stack action is labeled');
         ackAssert(actions.includes("key: 'audio_walkthrough'"), 'has audio guide action');
         ackAssert(actions.includes("label: 'Audio guide'"), 'audio guide action is labeled');
         ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
@@ -28923,6 +29031,8 @@ RULES:
         const robotActions = source.slice(source.indexOf('const ROBOT_RECIPE_ACTIONS'), source.indexOf('const SYSTEM_BASE'));
         ackAssert(fn.includes('reimplementation: {'), 'defines reimplementation recipe');
         ackAssert(robotActions.includes("label: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
+        ackAssert(fn.includes('suggestion_stack: {'), 'defines suggestion stack recipe');
+        ackAssert(robotActions.includes("label: 'Suggestions'"), 'titles suggestion stack recipe as suggestions');
         ackAssert(fn.includes('audio_walkthrough: {'), 'defines audio guide recipe');
         ackAssert(robotActions.includes("label: 'Audio guide'"), 'titles audio guide recipe');
         ackAssert(fn.includes('maintainer_summary: {'), 'defines maintainer summary recipe');
@@ -28931,7 +29041,9 @@ RULES:
             fn.includes('title.textContent = `🤖 ${getRobotRecipeTitle(recipe)}`'),
             'updates panel title for selected robot action',
         );
-        ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses full recipe context');
+        ackAssert(fn.includes('gatherRecipeContext'), 'recipe mode uses recipe context');
+        ackAssert(fn.includes('recipeCfg.contextOptions || {}'), 'recipe mode can customize source context');
+        ackAssert(fn.includes('recipeCfg.sourceContextLabel'), 'recipe mode can customize source label');
         ackAssert(fn.includes('fullPRContext: true'), 'full-context recipes opt into PR context');
         ackAssert(
             fn.includes('DEFAULT_INSTRUCTIONS[recipe]'),
@@ -28941,41 +29053,29 @@ RULES:
         ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
     });
 
-    ackTest('reimplementation prompt builds one gated local reproducer workflow', () => {
+    ackTest('reimplementation prompt builds no-peek local reproducer only', () => {
         const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
         ackAssert(prompt.includes('outcome-focused'), 'prompt is outcome-focused');
         ackAssert(prompt.includes('target artifact'), 'prompt focuses on artifacts');
         ackAssert(prompt.includes('local reproducer prompt'), 'prompt is a local reproducer prompt');
-        ackAssert(prompt.includes('independently rediscovered'), 'starts from independent rediscovery');
+        ackAssert(prompt.includes('independently rediscovered') || prompt.includes('independent PR-review evidence'), 'starts from independent rediscovery');
         ackAssert(prompt.includes('base tree'), 'starts from base tree');
         ackAssert(prompt.includes('submitted PR implementation'), 'guards submitted implementation');
-        ackAssert(prompt.includes('approval gates'), 'requires approval gates');
-        ackAssert(prompt.includes('split the actual PR'), 'includes actual PR splitting phase');
-        ackAssert(prompt.includes('tests that pass before code changes'), 'separates tests-before-code');
-        ackAssert(prompt.includes('low-risk cleanup'), 'separates low-risk cleanup');
-        ackAssert(prompt.includes('high-risk behavior'), 'separates high-risk behavior');
-        ackAssert(prompt.includes('code moves'), 'separates code moves');
-        ackAssert(prompt.includes('original commit ordinal'), 'prefixes split commits by original ordinal');
-        ackAssert(prompt.includes('squash-equivalence check'), 'requires squash equivalence');
-        ackAssert(prompt.includes('suggestion commit'), 'adds suggestion commits');
-        ackAssert(prompt.includes('GitHub code URLs'), 'requires GitHub evidence URLs');
-        ackAssert(prompt.includes('original PR is better'), 'admits when the PR is better');
-        ackAssert(prompt.includes('audio-guide walkthrough'), 'includes audio guide workflow');
-        ackAssert(prompt.includes('standalone audio-guide handoff contract'), 'uses standalone audio guide contract');
-        ackAssert(prompt.includes('internet/GitHub access'), 'audio guide assumes online access');
-        ackAssert(prompt.includes('no local repository access'), 'audio guide assumes no local repo');
+        ackAssert(prompt.includes('stop before seeing any submitted implementation'), 'stops before PR comparison');
+        ackAssert(prompt.includes('separate actual-PR comparison/suggestion prompt'), 'points to separate follow-up prompt');
         ackAssert(prompt.includes('context window'), 'handles context-window overflow');
-        ackAssert(prompt.includes('source as an index'), 'treats truncated context as an index');
-        ackAssert(prompt.includes('missing commits, diffs, review threads'), 'requires fetching missing source data');
-        ackAssert(prompt.includes('phase where that evidence is allowed'), 'keeps source retrieval behind gates');
-        ackAssert(prompt.includes(AUDIO_GUIDE_READY_GATE), 'reproducer audio phase keeps final OK-only gate');
+        ackAssert(prompt.includes('source as an index of problem evidence'), 'treats truncated context as problem index');
+        ackAssert(prompt.includes('no-peek-safe missing metadata'), 'retrieval stays no-peek safe');
+        ackAssert(!prompt.includes('## Phase 2 - Split The Actual PR'), 'does not include actual PR split phase');
+        ackAssert(!prompt.includes('## Phase 3 - Rebase And Suggest'), 'does not include rebase/suggest phase');
+        ackAssert(!prompt.includes('## Phase 4 - Audio Guide'), 'does not include audio guide phase');
     });
 
-    ackTest('reimplementation prompt keeps Phase 1 abstract and non-prescriptive', () => {
+    ackTest('reimplementation prompt keeps no-peek task abstract and non-prescriptive', () => {
         const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
         ackAssert(
             prompt.includes('abstract issue') && prompt.includes('implementation recipe'),
-            'Phase 1 is abstract',
+            'no-peek task is abstract',
         );
         ackAssert(prompt.includes('desired behavior'), 'uses desired behavior');
         ackAssert(prompt.includes('invariants'), 'uses invariants');
@@ -28986,10 +29086,16 @@ RULES:
         ackAssert(prompt.includes('replacement mechanisms'), 'forbids replacement mechanisms');
         ackAssert(prompt.includes('control-flow structure'), 'forbids control-flow structure');
         ackAssert(prompt.includes('implementation-shaped fix verbs'), 'forbids implementation-shaped verbs');
+        ackAssert(prompt.includes('existing code'), 'forbids existing code in generated prompt');
+        ackAssert(prompt.includes('patch snippets'), 'forbids patch snippets');
+        ackAssert(prompt.includes('code blocks'), 'forbids code blocks');
+        ackAssert(prompt.includes('commit lists'), 'forbids commit lists');
+        ackAssert(prompt.includes('commit messages'), 'forbids commit messages');
+        ackAssert(prompt.includes('submitted PR in the generated no-peek prompt'), 'forbids submitted PR code in output');
         ackAssert(prompt.includes('different valid design'), 'leaves room for alternate design');
         ackAssert(prompt.includes('corrected target behavior'), 'uses corrected behavior from review comments');
         ackAssert(prompt.includes('must mark missing evidence instead of guessing'), 'prevents hallucinated claims');
-        ackAssert(prompt.includes('preserve Phase 1 no-peek restrictions'), 'keeps retrieval plan no-peek safe');
+        ackAssert(prompt.includes('no-peek-safe retrieval plan'), 'keeps retrieval plan no-peek safe');
     });
 
     ackTest('reimplementation user prompt generates the inspectable reproducer prompt', () => {
@@ -29011,37 +29117,24 @@ RULES:
             fn.includes('getRecipeSystemPrompt(recipe, extraInstr, citationInstructions)'),
             'recipe prompt uses the recipe-specific system prompt',
         );
-        ackAssert(
-            fn.includes("wrapPromptBlock('FULL PR CONTEXT SOURCE MATERIAL', fullContext)"),
-            'recipe prompt wraps long source context',
-        );
+        ackAssert(fn.includes("'FULL PR CONTEXT SOURCE MATERIAL'"), 'default recipe prompt labels long source context');
+        ackAssert(fn.includes('PR ISSUE SOURCE MATERIAL (PATCH AND CODE BLOCKS OMITTED)'), 'reproducer source label warns patch omission');
+        ackAssert(fn.includes('includePatch: false'), 'reproducer omits raw patch context');
+        ackAssert(fn.includes('includeCommits: false'), 'reproducer omits commit messages');
+        ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
+        ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
-        ackAssert(fn.includes('one outcome-focused local reproducer prompt'), 'generates one combined prompt');
+        ackAssert(fn.includes('one outcome-focused no-peek local reproducer prompt'), 'generates one no-peek prompt');
         ackAssert(fn.includes('artifact') && fn.includes('acceptance criteria'), 'prompt focuses on outcomes');
-        ackAssert(fn.includes('no-peek local implementation'), 'keeps first phase no-peek');
-        ackAssert(fn.includes('reviewable split of the actual PR after approval'), 'includes split phase');
-        ackAssert(
-            fn.includes('rebase') &&
-                fn.includes('local reimplementation') &&
-                fn.includes('suggestion commits'),
-            'includes suggestion rebase',
-        );
-        ackAssert(fn.includes('verbose audio-guide walkthrough with GitHub links'), 'includes audio-guide output');
-        ackAssert(fn.includes('Phase 1 must stay abstract'), 'keeps first phase abstract');
-        ackAssert(fn.includes('do not hard-code current structure'), 'forbids current structure');
-        ackAssert(fn.includes('changed files'), 'forbids changed-file leakage');
+        ackAssert(fn.includes('independently rediscovered local implementation'), 'keeps no-peek implementation target');
+        ackAssert(fn.includes('contains no existing code or implementation details'), 'requires no existing code in output');
         ackAssert(fn.includes('concrete helpers'), 'forbids helper leakage');
-        ackAssert(fn.includes('patch shape'), 'forbids patch-shape leakage');
+        ackAssert(fn.includes('patch snippets'), 'forbids patch snippet leakage');
+        ackAssert(fn.includes('commit messages'), 'forbids commit-message leakage');
         ackAssert(fn.includes('truncated or incomplete'), 'requires oversized-context fallback');
-        ackAssert(fn.includes('treat the source as an index'), 'uses source as an index for huge PRs');
-        ackAssert(fn.includes('fetch missing commits, diffs, comments'), 'fetches missing evidence when allowed');
+        ackAssert(fn.includes('source as an index of problem evidence'), 'uses source as problem index for huge PRs');
+        ackAssert(fn.includes('no-peek-safe missing metadata'), 'fetches only safe evidence before approval');
         ackAssert(fn.includes('mark missing evidence instead of guessing'), 'forbids guessing around omitted source');
-        ackAssert(fn.includes('split ordinal commit-message prefixes'), 'requires ordinal prefixes');
-        ackAssert(fn.includes('GitHub URL evidence requirements'), 'requires GitHub URL evidence');
-        ackAssert(
-            fn.includes('does not leak implementation details into Phase 1'),
-            'requires final no-leak check',
-        );
         ackAssert(
             fn.includes('formatLLMPromptPreview(system, userContent)'),
             'reimplementation recipe builds inspectable prompt preview',
@@ -29062,6 +29155,41 @@ RULES:
             fn.includes('reasoningEffort: getHighContextReasoningEffort(provider)'),
             'reimplementation recipe uses high-context OpenAI reasoning effort',
         );
+    });
+
+    ackTest('suggestion stack prompt builds split/rebase/suggestion follow-up', () => {
+        const prompt = DEFAULT_INSTRUCTIONS.suggestion_stack;
+        ackAssert(prompt.includes('follow-up prompt'), 'prompt is a follow-up prompt');
+        ackAssert(prompt.includes('no-peek local reproducer exists'), 'assumes reproducer exists');
+        ackAssert(prompt.includes('approved inspecting the actual PR'), 'starts after approval');
+        ackAssert(prompt.includes('split the actual PR'), 'includes actual PR splitting');
+        ackAssert(prompt.includes('split/squash equivalence'), 'requires squash equivalence');
+        ackAssert(prompt.includes('original-ordinal prefixes'), 'uses original ordinal prefixes');
+        ackAssert(prompt.includes('rebase or replay'), 'rebases/replays local work');
+        ackAssert(prompt.includes('suggestion commit'), 'creates suggestion commits');
+        ackAssert(prompt.includes('actual PR code review comments'), 'messages read like code review comments');
+        ackAssert(prompt.includes('smallest possible patch'), 'keeps suggestion patches minimal');
+        ackAssert(prompt.includes('exact GitHub code/review URLs'), 'requires evidence URLs');
+        ackAssert(prompt.includes("original PR's solution is better"), 'admits when original PR is better');
+        ackAssert(prompt.includes('Do not tell the local agent to push'), 'keeps changes local');
+        ackAssert(prompt.includes('## Step 1 - Inspect And Split The Actual PR'), 'has actual PR split step');
+        ackAssert(prompt.includes('## Step 2 - Rebase The Local Reproducer'), 'has rebase step');
+        ackAssert(prompt.includes('## Step 3 - Add Suggestion Commits'), 'has suggestion step');
+        ackAssert(prompt.includes('## Step 4 - Report And Stop'), 'has report stop step');
+    });
+
+    ackTest('suggestion stack recipe generates inspectable follow-up prompt', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        ackAssert(fn.includes('Generate the suggestion-stack prompt now.'), 'suggestion recipe has trigger text');
+        ackAssert(fn.includes('Generated suggestion-stack prompt'), 'suggestion prompt details title exists');
+        ackAssert(fn.includes('after the no-peek local reproducer exists'), 'recipe assumes reproducer exists');
+        ackAssert(fn.includes('split the actual PR into reviewable commits'), 'recipe asks for PR split');
+        ackAssert(fn.includes('prove split/squash equivalence'), 'recipe asks for equivalence proof');
+        ackAssert(fn.includes('rebase or replay the local rediscovery work'), 'recipe asks for rebase/replay');
+        ackAssert(fn.includes('smallest possible change that satisfies the suggestion'), 'recipe keeps suggestion patches minimal');
+        ackAssert(fn.includes('actual PR code review comment'), 'recipe asks for review-comment-style messages');
+        ackAssert(fn.includes('exact GitHub code or review URLs'), 'recipe requires GitHub evidence URLs');
     });
 
     ackTest('recipe context includes explicit base checkout metadata', () => {
@@ -29085,11 +29213,22 @@ RULES:
             'derives base commit from the parent of the first commit',
         );
         ackAssert(helper.includes('/commits/${firstSha}'), 'falls back to commit API when the list lacks parent data');
-        ackAssert(fn.includes('gatherFullPRContext'), 'includes full PR context after metadata');
-        ackAssert(fn.includes('includePatch: true'), 'recipe context keeps raw patch details');
-        ackAssert(fn.includes('includeComments: true'), 'recipe context keeps threaded comment details');
+        ackAssert(fn.includes('gatherFullPRContext'), 'includes recipe context after metadata');
+        ackAssert(fn.includes('includePatch = true'), 'recipe context defaults to raw patch details');
+        ackAssert(fn.includes('includeComments = true'), 'recipe context defaults to threaded comment details');
+        ackAssert(fn.includes('includeCommentCodeContext'), 'recipe context can include or omit comment code context');
+        ackAssert(fn.includes('stripFencedBlocksForNoPeekPrompt'), 'recipe context can strip fenced source blocks');
         ackAssert(fn.includes('formatOversizedRecipeContext'), 'bounds oversized recipe context');
         ackAssert(fn.includes('RECIPE_CONTEXT_MAX_CHARS'), 'uses recipe context limit');
+    });
+
+    ackTest('no-peek recipe context can strip fenced source blocks', () => {
+        const input = 'intro\n```cpp\nint leaked = 1;\n```\noutro';
+        const stripped = stripFencedBlocksForNoPeekPrompt(input);
+        ackAssert(stripped.includes('intro'), 'keeps surrounding context');
+        ackAssert(stripped.includes('outro'), 'keeps trailing context');
+        ackAssert(stripped.includes('fenced source block omitted'), 'marks omitted source block');
+        ackAssert(!stripped.includes('int leaked'), 'removes fenced code content');
     });
 
     ackTest('oversized recipe context is marked as truncated source index', () => {
@@ -29101,18 +29240,18 @@ RULES:
         ackAssert(formatted.includes('truncated'), 'marks truncation');
         ackAssert(formatted.includes('index of PR metadata'), 'describes source as index');
         ackAssert(formatted.includes('fetch any missing commits, diffs'), 'requires missing source retrieval');
-        ackAssert(formatted.includes('Preserve Phase 1 no-peek restrictions'), 'keeps no-peek gate');
+        ackAssert(formatted.includes('Preserve no-peek restrictions'), 'keeps no-peek gate');
         ackAssert(formatted.includes('[TRUNCATED'), 'uses middle truncation marker');
     });
 
-    ackTest('reimplementation output format includes all reproducer phases', () => {
+    ackTest('reimplementation output format is no-peek only', () => {
         const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
         ackAssert(prompt.includes('## Mission'), 'output includes mission section');
         ackAssert(prompt.includes('## Hard Rules'), 'output includes hard rules');
-        ackAssert(prompt.includes('## Phase 1 - No-Peek Reproducer'), 'output includes no-peek reproducer phase');
-        ackAssert(prompt.includes('## Phase 2 - Split The Actual PR'), 'output includes PR split phase');
-        ackAssert(prompt.includes('## Phase 3 - Rebase And Suggest'), 'output includes rebase/suggest phase');
-        ackAssert(prompt.includes('## Phase 4 - Audio Guide'), 'output includes audio guide phase');
+        ackAssert(prompt.includes('## No-Peek Reproducer'), 'output includes no-peek reproducer section');
+        ackAssert(prompt.includes('## Local Commit Expectations'), 'output includes local commit expectations');
+        ackAssert(prompt.includes('## Verification And Evidence'), 'output includes verification section');
+        ackAssert(prompt.includes('## Stop Point'), 'output includes stop point');
         ackAssert(prompt.includes('## Final Checks'), 'output includes final checks');
     });
 
@@ -30026,9 +30165,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.60', () => {
+    ackTest('version bumped to 1.61', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.60' || _ackSource.includes('@version      1.60'), 'version is 1.60');
+        ackAssert(versionFromMeta === '1.61' || _ackSource.includes('@version      1.61'), 'version is 1.61');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
