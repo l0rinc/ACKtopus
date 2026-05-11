@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.67
+// @version      1.68
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4822,6 +4822,32 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return `llm_prompt_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${reasoningEffort || 'default'}_${hashPrompt(system + '\0' + userContent)}`;
     }
 
+    function formatErrorField(value) {
+        if (value === null || value === undefined || value === '') return '';
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+        if (value instanceof Error) return `${value.name}: ${value.message}`;
+        try {
+            const json = JSON.stringify(value);
+            return json === undefined ? String(value) : json;
+        } catch (_) {
+            return String(value);
+        }
+    }
+
+    function formatTransportErrorDetails(event) {
+        if (!event) return 'unknown transport error';
+        if (typeof event === 'string') return event;
+        const parts = [];
+        for (const field of ['status', 'statusText', 'error', 'message', 'type', 'finalUrl', 'readyState']) {
+            const value = formatErrorField(event[field]);
+            if (value) parts.push(`${field}=${value.slice(0, 200)}`);
+        }
+        const responseText = formatErrorField(event.responseText || event.response);
+        if (responseText) parts.push(`response=${responseText.slice(0, 200)}`);
+        return parts.length ? parts.join(', ') : Object.prototype.toString.call(event);
+    }
+
     // Single LLM call implementation driven by PROVIDER_API config.
     function callLLM(
         provider,
@@ -4854,13 +4880,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         console.log('user:', userContent);
         if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
         if (maxTokens) console.log('max_tokens:', maxTokens);
+        const requestBody = JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens }));
+        console.log('request_chars:', requestBody.length);
         console.groupEnd();
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: api.url,
                 headers: api.headers(cfg.key),
-                data: JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens })),
+                data: requestBody,
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         let data;
@@ -4885,10 +4913,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         }
                         resolve(text);
                     } else {
-                        reject(new Error(`${label} ${r.status}: ${r.responseText.slice(0, 200)}`));
+                        reject(new Error(`${label} ${r.status}: ${parseProviderError(r)}`));
                     }
                 },
-                onerror: (e) => reject(new Error(`${label} network error: ${e}`)),
+                onerror: (e) => reject(new Error(`${label} network error: ${formatTransportErrorDetails(e)}`)),
+                ontimeout: (e) => reject(new Error(`${label} request timed out: ${formatTransportErrorDetails(e)}`)),
             });
         });
     }
@@ -5004,7 +5033,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         reject(err);
                     }
                 },
-                onerror: (e) => reject(new Error(`OpenAI Image network error: ${e}`)),
+                onerror: (e) => reject(new Error(`OpenAI Image network error: ${formatTransportErrorDetails(e)}`)),
             });
         });
     }
@@ -6930,10 +6959,10 @@ The prompt must ask for:
                     userText: 'Generate the local reproducer prompt now.',
                     sendAsConversation: false,
                     fullPRContext: true,
-                    sourceContextLabel: 'PR REPRODUCER SOURCE MATERIAL (PATCH AND CODE BLOCKS OMITTED)',
+                    sourceContextLabel: 'PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, AND CODE BLOCKS OMITTED)',
                     contextOptions: {
                         includePatch: false,
-                        includeComments: true,
+                        includeComments: false,
                         includeCommits: true,
                         includeCommentCodeContext: false,
                         stripFencedBlocks: true,
@@ -18808,7 +18837,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.67
+// @version      1.68
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -27507,6 +27536,24 @@ RULES:
         ackAssert(fn.includes('invalid JSON response'), 'rejects with descriptive error on parse failure');
     });
 
+    ackTest('callLLM formats provider transport errors', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function callLLM('), source.indexOf('function fetchPatch'));
+        ackAssert(source.includes('function formatTransportErrorDetails'), 'has transport error formatter');
+        ackAssert(fn.includes('formatTransportErrorDetails(e)'), 'uses structured transport error details');
+        ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
+        const formatted = formatTransportErrorDetails({
+            status: 0,
+            statusText: 'error',
+            error: { code: 'network' },
+            finalUrl: 'https://api.anthropic.com/v1/messages',
+        });
+        ackAssert(!formatted.includes('[object Object]'), 'does not collapse error objects');
+        ackAssert(formatted.includes('status=0'), 'includes status');
+        ackAssert(formatted.includes('error={"code":"network"}'), 'includes structured nested error');
+        ackAssert(formatted.includes('finalUrl=https://api.anthropic.com/v1/messages'), 'includes target URL');
+    });
+
     ackTest('comment/code mismatches fixed', () => {
         const source = _ackSource;
         // escapeHTML should not have the "Scoped querySelectorAll" comment above it
@@ -29354,8 +29401,12 @@ RULES:
             'recipe prompt uses the recipe-specific system prompt',
         );
         ackAssert(fn.includes("'FULL PR CONTEXT SOURCE MATERIAL'"), 'default recipe prompt labels long source context');
-        ackAssert(fn.includes('PR REPRODUCER SOURCE MATERIAL (PATCH AND CODE BLOCKS OMITTED)'), 'reproducer source label warns patch omission');
+        ackAssert(
+            fn.includes('PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, AND CODE BLOCKS OMITTED)'),
+            'reproducer source label warns patch/comment omission',
+        );
         ackAssert(fn.includes('includePatch: false'), 'reproducer omits raw patch context');
+        ackAssert(fn.includes('includeComments: false'), 'reproducer omits raw comment context');
         ackAssert(fn.includes('includeCommits: true'), 'reproducer includes commit metadata for commit-by-commit jobs');
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
@@ -30439,9 +30490,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.67', () => {
+    ackTest('version bumped to 1.68', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.67' || _ackSource.includes('@version      1.67'), 'version is 1.67');
+        ackAssert(versionFromMeta === '1.68' || _ackSource.includes('@version      1.68'), 'version is 1.68');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
