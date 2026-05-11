@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.61
+// @version      1.62
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3558,7 +3558,7 @@ Produce a prompt for a local coding agent that has the project checked out. That
 - The walkthrough must start from first principles with minimal jargon, then progressively go deeper until the user can ask an external audio-enabled LLM precise questions about every commit and meaningful line.
 - The walkthrough must explain each pending commit: what problem it addresses, what behavior changes, what invariants it relies on, what tests or evidence support it, and why the implementation is shaped that way.
 - The walkthrough must include GitHub links for further lookup: PR URL, commit URLs, file/line URLs, important review threads, and related issues or PRs when the source context supports them.
-- The walkthrough must not include the full patch, raw PR comments, or raw review threads. The user will supply those separately if needed.
+- The walkthrough must not include the full patch, raw PR comments, or raw review threads. ACKtopus will attach the actual PR patch after the generated prompt without asking you to print it back. Use that attached patch as source evidence, but do not copy it into the final handoff document. The user will supply raw comments separately if needed.
 - The target agent must mark missing evidence instead of guessing.
 
 # Constraints
@@ -3589,7 +3589,7 @@ Define the local agent's final handoff document structure: high-level story, glo
 Require GitHub URLs for commits, files/lines, review threads, related PRs/issues, and any claim that would otherwise be hard to verify.
 
 ## Exclusions
-State that the final guide must not include the raw patch, raw PR comments, or raw review-thread dump because the user will supply them separately.
+State that the final guide must not include the raw patch, raw PR comments, or raw review-thread dump. The generated prompt should tell the target local agent to use the ACKtopus-attached PR patch below as source evidence, but not to copy that patch into the final handoff.
 
 ## Final Checks
 Verify complete commit coverage, hard-part coverage, grounded claims, useful GitHub links, no raw patch/comment dump, enough detail for an external audio-enabled LLM with no local repo access, and the exact final OK-only line.`,
@@ -6397,6 +6397,36 @@ The prompt must ask for:
         return trimmed.endsWith(AUDIO_GUIDE_READY_GATE) ? trimmed : `${trimmed}\n\n${AUDIO_GUIDE_READY_GATE}`;
     }
 
+    function stripAudioGuideReadyGate(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return '';
+        return trimmed.endsWith(AUDIO_GUIDE_READY_GATE)
+            ? trimmed.slice(0, -AUDIO_GUIDE_READY_GATE.length).trimEnd()
+            : trimmed;
+    }
+
+    function appendBeforeAudioGuideReadyGate(text, addition) {
+        const body = stripAudioGuideReadyGate(text);
+        const extra = String(addition || '').trim();
+        return ensureAudioGuideReadyGate(extra ? `${body}\n\n${extra}` : body);
+    }
+
+    function formatAudioGuidePatchAttachment(patch, pr = parsePR()) {
+        const text = String(patch || '').replace(/\r\n/g, '\n').trimEnd();
+        if (!text) return '';
+        const prUrl = pr ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}` : '';
+        return [
+            '## ACKtopus-Attached PR Patch',
+            prUrl ? `Source PR: ${prUrl}` : '',
+            'This patch was fetched by ACKtopus and inserted after the prompt was generated. Use it as source evidence. Do not copy the raw patch into the final audio-guide handoff.',
+            '```patch',
+            text,
+            '```',
+        ]
+            .filter(Boolean)
+            .join('\n');
+    }
+
     function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
         if (isPromptRecipe(recipe)) return extraInstr;
         return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
@@ -6771,9 +6801,16 @@ The prompt must ask for:
                     userText: 'Generate the audio-guide handoff prompt now.',
                     sendAsConversation: false,
                     fullPRContext: true,
+                    sourceContextLabel: 'FULL PR CONTEXT SOURCE MATERIAL (PATCH ATTACHED AFTER GENERATED PROMPT)',
+                    contextOptions: {
+                        includePatch: false,
+                        includeComments: true,
+                        includeCommits: true,
+                    },
+                    appendPatchAttachment: true,
                     promptDetailsTitle: 'Generated audio guide prompt',
                     finalTask:
-                        `Now write one outcome-focused audio-guide handoff prompt for a target local coding agent that has the project checked out. The target agent must investigate the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs itself, then produce a ready-to-use handoff document for an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before writing the handoff. Require GitHub links for further lookup. Do not ask the external audio LLM to do the source investigation; the local agent's output must already contain the context needed for the audio conversation. Do not ask the target agent to include the raw patch, raw comments, or raw review-thread dump because I will supply those separately. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.`,
+                        `Now write one outcome-focused audio-guide handoff prompt for a target local coding agent that has the project checked out. The target agent must investigate the current branch, every pending commit, commit messages, tests, docs, PR comments, review threads, and range-diffs itself, then produce a ready-to-use handoff document for an external audio-enabled LLM that has internet/GitHub access but no local source access. The prompt should press the target agent to identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before writing the handoff. Require GitHub links for further lookup. Do not ask the external audio LLM to do the source investigation; the local agent's output must already contain the context needed for the audio conversation. Do not ask the target agent to print or duplicate the raw patch, raw comments, or raw review-thread dump. ACKtopus will append the fetched PR patch after the generated prompt, so refer to it as the ACKtopus-attached PR patch below and instruct the target agent to use it as source evidence, not to copy it into the final handoff. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context and satisfies the requested output format.`,
                 },
                 maintainer_summary: {
                     label: 'Maintainer summary',
@@ -6909,7 +6946,8 @@ The prompt must ask for:
                     history.push({ role: 'assistant', content: summary });
                     messages.scrollTop = messages.scrollHeight;
                 } else if (recipeCfg?.fullPRContext) {
-                    if (!parsePR()) throw new Error('this recipe is only available on pull request pages');
+                    const prForRecipe = parsePR();
+                    if (!prForRecipe) throw new Error('this recipe is only available on pull request pages');
                     const fullContext = await gatherRecipeContext((msg) => {
                         setAssistantText(assistantMsg, msg);
                     }, recipeCfg.contextOptions || {});
@@ -6939,8 +6977,16 @@ The prompt must ask for:
                         reasoningEffort: getHighContextReasoningEffort(provider),
                         maxTokens: getHighContextMaxTokens(provider),
                     });
+                    let patchAttachment = '';
+                    if (recipe === 'audio_walkthrough' && recipeCfg.appendPatchAttachment) {
+                        setAssistantText(assistantMsg, 'Fetching PR patch attachment...');
+                        patchAttachment = formatAudioGuidePatchAttachment(await fetchPatch(prForRecipe), prForRecipe);
+                    }
                     stopSpin();
-                    const trimmed = recipe === 'audio_walkthrough' ? ensureAudioGuideReadyGate(result) : result.trim();
+                    const trimmed =
+                        recipe === 'audio_walkthrough'
+                            ? appendBeforeAudioGuideReadyGate(result, patchAttachment)
+                            : result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     if (generatedPrompt) setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt);
                     history.push({ role: 'assistant', content: trimmed });
@@ -18599,7 +18645,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.61
+// @version      1.62
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -29273,8 +29319,10 @@ RULES:
         ackAssert(prompt.includes('difficult, risky, subtle, or disputed areas'), 'focuses hard parts');
         ackAssert(prompt.includes('GitHub links'), 'requires GitHub links');
         ackAssert(prompt.includes('must not include the full patch'), 'forbids patch dump');
+        ackAssert(prompt.includes('ACKtopus will attach the actual PR patch'), 'patch is attached by ACKtopus');
+        ackAssert(prompt.includes('ACKtopus-attached PR patch below'), 'points local agent at attached patch');
         ackAssert(prompt.includes('raw PR comments'), 'forbids comment dump');
-        ackAssert(prompt.includes('The user will supply those separately'), 'expects separate source attachments');
+        ackAssert(prompt.includes('The user will supply raw comments separately'), 'expects separate comment attachments');
         ackAssert(prompt.includes(AUDIO_GUIDE_READY_GATE), 'requires final OK-only audio gate');
         ackAssert(prompt.includes('## Focus Areas'), 'has focus areas section');
         ackAssert(prompt.includes('## Walkthrough Requirements'), 'has walkthrough requirements section');
@@ -29306,10 +29354,16 @@ RULES:
         ackAssert(fn.includes('has the project checked out'), 'audio guide recipe assumes a project checkout');
         ackAssert(fn.includes('ready-to-use handoff document'), 'audio guide recipe asks for a complete handoff');
         ackAssert(fn.includes('Do not ask the external audio LLM to do the source investigation'), 'local agent investigates first');
-        ackAssert(fn.includes('raw patch, raw comments'), 'audio guide recipe excludes raw source dumps');
+        ackAssert(fn.includes("sourceContextLabel: 'FULL PR CONTEXT SOURCE MATERIAL (PATCH ATTACHED AFTER GENERATED PROMPT)'"), 'audio guide source label explains patch attachment');
+        ackAssert(fn.includes('includePatch: false'), 'audio guide source context omits the patch before LLM generation');
+        ackAssert(fn.includes('appendPatchAttachment: true'), 'audio guide recipe requests deterministic patch attachment');
+        ackAssert(fn.includes('Do not ask the target agent to print or duplicate the raw patch'), 'audio guide recipe excludes raw source dumps');
+        ackAssert(fn.includes('ACKtopus-attached PR patch below'), 'audio guide recipe refers to the local patch attachment');
         ackAssert(fn.includes('promptDetailsTitle'), 'prompt recipes can name their prompt preview');
         ackAssert(fn.includes('formatLLMPromptPreview(system, userContent)'), 'audio guide prompt is inspectable');
-        ackAssert(fn.includes('ensureAudioGuideReadyGate(result)'), 'audio guide output gets final OK-only gate');
+        ackAssert(fn.includes('fetchPatch(prForRecipe)'), 'audio guide fetches the patch after prompt generation');
+        ackAssert(fn.includes('formatAudioGuidePatchAttachment'), 'audio guide formats a deterministic patch attachment');
+        ackAssert(fn.includes('appendBeforeAudioGuideReadyGate(result, patchAttachment)'), 'audio guide appends patch before final OK-only gate');
         ackEq(
             ensureAudioGuideReadyGate('handoff body'),
             `handoff body\n\n${AUDIO_GUIDE_READY_GATE}`,
@@ -29320,6 +29374,24 @@ RULES:
             `handoff body\n\n${AUDIO_GUIDE_READY_GATE}`,
             'does not duplicate final OK-only gate',
         );
+        ackEq(
+            appendBeforeAudioGuideReadyGate('handoff body', 'patch body'),
+            `handoff body\n\npatch body\n\n${AUDIO_GUIDE_READY_GATE}`,
+            'appends patch before final OK-only gate',
+        );
+        ackEq(
+            appendBeforeAudioGuideReadyGate(`handoff body\n\n${AUDIO_GUIDE_READY_GATE}`, 'patch body'),
+            `handoff body\n\npatch body\n\n${AUDIO_GUIDE_READY_GATE}`,
+            'moves existing OK-only gate after patch attachment',
+        );
+        const patchAttachment = formatAudioGuidePatchAttachment('diff --git a/a b/a\n+line', {
+            owner: 'bitcoin',
+            repo: 'bitcoin',
+            pr: '1',
+        });
+        ackAssert(patchAttachment.includes('## ACKtopus-Attached PR Patch'), 'patch attachment has a stable heading');
+        ackAssert(patchAttachment.includes('https://github.com/bitcoin/bitcoin/pull/1'), 'patch attachment includes source PR URL');
+        ackAssert(patchAttachment.includes('```patch'), 'patch attachment uses a patch code fence');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
@@ -30165,9 +30237,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.61', () => {
+    ackTest('version bumped to 1.62', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.61' || _ackSource.includes('@version      1.61'), 'version is 1.61');
+        ackAssert(versionFromMeta === '1.62' || _ackSource.includes('@version      1.62'), 'version is 1.62');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
