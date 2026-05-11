@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.59
+// @version      1.60
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3289,10 +3289,12 @@
     };
     const OPENAI_IMAGE_MODEL = 'gpt-image-2';
     const OPENAI_IMAGE_SIZE = '1536x1024';
-    const OPENAI_IMAGE_QUALITY = 'medium';
-    const OPENAI_IMAGE_FORMAT = 'webp';
+    const OPENAI_IMAGE_QUALITY = 'high';
+    const OPENAI_IMAGE_FORMAT = 'png';
+    const OPENAI_IMAGE_BACKGROUND = 'opaque';
+    const OPENAI_IMAGE_MODERATION = 'low';
     const OPENAI_ORG_VERIFY_URL = 'https://platform.openai.com/settings/organization/general';
-    const PR_INFOGRAPHIC_PROMPT_VERSION = 5;
+    const PR_INFOGRAPHIC_PROMPT_VERSION = 6;
 
     function getHighContextModelOverride(provider) {
         if (provider === 'claude') return LLM_MODELS.claude_high_context;
@@ -3725,7 +3727,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const version = `v${PR_INFOGRAPHIC_PROMPT_VERSION}`;
         const sha = /^[0-9a-f]{7,40}$/i.test(String(headSha || '')) ? String(headSha).toLowerCase() : 'unknown';
         const scopeKey = scope === 'commit' ? 'commit' : 'pr';
-        return `${prInfographicCachePrefix(pr)}${scopeKey}_${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${version}_${sha}`;
+        return `${prInfographicCachePrefix(pr)}${scopeKey}_${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${OPENAI_IMAGE_BACKGROUND}_${OPENAI_IMAGE_MODERATION}_${version}_${sha}`;
     }
 
     function normalizeInfographicCacheValue(value) {
@@ -4700,10 +4702,42 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         );
     }
 
+    function imageFormatToMimeType(format) {
+        const normalized = String(format || '').toLowerCase();
+        if (normalized === 'jpeg' || normalized === 'jpg') return 'image/jpeg';
+        if (normalized === 'webp') return 'image/webp';
+        return 'image/png';
+    }
+
+    function extractOpenAIImagePayload(data) {
+        const image = Array.isArray(data?.data) ? data.data.find((item) => item?.b64_json) || data.data[0] : null;
+        const outputImage = Array.isArray(data?.output)
+            ? data.output.find((item) => item?.type === 'image_generation_call' && item?.result)
+            : null;
+        const completed = data?.type === 'image_generation.completed' ? data : null;
+        return {
+            b64: image?.b64_json || outputImage?.result || completed?.b64_json || data?.b64_json || '',
+            revisedPrompt: image?.revised_prompt || '',
+            outputFormat: image?.output_format || completed?.output_format || OPENAI_IMAGE_FORMAT,
+            usage: data?.usage || image?.usage || completed?.usage || {},
+        };
+    }
+
     function requestOpenAIImage(prompt, key) {
         console.groupCollapsed(`ACKtopus: image request -> OpenAI (${OPENAI_IMAGE_MODEL})`);
         console.log('prompt:', prompt);
-        console.log('size:', OPENAI_IMAGE_SIZE, 'quality:', OPENAI_IMAGE_QUALITY, 'format:', OPENAI_IMAGE_FORMAT);
+        console.log(
+            'size:',
+            OPENAI_IMAGE_SIZE,
+            'quality:',
+            OPENAI_IMAGE_QUALITY,
+            'format:',
+            OPENAI_IMAGE_FORMAT,
+            'background:',
+            OPENAI_IMAGE_BACKGROUND,
+            'moderation:',
+            OPENAI_IMAGE_MODERATION,
+        );
         console.groupEnd();
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -4717,6 +4751,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     size: OPENAI_IMAGE_SIZE,
                     quality: OPENAI_IMAGE_QUALITY,
                     output_format: OPENAI_IMAGE_FORMAT,
+                    background: OPENAI_IMAGE_BACKGROUND,
+                    moderation: OPENAI_IMAGE_MODERATION,
                 }),
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
@@ -4727,23 +4763,24 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                             reject(new Error(`OpenAI Image: invalid JSON response: ${r.responseText.slice(0, 100)}`));
                             return;
                         }
-                        const image = data.data?.[0] || null;
-                        const b64 = image?.b64_json || '';
+                        const imagePayload = extractOpenAIImagePayload(data);
+                        const b64 = imagePayload.b64;
                         if (!b64) {
                             reject(new Error('OpenAI Image: response did not include image data'));
                             return;
                         }
-                        const usage = data.usage || {};
+                        const usage = imagePayload.usage || {};
                         if (usage.input_tokens || usage.output_tokens)
                             addUsage('openai', usage.input_tokens, usage.output_tokens);
+                        const outputFormat = imagePayload.outputFormat || OPENAI_IMAGE_FORMAT;
                         resolve({
                             b64,
-                            mimeType: `image/${OPENAI_IMAGE_FORMAT}`,
-                            revisedPrompt: image?.revised_prompt || '',
+                            mimeType: imageFormatToMimeType(outputFormat),
+                            revisedPrompt: imagePayload.revisedPrompt || '',
                             model: OPENAI_IMAGE_MODEL,
                             size: OPENAI_IMAGE_SIZE,
                             quality: OPENAI_IMAGE_QUALITY,
-                            outputFormat: OPENAI_IMAGE_FORMAT,
+                            outputFormat,
                             generatedAt: Date.now(),
                         });
                     } else {
@@ -6203,21 +6240,24 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const system = `You are a technical visual editor for code review.
 Your task is to turn source-grounded PR or commit context into one prompt for an image-generation model.
 
-Goal: compress the supplied ${scopeLabel} context into one landscape technical brief that gives reviewers the overall concept, high-level purpose, and key technical details at elevator-pitch speed.
+Goal: create text-first semantic compression for the supplied ${scopeLabel}. The resulting image should help reviewers see intent, invariants, blast radius, risk surface, and test surface faster than reading the whole diff.
 
 Rules:
 - Ground every claim in the supplied context. If the purpose, flow, risk, or test story is unclear, keep the label generic or omit it.
 - Before describing layout, identify the single overall concept the image should communicate. The concept should explain the ${scopeLabel}'s main idea, not list files or commits.
 - Include technical details at a high level: name the important mechanism, state/data flow, invariant, API boundary, performance claim, compatibility concern, or test signal when the source supports it.
+- Classify the best visual grammar before describing the scene: threshold curve, sequence diagram, ownership/dependency map, before/after data path, state machine, benchmark/evidence plot, or scenario matrix.
+- Use PR cover-card framing for a full PR and commit review-card framing for a commit. Useful card fields are Problem, Change, Invariant, Blast radius, Best visual, and Test hook, but only render the fields that help the image.
 - Spend the most visual space on the most important, complicated, risky, or hard-to-explain parts. It is better to explain one difficult mechanism well than to cover every routine edit.
 - If the source is scoped to one commit, make the infographic about that commit; use PR-level context only to explain why the commit matters.
-- Prefer a visual structure over prose: before/after, request -> processing -> validation, data flow, stack/layer diagram, or risk/test map, whichever best fits the review target.
+- Prefer a visual structure over prose: before/after, request -> processing -> validation, data flow, stack/layer diagram, state transition, threshold curve, or risk/test map, whichever best fits the review target.
 - Use visual elements for relationships that are hard to explain in text: ownership/lifetime, data movement, control flow, before/after topology, dependency direction, risk surface, or benchmark/test coverage.
 - Use text for the opposite: exact terms, invariants, constraints, outcomes, and caveats that are hard to draw accurately.
+- For measurable claims, do not invent numbers, charts, or benchmark data. Render exact metrics only if supplied; otherwise show a small "evidence needed" or "benchmark hook" callout.
 - Every visual block must explain what it represents with a short readable label and a tiny callout. Do not rely on emojis, icons, arrows, or abstract lines without explanatory text.
 - Keep literal text sparse but explanatory: at most 10 labels/callouts, each 1 to 6 words, and at most 55 words total inside the image.
 - Put exact labels in double quotes so the image model knows what text to render.
-- Do not request code snippets, commit hashes, long file lists, tiny captions, watermarks, logos, emojis, or decorative clutter.
+- Do not request code snippets, commit hashes, long file lists, fake screenshots, tiny captions, watermarks, logos, emojis, mascot art, or decorative clutter.
 - Include enough layout direction that a generated image can be useful on the first try.`;
         const context = truncateMiddle(fullContext, 180000);
         const sourceRefs = [
@@ -6238,14 +6278,16 @@ The prompt must explicitly include:
 - the source PR URL as context only, with instructions not to render it as image text,
 - the source page URL when provided as context only, with instructions not to render it as image text,
 - an "Overall concept to communicate" sentence that compresses the review target into the one idea reviewers should understand first.
+- a "Best visual form" sentence that chooses the visual grammar: threshold curve, sequence diagram, ownership/dependency map, before/after data path, state machine, benchmark/evidence plot, or scenario matrix.
 - a "Most important/risky parts to visualize" sentence that tells the image model which complicated or hard-to-explain elements deserve the most space.
 - a "Technical details to preserve" sentence that names the important mechanism, invariant, data/control flow, API boundary, performance claim, or test signal at a high level.
 - a "What text must explain" sentence for details that should be written because they are hard to render visually.
+- an "Evidence/test surface" sentence that says what the reviewer should be able to falsify or verify from the visual and supplied context.
 
 The prompt must ask for:
 - a clean 1536x1024 landscape technical visual brief,
 - a one-line title,
-- 3 to 5 visual blocks or lanes showing the ${scopeLabel}'s main flow or before/after,
+- ${target?.scope === 'commit' ? '2 to 3 compact visual blocks or lanes for the commit card' : '3 to 5 visual blocks or lanes for the PR cover card'},
 - a short explanation attached to each block so every image section communicates meaning instead of just shapes, emojis, or connector lines,
 - visual emphasis on the parts that are hard to explain in prose,
 - text callouts for exact technical details that are hard to draw,
@@ -18453,7 +18495,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.59
+// @version      1.60
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28731,7 +28773,11 @@ RULES:
         ackAssert(source.includes("const OPENAI_IMAGE_MODEL = 'gpt-image-2'"), 'uses gpt-image-2');
         ackAssert(!source.includes('const OPENAI_IMAGE_' + 'FALLBACK_MODELS'), 'does not use older image model fallbacks');
         ackAssert(source.includes('OPENAI_ORG_VERIFY_URL'), 'links organization verification');
-        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 5'), 'bumps infographic cache for prompt content');
+        ackAssert(source.includes("const OPENAI_IMAGE_QUALITY = 'high'"), 'uses high quality for text-heavy visuals');
+        ackAssert(source.includes("const OPENAI_IMAGE_FORMAT = 'png'"), 'uses lossless png output');
+        ackAssert(source.includes("const OPENAI_IMAGE_BACKGROUND = 'opaque'"), 'requests supported opaque background');
+        ackAssert(source.includes("const OPENAI_IMAGE_MODERATION = 'low'"), 'uses lower moderation strictness for technical prompts');
+        ackAssert(source.includes('const PR_INFOGRAPHIC_PROMPT_VERSION = 6'), 'bumps infographic cache for prompt content');
         const promptBuilder = source.slice(
             source.indexOf('async function buildInfographicImagePrompt'),
             source.indexOf('function formatLLMPromptPreview'),
@@ -28742,6 +28788,18 @@ RULES:
         ackAssert(
             promptBuilder.includes('Overall concept to communicate'),
             'image prompt asks for compressed overall concept',
+        );
+        ackAssert(
+            promptBuilder.includes('text-first semantic compression'),
+            'image prompt frames output as semantic compression',
+        );
+        ackAssert(
+            promptBuilder.includes('Best visual form'),
+            'image prompt asks for the appropriate visual grammar',
+        );
+        ackAssert(
+            promptBuilder.includes('threshold curve, sequence diagram, ownership/dependency map'),
+            'image prompt names Bitcoin Core review visual grammars',
         );
         ackAssert(
             promptBuilder.includes('most important, complicated, risky, or hard-to-explain parts'),
@@ -28767,6 +28825,14 @@ RULES:
             promptBuilder.includes('Most important/risky parts to visualize'),
             'image prompt asks image model where to spend visual space',
         );
+        ackAssert(
+            promptBuilder.includes('Evidence/test surface'),
+            'image prompt asks for falsifiable review evidence',
+        );
+        ackAssert(
+            promptBuilder.includes('do not invent numbers, charts, or benchmark data'),
+            'image prompt forbids invented measured evidence',
+        );
         ackAssert(promptBuilder.includes('Do not rely on emojis'), 'image prompt avoids emoji-only diagrams');
         ackAssert(
             promptBuilder.includes('a short explanation attached to each block'),
@@ -28774,7 +28840,7 @@ RULES:
         );
         ackAssert(promptBuilder.includes('landscape technical visual brief'), 'image prompt frames output as visual brief');
         const imageCall = source.slice(
-            source.indexOf('function requestOpenAIImage'),
+            source.indexOf('function imageFormatToMimeType'),
             source.indexOf('// --- Diff Fetching ---'),
         );
         ackAssert(
@@ -28783,8 +28849,13 @@ RULES:
         );
         ackAssert(imageCall.includes('model: OPENAI_IMAGE_MODEL'), 'passes image model');
         ackAssert(imageCall.includes('output_format: OPENAI_IMAGE_FORMAT'), 'requests configured output format');
-        ackAssert(imageCall.includes('data.data?.[0]'), 'reads image response data array');
+        ackAssert(imageCall.includes('background: OPENAI_IMAGE_BACKGROUND'), 'requests configured image background');
+        ackAssert(imageCall.includes('moderation: OPENAI_IMAGE_MODERATION'), 'passes configured image moderation');
+        ackAssert(imageCall.includes('extractOpenAIImagePayload(data)'), 'uses shared image response extractor');
+        ackAssert(imageCall.includes('data.data.find'), 'extractor reads image response data array');
+        ackAssert(imageCall.includes('image_generation_call'), 'extractor tolerates Responses API shaped image output');
         ackAssert(imageCall.includes('b64_json'), 'reads base64 image data');
+        ackAssert(imageCall.includes('imageFormatToMimeType'), 'sets MIME type from image format');
         ackAssert(imageCall.includes('isOpenAIImageVerificationError'), 'detects organization verification errors');
         ackAssert(source.includes('function addPromptDetails'), 'has reusable collapsible prompt details');
         const cache = source.slice(
@@ -28796,6 +28867,8 @@ RULES:
         ackAssert(cache.includes("scope === 'commit' ? 'commit' : 'pr'"), 'cache key separates commit scope');
         ackAssert(cache.includes('PR_INFOGRAPHIC_PROMPT_VERSION'), 'cache key includes prompt version');
         ackAssert(cache.includes('OPENAI_IMAGE_MODEL'), 'cache key includes image model');
+        ackAssert(cache.includes('OPENAI_IMAGE_BACKGROUND'), 'cache key includes image background');
+        ackAssert(cache.includes('OPENAI_IMAGE_MODERATION'), 'cache key includes image moderation');
         const targetHelper = source.slice(
             source.indexOf('function buildInfographicTarget'),
             source.indexOf('async function buildInfographicImagePrompt'),
@@ -29953,9 +30026,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.59', () => {
+    ackTest('version bumped to 1.60', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.59' || _ackSource.includes('@version      1.59'), 'version is 1.59');
+        ackAssert(versionFromMeta === '1.60' || _ackSource.includes('@version      1.60'), 'version is 1.60');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
