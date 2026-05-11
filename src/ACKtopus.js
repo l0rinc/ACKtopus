@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.65
+// @version      1.66
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3593,7 +3593,7 @@ INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performan
         reimplementation: `Write one self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
 # Goal
-Produce a local reproducer prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reinvent a local implementation, add focused tests where appropriate, commit the result locally, and stop before seeing any submitted implementation.
+Produce a local reproducer prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reinvent a local implementation, add focused tests where appropriate, commit the result locally, and stop before seeing any submitted implementation or submitted PR implementation.
 
 # Success criteria
 - The generated prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, review-comment concerns, and validation evidence.
@@ -3690,7 +3690,7 @@ A short checklist that verifies split/squash equivalence, grounded GitHub URLs, 
         audio_walkthrough: `Write one self-contained, outcome-focused handoff prompt for a local coding agent.
 
 # Goal
-Produce a prompt for a local coding agent that has the project checked out. That local agent must do the investigation itself and produce a ready-to-use audio-guide handoff document for a clean external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM will not have local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
+Produce a prompt for a local coding agent that has the project checked out. That local agent must do the investigation itself and produce a ready-to-use audio-guide handoff document for a clean external LLM. The human reviewer wants to ask that external LLM detailed questions about a PR under review, but the external LLM has no local source access. The local agent must fully understand the current changes, every pending commit, and the review discussion first, then write a source-grounded explanation that can stand alone.
 
 # Success criteria
 - The prompt tells the target agent that the current changes represent a PR the user is reviewing.
@@ -6928,7 +6928,7 @@ The prompt must ask for:
                     },
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write one outcome-focused no-peek local reproducer prompt for a target coding agent. Center the prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is only an independently rediscovered local implementation derived from the base tree, with focused tests or verification and a stop point asking the user whether to continue to the separate actual-PR comparison/suggestion prompt. Do not include the submitted implementation, existing code, patch snippets, code blocks, commit lists, commit messages, changed-file lists, concrete helpers, exact algorithms, control-flow shape, exact values, assertion choices, include churn, or implementation-shaped fix verbs. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, review-comment concerns, validation signals, and no-peek-safe metadata needed for the agent to discover the design itself. If supplied context is truncated or incomplete because the PR is too large, tell the target agent to treat it as an index of problem evidence, fetch only no-peek-safe missing metadata before approval, and mark missing evidence instead of guessing. Include explicit approval and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, contains no existing code or implementation details, handles truncated/incomplete source context, and satisfies the requested output format.',
+                        'Now write one outcome-focused no-peek local reproducer prompt for a target coding agent. Center the prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is only an independently rediscovered local implementation derived from the base tree, with focused tests or verification and a stop point asking the user whether to continue to the separate actual-PR comparison/suggestion prompt. Do not include the submitted implementation, existing code, patch snippets, code blocks, commit lists, commit messages, changed-file lists, concrete helpers, exact algorithms, control-flow shape, exact values, assertion choices, include churn, or implementation-shaped fix verbs. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, review-comment concerns, validation signals, and no-peek-safe metadata needed for the agent to discover the design itself. If supplied context is truncated or incomplete because the PR is too large, tell the target agent to treat the supplied source as an index of problem evidence, fetch only no-peek-safe missing metadata before approval, and mark missing evidence instead of guessing. Include explicit approval and stop rules. Before finalizing, verify that the generated prompt is grounded in the source context, contains no existing code or implementation details, handles truncated/incomplete source context, and satisfies the requested output format.',
                 },
                 suggestion_stack: {
                     label: 'Suggestions',
@@ -18796,7 +18796,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.65
+// @version      1.66
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -30415,9 +30415,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.65', () => {
+    ackTest('version bumped to 1.66', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.65' || _ackSource.includes('@version      1.65'), 'version is 1.65');
+        ackAssert(versionFromMeta === '1.66' || _ackSource.includes('@version      1.66'), 'version is 1.66');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {

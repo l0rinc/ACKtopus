@@ -282,3 +282,4 @@ After collapsing unrelated files, it also scrolls to the first remaining open fi
 - `pnpm run check` runs a Node syntax check over the userscript.
 - `pnpm run build` runs TypeScript over the JavaScript source without emitting files.
 - The in-browser self-test runner is available from ACKtopus settings on GitHub pages and covers DOM-dependent behavior against the live page.
+- Console errors from `collector.github.com/github/collect` are GitHub Hydro analytics failures, not ACKtopus requests.
