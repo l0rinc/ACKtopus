@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.62
+// @version      1.63
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2207,6 +2207,101 @@
 
         if (handle) handle.stop();
         if (!lt.signal.aborted && el) spinUntilVisible(chip, el);
+    }
+
+    let reviewCommentHashNavigationKey = '';
+    let reviewCommentHashNavigationTimer = null;
+
+    function reviewCommentDiscussionHashId(hash = location.hash) {
+        const match = String(hash || '').match(/^#discussion_r(\d+)$/);
+        return match ? match[1] : '';
+    }
+
+    function reviewCommentChangesHash(id) {
+        return `#r${id}`;
+    }
+
+    function buildReviewCommentChangesUrl(pr, id) {
+        return `/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes${reviewCommentChangesHash(id)}`;
+    }
+
+    function isPRChangesOrFilesPath(pathname, pr) {
+        const prefix = `/${pr.owner}/${pr.repo}/pull/${pr.pr}/`;
+        return pathname === `${prefix}changes` || pathname === `${prefix}files`;
+    }
+
+    function findReviewCommentHashTarget(id) {
+        const target =
+            document.getElementById(`discussion_r${id}`) ||
+            document.getElementById(`r${id}`) ||
+            document.getElementById(`pullrequestreviewcomment-${id}`);
+        if (target) return target;
+        const anchor = document.querySelector(
+            [
+                `a[href="#discussion_r${id}"]`,
+                `a[href$="#discussion_r${id}"]`,
+                `a[href="#r${id}"]`,
+                `a[href$="#r${id}"]`,
+            ].join(','),
+        );
+        return anchor?.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || anchor || null;
+    }
+
+    function navigateToReviewCommentHashTarget(id) {
+        const target =
+            navigateToFragment(`${location.pathname}${location.search}#discussion_r${id}`) ||
+            navigateToFragment(`${location.pathname}${location.search}${reviewCommentChangesHash(id)}`) ||
+            findReviewCommentHashTarget(id);
+        if (!target) return null;
+        scrollToAndHighlight(target);
+        return target;
+    }
+
+    async function handleReviewCommentHashNavigation(reason = '') {
+        if (_ackTesting) return false;
+        const id = reviewCommentDiscussionHashId();
+        if (!id) return false;
+        const pr = parsePR();
+        if (!pr) return false;
+        const key = `${location.pathname}${location.search}${location.hash}`;
+        if (reviewCommentHashNavigationKey === key) return false;
+        reviewCommentHashNavigationKey = key;
+
+        try {
+            const startedAt = location.href;
+            for (let attempt = 0; attempt < 8; attempt++) {
+                if (location.href !== startedAt) return false;
+                const target = navigateToReviewCommentHashTarget(id);
+                if (target) return true;
+                if (await ackSleep(250)) return false;
+            }
+
+            if (location.href !== startedAt) return false;
+            const nextHash = reviewCommentChangesHash(id);
+            if (isPRChangesOrFilesPath(location.pathname, pr)) {
+                console.log(`ACKtopus: rewriting stale review-comment hash after ${reason || 'navigation'}: ${nextHash}`);
+                location.hash = nextHash;
+                return true;
+            }
+
+            const nextUrl = buildReviewCommentChangesUrl(pr, id);
+            console.log(`ACKtopus: opening review-comment changes path after ${reason || 'navigation'}: ${nextUrl}`);
+            location.assign(nextUrl);
+            return true;
+        } finally {
+            ackSetTimeout(() => {
+                if (reviewCommentHashNavigationKey === key) reviewCommentHashNavigationKey = '';
+            }, 5000);
+        }
+    }
+
+    function scheduleReviewCommentHashNavigation(reason = '') {
+        if (_ackTesting || !reviewCommentDiscussionHashId()) return;
+        if (reviewCommentHashNavigationTimer) ackClearTimeout(reviewCommentHashNavigationTimer);
+        reviewCommentHashNavigationTimer = ackSetTimeout(() => {
+            reviewCommentHashNavigationTimer = null;
+            void handleReviewCommentHashNavigation(reason);
+        }, 500);
     }
 
     function findUserAcks(username) {
@@ -18420,6 +18515,7 @@ RULES:
     }
 
     tryInject();
+    scheduleReviewCommentHashNavigation('initial load');
     if (isPRPage() && !_ackTesting) {
         addFloatingCommitNav();
         hideNativeCommitNav();
@@ -18427,6 +18523,7 @@ RULES:
     document.addEventListener('turbo:load', () => {
         if (_ackTesting) return;
         tryInject();
+        scheduleReviewCommentHashNavigation('turbo load');
         if (isPRPage()) {
             addFloatingCommitNav();
             hideNativeCommitNav();
@@ -18435,6 +18532,7 @@ RULES:
     document.addEventListener('turbo:render', () => {
         if (_ackTesting) return;
         tryInject();
+        scheduleReviewCommentHashNavigation('turbo render');
         if (isPRPage()) {
             addFloatingCommitNav();
             hideNativeCommitNav();
@@ -18446,6 +18544,7 @@ RULES:
         lastInjectedPR = null;
         lastInjectedPath = null;
         tryInject();
+        scheduleReviewCommentHashNavigation('pageshow');
         if (isPRPage()) {
             addFloatingCommitNav();
             hideNativeCommitNav();
@@ -18645,7 +18744,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.62
+// @version      1.63
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -21369,6 +21468,33 @@ RULES:
         const originalUrl = 'https://github.com/bitcoin/bitcoin/pull/42#issuecomment-123';
         const hash = originalUrl.includes('#') ? '#' + originalUrl.split('#')[1] : '';
         ackEq(hash, '#issuecomment-123', 'hash extracted correctly');
+    });
+
+    ackTest('review comment hash fallback maps discussion anchors to changes anchors', () => {
+        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '31212' };
+        ackEq(reviewCommentDiscussionHashId('#discussion_r1854105033'), '1854105033');
+        ackEq(reviewCommentDiscussionHashId('#r1854105033'), '');
+        ackEq(reviewCommentChangesHash('1854105033'), '#r1854105033');
+        ackEq(
+            buildReviewCommentChangesUrl(pr, '1854105033'),
+            '/bitcoin/bitcoin/pull/31212/changes#r1854105033',
+        );
+        ackAssert(isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212/changes', pr), 'changes path detected');
+        ackAssert(isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212/files', pr), 'files path detected');
+        ackAssert(!isPRChangesOrFilesPath('/bitcoin/bitcoin/pull/31212', pr), 'conversation path is not changes/files');
+    });
+
+    ackTest('review comment hash fallback is wired into URL navigation', () => {
+        const source = _ackSource;
+        const helper = source.slice(
+            source.indexOf('async function handleReviewCommentHashNavigation'),
+            source.indexOf('\n    function findUserAcks'),
+        );
+        ackAssert(helper.includes('buildReviewCommentChangesUrl(pr, id)'), 'opens changes anchor fallback');
+        ackAssert(helper.includes('location.assign(nextUrl)'), 'uses browser navigation for missing discussion anchors');
+        ackAssert(source.includes("scheduleReviewCommentHashNavigation('initial load')"), 'runs on initial load');
+        ackAssert(source.includes("scheduleReviewCommentHashNavigation('hashchange')"), 'runs on hash changes');
+        ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
     });
 
     // ============================================================================
@@ -30237,9 +30363,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.62', () => {
+    ackTest('version bumped to 1.63', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.62' || _ackSource.includes('@version      1.62'), 'version is 1.62');
+        ackAssert(versionFromMeta === '1.63' || _ackSource.includes('@version      1.63'), 'version is 1.63');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -31668,6 +31794,14 @@ RULES:
         NAV_QUERY_RE,
         scrollToAndHighlight,
         linkifyRefs,
+        reviewCommentDiscussionHashId,
+        reviewCommentChangesHash,
+        buildReviewCommentChangesUrl,
+        isPRChangesOrFilesPath,
+        findReviewCommentHashTarget,
+        navigateToReviewCommentHashTarget,
+        handleReviewCommentHashNavigation,
+        scheduleReviewCommentHashNavigation,
         waitForEl,
         clickWithRetry,
         waitForElement,
@@ -31715,6 +31849,7 @@ RULES:
             lastUrl = location.href;
             tryInject();
             addFloatingCommitNav();
+            scheduleReviewCommentHashNavigation('url change');
             // Some SPA navigations update the main content without recreating the toolbar.
             // Re-run cheap DOM passes so hover reactions + commit-prefix prefill stay reliable.
             try {
@@ -31731,6 +31866,11 @@ RULES:
         tryInject();
         addFloatingCommitNav();
         hideNativeCommitNav();
+        scheduleReviewCommentHashNavigation('popstate');
+    });
+    navWindow.addEventListener('hashchange', () => {
+        if (_ackTesting) return;
+        scheduleReviewCommentHashNavigation('hashchange');
     });
 
     let pending = false;

@@ -196,6 +196,8 @@ The infographic flow first asks OpenAI to distill the source into a semantic-com
 
 The **main PR description lightbulb** is treated specially: after generating the high-level overview, it also precomputes commit lightbulb caches (commits view + single-commit view) using richer PR context (including discussion/replies), so those views can open their lightbulb panels immediately from cache.
 
+When GitHub fails to resolve an old review-comment permalink like `#discussion_r...` on the PR conversation page, ACKtopus detects the missing hash target and opens the corresponding Changes-tab anchor (`/changes#r...`) so the inline diff path can reveal the comment.
+
 ### ☑️ Queue
 
 Keeps a personal list of PRs you want to come back to. You can add the current PR, search GitHub by PR number or text, open queued PRs in a new tab, reorder entries, remove entries, and see the queue count on the toolbar. The delayed Ctrl hotkey chooser exposes this as **Ctrl+L**.
