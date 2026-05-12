@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.69
+// @version      1.70
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3426,7 +3426,7 @@
     // --- LLM Config & Analysis ---
 
     const LLM_MODELS = {
-        claude: 'claude-sonnet-4-7',
+        claude: 'claude-sonnet-4-6',
         claude_high_context: 'claude-opus-4-7',
         openai: 'gpt-5.5',
     };
@@ -4133,7 +4133,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                       else if (r.responseText.includes('credit'))
                           onWarn('Key valid but no credits, add funds', 'nofunds');
                       else if (r.status === 529) onWarn('Key valid, API temporarily overloaded');
-                      else if (r.status === 400 || r.status === 404) onResult(true, 'Key accepted');
+                      else if (r.status === 404) onResult(false, 'Key valid but model not available');
+                      else if (r.status === 400) onResult(true, 'Key accepted');
                       else if (r.status === 403) onResult(false, 'Key forbidden, check permissions');
                       else onWarn(`Key likely valid, HTTP ${r.status}`);
                   }
@@ -18844,7 +18845,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.69
+// @version      1.70
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -19478,8 +19479,8 @@ RULES:
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
 
-    ackTest('LLM_MODELS.claude is claude-sonnet-4-7', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-7');
+    ackTest('LLM_MODELS.claude is claude-sonnet-4-6', () => {
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
     });
 
     ackTest('LLM_MODELS.claude_high_context is claude-opus-4-7', () => {
@@ -26236,6 +26237,11 @@ RULES:
         ackAssert(fn.includes('api.url'), 'uses api.url');
         ackAssert(fn.includes('api.headers(key)'), 'uses api.headers');
         ackAssert(fn.includes('api.validateBody('), 'uses api.validateBody');
+        ackAssert(
+            fn.includes("r.status === 404) onResult(false, 'Key valid but model not available')"),
+            'Claude model 404 is surfaced as unavailable model',
+        );
+        ackAssert(!fn.includes('r.status === 400 || r.status === 404'), 'does not accept Claude model 404');
         // No hardcoded provider URLs
         ackAssert(!fn.includes("'https://api.anthropic.com"), 'no hardcoded Anthropic URL');
         ackAssert(!fn.includes("'https://api.openai.com"), 'no hardcoded OpenAI URL');
@@ -30559,9 +30565,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.69', () => {
+    ackTest('version bumped to 1.70', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.69' || _ackSource.includes('@version      1.69'), 'version is 1.69');
+        ackAssert(versionFromMeta === '1.70' || _ackSource.includes('@version      1.70'), 'version is 1.70');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -31097,7 +31103,7 @@ RULES:
     });
 
     ackTest('LLM_MODELS match documented provider models', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-7');
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });

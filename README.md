@@ -204,7 +204,7 @@ Keeps a personal list of PRs you want to come back to. You can add the current P
 
 ### Settings
 
-Lets you configure the optional GitHub PAT, Claude/OpenAI API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. The toolbar background toggles compact mode. Shift-clicking the settings logo clears caches. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
+Lets you configure the optional GitHub PAT, Claude/OpenAI API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. ACKtopus uses Claude Sonnet 4.6 for normal Claude requests and Claude Opus 4.7 for high-context Claude recipes. The toolbar background toggles compact mode. Shift-clicking the settings logo clears caches. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
 
 ## In-page review helpers
 
