@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.68
+// @version      1.69
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3782,6 +3782,9 @@ Under each section, keep bullets short and high signal.`,
 Fix grammar, spelling, and clarity with minimal edits. Preserve the author's tone and intent.
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
 If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages, or thread context, fix it minimally. Only correct objective errors, not opinions.
+Make the reply make sense in light of the commit messages and the current thread (if any). If the surrounding thread has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
+Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it -- rephrase as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
+Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
 Do not change technical meaning unless it is factually incorrect.
 Do not change quoted text (lines starting with >) in any way. Those are someone else's words -- copy them verbatim.
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
@@ -8193,12 +8196,14 @@ The prompt must ask for:
                         parts.join('\n\n');
                 }
             } else {
-                // Regular comment: include PR description, commit messages, diff, and thread context
+                // Regular comment: include PR description, commit messages, and surrounding
+                // discussion. Skip the full unified PR diff -- commit messages plus the
+                // local code-context block below convey enough for the reply to make sense
+                // without inflating the prompt with every commit's patch.
                 const parts = [];
                 if (ctx.description) parts.push(wrapPromptBlock('PR description', ctx.description.slice(0, 8000)));
                 if (ctx.commitMessages)
                     parts.push(wrapPromptBlock('Commit messages', ctx.commitMessages.slice(0, 10000)));
-                if (ctx.diff) parts.push(wrapPromptBlock('Diff (for fact-checking)', ctx.diff.slice(0, 50000)));
 
                 // Thread context: gather sibling comments in the same thread
                 const containerSelectors = EXTENDED_COMMENT_CONTAINER_SELECTOR;
@@ -8446,9 +8451,11 @@ The prompt must ask for:
                                 maxInteriorBlankRun,
                                 maxInteriorBlankCount,
                             });
-                            // Reject segments that grew significantly (LLM added content)
-                            // Allow up to 10% growth or 20 chars (whichever is larger) for spelling fixes
-                            const maxLen = Math.max(original.length * 1.1, original.length + 20);
+                            // Reject segments that grew significantly (LLM added content).
+                            // Allow up to 30% growth or 50 chars (whichever is larger) so the
+                            // LLM has room to wrap technical identifiers in backticks and to
+                            // soften adversarial phrasing without tripping the guard.
+                            const maxLen = Math.max(original.length * 1.3, original.length + 50);
                             if (result.length > maxLen) {
                                 console.warn(
                                     `ACKtopus: proofread segment ${i} grew from ${original.length} to ${result.length} chars, rejecting (likely added content)`,
@@ -8484,7 +8491,7 @@ The prompt must ask for:
                         stripped: text !== cleaned ? text : null,
                     };
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Your output for each section must NEVER be longer than the input for that section (except for corrected spelling of individual words or minimal accuracy fixes).\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve ALL markdown formatting. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve ALL markdown formatting. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -18837,7 +18844,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.68
+// @version      1.69
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20722,6 +20729,64 @@ RULES:
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes("author's normal punctuation style"),
             'preserves the author punctuation style',
+        );
+    });
+
+    ackTest('proofread instructions soften adversarial wording', () => {
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('collaborative phrasing'),
+            'mentions collaborative phrasing',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('adversarial second-person'),
+            'names the anti-pattern it is softening',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('only soften clearly hostile or accusatory wording'),
+            'restricts softening to clearly hostile wording, not opinions',
+        );
+    });
+
+    ackTest('proofread instructions wrap technical identifiers in backticks', () => {
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Wrap technical identifiers in single backticks'),
+            'mentions wrapping technical identifiers in backticks',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('function and method names'),
+            'lists function names as targets',
+        );
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('file paths'), 'lists file paths as targets');
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('command-line flags'),
+            'lists command-line flags as targets',
+        );
+    });
+
+    ackTest('proofread instructions use commit messages and thread for context', () => {
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('make sense in light of the commit messages'),
+            'aligns reply to commit messages',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('current thread'),
+            'aligns reply to current thread',
+        );
+    });
+
+    ackTest('proofread system prompt allows small length growth for backticks and tone fixes', () => {
+        const promptSection = _ackSource.slice(_ackSource.indexOf('makePrompt'), _ackSource.indexOf('cleanResult'));
+        ackAssert(
+            promptSection.includes('Small length growth is acceptable'),
+            'system prompt explicitly allows small growth',
+        );
+        ackAssert(
+            promptSection.includes('wrapping technical identifiers in inline backticks'),
+            'system prompt lists backticks as a permitted growth reason',
+        );
+        ackAssert(
+            !promptSection.includes('NEVER be longer than the input'),
+            'system prompt no longer hard-bans growth',
         );
     });
 
@@ -24552,7 +24617,7 @@ RULES:
         ackAssert(fn.includes('changed variable'), 'instructs LLM to check changed variables');
     });
 
-    ackTest('non-PR-body proofreading includes diff for fact-checking', () => {
+    ackTest('non-PR-body proofreading uses messages, thread, and code context (no full diff)', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function runProofreadOnComment'),
@@ -24563,7 +24628,7 @@ RULES:
         ackAssert(fn.includes('Code context'), 'includes code context for inline comments');
         ackAssert(fn.includes('ctx.description'), 'includes PR description for regular comments');
         ackAssert(fn.includes('ctx.commitMessages'), 'includes commit messages for regular comments');
-        ackAssert(fn.includes('ctx.diff'), 'includes diff for regular comments too');
+        ackAssert(!fn.includes("'Diff (for fact-checking)'"), 'no longer attaches the full unified diff');
         ackAssert(fn.includes('fact-checking'), 'labels context for fact-checking');
     });
 
@@ -26545,7 +26610,11 @@ RULES:
         ackAssert(fromXML.includes('maxLen'), 'has maxLen threshold');
         ackAssert(fromXML.includes('result.length > maxLen'), 'checks result length vs threshold');
         ackAssert(fromXML.includes('likely added content'), 'logs rejection reason');
-        ackAssert(fromXML.includes('original.length * 1.1'), 'allows 10% growth');
+        ackAssert(
+            fromXML.includes('original.length * 1.3'),
+            'allows up to 30% growth so backtick wrapping and tone softening survive',
+        );
+        ackAssert(fromXML.includes('original.length + 50'), 'allows +50 chars for short segments');
     });
 
     ackTest('waitForElement helper exists and is exported', () => {
@@ -30490,9 +30559,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.68', () => {
+    ackTest('version bumped to 1.69', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.68' || _ackSource.includes('@version      1.68'), 'version is 1.68');
+        ackAssert(versionFromMeta === '1.69' || _ackSource.includes('@version      1.69'), 'version is 1.69');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
