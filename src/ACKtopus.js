@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.74
+// @version      1.76
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3592,7 +3592,7 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
         reimplementation: `Write the actual self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
-Do not write a prompt asking another agent to generate a prompt. Use the supplied PR context to produce the prompt that will directly guide the local reproduction work.
+Internal generation rule: answer with the ready-to-paste target-agent prompt itself. Keep generation-only checks out of the prompt you output, including checks about whether the text is a prompt.
 
 # Goal
 Produce a local reproducer prompt whose only target artifact is useful independent PR-review evidence from a local rediscovery attempt. The target agent should start from the base tree, understand the high-level problem, reproduce the full change independently, add focused tests where appropriate, commit the result locally in a reviewable shape, and stop before seeing any submitted implementation or submitted PR implementation.
@@ -3605,7 +3605,7 @@ Produce a local reproducer prompt whose only target artifact is useful independe
 - The generated prompt frames the task as an independent reinvention from the problem description and base tree. The user will provide the actual commits or PR separately after the local result is ready; the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation.
 - The target artifact is a coherent local branch with reviewable commits, focused tests or clear verification evidence, an explanation of the independently chosen design, and explicit uncertainty.
 - The target agent stops after the local result is coherent and asks the user before inspecting, splitting, rebasing, or comparing against the actual PR.
-- If the supplied source is truncated or incomplete, the agent treats it as an index of the problem, marks missing evidence, and proceeds from the problem description rather than trying to locate the existing implementation.
+- If the supplied source is truncated because of the context window or incomplete, the agent treats the supplied source as an index of the problem, marks missing evidence, and proceeds from the problem description rather than trying to locate the existing implementation.
 
 # Constraints
 - Treat the supplied PR context as private source material for prompt construction.
@@ -3642,7 +3642,7 @@ Explain how the target agent should shape its final report so the user can hand 
 The required final report: local branch name, base commit/branch, local commit list, what was implemented, why this design was chosen, exact verification, uncertainty, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt.
 
 ## Final Checks
-A short checklist that verifies the prompt is direct rather than meta, commit-by-commit jobs are outcome-level, the leakage list in Constraints is honored, truncated/incomplete context is handled, claims are grounded, follow-up notes frame the comparison material as user-supplied, and the stop point is explicit.`,
+A short checklist for the target agent to run before local work and before final reporting: base branch/commit confirmed, no submitted implementation inspected, no omitted evidence guessed, validation commands/results recorded, follow-up comparison remains user-supplied, and the stop point is honored.`,
         suggestion_stack: `Write one self-contained, outcome-focused follow-up prompt for a local coding agent.
 
 # Goal
@@ -6982,7 +6982,7 @@ The prompt must ask for:
                     },
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Do not write a meta-prompt that asks another agent to generate a reproducer prompt. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from the base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must frame the task as an independent reinvention from the problem description and base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the base commit/branch the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before finalizing, verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format.',
+                        'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from the base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must frame the task as an independent reinvention from the problem description and base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the base commit/branch the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
                 },
                 suggestion_stack: {
                     label: 'Suggestions',
@@ -18854,7 +18854,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.74
+// @version      1.76
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -24847,7 +24847,10 @@ RULES:
             'PR-body proofread uses larger commit-message context',
         );
         ackAssert(fn.includes('ctx.diff.slice(0, 120000)'), 'PR-body proofread uses larger diff context');
-        ackAssert(fn.includes('ctx.diff.slice(0, 50000)'), 'comment proofread uses larger diff context');
+        ackAssert(
+            !fn.includes('ctx.diff.slice(0, 50000)'),
+            'comment proofread skips the full unified diff',
+        );
         ackAssert(
             fn.includes('ctx.description.slice(0, 8000)'),
             'comment proofread uses larger PR description context',
@@ -29420,13 +29423,17 @@ RULES:
         const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
         ackAssert(prompt.includes('outcome-focused'), 'prompt is outcome-focused');
         ackAssert(prompt.includes('target artifact'), 'prompt focuses on artifacts');
-        ackAssert(prompt.includes('Do not write a prompt asking another agent to generate a prompt'), 'removes meta-prompt indirection');
+        ackAssert(prompt.includes('Internal generation rule'), 'keeps prompt-generation guard internal');
+        ackAssert(
+            prompt.includes('Keep generation-only checks out of the prompt you output'),
+            'keeps self-referential checks out of generated target prompt',
+        );
         ackAssert(prompt.includes('local reproducer prompt'), 'prompt is a local reproducer prompt');
         ackAssert(prompt.includes('independently rediscovered') || prompt.includes('independent PR-review evidence'), 'starts from independent rediscovery');
         ackAssert(prompt.includes('base tree'), 'starts from base tree');
         ackAssert(prompt.includes('submitted PR implementation'), 'guards submitted implementation');
         ackAssert(prompt.includes('stop before seeing any submitted implementation'), 'stops before PR comparison');
-        ackAssert(prompt.includes('separate actual-PR comparison/suggestion prompt'), 'points to separate follow-up prompt');
+        ackAssert(prompt.includes('separate comparison/suggestion prompt'), 'points to separate follow-up prompt');
         ackAssert(prompt.includes('Commit-By-Commit Target Jobs'), 'asks for commit-by-commit reproduction jobs');
         ackAssert(prompt.includes('Follow-Up Handoff Notes'), 'mentions follow-up handoff shape');
         ackAssert(prompt.includes('context window'), 'handles context-window overflow');
@@ -29438,6 +29445,11 @@ RULES:
         ackAssert(!prompt.includes('## Phase 2 - Split The Actual PR'), 'does not include actual PR split phase');
         ackAssert(!prompt.includes('## Phase 3 - Rebase And Suggest'), 'does not include rebase/suggest phase');
         ackAssert(!prompt.includes('## Phase 4 - Audio Guide'), 'does not include audio guide phase');
+        ackAssert(!prompt.includes('direct rather than meta'), 'does not ask target agent to self-check prompt indirection');
+        ackAssert(
+            !prompt.includes('not a request to generate another prompt'),
+            'does not include weird meta-prompt final check wording',
+        );
     });
 
     ackTest('reimplementation prompt keeps no-peek task abstract and non-prescriptive', () => {
@@ -29457,7 +29469,7 @@ RULES:
         ackAssert(prompt.includes('verbatim commit messages'), 'forbids verbatim commit messages');
         ackAssert(prompt.includes('commit SHAs'), 'forbids exposing commit SHAs');
         ackAssert(prompt.includes('different valid design'), 'leaves room for alternate design');
-        ackAssert(prompt.includes('mark missing evidence'), 'prevents hallucinated claims');
+        ackAssert(prompt.includes('marks missing evidence'), 'prevents hallucinated claims');
         ackAssert(
             prompt.includes('head branch, head commit SHA, PR number, PR URL'),
             'forbids leaking head/PR identifiers into the generated prompt',
@@ -29503,7 +29515,8 @@ RULES:
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
         ackAssert(fn.includes('the actual outcome-focused no-peek local reproducer prompt'), 'generates the direct no-peek prompt');
-        ackAssert(fn.includes('Do not write a meta-prompt'), 'removes prompt-generation indirection');
+        ackAssert(fn.includes('Internal generation constraint'), 'keeps prompt-generation guard internal');
+        ackAssert(fn.includes('do not include this constraint'), 'keeps generation constraint out of generated prompt');
         ackAssert(fn.includes('artifact') && fn.includes('acceptance criteria'), 'prompt focuses on outcomes');
         ackAssert(fn.includes('independently rediscovered local implementation'), 'keeps no-peek implementation target');
         ackAssert(fn.includes('commit by commit in original order'), 'asks for commit-by-commit target jobs');
@@ -29529,7 +29542,9 @@ RULES:
         );
         ackAssert(fn.includes('follow-up handoff notes'), 'asks for later prompt handoff notes');
         ackAssert(fn.includes('later dedicated Suggestions prompt'), 'names the suggestions follow-up without over-defining other recipes');
-        ackAssert(fn.includes('mark missing evidence instead of guessing'), 'forbids guessing around omitted source');
+        ackAssert(fn.includes('mark missing evidence'), 'forbids guessing around omitted source');
+        ackAssert(fn.includes('Do not include generator-only final checks'), 'prevents generator checks from leaking into output');
+        ackAssert(!fn.includes('direct rather than meta'), 'does not request meta-prompt final checks');
         ackAssert(
             fn.includes('formatLLMPromptPreview(system, userContent)'),
             'reimplementation recipe builds inspectable prompt preview',
@@ -30650,9 +30665,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.74', () => {
+    ackTest('version bumped to 1.76', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.74' || _ackSource.includes('@version      1.74'), 'version is 1.74');
+        ackAssert(versionFromMeta === '1.76' || _ackSource.includes('@version      1.76'), 'version is 1.76');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
