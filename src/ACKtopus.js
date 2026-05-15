@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.76
+// @version      1.77
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18356,7 +18356,7 @@ RULES:
             });
             const jumpSearch = document.createElement('input');
             jumpSearch.type = 'search';
-            jumpSearch.placeholder = 'Search commits...';
+            jumpSearch.placeholder = 'Search commits, hashes, or diffs...';
             jumpSearch.setAttribute('aria-label', 'Search commits');
             Object.assign(jumpSearch.style, {
                 display: 'block',
@@ -18374,6 +18374,18 @@ RULES:
                 top: '0',
                 zIndex: '1',
             });
+            const jumpDiffStatus = document.createElement('div');
+            Object.assign(jumpDiffStatus.style, {
+                display: 'none',
+                margin: '-2px 0 6px',
+                padding: '0 2px',
+                color: '#8b949e',
+                fontSize: '11px',
+                position: 'sticky',
+                top: '34px',
+                zIndex: '1',
+                background: '#161b22',
+            });
             const emptyJumpSearch = document.createElement('div');
             emptyJumpSearch.textContent = 'No matching commits';
             Object.assign(emptyJumpSearch.style, {
@@ -18385,7 +18397,34 @@ RULES:
             });
             const jumpItems = [];
             let activeJumpIdx = -1;
+            let jumpDiffSearchTimer = null;
+            let jumpDiffSearchToken = 0;
+            let jumpDiffSearchRunning = false;
+            let jumpDiffSearchQuery = '';
+            const commitDiffSearchText = new Map(); // sha -> lowercased commit patch
             const visibleJumpItems = () => jumpItems.filter((item) => item.style.display !== 'none');
+            const commitForJumpItem = (item) => commits[Number(item.dataset.ackIndex || '-1')];
+            const itemDiffMatches = (item, query) => {
+                if (!query) return false;
+                const commit = commitForJumpItem(item);
+                if (!commit) return false;
+                return (commitDiffSearchText.get(commit.sha) || '').includes(query);
+            };
+            const loadedDiffCount = () => commits.filter((commit) => commitDiffSearchText.has(commit.sha)).length;
+            const updateJumpDiffStatus = (query, loaded = loadedDiffCount()) => {
+                if (!query) {
+                    jumpDiffStatus.style.display = 'none';
+                    jumpDiffStatus.textContent = '';
+                    return;
+                }
+                const diffMatches = jumpItems.filter((item) => itemDiffMatches(item, query)).length;
+                jumpDiffStatus.style.display = 'block';
+                jumpDiffStatus.textContent = jumpDiffSearchRunning
+                    ? `Searching diffs ${loaded}/${commits.length}${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
+                    : loaded === commits.length
+                      ? `Diff search complete${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
+                      : 'Type to search commit diffs';
+            };
             const paintJumpItem = (item) => {
                 const idx = Number(item.dataset.ackIndex || '-1');
                 const isCurrent = idx === currentIdx;
@@ -18416,16 +18455,23 @@ RULES:
                 );
                 if (active) active.click();
             };
-            const filterJumpItems = () => {
+            const applyJumpFilter = () => {
                 const query = jumpSearch.value.trim().toLowerCase();
                 let visible = 0;
                 for (const item of jumpItems) {
-                    const matches = !query || item.dataset.ackSearch.includes(query);
+                    const textMatches = !query || item.dataset.ackSearch.includes(query);
+                    const diffMatches = itemDiffMatches(item, query);
+                    const matches = textMatches || diffMatches;
                     item.style.display = matches ? 'block' : 'none';
+                    if (item._ackDiffBadge) item._ackDiffBadge.style.display = diffMatches ? 'inline-block' : 'none';
                     if (matches) visible++;
                     paintJumpItem(item);
                 }
+                emptyJumpSearch.textContent = jumpDiffSearchRunning
+                    ? 'No matching commits yet, still searching diffs'
+                    : 'No matching commits';
                 emptyJumpSearch.style.display = visible ? 'none' : 'block';
+                updateJumpDiffStatus(query);
                 const activeStillVisible = jumpItems.some(
                     (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
                 );
@@ -18433,6 +18479,61 @@ RULES:
                     const firstVisible = visibleJumpItems()[0] || null;
                     setActiveJumpItem(firstVisible ? Number(firstVisible.dataset.ackIndex || '-1') : -1);
                 }
+            };
+            const runJumpDiffSearch = async (query, token) => {
+                const pending = commits.filter((commit) => !commitDiffSearchText.has(commit.sha));
+                if (!pending.length) {
+                    applyJumpFilter();
+                    return;
+                }
+                jumpDiffSearchRunning = true;
+                updateJumpDiffStatus(query);
+                let loaded = loadedDiffCount();
+                const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
+                    while (pending.length && token === jumpDiffSearchToken) {
+                        const commit = pending.shift();
+                        try {
+                            const patch = await fetchCommitPatch(pr, commit.sha);
+                            commitDiffSearchText.set(commit.sha, String(patch || '').toLowerCase());
+                        } catch (_) {
+                            commitDiffSearchText.set(commit.sha, '');
+                        }
+                        loaded++;
+                        if (token !== jumpDiffSearchToken) return;
+                        applyJumpFilter();
+                        updateJumpDiffStatus(query, loaded);
+                    }
+                });
+                await Promise.all(workers);
+                if (token !== jumpDiffSearchToken) return;
+                jumpDiffSearchRunning = false;
+                applyJumpFilter();
+            };
+            const scheduleJumpDiffSearch = () => {
+                const query = jumpSearch.value.trim().toLowerCase();
+                if (jumpDiffSearchTimer) clearTimeout(jumpDiffSearchTimer);
+                if (!query) {
+                    jumpDiffSearchToken++;
+                    jumpDiffSearchRunning = false;
+                    jumpDiffSearchQuery = '';
+                    applyJumpFilter();
+                    return;
+                }
+                if (loadedDiffCount() === commits.length) {
+                    applyJumpFilter();
+                    return;
+                }
+                jumpDiffSearchTimer = window.setTimeout(() => {
+                    const latest = jumpSearch.value.trim().toLowerCase();
+                    if (!latest || latest === jumpDiffSearchQuery) return;
+                    jumpDiffSearchQuery = latest;
+                    const token = ++jumpDiffSearchToken;
+                    runJumpDiffSearch(latest, token);
+                }, 250);
+            };
+            const filterJumpItems = () => {
+                applyJumpFilter();
+                scheduleJumpDiffSearch();
             };
             jumpSearch.addEventListener('focus', () => {
                 jumpSearch.style.borderColor = '#58a6ff';
@@ -18457,6 +18558,21 @@ RULES:
                 const item = document.createElement('a');
                 item.href = commitHref(commit);
                 item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
+                const diffBadge = document.createElement('span');
+                diffBadge.className = 'ack-commit-diff-hit';
+                diffBadge.textContent = 'diff';
+                Object.assign(diffBadge.style, {
+                    display: 'none',
+                    marginLeft: '8px',
+                    padding: '1px 4px',
+                    borderRadius: '4px',
+                    background: '#1f6feb',
+                    color: '#fff',
+                    fontSize: '10px',
+                    fontWeight: '600',
+                });
+                item.appendChild(diffBadge);
+                item._ackDiffBadge = diffBadge;
                 item.dataset.ackSearch =
                     `${commit.sha} ${idx + 1}/${commits.length} ${commitLine(commit)}`.toLowerCase();
                 item.dataset.ackIndex = String(idx);
@@ -18489,6 +18605,7 @@ RULES:
             });
             jumpMenu.setAttribute('role', 'listbox');
             jumpMenu.prepend(jumpSearch);
+            jumpSearch.insertAdjacentElement('afterend', jumpDiffStatus);
             jumpMenu.appendChild(emptyJumpSearch);
             const closeJumpMenu = () => {
                 jumpDetails.removeAttribute('open');
@@ -18520,6 +18637,10 @@ RULES:
                 } else {
                     removeJumpCloseListeners();
                     jumpSearch.value = '';
+                    if (jumpDiffSearchTimer) clearTimeout(jumpDiffSearchTimer);
+                    jumpDiffSearchToken++;
+                    jumpDiffSearchRunning = false;
+                    jumpDiffSearchQuery = '';
                     activeJumpIdx = currentIdx >= 0 ? currentIdx : 0;
                     filterJumpItems();
                 }
@@ -18949,7 +19070,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.76
+// @version      1.77
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -30669,6 +30790,10 @@ RULES:
         );
         ackAssert(fn.includes("const jumpSearch = document.createElement('input')"), 'creates search input');
         ackAssert(fn.includes("jumpSearch.type = 'search'"), 'uses search input type');
+        ackAssert(
+            fn.includes('Search commits, hashes, or diffs'),
+            'search input advertises commit diff search',
+        );
         ackAssert(fn.includes('jumpSearch.focus()'), 'focuses search when chooser opens');
         ackAssert(fn.includes('filterJumpItems'), 'filters dropdown items');
         ackAssert(fn.includes('item.dataset.ackSearch'), 'stores searchable commit text');
@@ -30693,6 +30818,23 @@ RULES:
             fn.includes("document.removeEventListener('pointerdown', onJumpOutsidePointer, true)"),
             'removes outside listener',
         );
+    });
+
+    ackTest('floating commit nav jump dropdown searches commit diffs asynchronously', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function _addFloatingCommitNavInner'),
+            source.indexOf('function isPRPage'),
+        );
+        ackAssert(fn.includes('commitDiffSearchText = new Map()'), 'keeps commit patch search cache');
+        ackAssert(fn.includes('fetchCommitPatch(pr, commit.sha)'), 'loads each commit patch for diff search');
+        ackAssert(fn.includes('window.setTimeout'), 'debounces async diff search after text filtering');
+        ackAssert(fn.includes('jumpDiffSearchToken'), 'invalidates stale async diff searches');
+        ackAssert(fn.includes('Math.min(4, pending.length)'), 'bounds concurrent patch fetches');
+        ackAssert(fn.includes('itemDiffMatches(item, query)'), 'matches rows by loaded diff text');
+        ackAssert(fn.includes('ack-commit-diff-hit'), 'marks diff-only hits in the chooser');
+        ackAssert(fn.includes('Searching diffs'), 'shows async diff search progress');
+        ackAssert(fn.includes("jumpSearch.insertAdjacentElement('afterend', jumpDiffStatus)"), 'renders diff search status');
     });
 
     ackTest('navigateCommit wraps around circularly', () => {
@@ -30801,9 +30943,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.76', () => {
+    ackTest('version bumped to 1.77', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.76' || _ackSource.includes('@version      1.76'), 'version is 1.76');
+        ackAssert(versionFromMeta === '1.77' || _ackSource.includes('@version      1.77'), 'version is 1.77');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
