@@ -4806,20 +4806,38 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         GM_setValue(`llm_usage_${provider}`, { input: 0, output: 0, calls: 0 });
     }
 
-    // Simple string hash for cache keys (FNV-1a 32-bit + DJB2 32-bit).
-    // Prompt caches can be used heavily; a single 32-bit hash can collide and cause
-    // "wrong answer for this prompt" incidents. Using two independent hashes reduces
-    // collision risk dramatically without BigInt/WebCrypto overhead.
+    // String hash for cache keys, combining four cheap 32-bit mixers
+    // (FNV-1a, DJB2-xor, SDBM, Murmur3-style avalanche mixing).
+    // Why: prompt cache lookups must never return another prompt's response. A
+    // single 32-bit hash has a tractable birthday bound; combining multiple
+    // low-cost mixers reduces accidental collision risk without needing async
+    // WebCrypto in the cache hot path.
     function hashPrompt(str) {
         let fnv = 0x811c9dc5;
         let djb = 5381;
+        let sdbm = 0;
+        let mur = 0xcafebabe;
         for (let i = 0; i < str.length; i++) {
             const c = str.charCodeAt(i);
             fnv ^= c;
             fnv = Math.imul(fnv, 0x01000193);
             djb = ((djb << 5) + djb) ^ c; // djb2 xor
+            sdbm = (Math.imul(sdbm, 65599) + c) | 0;
+            let k = Math.imul(c, 0xcc9e2d51);
+            k = (k << 15) | (k >>> 17);
+            k = Math.imul(k, 0x1b873593);
+            mur ^= k;
+            mur = (mur << 13) | (mur >>> 19);
+            mur = (Math.imul(mur, 5) + 0xe6546b64) | 0;
         }
-        return (fnv >>> 0).toString(36) + (djb >>> 0).toString(36) + '_' + str.length.toString(36);
+        return (
+            (fnv >>> 0).toString(36) +
+            (djb >>> 0).toString(36) +
+            (sdbm >>> 0).toString(36) +
+            (mur >>> 0).toString(36) +
+            '_' +
+            str.length.toString(36)
+        );
     }
 
     // Build a deterministic cache key for an LLM prompt (provider + model + page + content hash).
