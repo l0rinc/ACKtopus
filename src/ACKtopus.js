@@ -5404,8 +5404,59 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         breaks: true,
     });
 
+    // Defense-in-depth backstop for renderMarkdown: walks the parsed DOM and
+    // strips anything dangerous that survived the custom marked renderer
+    // (mutation-XSS quirks, raw HTML reaching unhandled token types, future
+    // marked upgrades). The custom renderers in marked.use(...) escape
+    // html/link/img tokens — this is a second wall, not the primary defense.
+    const SANITIZE_BLOCKED_TAGS = new Set([
+        'script',
+        'style',
+        'iframe',
+        'object',
+        'embed',
+        'link',
+        'meta',
+        'base',
+        'form',
+    ]);
+    function sanitizeRenderedMarkdown(html) {
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_ELEMENT);
+        const toRemove = [];
+        let node = walker.nextNode();
+        while (node) {
+            if (SANITIZE_BLOCKED_TAGS.has(node.tagName.toLowerCase())) {
+                toRemove.push(node);
+            } else {
+                for (const attr of Array.from(node.attributes)) {
+                    const name = attr.name.toLowerCase();
+                    if (name.startsWith('on')) {
+                        node.removeAttribute(attr.name);
+                        continue;
+                    }
+                    const value = String(attr.value || '');
+                    if (
+                        (name === 'href' || name === 'xlink:href') &&
+                        /^\s*(javascript|data|vbscript):/i.test(value)
+                    ) {
+                        node.removeAttribute(attr.name);
+                        continue;
+                    }
+                    if (name === 'src' && /^\s*(javascript|data|vbscript):/i.test(value)) {
+                        node.removeAttribute(attr.name);
+                    }
+                }
+            }
+            node = walker.nextNode();
+        }
+        for (const el of toRemove) el.remove();
+        return template.innerHTML;
+    }
+
     function renderMarkdown(text) {
-        return marked.parse(text);
+        return sanitizeRenderedMarkdown(marked.parse(text));
     }
 
     function buildAnalysisPanel() {
@@ -19167,6 +19218,47 @@ RULES:
         const r = renderMarkdown('**use `x`**');
         ackAssert(r.includes('<strong>'));
         ackAssert(r.includes('<code'));
+    });
+
+    ackTest('renderMarkdown strips XSS payloads from raw HTML and dangerous URLs', () => {
+        const payloads = [
+            '<svg onload="alert(1)">probe</svg>',
+            '<img src="x" onerror="alert(1)">',
+            '[click](javascript:alert(1))',
+            '<script>alert(1)</script>',
+            '<iframe src="https://evil.example"></iframe>',
+            '[d](data:text/html,<script>alert(1)</script>)',
+            '<a href="vbscript:alert(1)">x</a>',
+            '<img src="data:image/svg+xml,<svg onload=alert(1)>">',
+            '<math><mtext><option><FAKE><option></option><mglyph><svg><mtext><style><a title="</style><img src=x onerror=alert(1)>">',
+        ];
+        for (const p of payloads) {
+            const out = renderMarkdown(p);
+            const probe = document.createElement('div');
+            probe.innerHTML = out;
+            ackAssert(
+                !probe.querySelector('[onload],[onerror],[onclick],[onmouseover],[onfocus]'),
+                `no event-handler attribute survives: ${p} -> ${out}`,
+            );
+            ackAssert(
+                !probe.querySelector('script,iframe,object,embed,form,meta,base'),
+                `no dangerous tag survives: ${p} -> ${out}`,
+            );
+            for (const a of probe.querySelectorAll('a[href]')) {
+                const href = a.getAttribute('href') || '';
+                ackAssert(
+                    !/^\s*(javascript|vbscript|data):/i.test(href),
+                    `no dangerous href scheme: ${p} -> ${href}`,
+                );
+            }
+            for (const img of probe.querySelectorAll('img[src]')) {
+                const src = img.getAttribute('src') || '';
+                ackAssert(
+                    !/^\s*(javascript|vbscript|data):/i.test(src),
+                    `no dangerous img src scheme: ${p} -> ${src}`,
+                );
+            }
+        }
     });
 
     // --- SHA_FORMATS ---
