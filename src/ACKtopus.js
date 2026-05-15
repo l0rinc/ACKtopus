@@ -4341,8 +4341,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                   };
 
         const provHdr = document.createElement('div');
-        provHdr.innerHTML = `${meta.icon} <span style="font-weight:500">${meta.label}</span> <span style="font-size:11px;color:#484f58">${cfg.model}</span>`;
         Object.assign(provHdr.style, { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' });
+        const provIcon = document.createElement('span');
+        provIcon.innerHTML = meta.icon; // trusted SVG constant from PROVIDER_META
+        const provLabel = document.createElement('span');
+        provLabel.style.fontWeight = '500';
+        provLabel.textContent = meta.label;
+        const provModel = document.createElement('span');
+        Object.assign(provModel.style, { fontSize: '11px', color: '#484f58' });
+        provModel.textContent = cfg.model;
+        provHdr.append(provIcon, provLabel, provModel);
         panel.appendChild(provHdr);
 
         const keyRow = document.createElement('div');
@@ -4584,7 +4592,25 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 fontSize: '12px',
             });
             const info = document.createElement('span');
-            info.innerHTML = `${m.icon} <span style="color:${m.color}">${m.label}</span>: ${u.calls} calls · <span title="Input tokens">↑${fmtTokens(u.input)}</span> · <span title="Output tokens">↓${fmtTokens(u.output)}</span> · <span title="Estimated cost">${fmtCost(provName, u.input, u.output)}</span>`;
+            const renderUsageRow = (usage) => {
+                info.replaceChildren();
+                const iconSpan = document.createElement('span');
+                iconSpan.innerHTML = m.icon; // trusted SVG constant from PROVIDER_META
+                const labelSpan = document.createElement('span');
+                labelSpan.style.color = m.color;
+                labelSpan.textContent = m.label;
+                const inSpan = document.createElement('span');
+                inSpan.title = 'Input tokens';
+                inSpan.textContent = `↑${fmtTokens(usage.input)}`;
+                const outSpan = document.createElement('span');
+                outSpan.title = 'Output tokens';
+                outSpan.textContent = `↓${fmtTokens(usage.output)}`;
+                const costSpan = document.createElement('span');
+                costSpan.title = 'Estimated cost';
+                costSpan.textContent = fmtCost(provName, usage.input, usage.output);
+                info.append(iconSpan, ' ', labelSpan, `: ${usage.calls} calls · `, inSpan, ' · ', outSpan, ' · ', costSpan);
+            };
+            renderUsageRow(u);
             row.appendChild(info);
             const resetBtn = document.createElement('button');
             resetBtn.textContent = 'Reset';
@@ -4599,7 +4625,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             });
             resetBtn.addEventListener('click', () => {
                 resetUsage(provName);
-                info.innerHTML = `${m.icon} <span style="color:${m.color}">${m.label}</span>: 0 calls · ↑0 · ↓0 · $0.00`;
+                renderUsageRow({ calls: 0, input: 0, output: 0 });
             });
             row.appendChild(resetBtn);
             panel.appendChild(row);
