@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.77
+// @version      1.78
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -495,6 +495,54 @@
 
     const COPY_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-copy" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>`;
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
+    const SHIFT_COPY_HINT = '📋';
+    const SHIFT_REVEAL_HINT = '📂';
+    let ackShiftPressed = false;
+    const ackShiftAlternateRenderers = new Set();
+
+    function notifyShiftAlternateRenderers() {
+        for (const render of [...ackShiftAlternateRenderers]) {
+            if (render() === false) ackShiftAlternateRenderers.delete(render);
+        }
+    }
+
+    function setAckShiftPressed(next) {
+        const pressed = !!next;
+        if (ackShiftPressed === pressed) return;
+        ackShiftPressed = pressed;
+        notifyShiftAlternateRenderers();
+    }
+
+    function eventUsesShiftAlternate(e) {
+        return !!e?.shiftKey || ackShiftPressed;
+    }
+
+    function registerShiftAlternateRenderer(owner, render) {
+        const wrapped = () => {
+            if (!owner?.isConnected) return false;
+            render();
+            return true;
+        };
+        ackShiftAlternateRenderers.add(wrapped);
+        render();
+        return () => ackShiftAlternateRenderers.delete(wrapped);
+    }
+
+    document.addEventListener(
+        'keydown',
+        (e) => {
+            if (e.key === 'Shift') setAckShiftPressed(true);
+        },
+        true,
+    );
+    document.addEventListener(
+        'keyup',
+        (e) => {
+            if (e.key === 'Shift') setAckShiftPressed(false);
+        },
+        true,
+    );
+    window.addEventListener('blur', () => setAckShiftPressed(false));
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
@@ -6760,7 +6808,7 @@ The prompt must ask for:
     }
 
     function buildChatPanel(opts = {}) {
-        const { initialRecipe = null } = opts;
+        const { initialRecipe = null, promptOnly = false } = opts;
         const panel = document.createElement('div');
         panel.id = 'acktopus-analysis';
         Object.assign(panel.style, {
@@ -7047,9 +7095,10 @@ The prompt must ask for:
             messages.scrollTop = messages.scrollHeight;
         }
 
-        async function send(recipe = null) {
+        async function send(recipe = null, opts = {}) {
+            const copyPromptOnly = !!opts.promptOnly;
             const provider = getActiveProvider();
-            if (!isProviderAvailable(provider)) {
+            if (!copyPromptOnly && !isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
                 return;
             }
@@ -7264,6 +7313,25 @@ The prompt must ask for:
                             prompt: generatedPrompt,
                         };
                     }
+                    if (copyPromptOnly) {
+                        stopSpin();
+                        if (!generatedPrompt) {
+                            setAssistantText(assistantMsg, 'No reusable prompt is available for this recipe.', '#f85149');
+                            return;
+                        }
+                        setAssistantHtml(
+                            assistantMsg,
+                            renderMarkdown(`Copied the ${recipeCfg.label} request prompt to clipboard.`),
+                            generatedPrompt,
+                        );
+                        await copyTextWithSpinner(assistantMsg._ackCopyBtn, generatedPrompt);
+                        setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt, {
+                            open: true,
+                        });
+                        history.push({ role: 'assistant', content: generatedPrompt });
+                        messages.scrollTop = messages.scrollHeight;
+                        return;
+                    }
                     const result = await callLLM(provider, system, userContent, {
                         modelOverride: getHighContextModelOverride(provider),
                         reasoningEffort: getHighContextReasoningEffort(provider),
@@ -7331,7 +7399,7 @@ The prompt must ask for:
         setTimeout(() => input.focus(), 100);
         if (initialRecipe && initialRecipe !== 'chat') {
             ackSetTimeout(() => {
-                send(initialRecipe);
+                send(initialRecipe, { promptOnly });
             }, 50);
         }
 
@@ -7957,18 +8025,19 @@ The prompt must ask for:
     // Old analyzePR/analyzeCommitsList/analyzeSingleCommit are retained above
     // because they seed the cache that gatherChatContext reads from.
 
-    async function runAnalysis(wrapper, recipe = 'chat') {
+    async function runAnalysis(wrapper, recipe = 'chat', opts = {}) {
         if (recipe === 'infographic') {
             await runPRInfographic(wrapper);
             return;
         }
-        if (!isProviderAvailable(getActiveProvider())) {
+        const promptOnly = !!opts.promptOnly && isPromptRecipe(recipe);
+        if (!promptOnly && !isProviderAvailable(getActiveProvider())) {
             document.body.appendChild(buildConfigPanel());
             return;
         }
         const old = document.getElementById('acktopus-analysis');
         if (old) old.remove();
-        const panel = buildChatPanel({ initialRecipe: recipe });
+        const panel = buildChatPanel({ initialRecipe: recipe, promptOnly });
         wrapper.appendChild(panel);
     }
 
@@ -17170,7 +17239,7 @@ RULES:
         });
     }
 
-    async function revealAllContext(btn) {
+    async function revealAllContext(btn, { restoreMs = 2000 } = {}) {
         if (btn._running) return;
         btn._running = true;
         const compact = GM_getValue('compactToolbar', false);
@@ -17183,16 +17252,19 @@ RULES:
                   btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
               });
         const popup = makeStatusPopup('Revealing hidden conversations, resolved threads, and collapsed sections...');
-        const finish = (msg, shortMsg) => {
+        const finish = (msg, shortMsg, ok = false) => {
             if (stopAnim) stopAnim();
             if (stopCompactSpin) stopCompactSpin(shortMsg || msg);
             else btn.textContent = shortMsg || msg;
             popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
-            setTimeout(() => {
+            const restore = () => {
                 btn.textContent = origText;
                 popup.remove();
                 btn._running = false;
-            }, 2000);
+            };
+            if (restoreMs <= 0) restore();
+            else setTimeout(restore, restoreMs);
+            return ok;
         };
 
         try {
@@ -17214,8 +17286,7 @@ RULES:
                 popup.textContent =
                     state.total > 0 ? `Revealing ${phase}... ${state.total} remaining` : 'Finalizing...';
                 if (state.total === 0) {
-                    finish('Revealed everything needed for context copy', '✅');
-                    return;
+                    return finish('Revealed everything needed for context copy', '✅', true);
                 }
 
                 if (round === 0 || openedCount - lastScrolledAt >= 10) {
@@ -17244,11 +17315,11 @@ RULES:
             }
 
             const remaining = getRevealAllState().total;
-            if (remaining === 0) finish('Revealed everything needed for context copy', '✅');
-            else finish(`${remaining} items still appear collapsed`, '❌');
+            if (remaining === 0) return finish('Revealed everything needed for context copy', '✅', true);
+            return finish(`${remaining} items still appear collapsed`, '❌', false);
         } catch (e) {
             console.error('ACKtopus: reveal all context failed:', e);
-            finish(`Error: ${e.message}`, '❌');
+            return finish(`Error: ${e.message}`, '❌', false);
         }
     }
 
@@ -17292,18 +17363,29 @@ RULES:
         ];
         let selectedAction = GM_getValue('contextCopyAction', 'patch');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
+        const contextShiftSuffix = () => (ackShiftPressed ? ` ${SHIFT_REVEAL_HINT}` : '');
+        const runContextCopyAction = async (action, btn, e) => {
+            if (!action.enabled()) return;
+            if (eventUsesShiftAlternate(e) && getRevealAllState().total > 0) {
+                await revealAllContext(btn, { restoreMs: 0 });
+            }
+            await action.run(btn);
+        };
 
         const mainBtn = document.createElement('button');
         const updateMainLabel = () => {
             const action = getAction();
-            mainBtn.innerHTML = compact ? action.emoji : `${action.emoji} ${action.label}`;
-            mainBtn.title = action.tip;
+            mainBtn.innerHTML = compact
+                ? `${action.emoji}${contextShiftSuffix()}`
+                : `${action.emoji} ${action.label}${contextShiftSuffix()}`;
+            mainBtn.title = `${action.tip}\nShift+click: reveal hidden/resolved/collapsed content first, then copy.`;
             const enabled = action.enabled();
             mainBtn.disabled = !enabled;
             mainBtn.style.opacity = enabled ? '' : '0.35';
             mainBtn.style.cursor = enabled ? 'pointer' : 'default';
         };
         updateMainLabel();
+        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
         Object.assign(mainBtn.style, {
             padding: '4px 10px',
             fontSize: '12px',
@@ -17319,10 +17401,9 @@ RULES:
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', function () {
+        mainBtn.addEventListener('click', async function (e) {
             const action = getAction();
-            if (!action.enabled()) return;
-            action.run(this);
+            await runContextCopyAction(action, this, e);
         });
 
         const dropBtn = document.createElement('button');
@@ -17356,7 +17437,6 @@ RULES:
         });
         for (const action of actions) {
             const item = document.createElement('div');
-            item.textContent = `${action.emoji} ${action.label}`;
             item.title = action.tip;
             Object.assign(item.style, {
                 padding: '6px 12px',
@@ -17370,7 +17450,12 @@ RULES:
             item.addEventListener('mouseleave', () => {
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
-            item.addEventListener('click', () => {
+            const renderItem = () => {
+                item.textContent = `${action.emoji} ${action.label}${contextShiftSuffix()}`;
+            };
+            renderItem();
+            registerShiftAlternateRenderer(item, renderItem);
+            item.addEventListener('click', async (e) => {
                 if (!action.enabled()) return;
                 selectedAction = action.key;
                 GM_setValue('contextCopyAction', action.key);
@@ -17378,7 +17463,7 @@ RULES:
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
                 menu.style.display = 'none';
-                action.run(mainBtn);
+                await runContextCopyAction(action, mainBtn, e);
             });
             const renderItemState = () => {
                 const enabled = action.enabled();
@@ -17442,14 +17527,24 @@ RULES:
         const actions = ROBOT_RECIPE_ACTIONS;
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
+        const robotShiftSuffix = (action) => (ackShiftPressed && isPromptRecipe(action.key) ? ` ${SHIFT_COPY_HINT}` : '');
+        const robotShiftTitle = (action) =>
+            `${action.tip}${isPromptRecipe(action.key) ? '\nShift+click: copy the LLM request prompt instead of running it.' : ''}`;
+        const runRobotAction = async (action, e) => {
+            const promptOnly = eventUsesShiftAlternate(e) && isPromptRecipe(action.key);
+            await runAnalysis(wrapper, action.key, { promptOnly });
+        };
 
         const mainBtn = document.createElement('button');
         const updateMainLabel = () => {
             const action = getAction();
-            mainBtn.innerHTML = compact ? action.emoji : `${action.emoji} ${action.label}`;
-            mainBtn.title = action.tip;
+            mainBtn.innerHTML = compact
+                ? `${action.emoji}${robotShiftSuffix(action)}`
+                : `${action.emoji} ${action.label}${robotShiftSuffix(action)}`;
+            mainBtn.title = robotShiftTitle(action);
         };
         updateMainLabel();
+        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
         Object.assign(mainBtn.style, {
             padding: '4px 10px',
             fontSize: '12px',
@@ -17465,14 +17560,15 @@ RULES:
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', async function () {
+        mainBtn.addEventListener('click', async function (e) {
             const action = getAction();
+            const promptOnly = eventUsesShiftAlternate(e) && isPromptRecipe(action.key);
             const existing = document.getElementById('acktopus-analysis');
-            if (action.key === 'chat' && existing) {
+            if (action.key === 'chat' && existing && !promptOnly) {
                 existing.remove();
                 return;
             }
-            await runAnalysis(wrapper, action.key);
+            await runRobotAction(action, e);
         });
 
         const dropBtn = document.createElement('button');
@@ -17506,8 +17602,7 @@ RULES:
         });
         for (const action of actions) {
             const item = document.createElement('div');
-            item.textContent = `${action.emoji} ${action.label}`;
-            item.title = action.tip;
+            item.title = robotShiftTitle(action);
             Object.assign(item.style, {
                 padding: '6px 12px',
                 fontSize: '12px',
@@ -17520,14 +17615,19 @@ RULES:
             item.addEventListener('mouseleave', () => {
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
-            item.addEventListener('click', async () => {
+            const renderItem = () => {
+                item.textContent = `${action.emoji} ${action.label}${robotShiftSuffix(action)}`;
+            };
+            renderItem();
+            registerShiftAlternateRenderer(item, renderItem);
+            item.addEventListener('click', async (e) => {
                 selectedAction = action.key;
                 GM_setValue('robotRecipeAction', action.key);
                 updateMainLabel();
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
                 menu.style.display = 'none';
-                await runAnalysis(wrapper, action.key);
+                await runRobotAction(action, e);
             });
             menu.appendChild(item);
         }
@@ -18022,17 +18122,8 @@ RULES:
         settingsBtn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            if (e.shiftKey) {
-                const n = clearAllCaches();
-                settingsBtn.title = `✓ Cleared ${n} cache entries - reload to refresh`;
-                setTimeout(() => {
-                    settingsBtn.title = 'ACKtopus settings (Shift+click to clear all caches)';
-                }, 3000);
-                return;
-            }
             document.body.appendChild(buildConfigPanel());
         });
-        settingsBtn.title = 'ACKtopus settings (Shift+click to clear all caches)';
 
         settingsGroup.appendChild(providerBtn);
         settingsGroup.appendChild(settingsBtn);
@@ -19070,7 +19161,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.77
+// @version      1.78
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -23714,7 +23805,7 @@ RULES:
         const source = _ackSource;
         // runAnalysis should call buildChatPanel
         ackAssert(
-            sourceIncludesLoose(source, 'buildChatPanel({initialRecipe: recipe})'),
+            sourceIncludesLoose(source, 'buildChatPanel({initialRecipe: recipe, promptOnly})'),
             'runAnalysis uses buildChatPanel',
         );
         // runAnalysis should NOT call analyzePR/analyzeCommitsList/analyzeSingleCommit
@@ -27652,7 +27743,13 @@ RULES:
             'commit-page patch action says it copies only the viewed commit patch',
         );
         ackAssert(group.includes("label: 'Comments'"), 'comments-only action is present');
-        ackAssert(group.includes('revealAllContext(mainBtn)'), 'context dropdown can reveal all before copying');
+        ackAssert(group.includes('runContextCopyAction'), 'context split group routes clicks through one runner');
+        ackAssert(group.includes('eventUsesShiftAlternate(e)'), 'context copy checks Shift-click');
+        ackAssert(
+            group.includes('revealAllContext(btn, { restoreMs: 0 })'),
+            'Shift-click reveals all before copying',
+        );
+        ackAssert(group.includes('SHIFT_REVEAL_HINT'), 'Shift context-copy mode shows reveal hint');
         ackAssert(
             group.includes("revealItem.dataset.ackRevealAll = 'true'"),
             'reveal-all item is rendered as a menu-only action',
@@ -28132,14 +28229,15 @@ RULES:
         ackAssert(cfg.includes('confirm('), 'factory reset requires confirmation');
     });
 
-    ackTest('settings button supports Shift+click to clear all caches', () => {
+    ackTest('settings button opens config without Shift cache shortcut', () => {
         const source = _ackSource;
         const inject = source.slice(
             source.indexOf('settingsBtn.addEventListener'),
             source.indexOf('settingsGroup.appendChild(providerBtn)'),
         );
-        ackAssert(inject.includes('shiftKey'), 'checks Shift key');
-        ackAssert(inject.includes('clearAllCaches'), 'calls clearAllCaches on Shift+click');
+        ackAssert(!inject.includes('shiftKey'), 'does not overload settings Shift-click');
+        ackAssert(!inject.includes('clearAllCaches'), 'does not clear caches from the settings toolbar button');
+        ackAssert(inject.includes('buildConfigPanel()'), 'opens settings panel');
     });
 
     ackTest('toolbar settings and provider buttons cannot submit forms', () => {
@@ -29496,7 +29594,10 @@ RULES:
         ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
-        ackAssert(fn.includes('runAnalysis(wrapper, action.key)'), 'dispatches selected recipe through runAnalysis');
+        ackAssert(fn.includes('runRobotAction(action, e)'), 'dispatches selected recipe through the shared runner');
+        ackAssert(fn.includes('eventUsesShiftAlternate(e)'), 'robot recipe group checks Shift-click');
+        ackAssert(fn.includes('isPromptRecipe(action.key)'), 'Shift-copy only applies to prompt recipes');
+        ackAssert(fn.includes('SHIFT_COPY_HINT'), 'Shift prompt-copy mode shows clipboard hint');
     });
 
     ackTest('infographic recipe uses OpenAI image API with PR-head or commit cache', () => {
@@ -29673,7 +29774,12 @@ RULES:
             'full-context recipe instructions are selected by recipe key',
         );
         ackAssert(fn.includes('Generated audio guide prompt'), 'audio guide prompt is inspectable');
-        ackAssert(fn.includes('send(initialRecipe)'), 'recipe panel auto-runs initial recipe');
+        ackAssert(fn.includes('promptOnly = false'), 'chat panel accepts prompt-only mode');
+        ackAssert(fn.includes('send(initialRecipe, { promptOnly })'), 'recipe panel auto-runs initial recipe');
+        ackAssert(fn.includes('copyPromptOnly'), 'recipe send path can copy prompt instead of running');
+        ackAssert(fn.includes('Copied the ${recipeCfg.label} request prompt to clipboard'), 'prompt-only mode reports clipboard copy');
+        ackAssert(fn.includes('copyTextWithSpinner(assistantMsg._ackCopyBtn, generatedPrompt)'), 'prompt-only mode copies generated request prompt');
+        ackAssert(fn.includes('open: true'), 'prompt-only mode shows the copied prompt details');
     });
 
     ackTest('reimplementation prompt builds direct no-peek local reproducer', () => {
@@ -30943,9 +31049,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.77', () => {
+    ackTest('version bumped to 1.78', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.77' || _ackSource.includes('@version      1.77'), 'version is 1.77');
+        ackAssert(versionFromMeta === '1.78' || _ackSource.includes('@version      1.78'), 'version is 1.78');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
