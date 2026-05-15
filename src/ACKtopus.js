@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.78
+// @version      1.79
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -497,6 +497,7 @@
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
     const SHIFT_COPY_HINT = '📋';
     const SHIFT_REVEAL_HINT = '📂';
+    const SHIFT_REVERSE_HINT = '⬆';
     let ackShiftPressed = false;
     const ackShiftAlternateRenderers = new Set();
 
@@ -3861,6 +3862,8 @@ Return only the corrected text. If nothing needs fixing, return the original tex
     ]);
     const LLM_INSTRUCTION_KEYS = CONFIG_INSTRUCTION_DEFS.map(({ key }) => key);
     const PROMPT_RECIPE_KEYS = new Set(['reimplementation', 'suggestion_stack', 'audio_walkthrough']);
+    const COPYABLE_RECIPE_KEYS = new Set([...PROMPT_RECIPE_KEYS, 'maintainer_summary']);
+    const SHIFT_COPY_ACTION_KEYS = new Set([...COPYABLE_RECIPE_KEYS, 'infographic']);
     const ROBOT_RECIPE_ACTIONS = Object.freeze([
         {
             key: 'chat',
@@ -3944,6 +3947,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     function isPromptRecipe(recipe) {
         return PROMPT_RECIPE_KEYS.has(recipe);
+    }
+
+    function isCopyableRecipe(recipe) {
+        return COPYABLE_RECIPE_KEYS.has(recipe);
+    }
+
+    function isShiftCopyAction(action) {
+        return SHIFT_COPY_ACTION_KEYS.has(action);
     }
 
     function getRobotRecipeTitle(recipe) {
@@ -7158,6 +7169,7 @@ The prompt must ask for:
                     userText: 'Generate the maintainer-facing PR status summary now.',
                     sendAsConversation: false,
                     fullPRContext: true,
+                    promptDetailsTitle: 'Generated maintainer-summary prompt',
                     finalTask:
                         'Now write the maintainer-facing PR status summary using only the source context. If the source context does not establish a claim, say what evidence is missing instead of guessing.',
                 },
@@ -7294,6 +7306,7 @@ The prompt must ask for:
                     }, recipeCfg.contextOptions || {});
                     const extraInstr = (getLLMConfig().instructions[recipe] || DEFAULT_INSTRUCTIONS[recipe]).trim();
                     const promptRecipe = isPromptRecipe(recipe);
+                    const copyableRecipe = isCopyableRecipe(recipe);
                     // Reproducer/audio prompts are copied out for downstream agents - no [ref:N] citations.
                     // Maintainer summaries stay on the page - keep citations for navigation.
                     const citationInstructions =
@@ -7306,7 +7319,7 @@ The prompt must ask for:
                         fullContext,
                     );
                     const userContent = `${sourceContext}\n\n${recipeCfg.finalTask}`;
-                    const generatedPrompt = promptRecipe ? formatLLMPromptPreview(system, userContent) : '';
+                    const generatedPrompt = copyableRecipe ? formatLLMPromptPreview(system, userContent) : '';
                     if (generatedPrompt) {
                         assistantMsg._ackPromptDetails = {
                             title: recipeCfg.promptDetailsTitle,
@@ -7715,6 +7728,26 @@ The prompt must ask for:
                 renderProviderError(body, err);
                 if (prompt) addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt, { open: !!err.openaiVerifyUrl });
             },
+            resolvePrompt: async (prompt, { cached = false } = {}) => {
+                if (closed) return;
+                stopSpin();
+                header.innerHTML = `${label} prompt${cached ? ' (cached)' : ''}`;
+                body.innerHTML = '';
+                const note = document.createElement('div');
+                note.textContent = 'Copied the image-generation prompt to clipboard.';
+                Object.assign(note.style, { marginBottom: '8px', color: '#c9d1d9' });
+                body.appendChild(note);
+
+                const actions = document.createElement('div');
+                Object.assign(actions.style, { display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' });
+                const copyBtn = renderButton('Copy prompt', 'Copy image-generation prompt', async (e) => {
+                    await copyTextWithSpinner(e.currentTarget, prompt);
+                });
+                actions.appendChild(copyBtn);
+                body.appendChild(actions);
+                addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt, { open: true });
+                await copyTextWithSpinner(copyBtn, prompt);
+            },
         };
     }
 
@@ -7973,13 +8006,14 @@ The prompt must ask for:
         await dispatchToProviders(panel, pr, `commit_${sha.slice(0, 12)}`, system, user);
     }
 
-    async function runPRInfographic(wrapper) {
+    async function runPRInfographic(wrapper, opts = {}) {
         const pr = parsePR();
         if (!pr) return;
         if (!isProviderAvailable('openai')) {
             openConfigForProvider('openai');
             return;
         }
+        const promptOnly = !!opts.promptOnly;
 
         const old = document.getElementById('acktopus-analysis');
         if (old) old.remove();
@@ -7996,8 +8030,12 @@ The prompt must ask for:
             const ctx = await fetchPRContext(pr);
             const target = buildInfographicTarget(pr, ctx);
             const cached = getInfographicCache(pr, target.cacheSha, target.scope);
-            if (cached) {
+            if (cached && !promptOnly) {
                 card.resolve(cached, { cached: true });
+                return;
+            }
+            if (cached?.prompt && promptOnly) {
+                await card.resolvePrompt(cached.prompt, { cached: true });
                 return;
             }
 
@@ -8005,6 +8043,10 @@ The prompt must ask for:
             const fullContext = await gatherInfographicContext(target, (msg) => card.setStatus(msg));
             card.setStatus('Designing visual brief...');
             prompt = await buildInfographicImagePrompt(fullContext, target.prUrl, target);
+            if (promptOnly) {
+                await card.resolvePrompt(prompt);
+                return;
+            }
             card.setStatus(`Generating image with ${OPENAI_IMAGE_MODEL}...`);
             const result = await callOpenAIImage(prompt);
             const enriched = {
@@ -8027,10 +8069,10 @@ The prompt must ask for:
 
     async function runAnalysis(wrapper, recipe = 'chat', opts = {}) {
         if (recipe === 'infographic') {
-            await runPRInfographic(wrapper);
+            await runPRInfographic(wrapper, opts);
             return;
         }
-        const promptOnly = !!opts.promptOnly && isPromptRecipe(recipe);
+        const promptOnly = !!opts.promptOnly && isCopyableRecipe(recipe);
         if (!promptOnly && !isProviderAvailable(getActiveProvider())) {
             document.body.appendChild(buildConfigPanel());
             return;
@@ -17527,11 +17569,11 @@ RULES:
         const actions = ROBOT_RECIPE_ACTIONS;
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
-        const robotShiftSuffix = (action) => (ackShiftPressed && isPromptRecipe(action.key) ? ` ${SHIFT_COPY_HINT}` : '');
+        const robotShiftSuffix = (action) => (ackShiftPressed && isShiftCopyAction(action.key) ? ` ${SHIFT_COPY_HINT}` : '');
         const robotShiftTitle = (action) =>
-            `${action.tip}${isPromptRecipe(action.key) ? '\nShift+click: copy the LLM request prompt instead of running it.' : ''}`;
+            `${action.tip}${isShiftCopyAction(action.key) ? '\nShift+click: copy the request or visual prompt instead of running it.' : ''}`;
         const runRobotAction = async (action, e) => {
-            const promptOnly = eventUsesShiftAlternate(e) && isPromptRecipe(action.key);
+            const promptOnly = eventUsesShiftAlternate(e) && isShiftCopyAction(action.key);
             await runAnalysis(wrapper, action.key, { promptOnly });
         };
 
@@ -17562,7 +17604,7 @@ RULES:
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
         mainBtn.addEventListener('click', async function (e) {
             const action = getAction();
-            const promptOnly = eventUsesShiftAlternate(e) && isPromptRecipe(action.key);
+            const promptOnly = eventUsesShiftAlternate(e) && isShiftCopyAction(action.key);
             const existing = document.getElementById('acktopus-analysis');
             if (action.key === 'chat' && existing && !promptOnly) {
                 existing.remove();
@@ -17997,15 +18039,22 @@ RULES:
         expandGroup.appendChild(expandMenu);
 
         // --- 💬 Comment navigator ---
+        const commentNavLabel = compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments';
+        const commentNavTitle = onCompare
+            ? 'Navigate visible compare files top-to-bottom (Shift reverses) [Ctrl+N]'
+            : 'Navigate posted comments by date (newest first; Shift reverses) [Ctrl+N]';
         const commentNavBtn = createBtn(
-            compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments',
+            commentNavLabel,
             function (e) {
-                navigatePrimaryReviewTarget(e?.shiftKey ? 1 : -1);
+                navigatePrimaryReviewTarget(eventUsesShiftAlternate(e) ? 1 : -1);
             },
-            onCompare
-                ? 'Navigate visible compare files top-to-bottom (Shift reverses) [Ctrl+N]'
-                : 'Navigate posted comments by date (newest first; Shift reverses) [Ctrl+N]',
+            commentNavTitle,
         );
+        const updateCommentNavLabel = () => {
+            commentNavBtn.textContent = `${commentNavLabel}${ackShiftPressed ? ` ${SHIFT_REVERSE_HINT}` : ''}`;
+            commentNavBtn.title = `${commentNavTitle}\nShift+click: reverse direction.`;
+        };
+        registerShiftAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
 
@@ -19161,7 +19210,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.78
+// @version      1.79
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -29596,7 +29645,7 @@ RULES:
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
         ackAssert(fn.includes('runRobotAction(action, e)'), 'dispatches selected recipe through the shared runner');
         ackAssert(fn.includes('eventUsesShiftAlternate(e)'), 'robot recipe group checks Shift-click');
-        ackAssert(fn.includes('isPromptRecipe(action.key)'), 'Shift-copy only applies to prompt recipes');
+        ackAssert(fn.includes('isShiftCopyAction(action.key)'), 'Shift-copy applies to prompt and visual actions');
         ackAssert(fn.includes('SHIFT_COPY_HINT'), 'Shift prompt-copy mode shows clipboard hint');
     });
 
@@ -29714,6 +29763,8 @@ RULES:
             source.indexOf('async function runPRInfographic'),
             source.indexOf('// --- Chat Dispatcher'),
         );
+        ackAssert(runner.includes('opts = {}'), 'infographic runner accepts prompt-only options');
+        ackAssert(runner.includes('const promptOnly = !!opts.promptOnly'), 'infographic runner detects prompt-only mode');
         ackAssert(
             runner.includes("isProviderAvailable('openai')"),
             'requires OpenAI key independent of active provider',
@@ -29724,6 +29775,8 @@ RULES:
         ackAssert(runner.includes('gatherInfographicContext(target'), 'gathers PR or commit context');
         ackAssert(runner.includes('buildInfographicImagePrompt(fullContext, target.prUrl, target)'), 'passes PR URL and target to image prompt builder');
         ackAssert(runner.includes("let prompt = ''"), 'keeps image prompt available for error fallback');
+        ackAssert(runner.includes('await card.resolvePrompt(cached.prompt'), 'Shift-copy can reuse cached infographic prompt');
+        ackAssert(runner.includes('await card.resolvePrompt(prompt)'), 'Shift-copy copies the visual prompt before image generation');
         ackAssert(runner.includes('callOpenAIImage(prompt)'), 'generates image from the visual prompt');
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
         ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
@@ -29735,6 +29788,9 @@ RULES:
         ackAssert(card.includes('URL.revokeObjectURL(activeBlobUrl)'), 'infographic close button releases blob URL');
         ackAssert(card.includes('addPromptDetails(body, `Manual ${result.model || OPENAI_IMAGE_MODEL} prompt`'), 'shows prompt with successful infographic');
         ackAssert(card.includes('addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt'), 'shows manual prompt fallback on errors');
+        ackAssert(card.includes('resolvePrompt: async'), 'infographic card can render prompt-only copy results');
+        ackAssert(card.includes('Copied the image-generation prompt to clipboard'), 'prompt-only infographic reports clipboard copy');
+        ackAssert(card.includes('copyTextWithSpinner(copyBtn, prompt)'), 'prompt-only infographic copies the visual prompt');
         const configHelper = source.slice(
             source.indexOf('function openConfigForProvider'),
             source.indexOf('// --- LLM API Callers ---'),
@@ -29774,9 +29830,11 @@ RULES:
             'full-context recipe instructions are selected by recipe key',
         );
         ackAssert(fn.includes('Generated audio guide prompt'), 'audio guide prompt is inspectable');
+        ackAssert(fn.includes('Generated maintainer-summary prompt'), 'maintainer summary prompt is inspectable');
         ackAssert(fn.includes('promptOnly = false'), 'chat panel accepts prompt-only mode');
         ackAssert(fn.includes('send(initialRecipe, { promptOnly })'), 'recipe panel auto-runs initial recipe');
         ackAssert(fn.includes('copyPromptOnly'), 'recipe send path can copy prompt instead of running');
+        ackAssert(fn.includes('isCopyableRecipe(recipe)'), 'prompt-only mode includes maintainer view');
         ackAssert(fn.includes('Copied the ${recipeCfg.label} request prompt to clipboard'), 'prompt-only mode reports clipboard copy');
         ackAssert(fn.includes('copyTextWithSpinner(assistantMsg._ackCopyBtn, generatedPrompt)'), 'prompt-only mode copies generated request prompt');
         ackAssert(fn.includes('open: true'), 'prompt-only mode shows the copied prompt details');
@@ -30658,9 +30716,11 @@ RULES:
             'toolbar has primary navigation button',
         );
         ackAssert(
-            inject.includes('navigatePrimaryReviewTarget(e?.shiftKey ? 1 : -1)'),
+            inject.includes('navigatePrimaryReviewTarget(eventUsesShiftAlternate(e) ? 1 : -1)'),
             'button navigates with Shift-reverse support',
         );
+        ackAssert(inject.includes('SHIFT_REVERSE_HINT'), 'button shows reverse-direction hint while Shift is held');
+        ackAssert(inject.includes('registerShiftAlternateRenderer(commentNavBtn'), 'button updates when Shift state changes');
     });
 
     ackTest('Ctrl+N shortcut uses primary navigation target', () => {
@@ -31049,9 +31109,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.78', () => {
+    ackTest('version bumped to 1.79', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.78' || _ackSource.includes('@version      1.78'), 'version is 1.78');
+        ackAssert(versionFromMeta === '1.79' || _ackSource.includes('@version      1.79'), 'version is 1.79');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
