@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.79
+// @version      1.80
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -82,6 +82,7 @@
     const FORCE_PUSH_BURST_WINDOW_MS = 15 * 60 * 1000;
     const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
+    const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -3654,7 +3655,7 @@ Produce a local reproducer prompt whose only target artifact is useful independe
 - The generated prompt frames the task as an independent reinvention from the problem description and base tree. The user will provide the actual commits or PR separately after the local result is ready; the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation.
 - The target artifact is a coherent local branch with reviewable commits, focused tests or clear verification evidence, an explanation of the independently chosen design, and explicit uncertainty.
 - The target agent stops after the local result is coherent and asks the user before inspecting, splitting, rebasing, or comparing against the actual PR.
-- If the supplied source is truncated because of the context window or incomplete, the agent treats the supplied source as an index of the problem, marks missing evidence, and proceeds from the problem description rather than trying to locate the existing implementation.
+- If the supplied source is truncated because of the context window or incomplete, tell the agent to treat the supplied source as an index of the problem, mark missing evidence, and proceed from the problem description rather than trying to locate the existing implementation.
 
 # Constraints
 - Treat the supplied PR context as private source material for prompt construction.
@@ -5000,6 +5001,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 url: api.url,
                 headers: api.headers(cfg.key),
                 data: requestBody,
+                timeout: 180000,
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         let data;
@@ -6569,6 +6571,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             includeCommentCodeContext = true,
             stripFencedBlocks = false,
             omitHeadMetadata = false,
+            maxChars = RECIPE_CONTEXT_MAX_CHARS,
         } = opts;
         const pr = parsePR();
         if (!pr) return '';
@@ -6591,7 +6594,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         let source = meta.length ? `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}` : context;
         if (stripFencedBlocks) source = stripFencedBlocksForNoPeekPrompt(source);
-        return formatOversizedRecipeContext(source, RECIPE_CONTEXT_MAX_CHARS);
+        return formatOversizedRecipeContext(source, maxChars);
     }
 
     function truncateMiddle(text, maxChars) {
@@ -7134,7 +7137,9 @@ The prompt must ask for:
                         includeCommentCodeContext: false,
                         stripFencedBlocks: true,
                         omitHeadMetadata: true,
+                        maxChars: REPRODUCER_CONTEXT_MAX_CHARS,
                     },
+                    maxTokens: 12000,
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
                         'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from the base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must frame the task as an independent reinvention from the problem description and base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the base commit/branch the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
@@ -7348,7 +7353,7 @@ The prompt must ask for:
                     const result = await callLLM(provider, system, userContent, {
                         modelOverride: getHighContextModelOverride(provider),
                         reasoningEffort: getHighContextReasoningEffort(provider),
-                        maxTokens: getHighContextMaxTokens(provider),
+                        maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
                     });
                     let patchAttachment = '';
                     if (recipe === 'audio_walkthrough' && recipeCfg.appendPatchAttachment) {
@@ -18445,6 +18450,7 @@ RULES:
             return a;
         };
 
+        // Position indicator
         if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, '◀', false));
         if (hasJumpMenu) {
             const jumpDetails = document.createElement('details');
@@ -19210,7 +19216,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.79
+// @version      1.80
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22617,7 +22623,8 @@ RULES:
         ackAssert(showFn.includes('Queue'), 'shows L for Queue');
         ackAssert(showFn.includes('Review dialog'), 'shows D for Review dialog');
         // hideHotkeyHints removes nav items
-        const hideFn = source.slice(source.indexOf('const hideHotkeyHints'), source.indexOf('window.addEventListener'));
+        const hideStart = source.indexOf('const hideHotkeyHints');
+        const hideFn = source.slice(hideStart, source.indexOf('// Cancel hints on window blur', hideStart));
         ackAssert(hideFn.includes('ackNavHint'), 'removes navigation hint items');
     });
 
@@ -25679,7 +25686,7 @@ RULES:
             'recipe path uses high-context reasoning effort',
         );
         ackAssert(
-            sourceIncludesLoose(recipeFn, 'maxTokens: getHighContextMaxTokens(provider)'),
+            sourceIncludesLoose(recipeFn, 'maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider)'),
             'recipe path uses high-context token cap',
         );
 
@@ -28032,6 +28039,7 @@ RULES:
         ackAssert(source.includes('function formatTransportErrorDetails'), 'has transport error formatter');
         ackAssert(fn.includes('formatTransportErrorDetails(e)'), 'uses structured transport error details');
         ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
+        ackAssert(fn.includes('timeout: 180000'), 'uses an explicit LLM transport timeout');
         const formatted = formatTransportErrorDetails({
             status: 0,
             statusText: 'error',
@@ -29934,6 +29942,8 @@ RULES:
         ackAssert(fn.includes('includeCommits: true'), 'reproducer includes commit metadata for commit-by-commit jobs');
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
+        ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a smaller Claude-safe source budget');
+        ackAssert(fn.includes('maxTokens: 12000'), 'reproducer uses a bounded output budget');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
         ackAssert(fn.includes('the actual outcome-focused no-peek local reproducer prompt'), 'generates the direct no-peek prompt');
         ackAssert(fn.includes('Internal generation constraint'), 'keeps prompt-generation guard internal');
@@ -30093,6 +30103,7 @@ RULES:
         ackAssert(fn.includes('includePatch = true'), 'recipe context defaults to raw patch details');
         ackAssert(fn.includes('includeComments = true'), 'recipe context defaults to threaded comment details');
         ackAssert(fn.includes('includeCommentCodeContext'), 'recipe context can include or omit comment code context');
+        ackAssert(fn.includes('maxChars = RECIPE_CONTEXT_MAX_CHARS'), 'recipe context supports per-recipe limits');
         ackAssert(fn.includes('stripFencedBlocksForNoPeekPrompt'), 'recipe context can strip fenced source blocks');
         ackAssert(fn.includes('omitHeadMetadata'), 'recipe context can omit head/PR-URL metadata');
         ackAssert(
@@ -31109,9 +31120,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.79', () => {
+    ackTest('version bumped to 1.80', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.79' || _ackSource.includes('@version      1.79'), 'version is 1.79');
+        ackAssert(versionFromMeta === '1.80' || _ackSource.includes('@version      1.80'), 'version is 1.80');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
