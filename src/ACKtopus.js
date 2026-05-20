@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.81
+// @version      1.84
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3103,6 +3103,159 @@
             badge.style.fontSize = '12px';
             link.appendChild(badge);
         });
+    }
+
+    function parseGitHubRepoPath(path = location.pathname) {
+        const m = String(path || '').match(/^\/([^/?#]+)\/([^/?#]+)(?:\/|$)/);
+        if (!m) return null;
+        return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
+    }
+
+    function repositoryMetaValue(name, root = document) {
+        const doc = root?.ownerDocument || document;
+        const roots = root === doc ? [doc] : [root, doc];
+        const dataName = name.replace(/_/g, '-');
+        for (const queryRoot of roots) {
+            const el = queryRoot?.querySelector?.(
+                `meta[name="${name}"], input[name="${name}"], [data-${dataName}], [data-${name}]`,
+            );
+            const value =
+                el?.content ||
+                el?.value ||
+                el?.getAttribute?.(`data-${dataName}`) ||
+                el?.getAttribute?.(`data-${name}`) ||
+                '';
+            if (String(value || '').trim()) return String(value).trim();
+        }
+        return '';
+    }
+
+    function currentGitHubRepo(root = document, path = location.pathname) {
+        const metaRepo =
+            repositoryMetaValue('octolytics-dimension-repository_nwo', root) ||
+            repositoryMetaValue('repository_nwo', root);
+        const m = String(metaRepo || '').match(/^([^/\s]+)\/([^/\s]+)$/);
+        if (m) return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
+        return parseGitHubRepoPath(path);
+    }
+
+    function normalizeBranchName(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function currentGitHubRepoBaseBranch(root = document) {
+        const metaBranch =
+            repositoryMetaValue('octolytics-dimension-repository_default_branch', root) ||
+            repositoryMetaValue('repository_default_branch', root) ||
+            repositoryMetaValue('default_branch', root);
+        const normalizedMetaBranch = normalizeBranchName(metaBranch);
+        if (normalizedMetaBranch) return normalizedMetaBranch;
+
+        const doc = root?.ownerDocument || document;
+        const branchEl = doc.querySelector(
+            '#branch-picker-repos-header-ref-selector [data-menu-button], ' +
+                '[data-testid="anchor-button"] [data-menu-button], ' +
+                '.js-branch-name, ' +
+                '[data-hotkey="w"] [data-menu-button]',
+        );
+        return normalizeBranchName(branchEl?.textContent || '');
+    }
+
+    const repoDefaultBranchCache = new Map();
+    const repoDefaultBranchRequests = new Map();
+
+    async function fetchGitHubRepoDefaultBranch(repo) {
+        const repoKey = repo?.repoKey || (repo?.owner && repo?.repo ? `${repo.owner}/${repo.repo}` : '');
+        if (!repoKey) return '';
+        if (repoDefaultBranchCache.has(repoKey)) return repoDefaultBranchCache.get(repoKey) || '';
+        if (repoDefaultBranchRequests.has(repoKey)) return repoDefaultBranchRequests.get(repoKey);
+        const request = gmFetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`)
+            .then((data) => {
+                const branch = normalizeBranchName(data?.default_branch || '');
+                if (branch) repoDefaultBranchCache.set(repoKey, branch);
+                return branch;
+            })
+            .catch((e) => {
+                if (!_ackTesting) console.warn(`ACKtopus: failed to fetch default branch for ${repoKey}`, e);
+                return '';
+            })
+            .finally(() => {
+                repoDefaultBranchRequests.delete(repoKey);
+            });
+        repoDefaultBranchRequests.set(repoKey, request);
+        return request;
+    }
+
+    function isGitHubRepoPage(path = location.pathname, root = document) {
+        return !!currentGitHubRepo(root, path);
+    }
+
+    function isComparePullRequestButton(link) {
+        const label = String(link?.textContent || '')
+            .replace(/\s*🏠\s*$/, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return /\bCompare\s*&\s*pull request\b/i.test(label);
+    }
+
+    function rewriteLocalRepoCompareHref(rawHref, opts = {}) {
+        const href = String(rawHref || '').trim();
+        const match = href.match(/^(?:https?:\/\/github\.com)?\/([^/?#]+)\/([^/?#]+)\/compare\/([^?#]+)(?:\?[^#]*)?(#.*)?$/);
+        if (!match) return null;
+        const [, owner, repo, headBranch, hash = ''] = match;
+        const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
+        if (!currentRepo || currentRepo.repoKey !== `${owner}/${repo}`) return null;
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document));
+        if (!baseBranch) return null;
+        if (!headBranch || headBranch.includes('..')) return null;
+        return {
+            href: `/${owner}/${repo}/compare/${baseBranch}...${headBranch}?quick_pull=1${hash}`,
+            owner,
+            repo,
+            repoKey: `${owner}/${repo}`,
+            baseBranch,
+            headBranch,
+        };
+    }
+
+    function queueLocalRepoCompareRewrite(root, currentRepo) {
+        fetchGitHubRepoDefaultBranch(currentRepo).then((baseBranch) => {
+            if (!baseBranch) return;
+            const scanRoot = root && (root === document || root.isConnected) ? root : document;
+            rewriteLocalRepoCompareLinks(scanRoot, { currentRepo, baseBranch, allowAsync: false });
+        });
+    }
+
+    function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
+        let rewritten = 0;
+        const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document));
+        if (!currentRepo) return rewritten;
+        if (!baseBranch) {
+            if (opts.allowAsync !== false) queueLocalRepoCompareRewrite(root, currentRepo);
+            return rewritten;
+        }
+        for (const link of qsa(root, 'a[href*="/compare/"]')) {
+            if (link.dataset.localRepoPrRewritten === '1') continue;
+            if (!isComparePullRequestButton(link)) continue;
+            const rewrite = rewriteLocalRepoCompareHref(link.getAttribute('href') || '', {
+                currentRepo,
+                baseBranch,
+                root: opts.root || document,
+            });
+            if (!rewrite) continue;
+            link.setAttribute('href', rewrite.href);
+            link.dataset.localRepoPrRewritten = '1';
+            link.title = `Rewritten by userscript: opens PR against ${rewrite.repoKey}:${rewrite.baseBranch}`;
+            if (!/\s🏠\s*$/.test(link.textContent || '')) {
+                const badge = document.createElement('span');
+                badge.textContent = ' 🏠';
+                badge.title = link.title;
+                link.appendChild(badge);
+            }
+            rewritten++;
+        }
+        return rewritten;
     }
 
     // On compare pages, detect which PR the head SHA belongs to,
@@ -11156,6 +11309,7 @@ Rules:
     // pass and the mutation observers stay consistent and idempotent.
     const ROOT_INJECTORS = [
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
+        { name: 'localRepoCompareLinks', when: (ctx) => ctx.onRepositoryPage, fn: rewriteLocalRepoCompareLinks },
         { name: 'queueLazyComments', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: queueLazyComments },
         { name: 'startReviewButtons', when: (ctx) => ctx.onPR, fn: addStartReviewButtons },
         {
@@ -11197,11 +11351,12 @@ Rules:
             onCompare: isComparePage(),
             onToolbar: isToolbarPage(),
             onCompose: isPRCreationPage(),
+            onRepositoryPage: isGitHubRepoPage(),
         };
     }
 
     function shouldRunEditorInjectors() {
-        return isToolbarPage() || isPRCreationPage();
+        return isToolbarPage() || isPRCreationPage() || isGitHubRepoPage();
     }
 
     function runRootInjectors(root, ctx = currentInjectContext()) {
@@ -18993,6 +19148,7 @@ RULES:
             lastInjectedPR = null;
             lastInjectedPath = location.pathname;
         } else {
+            const runLocalRepoCompareLinks = isGitHubRepoPage();
             const old = document.getElementById(BUTTON_CONTAINER_ID);
             if (old) old.remove();
             teardownDiffSelectionUI();
@@ -19003,7 +19159,8 @@ RULES:
             clearCommitPatchCache();
             resetReviewCommentHashNavigation();
             lastInjectedPR = null;
-            lastInjectedPath = null;
+            lastInjectedPath = runLocalRepoCompareLinks ? location.pathname : null;
+            if (runLocalRepoCompareLinks) runRootInjectors(document, currentInjectContext());
         }
         autoCollapseCompareFiles();
     }
@@ -19238,7 +19395,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.81
+// @version      1.84
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -24721,8 +24878,8 @@ RULES:
                 <span class="PullRequestHeaderSummary-module__summaryContainer__dA7dP">
                     <a href="/bitcoin/bitcoin/tree/master">bitcoin:master</a>
                     <div>
-                        <a id="ack-head-branch" href="/l0rinc/bitcoin/tree/l0rinc/test-macos-bind-netutil" aria-describedby="ack-head-tip">l0rinc:l0rinc/test-macos-bind-netutil</a>
-                        <span id="ack-head-tip">l0rinc/bitcoin:l0rinc/test-macos-bind-netutil</span>
+                        <a id="ack-head-branch" href="/octo/demo/tree/topic/test-macos-bind-netutil" aria-describedby="ack-head-tip">octo:topic/test-macos-bind-netutil</a>
+                        <span id="ack-head-tip">octo/demo:topic/test-macos-bind-netutil</span>
                         <button type="button" data-component="IconButton" aria-labelledby="ack-copy-tip">copy</button>
                         <span id="ack-copy-tip">Copy head branch name to clipboard</span>
                     </div>
@@ -24733,12 +24890,12 @@ RULES:
                 ackEq(normalizePRHeaderHeadBranch(host), true, 'normalizes PR header branch summary');
                 ackEq(
                     host.querySelector('#ack-head-branch').textContent.trim(),
-                    'l0rinc/test-macos-bind-netutil',
+                    'topic/test-macos-bind-netutil',
                     'removes owner prefix from displayed head branch',
                 );
                 ackEq(
                     host.querySelector('#ack-head-tip').textContent.trim(),
-                    'l0rinc/test-macos-bind-netutil',
+                    'topic/test-macos-bind-netutil',
                     'updates branch tooltip to branch-only text',
                 );
                 ackEq(
@@ -24749,7 +24906,7 @@ RULES:
                 host.querySelector('button[data-component="IconButton"]').dispatchEvent(
                     new MouseEvent('click', { bubbles: true, cancelable: true }),
                 );
-                ackEq(copied, 'l0rinc/test-macos-bind-netutil', 'copies branch name without owner prefix');
+                ackEq(copied, 'topic/test-macos-bind-netutil', 'copies branch name without owner prefix');
             } finally {
                 host.remove();
             }
@@ -24966,6 +25123,118 @@ RULES:
         ackAssert(fn.includes('sessionStorage.setItem'), 'stores PR number in sessionStorage');
         ackAssert(fn.includes('ack-compare-pr:'), 'uses namespaced sessionStorage key');
         ackAssert(fn.includes('parsePR'), 'extracts current PR number');
+    });
+
+    ackTest('local repo compare href rewrite targets the current repo base', () => {
+        const currentRepo = { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' };
+        ackDeepEq(parseGitHubRepoPath('/octo/demo/pulls'), currentRepo);
+        ackEq(isGitHubRepoPage('/octo/demo'), true);
+
+        const simple = rewriteLocalRepoCompareHref('/octo/demo/compare/detached537?expand=1', {
+            currentRepo,
+            baseBranch: 'main',
+        });
+        ackEq(simple.href, '/octo/demo/compare/main...detached537?quick_pull=1');
+        ackEq(simple.repoKey, 'octo/demo');
+        ackEq(simple.baseBranch, 'main');
+
+        const slashBranch = rewriteLocalRepoCompareHref('/octo/demo/compare/topic/remove-foo?expand=1', {
+            currentRepo,
+            baseBranch: 'main',
+        });
+        ackEq(slashBranch.href, '/octo/demo/compare/main...topic/remove-foo?quick_pull=1');
+
+        ackEq(rewriteLocalRepoCompareHref('/octo/demo/compare/main...detached537?quick_pull=1', { currentRepo, baseBranch: 'main' }), null);
+        ackEq(rewriteLocalRepoCompareHref('/upstream/demo/compare/detached537?expand=1', { currentRepo, baseBranch: 'main' }), null);
+    });
+
+    ackTest('local repo compare rewrite reads generic GitHub repository metadata', () => {
+        const host = document.createElement('div');
+        host.innerHTML = [
+            '<meta name="octolytics-dimension-repository_nwo" content="octo/demo">',
+            '<meta name="octolytics-dimension-repository_default_branch" content="trunk">',
+        ].join('');
+        ackDeepEq(currentGitHubRepo(host, '/fallback/repo'), { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' });
+        ackEq(currentGitHubRepoBaseBranch(host), 'trunk');
+    });
+
+    ackTest('local repo compare rewrite marks modified compare buttons', () => {
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>' +
+            '<a href="/octo/demo/compare/other?expand=1">Plain compare link</a>';
+        const count = rewriteLocalRepoCompareLinks(host, {
+            currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+            baseBranch: 'main',
+        });
+        const link = host.querySelector('a');
+        ackEq(count, 1);
+        ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
+        ackEq(link.dataset.localRepoPrRewritten, '1');
+        ackAssert(link.textContent.trim().endsWith('🏠'), 'adds emoji marker');
+        ackAssert(link.title.includes('octo/demo:main'), 'explains fork target');
+        ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
+
+        ackEq(
+            rewriteLocalRepoCompareLinks(host, {
+                currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+                baseBranch: 'main',
+            }),
+            0,
+        );
+        ackEq((link.textContent.match(/🏠/g) || []).length, 1, 'does not duplicate emoji');
+    });
+
+    ackTest('local repo compare rewrite fetches missing default branch on repo pages', async () => {
+        const repo = { owner: 'octo', repo: 'async-demo', repoKey: 'octo/async-demo' };
+        repoDefaultBranchCache.delete(repo.repoKey);
+        repoDefaultBranchRequests.delete(repo.repoKey);
+        const origGmFetch = gmFetch;
+        let fetchedUrl = '';
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<a href="/octo/async-demo/compare/topic/remove-foo?expand=1" class="btn btn-primary">Compare & pull request</a>';
+        document.body.appendChild(host);
+        try {
+            gmFetch = async (url) => {
+                fetchedUrl = url;
+                return { default_branch: 'develop' };
+            };
+            ackEq(rewriteLocalRepoCompareLinks(host, { currentRepo: repo }), 0, 'waits for async default branch');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const link = host.querySelector('a');
+            ackAssert(fetchedUrl.includes('/repos/octo/async-demo'), 'fetches repository metadata');
+            ackEq(link.getAttribute('href'), '/octo/async-demo/compare/develop...topic/remove-foo?quick_pull=1');
+            ackEq(link.dataset.localRepoPrRewritten, '1');
+            ackEq(repoDefaultBranchCache.get(repo.repoKey), 'develop');
+        } finally {
+            host.remove();
+            gmFetch = origGmFetch;
+            repoDefaultBranchCache.delete(repo.repoKey);
+            repoDefaultBranchRequests.delete(repo.repoKey);
+        }
+    });
+
+    ackTest('local repo compare rewrite uses shared injector pipeline', () => {
+        const source = _ackSource;
+        const roots = source.slice(source.indexOf('const ROOT_INJECTORS'), source.indexOf('const DOC_INJECTORS'));
+        ackAssert(roots.includes("name: 'localRepoCompareLinks'"), 'root injector includes local repo compare rewrite');
+        const ctxFn = source.slice(
+            source.indexOf('function currentInjectContext'),
+            source.indexOf('function runRootInjectors'),
+        );
+        ackAssert(ctxFn.includes('onRepositoryPage'), 'context tracks repository pages');
+        const gate = source.slice(source.indexOf('function shouldRunEditorInjectors'), source.indexOf('function runRootInjectors'));
+        ackAssert(gate.includes('isGitHubRepoPage()'), 'mutation observer runs on repository pages');
+        const tryFn = source.slice(
+            source.indexOf('function tryInject'),
+            source.indexOf('tryInject();', source.indexOf('function tryInject')),
+        );
+        ackAssert(tryFn.includes('runLocalRepoCompareLinks'), 'tryInject detects repository pages');
+        ackAssert(
+            tryFn.includes('if (runLocalRepoCompareLinks) runRootInjectors(document, currentInjectContext())'),
+            'repo pages run root injectors without toolbar',
+        );
     });
 
     ackTest('autoCollapseCompareFiles uses sessionStorage-first PR detection', () => {
@@ -26977,6 +27246,7 @@ RULES:
         );
         ackAssert(fn.includes('onCompare: isComparePage()'), 'tracks compare page mode');
         ackAssert(fn.includes('onCompose: isPRCreationPage()'), 'tracks compare/new-PR compose mode');
+        ackAssert(fn.includes('onRepositoryPage: isGitHubRepoPage()'), 'tracks repository page mode');
     });
 
     ackTest('tryInject runs root injectors on compare-page compose screens', () => {
@@ -31173,9 +31443,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.81', () => {
+    ackTest('version bumped to 1.84', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.81' || _ackSource.includes('@version      1.81'), 'version is 1.81');
+        ackAssert(versionFromMeta === '1.84' || _ackSource.includes('@version      1.84'), 'version is 1.84');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32644,6 +32914,17 @@ RULES:
         isHttpStatus,
         extractCsrfFromHtml,
         shouldExposeTestExports,
+        parseGitHubRepoPath,
+        repositoryMetaValue,
+        currentGitHubRepo,
+        currentGitHubRepoBaseBranch,
+        fetchGitHubRepoDefaultBranch,
+        repoDefaultBranchCache,
+        repoDefaultBranchRequests,
+        isGitHubRepoPage,
+        isComparePullRequestButton,
+        rewriteLocalRepoCompareHref,
+        rewriteLocalRepoCompareLinks,
         runACKtopusTests,
         _ackTests,
     };
@@ -32699,7 +32980,7 @@ RULES:
         ackSetTimeout(() => {
             pending = false;
             checkUrlChange();
-            if (isToolbarPage()) tryInject();
+            if (isToolbarPage() || isGitHubRepoPage()) tryInject();
         }, 500);
     }).observe(document.body, { childList: true, subtree: true });
 

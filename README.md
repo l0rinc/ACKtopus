@@ -280,6 +280,7 @@ ACKtopus scans visible comment details blocks for cleartext PGP signatures, fetc
 
 On compare-style views, ACKtopus can collapse files that are unrelated to the PR so the diff stays focused on what you’re reviewing.
 After collapsing unrelated files, it also scrolls to the first remaining open file.
+On repository pages, ACKtopus marks recent-push compare buttons with 🏠 and rewrites one-sided compare links so new PRs target the current repository’s base branch instead of GitHub’s upstream-parent default. If the page does not expose the base branch in the DOM, ACKtopus fetches and caches the repository default branch before rewriting the button.
 
 ## Development checks
 
