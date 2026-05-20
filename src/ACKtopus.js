@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.86
+// @version      1.89
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18,6 +18,7 @@
 // @connect      patch-diff.githubusercontent.com
 // @connect      api.anthropic.com
 // @connect      api.openai.com
+// @connect      generativelanguage.googleapis.com
 // @connect      keys.openpgp.org
 // @require      https://cdn.jsdelivr.net/npm/openpgp@6.3.0/dist/openpgp.min.js
 // @require      https://cdn.jsdelivr.net/npm/diff@9.0.0/dist/diff.min.js
@@ -3648,6 +3649,7 @@
         claude: 'claude-sonnet-4-6',
         claude_high_context: 'claude-opus-4-7',
         openai: 'gpt-5.5',
+        gemini: 'gemini-3.5-flash',
     };
     const OPENAI_IMAGE_MODEL = 'gpt-image-2';
     const OPENAI_IMAGE_SIZE = '2048x1152';
@@ -3671,16 +3673,17 @@
     function getHighContextMaxTokens(provider) {
         if (provider === 'claude') return 32768;
         if (provider === 'openai') return 32768;
+        if (provider === 'gemini') return 32768;
         return 0;
     }
 
     function getHighContextTimeoutMs(provider) {
-        if (provider === 'claude' || provider === 'openai') return LLM_HIGH_CONTEXT_TIMEOUT_MS;
+        if (provider === 'claude' || provider === 'openai' || provider === 'gemini') return LLM_HIGH_CONTEXT_TIMEOUT_MS;
         return LLM_REQUEST_TIMEOUT_MS;
     }
 
     // Provider API configuration -- drives callLLM, validateKey, and any future providers.
-    // Adding a new provider = one entry here + branding in PROVIDER_META + validation logic.
+    // Adding a new provider = one API entry, one link entry, one branding entry, and validation coverage.
     const PROVIDER_API = {
         claude: {
             url: 'https://api.anthropic.com/v1/messages',
@@ -3724,9 +3727,102 @@
             parseText: (data) => data.choices?.[0]?.message?.content || '',
             parseUsage: (data) => [data.usage?.prompt_tokens, data.usage?.completion_tokens],
         },
+        gemini: {
+            url: (model) =>
+                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+            headers: (key) => ({
+                'Content-Type': 'application/json',
+                'x-goog-api-key': key,
+            }),
+            body: (model, system, userContent, { maxTokens = 4096 } = {}) => ({
+                systemInstruction: { parts: [{ text: system }] },
+                contents: [{ role: 'user', parts: [{ text: userContent }] }],
+                generationConfig: { maxOutputTokens: maxTokens || 4096 },
+            }),
+            validateBody: () => ({
+                contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+                generationConfig: { maxOutputTokens: 5 },
+            }),
+            parseText: (data) =>
+                (data.candidates || [])
+                    .flatMap((candidate) => candidate.content?.parts || [])
+                    .map((part) => part.text || '')
+                    .join(''),
+            parseUsage: (data) => {
+                const usage = data.usageMetadata || {};
+                const input = usage.promptTokenCount;
+                const output =
+                    usage.candidatesTokenCount ||
+                    (typeof usage.totalTokenCount === 'number' && typeof input === 'number'
+                        ? Math.max(0, usage.totalTokenCount - input)
+                        : undefined);
+                return [input, output];
+            },
+        },
     };
 
-    // Provider branding -- small inline SVG icons (Bootstrap Icons, MIT)
+    const PROVIDER_LINKS = {
+        claude: {
+            keys: 'https://console.anthropic.com/settings/keys',
+            billing: 'https://console.anthropic.com/settings/billing',
+            usage: 'https://console.anthropic.com/settings/cost',
+            domain: 'console.anthropic.com',
+        },
+        openai: {
+            keys: 'https://platform.openai.com/api-keys',
+            billing: 'https://platform.openai.com/settings/organization/billing/overview',
+            usage: 'https://platform.openai.com/usage',
+            domain: 'platform.openai.com',
+        },
+        gemini: {
+            keys: 'https://aistudio.google.com/api-keys',
+            billing: 'https://aistudio.google.com/billing',
+            usage: 'https://aistudio.google.com/usage',
+            domain: 'aistudio.google.com',
+        },
+    };
+
+    function getProviderValidationTargets(provider) {
+        const targets = [];
+        const add = (target) => {
+            if (!target?.model || targets.some(({ model, kind }) => model === target.model && kind === target.kind)) {
+                return;
+            }
+            targets.push(target);
+        };
+        add({ kind: 'generate', model: LLM_MODELS[provider], label: LLM_MODELS[provider] });
+        const highContextModel = getHighContextModelOverride(provider);
+        add({ kind: 'generate', model: highContextModel, label: highContextModel });
+        if (provider === 'openai') {
+            add({ kind: 'model', model: OPENAI_IMAGE_MODEL, label: OPENAI_IMAGE_MODEL });
+        }
+        return targets;
+    }
+
+    function providerValidationRequest(provider, key, target) {
+        const api = PROVIDER_API[provider];
+        if (provider === 'openai' && target.kind === 'model') {
+            return {
+                method: 'GET',
+                url: `https://api.openai.com/v1/models/${encodeURIComponent(target.model)}`,
+                headers: api.headers(key),
+                timeout: LLM_REQUEST_TIMEOUT_MS,
+            };
+        }
+        return {
+            method: 'POST',
+            url: providerRequestUrl(api, target.model, key),
+            headers: api.headers(key),
+            data: JSON.stringify(api.validateBody(target.model)),
+            timeout: LLM_REQUEST_TIMEOUT_MS,
+        };
+    }
+
+    function providerRequestUrl(api, model, key = '') {
+        return typeof api.url === 'function' ? api.url(model, key) : api.url;
+    }
+
+    // Provider branding -- small trusted inline SVG icons for the settings and recipe UI.
     const PROVIDER_META = {
         claude: {
             label: 'Claude',
@@ -3742,7 +3838,22 @@
             outputPrice: 15, // $/M output tokens
             icon: `<svg width="14" height="14" viewBox="0 0 16 16" fill="#74d4a5" style="vertical-align:middle"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>`,
         },
+        gemini: {
+            label: 'Gemini',
+            color: '#8ab4f8',
+            inputPrice: 0.15, // $/M input tokens, <=200k prompt tier
+            outputPrice: 0.6, // $/M output tokens, <=200k prompt tier
+            icon: `<svg width="14" height="14" viewBox="0 0 16 16" fill="#8ab4f8" style="vertical-align:middle"><path d="M8 0 9.6 4.9 14.7 6.5 9.6 8.1 8 13 6.4 8.1 1.3 6.5 6.4 4.9z"/><path d="m12.5 10.2.6 1.7 1.7.6-1.7.6-.6 1.7-.6-1.7-1.7-.6 1.7-.6z"/></svg>`,
+        },
     };
+
+    function providerKeyStorageKey(provider) {
+        return `llm_${provider}_key`;
+    }
+
+    function providerKeyStorageKeys() {
+        return Object.keys(PROVIDER_META).map(providerKeyStorageKey);
+    }
 
     function getActiveProvider() {
         return GM_getValue('activeProvider', 'claude');
@@ -4139,9 +4250,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     function getLLMConfig() {
         const active = getActiveProvider();
+        const providerConfig = {};
+        for (const name of Object.keys(PROVIDER_META)) {
+            providerConfig[name] = { key: GM_getValue(providerKeyStorageKey(name), ''), model: LLM_MODELS[name] };
+        }
         return {
-            claude: { key: GM_getValue('llm_claude_key', ''), model: LLM_MODELS.claude },
-            openai: { key: GM_getValue('llm_openai_key', ''), model: LLM_MODELS.openai },
+            ...providerConfig,
             active,
             instructions: getProviderInstructions(active),
             includeFullPatch: GM_getValue('llm_include_patch', true),
@@ -4323,7 +4437,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     function factoryReset() {
         const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
-        const keep = new Set(['llm_claude_key', 'llm_openai_key', 'github_pat']);
+        const keep = new Set([...providerKeyStorageKeys(), 'github_pat']);
         let count = 0;
         keys.forEach((k) => {
             if (!keep.has(k)) {
@@ -4362,48 +4476,74 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (updateHelp) updateHelp(state);
         };
 
-        const api = PROVIDER_API[provider];
-        // Response interpretation is provider-specific (different error semantics)
-        const onload =
-            provider === 'claude'
-                ? (r) => {
-                      if (r.status >= 200 && r.status < 300) onResult(true, 'Valid key');
-                      else if (r.status === 401) onResult(false, 'Invalid API key');
-                      else if (r.responseText.includes('credit'))
-                          onWarn('Key valid but no credits, add funds', 'nofunds');
-                      else if (r.status === 529) onWarn('Key valid, API temporarily overloaded');
-                      else if (r.status === 404) onResult(false, 'Key valid but model not available');
-                      else if (r.status === 400) onResult(true, 'Key accepted');
-                      else if (r.status === 403) onResult(false, 'Key forbidden, check permissions');
-                      else onWarn(`Key likely valid, HTTP ${r.status}`);
-                  }
-                : (r) => {
-                      if (r.status >= 200 && r.status < 300) onResult(true, 'Valid key');
-                      else if (r.status === 401) onResult(false, 'Invalid API key');
-                      else if (r.status === 429 && r.responseText.includes('quota'))
-                          onWarn('Key valid but quota exceeded, add funds', 'nofunds');
-                      else if (r.status === 429) onWarn('Key valid, rate limited, try again shortly');
-                      else if (r.status === 404) onResult(false, 'Key valid but model not available');
-                      else if (r.status === 403) onResult(false, 'Key forbidden, check permissions');
-                      else if (r.status === 400) {
-                          const msg = (() => {
-                              try {
-                                  return JSON.parse(r.responseText).error?.message || r.responseText.slice(0, 100);
-                              } catch {
-                                  return r.responseText.slice(0, 100);
-                              }
-                          })();
-                          onResult(false, `400: ${msg}`);
-                      } else onResult(false, `HTTP ${r.status}`);
-                  };
+        const classifyResponse = (r) => {
+            const responseText = r.responseText || '';
+            if (r.status >= 200 && r.status < 300) return { ok: true, state: 'valid', msg: 'Valid' };
+            if (r.status === 401) return { ok: false, state: 'invalid', msg: 'Invalid API key' };
+            if (r.status === 403) return { ok: false, state: 'invalid', msg: 'Key forbidden, check permissions' };
+            if (r.status === 404) return { ok: false, state: 'invalid', msg: 'Model not available' };
+            if (provider === 'claude' && responseText.includes('credit')) {
+                return { ok: true, warn: true, state: 'nofunds', msg: 'No credits, add funds' };
+            }
+            if (provider !== 'claude' && r.status === 429 && responseText.includes('quota')) {
+                return { ok: true, warn: true, state: 'nofunds', msg: 'Quota exceeded, add funds' };
+            }
+            if (provider !== 'claude' && r.status === 429) {
+                return { ok: true, warn: true, state: 'valid', msg: 'Rate limited, try again shortly' };
+            }
+            if (provider === 'claude' && r.status === 529) {
+                return { ok: true, warn: true, state: 'valid', msg: 'API temporarily overloaded' };
+            }
+            if (provider === 'claude' && r.status === 400) return { ok: true, state: 'valid', msg: 'Key accepted' };
+            if (r.status === 400) return { ok: false, state: 'invalid', msg: `400: ${parseProviderError(r)}` };
+            return { ok: false, state: 'invalid', msg: `HTTP ${r.status}` };
+        };
 
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: api.url,
-            headers: api.headers(key),
-            data: JSON.stringify(api.validateBody(LLM_MODELS[provider])),
-            onload,
-            onerror: () => onResult(false, 'Network error'),
+        const validateTarget = (target) =>
+            new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    ...providerValidationRequest(provider, key, target),
+                    onload: (r) => resolve({ ...target, ...classifyResponse(r) }),
+                    onerror: (e) =>
+                        resolve({
+                            ...target,
+                            ok: false,
+                            state: 'invalid',
+                            msg: `Network error: ${formatTransportErrorDetails(e)}`,
+                        }),
+                    ontimeout: (e) =>
+                        resolve({
+                            ...target,
+                            ok: false,
+                            state: 'invalid',
+                            msg: `Timed out: ${formatTransportErrorDetails(e)}`,
+                        }),
+                });
+            });
+
+        const targets = getProviderValidationTargets(provider);
+        Promise.all(targets.map(validateTarget)).then((results) => {
+            const label = (r) => r.label || r.model;
+            const failed = results.filter((r) => !r.ok);
+            const warned = results.filter((r) => r.ok && r.warn);
+            if (failed.length) {
+                onResult(
+                    false,
+                    `Failed: ${failed.map((r) => `${label(r)} (${r.msg})`).join('; ')}. Checked: ${results
+                        .map(label)
+                        .join(', ')}`,
+                );
+            } else if (warned.length) {
+                const state = warned.some((r) => r.state === 'nofunds') ? 'nofunds' : 'valid';
+                onWarn(
+                    `Warning: ${warned.map((r) => `${label(r)} (${r.msg})`).join('; ')}. Checked: ${results
+                        .map(label)
+                        .join(', ')}`,
+                    state,
+                );
+            } else {
+                onResult(true, `Valid models: ${results.map(label).join(', ')}`);
+            }
         });
     }
 
@@ -4560,20 +4700,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         // --- Active provider section ---
         const meta = PROVIDER_META[active];
         const cfg = config[active];
-        const links =
-            active === 'claude'
-                ? {
-                      keys: 'https://console.anthropic.com/settings/keys',
-                      billing: 'https://console.anthropic.com/settings/billing',
-                      usage: 'https://console.anthropic.com/settings/cost',
-                      domain: 'console.anthropic.com',
-                  }
-                : {
-                      keys: 'https://platform.openai.com/api-keys',
-                      billing: 'https://platform.openai.com/settings/organization/billing/overview',
-                      usage: 'https://platform.openai.com/usage',
-                      domain: 'platform.openai.com',
-                  };
+        const links = PROVIDER_LINKS[active] || PROVIDER_LINKS.claude;
 
         const provHdr = document.createElement('div');
         Object.assign(provHdr.style, { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' });
@@ -5174,7 +5301,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
-                url: api.url,
+                url: providerRequestUrl(api, model, cfg.key),
                 headers: api.headers(cfg.key),
                 data: requestBody,
                 timeout: timeoutMs,
@@ -19554,7 +19681,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.86
+// @version      1.89
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -19569,6 +19696,7 @@ RULES:
 // @connect      patch-diff.githubusercontent.com
 // @connect      api.anthropic.com
 // @connect      api.openai.com
+// @connect      generativelanguage.googleapis.com
 // @connect      keys.openpgp.org
 // @require      https://cdn.jsdelivr.net/npm/openpgp@6.3.0/dist/openpgp.min.js
 // @require      https://cdn.jsdelivr.net/npm/diff@9.0.0/dist/diff.min.js
@@ -19724,6 +19852,10 @@ RULES:
                 cacheKey('openai', pr, 'commit_abc'),
                 `llm_cache_pull_alice_bitcoin_106_openai_${LLM_MODELS.openai}_commit_abc`,
             );
+            ackEq(
+                cacheKey('gemini', pr, 'commit_abc'),
+                `llm_cache_pull_alice_bitcoin_106_gemini_${LLM_MODELS.gemini}_commit_abc`,
+            );
         } finally {
             pageKind = origPageKind;
         }
@@ -19774,6 +19906,8 @@ RULES:
         ackAssert(PROVIDER_META.claude.outputPrice > 0, 'claude has outputPrice');
         ackAssert(PROVIDER_META.openai.inputPrice > 0, 'openai has inputPrice');
         ackAssert(PROVIDER_META.openai.outputPrice > 0, 'openai has outputPrice');
+        ackAssert(PROVIDER_META.gemini.inputPrice > 0, 'gemini has inputPrice');
+        ackAssert(PROVIDER_META.gemini.outputPrice > 0, 'gemini has outputPrice');
     });
 
     // --- renderMarkdown ---
@@ -19958,16 +20092,18 @@ RULES:
 
     // --- LLM_MODELS ---
 
-    ackTest('has claude and openai models', () => {
+    ackTest('has claude, openai, and gemini models', () => {
         ackAssert(LLM_MODELS.claude, 'missing claude model');
         ackAssert(LLM_MODELS.claude_high_context, 'missing high-context claude model');
         ackAssert(LLM_MODELS.openai, 'missing openai model');
+        ackAssert(LLM_MODELS.gemini, 'missing gemini model');
     });
 
     ackTest('model strings are non-empty', () => {
         ackAssert(LLM_MODELS.claude.length > 0);
         ackAssert(LLM_MODELS.claude_high_context.length > 0);
         ackAssert(LLM_MODELS.openai.length > 0);
+        ackAssert(LLM_MODELS.gemini.length > 0);
     });
 
     // --- qsa (scoped querySelectorAll) ---
@@ -20235,6 +20371,10 @@ RULES:
 
     ackTest('LLM_MODELS.claude_high_context is claude-opus-4-7', () => {
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
+    });
+
+    ackTest('LLM_MODELS.gemini is gemini-3.5-flash', () => {
+        ackEq(LLM_MODELS.gemini, 'gemini-3.5-flash');
     });
 
     // --- getFormat rdiff fallback ---
@@ -20659,6 +20799,12 @@ RULES:
         );
     });
 
+    ackTest('@connect includes all LLM provider API hosts', () => {
+        for (const host of ['api.anthropic.com', 'api.openai.com', 'generativelanguage.googleapis.com']) {
+            ackAssert(_ackSource.includes(`@connect      ${host}`), `${host} in @connect`);
+        }
+    });
+
     ackTest('extracts simple BENCHMARK names', () => {
         const src = `
     static void CCoinsCaching(benchmark::Bench& bench) { bench.run([]{}); }
@@ -20714,6 +20860,7 @@ RULES:
     ackTest('isProviderAvailable returns false when no key set', () => {
         ackEq(isProviderAvailable('claude'), false);
         ackEq(isProviderAvailable('openai'), false);
+        ackEq(isProviderAvailable('gemini'), false);
     });
 
     ackTest('isProviderAvailable returns false for unknown provider', () => {
@@ -22494,14 +22641,15 @@ RULES:
     // LLM_MODELS -- extended
     // ============================================================================
 
-    ackTest('LLM_MODELS has claude, claude_high_context, and openai', () => {
+    ackTest('LLM_MODELS has claude, claude_high_context, openai, and gemini', () => {
         const keys = Object.keys(LLM_MODELS);
-        ackDeepEq(keys.sort(), ['claude', 'claude_high_context', 'openai']);
+        ackDeepEq(keys.sort(), ['claude', 'claude_high_context', 'gemini', 'openai']);
     });
 
     ackTest('LLM_MODELS model strings are non-empty and contain expected patterns', () => {
         ackAssert(LLM_MODELS.claude.includes('claude'), 'claude model string contains "claude"');
         ackAssert(LLM_MODELS.openai.includes('gpt'), 'openai model string contains "gpt"');
+        ackAssert(LLM_MODELS.gemini.includes('gemini'), 'gemini model string contains "gemini"');
     });
 
     // ============================================================================
@@ -22537,8 +22685,27 @@ RULES:
     // PROVIDER_META
     // ============================================================================
 
-    ackTest('PROVIDER_META has claude and openai', () => {
-        ackDeepEq(Object.keys(PROVIDER_META).sort(), ['claude', 'openai']);
+    ackTest('PROVIDER_META has claude, openai, and gemini', () => {
+        ackDeepEq(Object.keys(PROVIDER_META).sort(), ['claude', 'gemini', 'openai']);
+    });
+
+    ackTest('PROVIDER_LINKS has provider-specific key, usage, and billing links', () => {
+        ackDeepEq(Object.keys(PROVIDER_LINKS).sort(), Object.keys(PROVIDER_META).sort());
+        ackAssert(PROVIDER_LINKS.claude.domain === 'console.anthropic.com', 'Claude uses Anthropic console');
+        ackAssert(PROVIDER_LINKS.openai.domain === 'platform.openai.com', 'OpenAI uses OpenAI platform');
+        ackAssert(PROVIDER_LINKS.gemini.domain === 'aistudio.google.com', 'Gemini uses Google AI Studio');
+        ackAssert(PROVIDER_LINKS.gemini.keys === 'https://aistudio.google.com/api-keys', 'Gemini key link uses AI Studio API Keys');
+        ackAssert(!PROVIDER_LINKS.gemini.keys.includes('platform.openai.com'), 'Gemini key link is not OpenAI');
+    });
+
+    ackTest('provider validation targets include every callable model version', () => {
+        const claude = getProviderValidationTargets('claude').map(({ model }) => model);
+        const openai = getProviderValidationTargets('openai');
+        const gemini = getProviderValidationTargets('gemini').map(({ model }) => model);
+        ackDeepEq(claude, [LLM_MODELS.claude, LLM_MODELS.claude_high_context]);
+        ackAssert(openai.some(({ kind, model }) => kind === 'generate' && model === LLM_MODELS.openai));
+        ackAssert(openai.some(({ kind, model }) => kind === 'model' && model === OPENAI_IMAGE_MODEL));
+        ackDeepEq(gemini, [LLM_MODELS.gemini]);
     });
 
     ackTest('each provider has label, color, and icon SVG', () => {
@@ -22556,6 +22723,10 @@ RULES:
 
     ackTest('OpenAI icon uses green color', () => {
         ackAssert(PROVIDER_META.openai.icon.includes('#74d4a5'), 'OpenAI icon fill color');
+    });
+
+    ackTest('Gemini icon uses blue color', () => {
+        ackAssert(PROVIDER_META.gemini.icon.includes('#8ab4f8'), 'Gemini icon fill color');
     });
 
     ackTest('provider icons are 14x14', () => {
@@ -22590,12 +22761,18 @@ RULES:
         const cfg = getLLMConfig();
         ackEq(cfg.claude.enabled, undefined, 'claude has no enabled');
         ackEq(cfg.openai.enabled, undefined, 'openai has no enabled');
+        ackEq(cfg.gemini.enabled, undefined, 'gemini has no enabled');
+    });
+
+    ackTest('provider key storage keys are derived from provider metadata', () => {
+        ackDeepEq(providerKeyStorageKeys().sort(), ['llm_claude_key', 'llm_gemini_key', 'llm_openai_key']);
     });
 
     ackTest('isProviderAvailable only checks key, not enabled', () => {
         // With no key set, should be false
         ackEq(isProviderAvailable('claude'), false);
         ackEq(isProviderAvailable('openai'), false);
+        ackEq(isProviderAvailable('gemini'), false);
     });
 
     // ============================================================================
@@ -22608,12 +22785,15 @@ RULES:
         const cfgC = getLLMConfig();
         setActiveProvider('openai');
         const cfgO = getLLMConfig();
+        setActiveProvider('gemini');
+        const cfgG = getLLMConfig();
         // Both should have all 4 instruction keys
         ackAssert('pr' in cfgC.instructions);
         ackAssert('commits' in cfgC.instructions);
         ackAssert('commit' in cfgC.instructions);
         ackAssert('proofread' in cfgC.instructions);
         ackAssert('pr' in cfgO.instructions);
+        ackAssert('pr' in cfgG.instructions);
         setActiveProvider('claude'); // restore
     });
 
@@ -22621,9 +22801,13 @@ RULES:
         const pr = { owner: 'o', repo: 'r', pr: '1' };
         const keyC = cacheKey('claude', pr, 'pr');
         const keyO = cacheKey('openai', pr, 'pr');
+        const keyG = cacheKey('gemini', pr, 'pr');
         ackAssert(keyC.includes('claude'), 'claude in cache key');
         ackAssert(keyO.includes('openai'), 'openai in cache key');
+        ackAssert(keyG.includes('gemini'), 'gemini in cache key');
         ackNeq(keyC, keyO, 'different providers = different keys');
+        ackNeq(keyC, keyG, 'different providers = different keys');
+        ackNeq(keyO, keyG, 'different providers = different keys');
     });
 
     // ============================================================================
@@ -26149,6 +26333,7 @@ RULES:
         );
         ackAssert(tokenHelper.includes("provider === 'claude'"), 'high-context token helper special-cases Claude');
         ackAssert(tokenHelper.includes("provider === 'openai'"), 'high-context token helper special-cases OpenAI');
+        ackAssert(tokenHelper.includes("provider === 'gemini'"), 'high-context token helper includes Gemini');
         ackAssert(
             tokenHelper.includes('return 32768'),
             'high-context token helper raises token cap for full-context calls',
@@ -26161,6 +26346,7 @@ RULES:
             timeoutHelper.includes('LLM_HIGH_CONTEXT_TIMEOUT_MS'),
             'high-context timeout helper raises the transport timeout',
         );
+        ackAssert(timeoutHelper.includes("provider === 'gemini'"), 'high-context timeout helper includes Gemini');
         ackAssert(
             timeoutHelper.includes('LLM_REQUEST_TIMEOUT_MS'),
             'high-context timeout helper falls back to the normal timeout',
@@ -27102,11 +27288,34 @@ RULES:
         const config = source.slice(source.indexOf('const PROVIDER_API'), source.indexOf('// Provider branding'));
         ackAssert(config.includes('claude:'), 'claude provider configured');
         ackAssert(config.includes('openai:'), 'openai provider configured');
+        ackAssert(config.includes('gemini:'), 'gemini provider configured');
         // Each has all required fields
         for (const field of ['url:', 'headers:', 'body:', 'validateBody:', 'parseText:', 'parseUsage:']) {
             const count = (config.match(new RegExp(field, 'g')) || []).length;
-            ackAssert(count >= 2, `${field} present for both providers (found ${count})`);
+            ackAssert(count >= 3, `${field} present for all providers (found ${count})`);
         }
+    });
+
+    ackTest('Gemini provider uses Gemini API host and x-goog-api-key header', () => {
+        const source = _ackSource;
+        const config = source.slice(source.indexOf('const PROVIDER_API'), source.indexOf('const PROVIDER_LINKS'));
+        const geminiBlock = config.slice(config.indexOf('gemini:'), config.indexOf('};', config.indexOf('gemini:')));
+        ackAssert(geminiBlock.includes('generativelanguage.googleapis.com'), 'Gemini uses Google endpoint');
+        ackAssert(geminiBlock.includes("'x-goog-api-key': key"), 'Gemini sends API key in documented header');
+        ackAssert(!geminiBlock.includes('?key='), 'Gemini API key is not embedded in request URL');
+    });
+
+    ackTest('provider validation requests use generation for text and metadata for image models', () => {
+        const opus = providerValidationRequest('claude', 'test-key', {
+            kind: 'generate',
+            model: LLM_MODELS.claude_high_context,
+        });
+        ackEq(opus.method, 'POST');
+        ackAssert(opus.data.includes(LLM_MODELS.claude_high_context), 'Opus validation posts a real model request');
+        const image = providerValidationRequest('openai', 'test-key', { kind: 'model', model: OPENAI_IMAGE_MODEL });
+        ackEq(image.method, 'GET');
+        ackAssert(image.url.includes(`/v1/models/${OPENAI_IMAGE_MODEL}`), 'image validation checks model metadata');
+        ackEq(image.data, undefined, 'image validation does not generate an image');
     });
 
     ackTest('LLM requests only set temperature when the provider/model supports it', () => {
@@ -27146,18 +27355,18 @@ RULES:
     ackTest('validateKey uses PROVIDER_API for request building', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function validateKey'), source.indexOf('function fmtTokens'));
-        ackAssert(fn.includes('PROVIDER_API[provider]'), 'uses PROVIDER_API');
-        ackAssert(fn.includes('api.url'), 'uses api.url');
-        ackAssert(fn.includes('api.headers(key)'), 'uses api.headers');
-        ackAssert(fn.includes('api.validateBody('), 'uses api.validateBody');
+        ackAssert(fn.includes('getProviderValidationTargets(provider)'), 'gets all provider validation targets');
+        ackAssert(fn.includes('providerValidationRequest(provider, key, target)'), 'uses shared validation request builder');
+        ackAssert(fn.includes('Promise.all(targets.map(validateTarget))'), 'validates all provider targets');
         ackAssert(
-            fn.includes("r.status === 404) onResult(false, 'Key valid but model not available')"),
+            fn.includes("r.status === 404) return { ok: false, state: 'invalid', msg: 'Model not available' }"),
             'Claude model 404 is surfaced as unavailable model',
         );
         ackAssert(!fn.includes('r.status === 400 || r.status === 404'), 'does not accept Claude model 404');
         // No hardcoded provider URLs
         ackAssert(!fn.includes("'https://api.anthropic.com"), 'no hardcoded Anthropic URL');
         ackAssert(!fn.includes("'https://api.openai.com"), 'no hardcoded OpenAI URL');
+        ackAssert(!fn.includes("'https://generativelanguage.googleapis.com"), 'no hardcoded Gemini URL');
     });
 
     // --- v1.10 fixes and features ---
@@ -28753,8 +28962,7 @@ RULES:
     ackTest('factoryReset deletes everything except API keys', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function factoryReset'), source.indexOf('// --- Config Panel'));
-        ackAssert(fn.includes('llm_claude_key'), 'keeps Claude API key');
-        ackAssert(fn.includes('llm_openai_key'), 'keeps OpenAI API key');
+        ackAssert(fn.includes('providerKeyStorageKeys()'), 'keeps provider API keys through provider metadata');
         ackAssert(fn.includes('github_pat'), 'keeps GitHub PAT');
         ackAssert(fn.includes('GM_deleteValue'), 'deletes GM values');
         ackAssert(fn.includes('keep.has'), 'uses keep set to filter');
@@ -31695,9 +31903,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.86', () => {
+    ackTest('version bumped to 1.89', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.86' || _ackSource.includes('@version      1.86'), 'version is 1.86');
+        ackAssert(versionFromMeta === '1.89' || _ackSource.includes('@version      1.89'), 'version is 1.89');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32236,6 +32444,7 @@ RULES:
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
+        ackEq(LLM_MODELS.gemini, 'gemini-3.5-flash');
     });
 
     // --- escapeHTML behavioral tests ---

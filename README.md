@@ -183,7 +183,7 @@ Each comment’s `...` menu also gets a **Copy comment context** action, which c
 
 ### 🤖 Robot recipes / Chat
 
-Opens a robot panel backed by the active Claude or ChatGPT provider. The dropdown supports:
+Opens a robot panel backed by the active Claude, ChatGPT, or Gemini provider. The dropdown supports:
 
 - **Chat**: ask about the page, use `/find ...` to navigate visible comments/code, or use `/quiz` for high-leverage review questions
 - **Reproducer**: generate the direct outcome-focused local-agent prompt for a no-peek reimplementation only, omitting raw patch and comment context from the LLM request
@@ -208,7 +208,7 @@ Keeps a personal list of PRs you want to come back to. You can add the current P
 
 ### Settings
 
-Lets you configure the optional GitHub PAT, Claude/OpenAI API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. ACKtopus uses Claude Sonnet 4.6 for normal Claude requests and Claude Opus 4.7 for high-context Claude recipes, with a longer request timeout for those larger calls. The toolbar background toggles compact mode. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
+Lets you configure the optional GitHub PAT, Claude/OpenAI/Gemini API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. ACKtopus uses Claude Sonnet 4.6 for normal Claude requests, Claude Opus 4.7 for high-context Claude recipes, ChatGPT `gpt-5.5`, and Gemini `gemini-3.5-flash`. Settings validation checks every model version ACKtopus can call for the provider, including high-context Claude Opus and the OpenAI image model. Provider key, usage, and billing links point to each provider's own console, including Google AI Studio for Gemini. High-context recipes use the larger request timeout for every configured provider. The toolbar background toggles compact mode. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
 
 ## In-page review helpers
 
