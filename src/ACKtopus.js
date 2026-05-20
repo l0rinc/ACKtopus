@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.80
+// @version      1.81
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -561,7 +561,7 @@
         'details.details-overlay summary, summary.timeline-comment-action';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
-    const NO_CHANGES_MSG = 'No changes needed -- text is already correct';
+    const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
         return String(s)
@@ -3837,12 +3837,13 @@ Fix grammar, spelling, and clarity with minimal edits. Preserve the author's ton
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
 If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages, or thread context, fix it minimally. Only correct objective errors, not opinions.
 Make the reply make sense in light of the commit messages and the current thread (if any). If the surrounding thread has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
-Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it -- rephrase as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
+Keep replies friendly and professional without making them more verbose or less direct.
+Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it by rephrasing as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
 Do not change technical meaning unless it is factually incorrect.
-Do not change quoted text (lines starting with >) in any way. Those are someone else's words -- copy them verbatim.
+Do not change quoted text (lines starting with >) in any way. Those are someone else's words, so copy them verbatim.
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
-Do not introduce double hyphens ("--") as punctuation if they were not already present in the original text. Keep the author's normal punctuation style.
+Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or double-hyphen ("--") punctuation. Preserve command-line flags such as \`--connect\`, quoted text, and any double hyphens that were already present in the original text.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
 When a fenced code block has no language (or only a generic one like text/plain), add a language tag only when the language is obvious.
@@ -8413,7 +8414,7 @@ The prompt must ask for:
                 if (ctx.diff) parts.push(wrapPromptBlock('Diff', ctx.diff.slice(0, 120000)));
                 if (parts.length) {
                     proofreadContext =
-                        '\n\nThe following is the actual PR diff and commit messages. Flag any claims in the description that are inaccurate -- renamed files, removed/changed variables, obsolete function names, incorrect behavior descriptions, etc.\n\n' +
+                        '\n\nThe following is the actual PR diff and commit messages. Flag any claims in the description that are inaccurate, such as renamed files, removed/changed variables, obsolete function names, incorrect behavior descriptions, etc.\n\n' +
                         parts.join('\n\n');
                 }
             } else {
@@ -13895,6 +13896,7 @@ Rules:
     const FOLD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5.25 4.75 8 2l2.75 2.75"/><path d="M5.25 11.25 8 14l2.75-2.75"/><path d="M2 8h12"/></svg>`;
     const PROOFREAD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5 2.25h4.25L12 5v7.25a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z"/><path d="M9.25 2.25V5H12"/><path d="m5.9 9 1.25 1.25L10.1 7.3"/></svg>`;
     const WAND_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="m9.75 2.25.35 1.05a1 1 0 0 0 .63.63l1.05.35-1.05.35a1 1 0 0 0-.63.63l-.35 1.05-.35-1.05a1 1 0 0 0-.63-.63l-1.05-.35 1.05-.35a1 1 0 0 0 .63-.63Z"/><path d="m5.1 6.4 4.5 4.5"/><path d="m3.25 12.75 1.2-3.05 1.85-1.85 1.85 1.85-1.85 1.85Z"/></svg>`;
+    const _toolbarControlPressBound = new WeakSet();
 
     function getToolbarEditorRoot(toolbar) {
         if (toolbar?.classList?.contains('ack-toolbar-actions')) {
@@ -14309,6 +14311,24 @@ RULES:
             'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]';
         const ackToolbarControlsSelector =
             '.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-item, .ack-toolbar-actions';
+        const bindToolbarControlPress = (btn, handler) => {
+            if (!btn || _toolbarControlPressBound.has(btn)) return;
+            _toolbarControlPressBound.add(btn);
+            let pointerHandledAt = 0;
+            btn.addEventListener('pointerdown', (e) => {
+                if (e.button != null && e.button !== 0) return;
+                e.preventDefault();
+                e.stopPropagation();
+                pointerHandledAt = Date.now();
+                handler(btn);
+            });
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (Date.now() - pointerHandledAt < 1000) return;
+                handler(btn);
+            });
+        };
         qsa(root, toolbarSelector).forEach((toolbar) => {
             // GitHub CSS modules can produce unrelated classes like
             // `PullRequestFilesToolbar-module__toolbar__...` which still contain the
@@ -14352,6 +14372,13 @@ RULES:
             );
             let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
             let hasProofreadBtn = !!toolbar.querySelector('.ack-toolbar-proofread');
+            const bindExistingToolbarButtons = () => {
+                const detailsBtn = toolbar.querySelector('.ack-details-btn');
+                const proofreadBtn = toolbar.querySelector('.ack-toolbar-proofread');
+                if (detailsBtn) bindToolbarControlPress(detailsBtn, () => wrapSelectionInDetails(toolbar));
+                if (proofreadBtn) bindToolbarControlPress(proofreadBtn, (btn) => runProofreadOnComment(btn));
+            };
+            bindExistingToolbarButtons();
             if (hasDetailsBtn && hasProofreadBtn) return;
 
             const isActionBarToolbar = toolbar.tagName === 'MARKDOWN-TOOLBAR';
@@ -14391,11 +14418,7 @@ RULES:
                 btn.addEventListener('mouseleave', () => {
                     btn.style.opacity = '0.6';
                 });
-                btn.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handler(btn);
-                });
+                bindToolbarControlPress(btn, handler);
                 return btn;
             };
 
@@ -14474,7 +14497,10 @@ RULES:
 
             const ensureBtn = (selector, className, html, title, handler) => {
                 let btn = row.querySelector(selector);
-                if (btn) return btn;
+                if (btn) {
+                    bindToolbarControlPress(btn, handler);
+                    return btn;
+                }
                 btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = className;
@@ -14499,11 +14525,7 @@ RULES:
                 btn.addEventListener('mouseleave', () => {
                     btn.style.opacity = '0.6';
                 });
-                btn.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handler(btn);
-                });
+                bindToolbarControlPress(btn, handler);
                 row.appendChild(btn);
                 return btn;
             };
@@ -19216,7 +19238,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.80
+// @version      1.81
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -21134,14 +21156,22 @@ RULES:
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('verbatim'), 'says copy verbatim');
     });
 
-    ackTest('proofread instructions forbid introducing double hyphens', () => {
+    ackTest('proofread instructions avoid double-hyphen punctuation', () => {
         ackAssert(
-            DEFAULT_INSTRUCTIONS.proofread.includes('double hyphens ("--")'),
-            'explicitly forbids introducing double hyphens',
+            DEFAULT_INSTRUCTIONS.proofread.includes('double-hyphen ("--") punctuation'),
+            'mentions double-hyphen punctuation',
         );
         ackAssert(
-            DEFAULT_INSTRUCTIONS.proofread.includes("author's normal punctuation style"),
-            'preserves the author punctuation style',
+            DEFAULT_INSTRUCTIONS.proofread.includes('command-line flags such as `--connect`'),
+            'keeps command-line flags distinct from punctuation',
+        );
+        ackAssert(
+            !DEFAULT_INSTRUCTIONS.proofread.includes(' -- '),
+            'proofread instructions do not use double hyphen punctuation themselves',
+        );
+        ackAssert(
+            !NO_CHANGES_MSG.includes(' -- '),
+            'no-changes message avoids double hyphen punctuation',
         );
     });
 
@@ -23047,6 +23077,29 @@ RULES:
             itemContainer.lastElementChild?.querySelector?.('.ack-toolbar-proofread'),
             'proofread remains at the far right edge',
         );
+    });
+
+    ackTest('edit toolbar buttons activate on pointerdown with keyboard click fallback', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function addDetailsButtons'),
+            source.indexOf('function wrapSelectionInDetails'),
+        );
+        ackAssert(source.includes('const _toolbarControlPressBound = new WeakSet()'), 'uses non-DOM binding marker');
+        ackAssert(fn.includes('const bindToolbarControlPress'), 'has shared toolbar press binder');
+        ackAssert(fn.includes('_toolbarControlPressBound.has(btn)'), 'does not double-bind the same live node');
+        ackAssert(
+            fn.includes('bindExistingToolbarButtons'),
+            'repairs matching toolbar buttons that were cloned without listeners',
+        );
+        ackAssert(fn.includes("'pointerdown'"), 'toolbar controls handle pointerdown before React can rerender');
+        ackAssert(fn.includes('pointerHandledAt = Date.now()'), 'records pointer activation time');
+        ackAssert(
+            fn.includes('Date.now() - pointerHandledAt < 1000'),
+            'suppresses only the synthetic click after pointer activation',
+        );
+        const bindCalls = (fn.match(/bindToolbarControlPress\(btn, handler\)/g) || []).length;
+        ackEq(bindCalls, 3, 'binds new buttons and existing fallback edit-row buttons');
     });
 
     ackTest('addDetailsButtons skips hidden markdown-toolbar when React toolbar exists', () => {
@@ -31120,9 +31173,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.80', () => {
+    ackTest('version bumped to 1.81', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.80' || _ackSource.includes('@version      1.80'), 'version is 1.80');
+        ackAssert(versionFromMeta === '1.81' || _ackSource.includes('@version      1.81'), 'version is 1.81');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
