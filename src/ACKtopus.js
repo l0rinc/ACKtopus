@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.85
+// @version      1.86
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -83,6 +83,8 @@
     const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
     const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
+    const LLM_REQUEST_TIMEOUT_MS = 180000;
+    const LLM_HIGH_CONTEXT_TIMEOUT_MS = 600000;
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -3672,6 +3674,11 @@
         return 0;
     }
 
+    function getHighContextTimeoutMs(provider) {
+        if (provider === 'claude' || provider === 'openai') return LLM_HIGH_CONTEXT_TIMEOUT_MS;
+        return LLM_REQUEST_TIMEOUT_MS;
+    }
+
     // Provider API configuration -- drives callLLM, validateKey, and any future providers.
     // Adding a new provider = one entry here + branding in PROVIDER_META + validation logic.
     const PROVIDER_API = {
@@ -5133,7 +5140,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         provider,
         system,
         userContent,
-        { skipCache = false, modelOverride = '', reasoningEffort = '', maxTokens = 0 } = {},
+        { skipCache = false, modelOverride = '', reasoningEffort = '', maxTokens = 0, timeoutMs = LLM_REQUEST_TIMEOUT_MS } = {},
     ) {
         // Check prompt-level cache first (exact same prompt → cached response)
         const llmCfg = getLLMConfig();
@@ -5160,6 +5167,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         console.log('user:', userContent);
         if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
         if (maxTokens) console.log('max_tokens:', maxTokens);
+        console.log('timeout_ms:', timeoutMs);
         const requestBody = JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens }));
         console.log('request_chars:', requestBody.length);
         console.groupEnd();
@@ -5169,7 +5177,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 url: api.url,
                 headers: api.headers(cfg.key),
                 data: requestBody,
-                timeout: 180000,
+                timeout: timeoutMs,
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         let data;
@@ -6762,7 +6770,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         let source = meta.length ? `## Checkout metadata\n${meta.map((x) => `- ${x}`).join('\n')}\n\n${context}` : context;
         if (stripFencedBlocks) source = stripFencedBlocksForNoPeekPrompt(source);
-        return formatOversizedRecipeContext(source, maxChars);
+        return formatOversizedRecipeContext(source, maxChars, {
+            preserveCommits: includeCommits,
+            preserveComments: includeComments,
+        });
     }
 
     function truncateMiddle(text, maxChars) {
@@ -6773,7 +6784,99 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return s.slice(0, head) + `\n\n...[TRUNCATED ${s.length - maxChars} chars]...\n\n` + s.slice(-tail);
     }
 
-    function formatOversizedRecipeContext(context, maxChars = RECIPE_CONTEXT_MAX_CHARS) {
+    function truncateEnd(text, maxChars) {
+        const s = String(text || '');
+        if (s.length <= maxChars) return s;
+        const keep = Math.max(0, maxChars - 44);
+        return `${s.slice(0, keep).trimEnd()}\n...[TRUNCATED ${s.length - maxChars} chars]...`;
+    }
+
+    function splitRecipeSections(text) {
+        const s = String(text || '');
+        const matches = [...s.matchAll(/^## [^\n]*(?:\n|$)/gm)];
+        if (!matches.length) return [{ heading: '', text: s }];
+        const sections = [];
+        if (matches[0].index > 0) {
+            sections.push({ heading: '', text: s.slice(0, matches[0].index).trim() });
+        }
+        for (let i = 0; i < matches.length; i++) {
+            const start = matches[i].index;
+            const end = i + 1 < matches.length ? matches[i + 1].index : s.length;
+            const heading = matches[i][0].replace(/^##\s*/, '').trim();
+            sections.push({ heading, text: s.slice(start, end).trim() });
+        }
+        return sections.filter((section) => section.text);
+    }
+
+    function splitEntriesByHeading(sectionText) {
+        const text = String(sectionText || '').trim();
+        const header = text.match(/^## [^\n]*(?:\n|$)/)?.[0]?.trimEnd() || '';
+        const body = header ? text.slice(header.length).trim() : text;
+        const entries = body.split(/\n(?=### )/).map((entry) => entry.trim()).filter(Boolean);
+        return { header, entries };
+    }
+
+    function compressRecipeEntrySection(sectionText, budget, minEntryChars) {
+        const text = String(sectionText || '');
+        if (text.length <= budget) return text;
+        const { header, entries } = splitEntriesByHeading(text);
+        if (entries.length < 2) return truncateMiddle(text, budget);
+        const perEntryBudget = Math.max(
+            minEntryChars,
+            Math.floor((budget - header.length - entries.length * 2) / entries.length),
+        );
+        const out = [header, ...entries.map((entry) => truncateEnd(entry, perEntryBudget))]
+            .filter(Boolean)
+            .join('\n\n');
+        return out.length <= budget ? out : truncateMiddle(out, budget);
+    }
+
+    function compressRecipeCommentSection(sectionText, budget) {
+        const text = String(sectionText || '');
+        if (text.length <= budget) return text;
+        const header = text.match(/^## [^\n]*(?:\n|$)/)?.[0]?.trimEnd() || '';
+        const body = header ? text.slice(header.length).trim() : text;
+        const entries = body.split(/\n\n---\n\n/).map((entry) => entry.trim()).filter(Boolean);
+        if (entries.length < 2) return truncateMiddle(text, budget);
+        const perEntryBudget = Math.max(
+            180,
+            Math.floor((budget - header.length - entries.length * 6) / entries.length),
+        );
+        const out = [header, ...entries.map((entry) => truncateEnd(entry, perEntryBudget))]
+            .filter(Boolean)
+            .join('\n\n---\n\n');
+        return out.length <= budget ? out : truncateMiddle(out, budget);
+    }
+
+    function isProtectedRecipeSection(section, opts) {
+        const heading = String(section.heading || '').toLowerCase();
+        if (!heading) return true;
+        if (heading.startsWith('checkout metadata') || heading.startsWith('title')) return true;
+        if (opts.preserveCommits && heading.startsWith('commits')) return true;
+        if (
+            opts.preserveComments &&
+            (heading.startsWith('comments') || heading.startsWith('visible comments'))
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    function compressProtectedRecipeSection(section, budget, opts) {
+        const heading = String(section.heading || '').toLowerCase();
+        if (opts.preserveCommits && heading.startsWith('commits')) {
+            return compressRecipeEntrySection(section.text, budget, 120);
+        }
+        if (
+            opts.preserveComments &&
+            (heading.startsWith('comments') || heading.startsWith('visible comments'))
+        ) {
+            return compressRecipeCommentSection(section.text, budget);
+        }
+        return truncateMiddle(section.text, budget);
+    }
+
+    function formatOversizedRecipeContext(context, maxChars = RECIPE_CONTEXT_MAX_CHARS, opts = {}) {
         const text = String(context || '');
         if (text.length <= maxChars) return text;
         const notice = [
@@ -6782,7 +6885,30 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             'The source material below is truncated. Treat it as an index of PR metadata, concerns, and evidence to ground the prompt, not as complete PR evidence.',
             'The target local agent must fetch any missing commits, diffs, file lists, review threads, comments, CI logs, and code details from GitHub or local git only when the generated prompt allows that evidence. Preserve no-peek restrictions for reproducer prompts and do not infer absent implementation details from this truncated source.',
         ].join('\n');
-        return `${notice}\n\n${truncateMiddle(text, maxChars)}`;
+        if (!opts.preserveCommits && !opts.preserveComments) {
+            return `${notice}\n\n${truncateMiddle(text, maxChars)}`;
+        }
+
+        const sections = splitRecipeSections(text);
+        const protectedSections = sections.filter((section) => isProtectedRecipeSection(section, opts));
+        const otherSections = sections.filter((section) => !isProtectedRecipeSection(section, opts));
+        if (!protectedSections.length) return `${notice}\n\n${truncateMiddle(text, maxChars)}`;
+
+        const protectedBudget = Math.max(2000, Math.floor((maxChars - notice.length) * 0.8));
+        const protectedChars = protectedSections.reduce((sum, section) => sum + section.text.length, 0);
+        const protectedText = protectedSections
+            .map((section) => {
+                const share = protectedChars ? section.text.length / protectedChars : 1 / protectedSections.length;
+                const sectionBudget = Math.max(500, Math.floor(protectedBudget * share));
+                return compressProtectedRecipeSection(section, sectionBudget, opts);
+            })
+            .join('\n\n');
+        const remainingBudget = Math.max(1000, maxChars - protectedText.length - notice.length - 80);
+        const otherText = otherSections.map((section) => section.text).join('\n\n');
+        const truncatedOther = otherText
+            ? `## Truncated Remaining Source\n${truncateMiddle(otherText, remainingBudget)}`
+            : '';
+        return [notice, protectedText, truncatedOther].filter(Boolean).join('\n\n');
     }
 
     function cleanInfographicImagePrompt(text) {
@@ -7522,6 +7648,7 @@ The prompt must ask for:
                         modelOverride: getHighContextModelOverride(provider),
                         reasoningEffort: getHighContextReasoningEffort(provider),
                         maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
+                        timeoutMs: getHighContextTimeoutMs(provider),
                     });
                     let patchAttachment = '';
                     if (recipe === 'audio_walkthrough' && recipeCfg.appendPatchAttachment) {
@@ -19427,7 +19554,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.85
+// @version      1.86
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20089,7 +20216,7 @@ RULES:
         ackAssert(_ackSource.includes('toXML'), 'converts mutable segments to XML');
         ackAssert(_ackSource.includes('fromXML'), 'reassembles from XML response');
         ackAssert(!_ackSource.includes('<<KEEP_'), 'no longer uses KEEP placeholders');
-        ackAssert(_ackSource.includes('makePrompt(textToProofread)'), 'used in EDIT mode');
+        ackAssert(_ackSource.includes('makePrompt(textForProofread)'), 'used in EDIT mode');
         // v1.03: extended patterns
         ackAssert(_ackSource.includes('<\\/?details'), 'protects <details> / </details> tags');
         ackAssert(_ackSource.includes('<\\/?summary'), 'protects <summary> / </summary> tags');
@@ -26026,6 +26153,18 @@ RULES:
             tokenHelper.includes('return 32768'),
             'high-context token helper raises token cap for full-context calls',
         );
+        const timeoutHelper = source.slice(
+            source.indexOf('function getHighContextTimeoutMs'),
+            source.indexOf('const PROVIDER_API'),
+        );
+        ackAssert(
+            timeoutHelper.includes('LLM_HIGH_CONTEXT_TIMEOUT_MS'),
+            'high-context timeout helper raises the transport timeout',
+        );
+        ackAssert(
+            timeoutHelper.includes('LLM_REQUEST_TIMEOUT_MS'),
+            'high-context timeout helper falls back to the normal timeout',
+        );
 
         const recipeFn = source.slice(
             source.indexOf('function buildChatPanel'),
@@ -26042,6 +26181,10 @@ RULES:
         ackAssert(
             sourceIncludesLoose(recipeFn, 'maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider)'),
             'recipe path uses high-context token cap',
+        );
+        ackAssert(
+            sourceIncludesLoose(recipeFn, 'timeoutMs: getHighContextTimeoutMs(provider)'),
+            'recipe path uses high-context request timeout',
         );
 
         const reviewAidFn = source.slice(
@@ -28394,7 +28537,8 @@ RULES:
         ackAssert(source.includes('function formatTransportErrorDetails'), 'has transport error formatter');
         ackAssert(fn.includes('formatTransportErrorDetails(e)'), 'uses structured transport error details');
         ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
-        ackAssert(fn.includes('timeout: 180000'), 'uses an explicit LLM transport timeout');
+        ackAssert(fn.includes('timeout_ms'), 'logs the configured request timeout');
+        ackAssert(fn.includes('timeout: timeoutMs'), 'uses an explicit LLM transport timeout');
         const formatted = formatTransportErrorDetails({
             status: 0,
             statusText: 'error',
@@ -30383,11 +30527,15 @@ RULES:
         );
         ackAssert(
             fn.includes('modelOverride: getHighContextModelOverride(provider)'),
-            'reimplementation recipe uses high-context Claude override',
+            'reimplementation recipe uses the visible high-context Claude model override',
         );
         ackAssert(
             fn.includes('reasoningEffort: getHighContextReasoningEffort(provider)'),
             'reimplementation recipe uses high-context OpenAI reasoning effort',
+        );
+        ackAssert(
+            fn.includes('timeoutMs: getHighContextTimeoutMs(provider)'),
+            'reimplementation recipe uses the high-context request timeout',
         );
     });
 
@@ -30504,7 +30652,41 @@ RULES:
             'head metadata block is gated by omitHeadMetadata option',
         );
         ackAssert(fn.includes('formatOversizedRecipeContext'), 'bounds oversized recipe context');
+        ackAssert(fn.includes('preserveCommits: includeCommits'), 'passes commit preservation into truncation');
+        ackAssert(fn.includes('preserveComments: includeComments'), 'passes comment preservation into truncation');
         ackAssert(fn.includes('RECIPE_CONTEXT_MAX_CHARS'), 'uses recipe context limit');
+    });
+
+    ackTest('oversized recipe context preserves commit and comment indexes', () => {
+        const commits = [
+            '### aaa111\nfirst commit message\n' + 'a'.repeat(2000),
+            '### bbb222\nsecond commit message\n' + 'b'.repeat(2000),
+            '### ccc333\nthird commit message\n' + 'c'.repeat(2000),
+        ].join('\n\n');
+        const comments = [
+            '**alice**:\nfirst comment\n' + 'x'.repeat(2000),
+            '**bob**:\nsecond comment\n' + 'y'.repeat(2000),
+            '**carol**:\nthird comment\n' + 'z'.repeat(2000),
+        ].join('\n\n---\n\n');
+        const context = [
+            '## Checkout metadata\n- Base commit: `base`',
+            '## Title\nPreserve context',
+            `## Description\n${'d'.repeat(10000)}`,
+            `## Commits (3)\n${commits}`,
+            `## Comments (3)\n${comments}`,
+            `## Patch\n${'p'.repeat(10000)}`,
+        ].join('\n\n');
+        const formatted = formatOversizedRecipeContext(context, 4500, {
+            preserveCommits: true,
+            preserveComments: true,
+        });
+        ackAssert(formatted.includes('aaa111'), 'keeps first commit entry');
+        ackAssert(formatted.includes('bbb222'), 'keeps middle commit entry');
+        ackAssert(formatted.includes('ccc333'), 'keeps last commit entry');
+        ackAssert(formatted.includes('alice'), 'keeps first comment entry');
+        ackAssert(formatted.includes('bob'), 'keeps middle comment entry');
+        ackAssert(formatted.includes('carol'), 'keeps last comment entry');
+        ackAssert(formatted.includes('Context Size Notice'), 'marks the source as truncated');
     });
 
     ackTest('reproducer recipe omits head/PR-URL metadata from source context', () => {
@@ -31513,9 +31695,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.85', () => {
+    ackTest('version bumped to 1.86', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.85' || _ackSource.includes('@version      1.85'), 'version is 1.85');
+        ackAssert(versionFromMeta === '1.86' || _ackSource.includes('@version      1.86'), 'version is 1.86');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
