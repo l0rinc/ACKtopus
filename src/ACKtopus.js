@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.84
+// @version      1.85
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -101,6 +101,7 @@
 
     // Deterministic markdown post-processor used after proofreading:
     // - upgrades "Note/Tip/Important/Warning/Caution" lead-ins to GitHub alerts
+    // - preserves GitHub commit-diff line ranges through Markdown rendering
     // `<details><summary>` labels are left entirely to the model.
     const PROOFREAD_ALERT_KIND_MAP = {
         note: 'NOTE',
@@ -189,10 +190,23 @@
         return out.join('\n');
     }
 
+    const GITHUB_COMMIT_DIFF_LINE_URL_RE =
+        /\bhttps:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-fA-F]{40})(#diff-[A-Za-z0-9]+L\d+-L\d+)\b/g;
+
+    function rewriteProofreadCommitDiffUrls(text) {
+        let count = 0;
+        const out = String(text || '').replace(GITHUB_COMMIT_DIFF_LINE_URL_RE, (_url, owner, repo, sha, fragment) => {
+            count++;
+            return `https://redirect.github.com/${owner}/${repo}/commit/${sha}${fragment}`;
+        });
+        return { text: out, count };
+    }
+
     function postProcessProofreadMarkdown(text) {
         // Keep this pipeline deterministic and conservative.
         let out = String(text || '');
         out = applyProofreadAlertBlocks(out);
+        out = rewriteProofreadCommitDiffUrls(out).text;
         return out;
     }
 
@@ -8541,6 +8555,11 @@ The prompt must ask for:
         if (commentEl instanceof HTMLButtonElement) commentEl.disabled = true;
 
         const stopSpin = startSpin(commentEl);
+        const showLinkRewriteMarker = (count) => {
+            if (!count) return;
+            commentEl.textContent = '🔗';
+            commentEl.title = `${count} GitHub commit diff URL${count === 1 ? '' : 's'} rewritten through redirect.github.com`;
+        };
 
         try {
             // Detect if proofreading the PR body (main description)
@@ -9177,9 +9196,12 @@ Rules:
                 const oldBorder = ta.style.borderColor;
                 ta.style.borderColor = '#58a6ff';
                 try {
+                    const initialUrlRewrite = rewriteProofreadCommitDiffUrls(textToProofread);
+                    const textForProofread = initialUrlRewrite.text;
+                    let linkRewriteCount = initialUrlRewrite.count;
                     let strippedOriginal = stripGitHubMeta(textToProofread);
-                    let result = strippedOriginal;
-                    const { system, user, parsed, noOp } = makePrompt(textToProofread);
+                    let result = stripGitHubMeta(textForProofread);
+                    const { system, user, parsed, noOp } = makePrompt(textForProofread);
                     if (noOp) {
                         console.log(
                             'ACKtopus: proofread: no mutable segments, running deterministic markdown post-processing only',
@@ -9227,7 +9249,8 @@ Rules:
                         }
                     }
                     ta.style.borderColor = oldBorder;
-                    stopSpin('✅');
+                    stopSpin(linkRewriteCount ? '🔗' : '✅');
+                    showLinkRewriteMarker(linkRewriteCount);
 
                     // Compare stripped original vs LLM result (footer removal is transparent)
                     const { action: accepted, text: finalText } = await showDiffDialog(strippedOriginal, result);
@@ -9250,6 +9273,10 @@ Rules:
                         return;
                     }
 
+                    const finalUrlRewrite = rewriteProofreadCommitDiffUrls(finalText);
+                    const textToApply = finalUrlRewrite.text;
+                    linkRewriteCount = Math.max(linkRewriteCount, finalUrlRewrite.count);
+
                     // Apply the corrected text via React-compatible setTextareaValue helper
                     // Re-query textarea: React may have replaced the DOM element during the async diff dialog
                     const freshTa = container.querySelector(taSelector) || ta;
@@ -9261,23 +9288,28 @@ Rules:
                             await setTextareaValueRobust(
                                 taContainer,
                                 freshTa,
-                                freshTa.value.replace(textToProofread, finalText),
+                                freshTa.value.replace(textToProofread, textToApply),
                                 taSelector,
                             );
                         } else {
                             await setTextareaValueRobust(
                                 taContainer,
                                 freshTa,
-                                freshTa.value.slice(0, selStart) + finalText + freshTa.value.slice(selEnd),
+                                freshTa.value.slice(0, selStart) + textToApply + freshTa.value.slice(selEnd),
                                 taSelector,
                             );
                         }
                     } else {
-                        await setTextareaValueRobust(taContainer, freshTa, finalText, taSelector);
+                        await setTextareaValueRobust(taContainer, freshTa, textToApply, taSelector);
                     }
 
                     // Restore button text, keep the textarea open for user to review.
-                    restoreButton();
+                    if (linkRewriteCount) {
+                        showLinkRewriteMarker(linkRewriteCount);
+                        setTimeout(() => restoreButton(), 1500);
+                    } else {
+                        restoreButton();
+                    }
                     // Refresh quick-action icons (soft rescan: no global clear needed).
                     scheduleQuickActionsSoftRescan(1500);
                 } catch (e) {
@@ -19395,7 +19427,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.84
+// @version      1.85
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -29752,6 +29784,44 @@ RULES:
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
     });
 
+    ackTest('rewriteProofreadCommitDiffUrls preserves commit diff line-range fragments', () => {
+        const input =
+            'https://github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-cc0c6a9039a1c9fe38b8a21fe28391fffbac9b8531dfda0f658919a9f74b46baL1055-L1085';
+        const out = rewriteProofreadCommitDiffUrls(input);
+        ackEq(out.count, 1);
+        ackEq(
+            out.text,
+            'https://redirect.github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-cc0c6a9039a1c9fe38b8a21fe28391fffbac9b8531dfda0f658919a9f74b46baL1055-L1085',
+        );
+    });
+
+    ackTest('rewriteProofreadCommitDiffUrls handles markdown links and skips normal commits', () => {
+        const normal = 'https://github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83';
+        ackDeepEq(rewriteProofreadCommitDiffUrls(normal), { text: normal, count: 0 });
+
+        const redirected =
+            'https://redirect.github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-abcL1-L2';
+        ackDeepEq(rewriteProofreadCommitDiffUrls(redirected), { text: redirected, count: 0 });
+
+        const input =
+            '[range](https://github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-abc123L1-L2)';
+        const out = rewriteProofreadCommitDiffUrls(input);
+        ackEq(out.count, 1);
+        ackEq(
+            out.text,
+            '[range](https://redirect.github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-abc123L1-L2)',
+        );
+    });
+
+    ackTest('proofread URL rewrite is applied before prompting and before replacement', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
+        ackAssert(fn.includes('initialUrlRewrite'), 'rewrites commit diff URLs before prompt creation');
+        ackAssert(fn.includes('makePrompt(textForProofread)'), 'sends rewritten text to the proofreader');
+        ackAssert(fn.includes('finalUrlRewrite'), 'rewrites commit diff URLs before textarea replacement');
+        ackAssert(fn.includes("stopSpin(linkRewriteCount ? '🔗' : '✅')"), 'marks proofread button when URLs changed');
+    });
+
     ackTest('diff selection proofread also runs deterministic markdown post-processing', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -31443,9 +31513,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.84', () => {
+    ackTest('version bumped to 1.85', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.84' || _ackSource.includes('@version      1.84'), 'version is 1.84');
+        ackAssert(versionFromMeta === '1.85' || _ackSource.includes('@version      1.85'), 'version is 1.85');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32861,6 +32931,8 @@ RULES:
         BRAILLE_START_FRAME,
         BRAILLE_STATES,
         BRAILLE,
+        rewriteProofreadCommitDiffUrls,
+        postProcessProofreadMarkdown,
         showDiffDialog,
         COPY_ICON,
         CHECK_ICON,
