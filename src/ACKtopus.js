@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.89
+// @version      1.90
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1233,6 +1233,43 @@
             ta.value.length,
         );
         return ta;
+    }
+
+    function resolveLiveTextareaContext(container, taContainer, taSelector, taFallback) {
+        const escapeCss = (value) =>
+            typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+                ? CSS.escape(String(value))
+                : String(value).replace(/["\\]/g, '\\$&');
+        const selector = taSelector || `${COMMENT_TA_SELECTOR}, textarea`;
+        const selectors = [];
+        const addSelector = (value) => {
+            if (value && !selectors.includes(value)) selectors.push(value);
+        };
+        addSelector(taSelector && taSelector !== 'textarea' ? taSelector : '');
+        addSelector(taFallback?.id ? `textarea#${escapeCss(taFallback.id)}` : '');
+        addSelector(taFallback?.name ? `textarea[name="${escapeCss(taFallback.name)}"]` : '');
+        addSelector(selector);
+        const liveContainer = container && document.body.contains(container) ? container : null;
+        const liveTaContainer = taContainer && document.body.contains(taContainer) ? taContainer : null;
+        const fallbackTa = taFallback && document.body.contains(taFallback) ? taFallback : null;
+        const query = (root, candidates = selectors) => {
+            for (const candidate of candidates) {
+                const found = root?.querySelector?.(candidate);
+                if (found) return found;
+            }
+            return null;
+        };
+        const textarea =
+            query(liveContainer) ||
+            query(liveTaContainer) ||
+            query(document, selectors.filter((candidate) => candidate !== 'textarea')) ||
+            fallbackTa ||
+            document.querySelector(selector) ||
+            taFallback;
+        return {
+            container: textarea?.closest?.('form') || liveTaContainer || liveContainer || document,
+            textarea,
+        };
     }
 
     function waitForNextPaint() {
@@ -4499,25 +4536,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             return { ok: false, state: 'invalid', msg: `HTTP ${r.status}` };
         };
 
+        const validationFailure = (target, prefix, event) => ({
+            ...target,
+            ok: false,
+            state: 'invalid',
+            msg: `${prefix}: ${formatTransportErrorDetails(event)}`,
+        });
+
         const validateTarget = (target) =>
             new Promise((resolve) => {
                 GM_xmlhttpRequest({
                     ...providerValidationRequest(provider, key, target),
                     onload: (r) => resolve({ ...target, ...classifyResponse(r) }),
-                    onerror: (e) =>
-                        resolve({
-                            ...target,
-                            ok: false,
-                            state: 'invalid',
-                            msg: `Network error: ${formatTransportErrorDetails(e)}`,
-                        }),
-                    ontimeout: (e) =>
-                        resolve({
-                            ...target,
-                            ok: false,
-                            state: 'invalid',
-                            msg: `Timed out: ${formatTransportErrorDetails(e)}`,
-                        }),
+                    onerror: (e) => resolve(validationFailure(target, 'Network error', e)),
+                    ontimeout: (e) => resolve(validationFailure(target, 'Timed out', e)),
                 });
             });
 
@@ -4526,23 +4558,26 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const label = (r) => r.label || r.model;
             const failed = results.filter((r) => !r.ok);
             const warned = results.filter((r) => r.ok && r.warn);
-            if (failed.length) {
+            const primaryFailed = failed.find((r) => r.model === LLM_MODELS[provider]) || null;
+            const checkedModels = results.map(label).join(', ');
+            const describeResults = (items) => items.map((r) => `${label(r)} (${r.msg})`).join('; ');
+            if (primaryFailed) {
                 onResult(
                     false,
-                    `Failed: ${failed.map((r) => `${label(r)} (${r.msg})`).join('; ')}. Checked: ${results
-                        .map(label)
-                        .join(', ')}`,
+                    `Primary model failed: ${label(primaryFailed)} (${primaryFailed.msg}). Checked: ${checkedModels}`,
+                );
+            } else if (failed.length) {
+                onWarn(
+                    `Warning: Secondary model unavailable: ${describeResults(
+                        failed,
+                    )}. Primary model is usable. Checked: ${checkedModels}`,
+                    'valid',
                 );
             } else if (warned.length) {
                 const state = warned.some((r) => r.state === 'nofunds') ? 'nofunds' : 'valid';
-                onWarn(
-                    `Warning: ${warned.map((r) => `${label(r)} (${r.msg})`).join('; ')}. Checked: ${results
-                        .map(label)
-                        .join(', ')}`,
-                    state,
-                );
+                onWarn(`Warning: ${describeResults(warned)}. Checked: ${checkedModels}`, state);
             } else {
-                onResult(true, `Valid models: ${results.map(label).join(', ')}`);
+                onResult(true, `Valid models: ${checkedModels}`);
             }
         });
     }
@@ -9453,7 +9488,7 @@ Rules:
                     const initialUrlRewrite = rewriteProofreadCommitDiffUrls(textToProofread);
                     const textForProofread = initialUrlRewrite.text;
                     let linkRewriteCount = initialUrlRewrite.count;
-                    let strippedOriginal = stripGitHubMeta(textToProofread);
+                    let strippedOriginal = stripGitHubMeta(textForProofread);
                     let result = stripGitHubMeta(textForProofread);
                     const { system, user, parsed, noOp } = makePrompt(textForProofread);
                     if (noOp) {
@@ -9533,28 +9568,29 @@ Rules:
 
                     // Apply the corrected text via React-compatible setTextareaValue helper
                     // Re-query textarea: React may have replaced the DOM element during the async diff dialog
-                    const freshTa = container.querySelector(taSelector) || ta;
+                    const liveTextArea = resolveLiveTextareaContext(container, taContainer, taSelector, ta);
+                    const freshTa = liveTextArea.textarea || ta;
                     freshTa.focus();
                     if (hasSelection) {
                         // Verify the captured text still matches -- abort if user typed during async LLM call
                         if (freshTa.value.slice(selStart, selEnd) !== textToProofread) {
                             console.warn('ACKtopus: selection drifted during proofread, aborting partial replace');
                             await setTextareaValueRobust(
-                                taContainer,
+                                liveTextArea.container,
                                 freshTa,
                                 freshTa.value.replace(textToProofread, textToApply),
                                 taSelector,
                             );
                         } else {
                             await setTextareaValueRobust(
-                                taContainer,
+                                liveTextArea.container,
                                 freshTa,
                                 freshTa.value.slice(0, selStart) + textToApply + freshTa.value.slice(selEnd),
                                 taSelector,
                             );
                         }
                     } else {
-                        await setTextareaValueRobust(taContainer, freshTa, textToApply, taSelector);
+                        await setTextareaValueRobust(liveTextArea.container, freshTa, textToApply, taSelector);
                     }
 
                     // Restore button text, keep the textarea open for user to review.
@@ -19681,7 +19717,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.89
+// @version      1.90
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -27358,6 +27394,8 @@ RULES:
         ackAssert(fn.includes('getProviderValidationTargets(provider)'), 'gets all provider validation targets');
         ackAssert(fn.includes('providerValidationRequest(provider, key, target)'), 'uses shared validation request builder');
         ackAssert(fn.includes('Promise.all(targets.map(validateTarget))'), 'validates all provider targets');
+        ackAssert(fn.includes('Primary model failed:'), 'primary model failure remains a hard validation failure');
+        ackAssert(fn.includes('Secondary model unavailable:'), 'secondary model failure is surfaced as warning');
         ackAssert(
             fn.includes("r.status === 404) return { ok: false, state: 'invalid', msg: 'Model not available' }"),
             'Claude model 404 is surfaced as unavailable model',
@@ -27367,6 +27405,60 @@ RULES:
         ackAssert(!fn.includes("'https://api.anthropic.com"), 'no hardcoded Anthropic URL');
         ackAssert(!fn.includes("'https://api.openai.com"), 'no hardcoded OpenAI URL');
         ackAssert(!fn.includes("'https://generativelanguage.googleapis.com"), 'no hardcoded Gemini URL');
+    });
+
+    ackTest('validateKey warns when secondary Claude model fails after primary succeeds', async () => {
+        const origReq = GM_xmlhttpRequest;
+        const status = document.createElement('span');
+        let helpState = '';
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                const model = JSON.parse(opts.data).model;
+                if (model === LLM_MODELS.claude) {
+                    opts.onload?.({ status: 200, responseText: '{}' });
+                } else if (model === LLM_MODELS.claude_high_context) {
+                    opts.ontimeout?.({ status: 408, statusText: 'Failed to fetch', readyState: 4 });
+                } else {
+                    opts.onload?.({ status: 500, responseText: 'unexpected model' });
+                }
+            };
+            validateKey('claude', 'test-key', status, (state) => {
+                helpState = state;
+            });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(status.textContent, '⚠️', 'secondary failure renders warning');
+            ackEq(helpState, 'valid', 'primary success keeps provider usable');
+            ackAssert(status.title.includes(LLM_MODELS.claude_high_context), 'warning names high-context model');
+            ackAssert(status.title.includes('Primary model is usable'), 'warning explains primary remains usable');
+        } finally {
+            GM_xmlhttpRequest = origReq;
+        }
+    });
+
+    ackTest('validateKey fails when primary Claude model fails', async () => {
+        const origReq = GM_xmlhttpRequest;
+        const status = document.createElement('span');
+        let helpState = '';
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                const model = JSON.parse(opts.data).model;
+                if (model === LLM_MODELS.claude) {
+                    opts.onload?.({ status: 401, responseText: 'invalid key' });
+                } else {
+                    opts.onload?.({ status: 200, responseText: '{}' });
+                }
+            };
+            validateKey('claude', 'bad-key', status, (state) => {
+                helpState = state;
+            });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(status.textContent, '❌', 'primary failure renders invalid state');
+            ackEq(helpState, 'invalid', 'primary failure keeps help pointed at key setup');
+            ackAssert(status.title.includes('Primary model failed'), 'primary failure is named explicitly');
+            ackAssert(status.title.includes(LLM_MODELS.claude), 'primary failure names the default model');
+        } finally {
+            GM_xmlhttpRequest = origReq;
+        }
     });
 
     // --- v1.10 fixes and features ---
@@ -30165,13 +30257,37 @@ RULES:
         );
     });
 
-    ackTest('proofread URL rewrite is applied before prompting and before replacement', () => {
+    ackTest('proofread URL rewrite is applied before prompting, diffing, and replacement', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
         ackAssert(fn.includes('initialUrlRewrite'), 'rewrites commit diff URLs before prompt creation');
         ackAssert(fn.includes('makePrompt(textForProofread)'), 'sends rewritten text to the proofreader');
+        ackAssert(
+            fn.includes('let strippedOriginal = stripGitHubMeta(textForProofread)'),
+            'uses rewritten text as diff baseline',
+        );
         ackAssert(fn.includes('finalUrlRewrite'), 'rewrites commit diff URLs before textarea replacement');
         ackAssert(fn.includes("stopSpin(linkRewriteCount ? '🔗' : '✅')"), 'marks proofread button when URLs changed');
+    });
+
+    ackTest('resolveLiveTextareaContext re-queries document when captured container is detached', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = '<form id="old-form"><textarea id="ack-live-ta">old</textarea></form>';
+        document.body.appendChild(host);
+        const oldForm = host.querySelector('form');
+        const oldTa = host.querySelector('textarea');
+        const replacement = oldForm.cloneNode(true);
+        replacement.querySelector('textarea').value = 'live';
+        oldForm.replaceWith(replacement);
+        try {
+            const resolved = resolveLiveTextareaContext(oldForm, oldForm, 'textarea#ack-live-ta', oldTa);
+            ackEq(resolved.textarea.value, 'live', 'resolves live textarea after old form is detached');
+            ackAssert(document.body.contains(resolved.container), 'resolved container is attached');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('diff selection proofread also runs deterministic markdown post-processing', () => {
@@ -31903,9 +32019,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.89', () => {
+    ackTest('version bumped to 1.90', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.89' || _ackSource.includes('@version      1.89'), 'version is 1.89');
+        ackAssert(versionFromMeta === '1.90' || _ackSource.includes('@version      1.90'), 'version is 1.90');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
