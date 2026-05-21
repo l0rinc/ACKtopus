@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.90
+// @version      1.91
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -86,6 +86,7 @@
     const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
     const LLM_REQUEST_TIMEOUT_MS = 180000;
     const LLM_HIGH_CONTEXT_TIMEOUT_MS = 600000;
+    const GITHUB_GET_TIMEOUT_MS = 30000;
 
     function shellQuote(arg) {
         return `'${String(arg).replace(/'/g, `'\"'\"'`)}'`;
@@ -2072,6 +2073,34 @@
     let _rateLimitWarned = false;
     let _patInvalidWarned = false;
 
+    function githubResponseSnippet(response) {
+        return String(response?.responseText || '').slice(0, 120);
+    }
+
+    function parseGithubJson(response, url) {
+        try {
+            return JSON.parse(response.responseText);
+        } catch (_) {
+            throw new Error(`JSON parse failed for ${url}: ${githubResponseSnippet(response)}`);
+        }
+    }
+
+    function githubHttpError(response, url) {
+        return new Error(`HTTP ${response.status} for ${url}: ${githubResponseSnippet(response)}`);
+    }
+
+    function githubTransportError(url, label, event) {
+        return new Error(`${label} for ${url}: ${formatTransportErrorDetails(event)}`);
+    }
+
+    function githubGetTransportHandlers(url, reject) {
+        return {
+            timeout: GITHUB_GET_TIMEOUT_MS,
+            onerror: (e) => reject(githubTransportError(url, 'Network error', e)),
+            ontimeout: (e) => reject(githubTransportError(url, 'Timed out', e)),
+        };
+    }
+
     function gmFetch(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -2081,9 +2110,9 @@
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         try {
-                            resolve(JSON.parse(r.responseText));
+                            resolve(parseGithubJson(r, url));
                         } catch (e) {
-                            reject(new Error(`JSON parse failed for ${url}: ${r.responseText.slice(0, 120)}`));
+                            reject(e);
                         }
                     } else if ((r.status === 401 || r.status === 403) && ghApiHeaders().Authorization) {
                         // PAT may be invalid/expired/wrong-scope. Retry without
@@ -2103,7 +2132,7 @@
                                     'ACKtopus: GitHub API rate limit hit. Add a Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
                                 );
                             }
-                            reject(new Error(`HTTP ${r.status} for ${url}: ${r.responseText.slice(0, 120)}`));
+                            reject(githubHttpError(r, url));
                             return;
                         }
                         GM_xmlhttpRequest({
@@ -2113,17 +2142,15 @@
                             onload: (r2) => {
                                 if (r2.status >= 200 && r2.status < 300) {
                                     try {
-                                        resolve(JSON.parse(r2.responseText));
+                                        resolve(parseGithubJson(r2, url));
                                     } catch (e) {
-                                        reject(
-                                            new Error(`JSON parse failed for ${url}: ${r2.responseText.slice(0, 120)}`),
-                                        );
+                                        reject(e);
                                     }
                                 } else {
-                                    reject(new Error(`HTTP ${r2.status} for ${url}: ${r2.responseText.slice(0, 120)}`));
+                                    reject(githubHttpError(r2, url));
                                 }
                             },
-                            onerror: reject,
+                            ...githubGetTransportHandlers(url, reject),
                         });
                     } else {
                         if (r.status === 403 && /rate limit/i.test(r.responseText) && !_rateLimitWarned) {
@@ -2132,10 +2159,10 @@
                                 'ACKtopus: GitHub API rate limit hit. Add a Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
                             );
                         }
-                        reject(new Error(`HTTP ${r.status} for ${url}: ${r.responseText.slice(0, 120)}`));
+                        reject(githubHttpError(r, url));
                     }
                 },
-                onerror: reject,
+                ...githubGetTransportHandlers(url, reject),
             });
         });
     }
@@ -2150,8 +2177,8 @@
                 onload: (r) =>
                     r.status >= 200 && r.status < 300
                         ? resolve(r.responseText)
-                        : reject(new Error(`HTTP ${r.status} for ${url}`)),
-                onerror: reject,
+                        : reject(githubHttpError(r, url)),
+                ...githubGetTransportHandlers(url, reject),
             });
         });
     }
@@ -2167,8 +2194,8 @@
                 onload: (r) =>
                     r.status >= 200 && r.status < 300
                         ? resolve(r.responseText)
-                        : reject(new Error(`HTTP ${r.status} for ${url}`)),
-                onerror: reject,
+                        : reject(githubHttpError(r, url)),
+                ...githubGetTransportHandlers(url, reject),
             });
         });
     }
@@ -2189,9 +2216,9 @@
                     onload: (r) => {
                         if (r.status >= 200 && r.status < 300) {
                             try {
-                                resolve(JSON.parse(r.responseText));
+                                resolve(parseGithubJson(r, url));
                             } catch (e) {
-                                reject(new Error(`JSON parse failed for ${url}: ${r.responseText.slice(0, 120)}`));
+                                reject(e);
                             }
                             return;
                         }
@@ -2199,9 +2226,9 @@
                             run(++attempt);
                             return;
                         }
-                        reject(new Error(`HTTP ${r.status} for ${url}: ${r.responseText.slice(0, 120)}`));
+                        reject(githubHttpError(r, url));
                     },
-                    onerror: reject,
+                    ...githubGetTransportHandlers(url, reject),
                 });
             };
             run();
@@ -4211,7 +4238,7 @@ Return only the corrected text. If nothing needs fixing, return the original tex
             key: 'audio_walkthrough',
             emoji: '🎧',
             label: 'Audio guide',
-            tip: 'Generate a clean-agent handoff prompt for a detailed external LLM walkthrough',
+            tip: 'Generate a direct audio-agent prompt for investigating the PR before spoken discussion',
         },
         {
             key: 'maintainer_summary',
@@ -4365,10 +4392,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!getLLMConfig().cacheEnabled) return;
         const key = cacheKey(provider, pr, id);
         GM_setValue(key, value);
-        // Track access time for eviction
-        const ts = GM_getValue('llm_cache_timestamps', {});
-        ts[key] = Date.now();
-        GM_setValue('llm_cache_timestamps', ts);
+        recordCacheTimestamp(key);
     }
 
     function recordCacheTimestamp(key) {
@@ -5358,9 +5382,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         // Store in prompt cache
                         if (promptKey) {
                             GM_setValue(promptKey, text);
-                            const ts = GM_getValue('llm_cache_timestamps', {});
-                            ts[promptKey] = Date.now();
-                            GM_setValue('llm_cache_timestamps', ts);
+                            recordCacheTimestamp(promptKey);
                         }
                         resolve(text);
                     } else {
@@ -5415,6 +5437,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function requestOpenAIImage(prompt, key) {
+        const timeoutMs = getHighContextTimeoutMs('openai');
         console.groupCollapsed(`ACKtopus: image request -> OpenAI (${OPENAI_IMAGE_MODEL})`);
         console.log('prompt:', prompt);
         console.log(
@@ -5429,12 +5452,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             'moderation:',
             OPENAI_IMAGE_MODERATION,
         );
+        console.log('timeout_ms:', timeoutMs);
         console.groupEnd();
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
                 url: 'https://api.openai.com/v1/images/generations',
                 headers: PROVIDER_API.openai.headers(key),
+                timeout: timeoutMs,
                 data: JSON.stringify({
                     model: OPENAI_IMAGE_MODEL,
                     prompt,
@@ -5485,6 +5510,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     }
                 },
                 onerror: (e) => reject(new Error(`OpenAI Image network error: ${formatTransportErrorDetails(e)}`)),
+                ontimeout: (e) =>
+                    reject(new Error(`OpenAI Image request timed out: ${formatTransportErrorDetails(e)}`)),
             });
         });
     }
@@ -10436,7 +10463,7 @@ Rules:
     function addStartReviewButtons(root = document) {
         if (!isPRPage()) return;
 
-        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: root === document })) {
+        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: true })) {
             markCommentButtonsPending(root);
             addSubmitReviewButtonToConversation(document);
             return;
@@ -10561,7 +10588,7 @@ Rules:
     }
 
     function addSubmitReviewButtonToConversation(root = document) {
-        syncPendingReviewState(root, { includeDocument: root === document });
+        syncPendingReviewState(root, { includeDocument: true });
         const existing = document.querySelector('.ack-submit-review-wrap');
         const form =
             root.querySelector?.('form#new_comment_form.js-new-comment-form, form.js-new-comment-form') ||
@@ -12526,6 +12553,10 @@ Rules:
     function focusVisibleDeleteCommentConfirmButton() {
         const btn = findVisibleDeleteCommentConfirmButton();
         if (!btn) return false;
+        const dialog = btn.closest(
+            'details-dialog[open], dialog[open], [role="dialog"][aria-modal="true"], [role="alertdialog"], [popover], [aria-modal="true"]',
+        );
+        if (dialog?.dataset.ackDeleteConfirmFocused) return false;
         try {
             btn.focus({ preventScroll: true });
         } catch (_) {
@@ -12533,6 +12564,7 @@ Rules:
                 btn.focus();
             } catch {}
         }
+        if (dialog?.dataset) dialog.dataset.ackDeleteConfirmFocused = 'true';
         return true;
     }
 
@@ -19667,6 +19699,15 @@ RULES:
         return compactSourceForMatch(source).includes(compactSourceForMatch(snippet));
     }
 
+    function sourceSection(source, startNeedle, endNeedle) {
+        const start = source.indexOf(startNeedle);
+        ackAssert(start !== -1, `source section start missing: ${startNeedle}`);
+        const end = source.indexOf(endNeedle, start + startNeedle.length);
+        ackAssert(end !== -1, `source section end missing: ${endNeedle}`);
+        ackAssert(end > start, `source section end precedes start: ${endNeedle}`);
+        return source.slice(start, end);
+    }
+
     let _ackSource = '';
     // Legacy structural tests expect a `src` variable (Node harness).
     // In-browser, we keep it as an alias for `_ackSource`.
@@ -19717,7 +19758,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.90
+// @version      1.91
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -19764,6 +19805,16 @@ RULES:
             'test-suite marker should not be present in _ackSource',
         );
         ackAssert(_ackSource.includes('function tryInject'), 'expected runtime code in _ackSource');
+    });
+
+    ackTest('sourceSection fails closed when structural-test anchors drift', () => {
+        let threw = false;
+        try {
+            sourceSection('function a() {}\nfunction b() {}', 'function a', 'function missing');
+        } catch (_) {
+            threw = true;
+        }
+        ackAssert(threw, 'missing end anchor should fail instead of slicing to EOF');
     });
 
     ackTest('parses standard PR URL', () => {
@@ -21845,7 +21896,7 @@ RULES:
         ackAssert(source.includes("'Accept'"), 'has Accept button');
         ackAssert(source.includes("action: 'edit'"), 'Accept resolves with action edit');
         ackAssert(source.includes('action: false'), 'Reject resolves with action false');
-        const fn = source.slice(source.indexOf('function showDiffDialog'), source.indexOf('function proofread'));
+        const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('countDiffLines(original, corrected)'), 'computes line-based diff counts');
         ackAssert(
             fn.includes('+${lineCounts.added}') && fn.includes('-${lineCounts.removed}'),
@@ -21892,7 +21943,7 @@ RULES:
     ackTest('showDiffDialog diff spans are clickable (click-to-revert)', () => {
         // NODE: // NODE: const source = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function showDiffDialog'), source.indexOf('function proofread'));
+        const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('revertState'), 'tracks revert state per diff entry');
         ackAssert(fn.includes("span.addEventListener('click'"), 'diff spans have click handlers');
         ackAssert(fn.includes('revertState[i] = !revertState[i]'), 'click toggles revert state');
@@ -22996,10 +23047,7 @@ RULES:
 
     ackTest('proofread uses setTextareaValue/setTextareaValueRobust for React-compatible textarea updates', () => {
         const source = _ackSource;
-        const proofreadSection = source.slice(
-            source.indexOf('async function runProofreadOnComment'),
-            source.indexOf('function pendingKey'),
-        );
+        const proofreadSection = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         const setterCalls = (proofreadSection.match(/setTextareaValue(Robust)?\(/g) || []).length;
         ackAssert(setterCalls >= 4, 'proofread uses setTextareaValue/Robust in both paths (' + setterCalls + ' calls)');
         // Must NOT use raw nativeSetter or execCommand
@@ -23011,14 +23059,11 @@ RULES:
 
     ackTest('proofread EDIT MODE re-queries textarea after async diff dialog', () => {
         const source = _ackSource;
-        const proofFn = source.slice(
-            source.indexOf('async function runProofreadOnComment'),
-            source.indexOf('function pendingKey'),
-        );
+        const proofFn = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         ackAssert(proofFn.includes('freshTa'), 'EDIT MODE re-queries textarea as freshTa');
         ackAssert(
-            proofFn.includes('container.querySelector(taSelector)'),
-            're-queries using taSelector to avoid wrong textarea',
+            proofFn.includes('resolveLiveTextareaContext(container, taContainer, taSelector, ta)'),
+            're-queries live textarea context after async diff dialog',
         );
     });
 
@@ -24411,9 +24456,10 @@ RULES:
     ackTest('schedulePostEditRefresh sweeps at multiple intervals', () => {
         const source = _ackSource;
         ackAssert(source.includes('function schedulePostEditRefresh'), 'has post-edit refresh function');
-        const fn = source.slice(
-            source.indexOf('function schedulePostEditRefresh'),
-            source.indexOf("document.addEventListener('submit'"),
+        const fn = sourceSection(
+            source,
+            'function schedulePostEditRefresh',
+            "document.addEventListener(\n        'submit'",
         );
         ackAssert(fn.includes('ackSetTimeout(refresh, 800)'), 'first sweep at 800ms');
         ackAssert(fn.includes('ackSetTimeout(refresh, 2500)'), 'second sweep at 2500ms');
@@ -25671,10 +25717,7 @@ RULES:
 
     ackTest('fetchCommitPullRequests uses preview accept header and auth fallback', () => {
         const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function fetchCommitPullRequests'),
-            source.indexOf('function getCurrentUserAckSha'),
-        );
+        const fn = sourceSection(source, 'function fetchCommitPullRequests', 'async function parseAcksFromAPI');
         ackAssert(
             fn.includes('application/vnd.github.groot-preview+json'),
             'uses pulls-for-commit preview accept header',
@@ -25796,9 +25839,10 @@ RULES:
     ackTest('PR context cache is invalidated on force push, navigation, and proofread submit', () => {
         const source = _ackSource;
         // Force push detection - look at the specific inject section
-        const injectSection = source.slice(
-            source.indexOf('force-pushes found:'),
-            source.indexOf('prFileCategories = pr ?'),
+        const injectSection = sourceSection(
+            source,
+            'force-pushes found:',
+            'applyFileCategories(await fileCategoriesPromise)',
         );
         ackAssert(injectSection.includes('invalidatePRContext'), 'invalidated on force push detection');
         ackAssert(injectSection.includes('commitListCache.clear()'), 'commitListCache cleared on force push');
@@ -25814,10 +25858,7 @@ RULES:
         ackAssert(teardown.includes('invalidatePRContext'), 'invalidated on PR navigation');
         ackAssert(teardown.includes('lastInjectedPath'), 'same-PR page changes also trigger teardown');
         // Proofread submit paths (both EDIT and VIEW modes)
-        const proofFn = source.slice(
-            source.indexOf('async function runProofreadOnComment'),
-            source.indexOf('// --- Pending Review'),
-        );
+        const proofFn = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         const matches = proofFn.match(/invalidatePRContext/g) || [];
         ackAssert(matches.length >= 2, `invalidated in both proofread submit paths (found ${matches.length})`);
     });
@@ -26183,9 +26224,13 @@ RULES:
 
     ackTest('gmFetch includes URL and response snippet in error messages', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('async function parseAcksFromAPI'));
-        ackAssert(fn.includes('r.responseText.slice(0,'), 'includes response snippet in error');
+        const fn = sourceSection(source, 'function githubResponseSnippet', 'async function parseAcksFromAPI');
+        ackAssert(fn.includes('function githubResponseSnippet'), 'centralizes response snippets');
+        ackAssert(fn.includes('githubResponseSnippet(response)'), 'includes response snippet in HTTP errors');
         ackAssert(fn.includes('JSON parse failed'), 'catches JSON parse errors gracefully');
+        ackAssert(fn.includes('function githubGetTransportHandlers'), 'centralizes GET transport handlers');
+        ackAssert(fn.includes('timeout: GITHUB_GET_TIMEOUT_MS'), 'sets timeout on GitHub GET requests');
+        ackAssert(fn.includes('formatTransportErrorDetails(event)'), 'formats transport events');
     });
 
     ackTest('splitSegments groups consecutive immutable/mutable lines and numbers mutable segments', () => {
@@ -27797,7 +27842,7 @@ RULES:
 
     ackTest('showDiffDialog auto-closes when all changes reverted', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function showDiffDialog'), source.indexOf('function proofread'));
+        const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('checkAllReverted'), 'has checkAllReverted function');
         ackAssert(fn.includes('buildText() === original'), 'compares buildText to original');
         ackAssert(fn.includes('action: false, text: original'), 'resolves as reject when all reverted');
@@ -29119,6 +29164,10 @@ RULES:
     ackTest('recordCacheTimestamp tracks explain/lightbulb/overview saves', () => {
         const source = _ackSource;
         ackAssert(source.includes('function recordCacheTimestamp'), 'helper exists');
+        const cacheHelpers = sourceSection(source, 'function getCache', 'function evictStaleCache');
+        ackAssert(cacheHelpers.includes('recordCacheTimestamp(key)'), 'setCache records timestamp');
+        const callFn = sourceSection(source, 'function callLLM(', 'function parseProviderError');
+        ackAssert(callFn.includes('recordCacheTimestamp(promptKey)'), 'prompt cache records timestamp');
         // Both save sites should call it
         const explainSave = source.slice(
             source.indexOf('fetchBatchCommitExplanations'),
@@ -29573,6 +29622,51 @@ RULES:
         }
     });
 
+    ackTest('partial-root review button injection sees page-global pending review state', () => {
+        const origIsPRPage = isPRPage;
+        const origPending = _ackPendingReviewActive;
+        try {
+            isPRPage = () => true;
+            _ackPendingReviewActive = false;
+            const pageMarker = document.createElement('div');
+            pageMarker.innerHTML = `
+                <div id="discussion_r999" class="timeline-comment">
+                    <div class="timeline-comment-header">
+                        <span title="Label: Pending" class="Label Label--warning">Pending</span>
+                    </div>
+                </div>
+            `;
+            const partialRoot = document.createElement('div');
+            partialRoot.innerHTML = `
+                <form id="reply">
+                    <input type="hidden" name="in_reply_to" value="999">
+                    <div class="actions">
+                        <button type="submit">Comment</button>
+                    </div>
+                </form>
+            `;
+            document.body.appendChild(pageMarker);
+            document.body.appendChild(partialRoot);
+            try {
+                addStartReviewButtons(partialRoot);
+                ackEq(_ackPendingReviewActive, true, 'syncs pending state from document during partial-root injection');
+                ackEq(
+                    partialRoot.querySelector('#reply button[type="submit"]').textContent,
+                    'Reply ⏳',
+                    'marks partial-root reply form as pending',
+                );
+                ackAssert(!partialRoot.querySelector('.ack-start-review-btn'), 'does not inject Start a review while pending');
+            } finally {
+                pageMarker.remove();
+                partialRoot.remove();
+            }
+        } finally {
+            isPRPage = origIsPRPage;
+            _ackPendingReviewActive = origPending;
+            unmarkCommentButtonsPending();
+        }
+    });
+
     ackTest('pending review mode marks generic close-with-comment reply editors', () => {
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
@@ -29914,6 +30008,38 @@ RULES:
         try {
             const found = findVisibleDeleteCommentConfirmButton();
             ackEq(found, btn, 'finds the confirm delete button');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('focusVisibleDeleteCommentConfirmButton focuses once per dialog', () => {
+        const host = document.createElement('details-dialog');
+        host.setAttribute('open', '');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.style.width = '10px';
+        host.style.height = '10px';
+        host.style.display = 'block';
+        const btn = document.createElement('button');
+        btn.className = 'btn-danger';
+        btn.textContent = 'Delete comment';
+        btn.style.width = '10px';
+        btn.style.height = '10px';
+        const cancel = document.createElement('button');
+        cancel.textContent = 'Cancel';
+        cancel.style.width = '10px';
+        cancel.style.height = '10px';
+        host.appendChild(btn);
+        host.appendChild(cancel);
+        document.body.appendChild(host);
+        try {
+            ackEq(focusVisibleDeleteCommentConfirmButton(), true, 'initial dialog focus succeeds');
+            ackEq(document.activeElement, btn, 'Delete button receives initial focus');
+            cancel.focus();
+            ackEq(focusVisibleDeleteCommentConfirmButton(), false, 'same dialog is not refocused');
+            ackEq(document.activeElement, cancel, 'user focus is preserved after first focus');
         } finally {
             host.remove();
         }
@@ -30509,6 +30635,7 @@ RULES:
         ackAssert(actions.includes("label: 'Suggestions'"), 'suggestion stack action is labeled');
         ackAssert(actions.includes("key: 'audio_walkthrough'"), 'has audio guide action');
         ackAssert(actions.includes("label: 'Audio guide'"), 'audio guide action is labeled');
+        ackAssert(actions.includes('direct audio-agent prompt'), 'audio guide tooltip describes direct workflow');
         ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
@@ -30607,6 +30734,12 @@ RULES:
         ackAssert(imageCall.includes('b64_json'), 'reads base64 image data');
         ackAssert(imageCall.includes('imageFormatToMimeType'), 'sets MIME type from image format');
         ackAssert(imageCall.includes('isOpenAIImageVerificationError'), 'detects organization verification errors');
+        ackAssert(
+            imageCall.includes("const timeoutMs = getHighContextTimeoutMs('openai')"),
+            'image generation uses high-context timeout',
+        );
+        ackAssert(imageCall.includes('timeout: timeoutMs'), 'image generation sets a transport timeout');
+        ackAssert(imageCall.includes('ontimeout:'), 'image generation handles transport timeouts');
         ackAssert(source.includes('function addPromptDetails'), 'has reusable collapsible prompt details');
         const cache = source.slice(
             source.indexOf('function prInfographicCacheKey'),
@@ -30672,6 +30805,28 @@ RULES:
             configHelper.includes('setActiveProvider(previous)'),
             'restores active provider after building provider-specific settings',
         );
+    });
+
+    ackTest('requestOpenAIImage rejects timeout events with structured details', async () => {
+        const origReq = GM_xmlhttpRequest;
+        let capturedOpts = null;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                capturedOpts = opts;
+                opts.ontimeout?.({ status: 408, statusText: 'Failed to fetch', readyState: 4 });
+            };
+            let message = '';
+            try {
+                await requestOpenAIImage('test image prompt', 'test-key');
+            } catch (e) {
+                message = e.message;
+            }
+            ackEq(capturedOpts?.timeout, getHighContextTimeoutMs('openai'), 'uses OpenAI high-context timeout');
+            ackAssert(message.includes('OpenAI Image request timed out'), 'rejects with timeout message');
+            ackAssert(message.includes('status=408'), 'timeout error includes structured status');
+        } finally {
+            GM_xmlhttpRequest = origReq;
+        }
     });
 
     ackTest('chat panel recipe mode supports full-context robot prompts', () => {
@@ -32019,9 +32174,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.90', () => {
+    ackTest('version bumped to 1.91', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.90' || _ackSource.includes('@version      1.90'), 'version is 1.90');
+        ackAssert(versionFromMeta === '1.91' || _ackSource.includes('@version      1.91'), 'version is 1.91');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32456,10 +32611,7 @@ RULES:
 
     ackTest('startReviewFromReplyForm clears draft before reload fallback', () => {
         ensureSelfSource();
-        const fn = _ackSource.slice(
-            _ackSource.indexOf('function addStartReviewButtons'),
-            _ackSource.indexOf("document.addEventListener('click', (e) => {"),
-        );
+        const fn = sourceSection(_ackSource, 'function addStartReviewButtons', 'async function openReviewDialog');
         ackAssert(fn.includes('clearCommentFormText(form);'), 'clears reply draft before forced reload fallback');
     });
 
@@ -32521,10 +32673,7 @@ RULES:
         ensureSelfSource();
         // We intentionally do not hardcode individual letters in the handler:
         // it should derive from `SHA_FORMATS` via `HOTKEY_MAP`.
-        const keySection = _ackSource.slice(
-            _ackSource.indexOf('const HOTKEY_MAP'),
-            _ackSource.indexOf("document.addEventListener('keyup'"),
-        );
+        const keySection = sourceSection(_ackSource, 'const HOTKEY_MAP', "document.addEventListener(\n            'keyup'");
         ackAssert(
             sourceIncludesLoose(keySection, 'Object.fromEntries(SHA_FORMATS.filter(f => f.hotkey)'),
             'builds HOTKEY_MAP from SHA_FORMATS hotkeys',
@@ -32537,10 +32686,7 @@ RULES:
 
     ackTest('Ctrl+Enter selects active SHA format when chooser is armed', () => {
         ensureSelfSource();
-        const keySection = _ackSource.slice(
-            _ackSource.indexOf('const HOTKEY_MAP'),
-            _ackSource.indexOf("document.addEventListener('keyup'"),
-        );
+        const keySection = sourceSection(_ackSource, 'const HOTKEY_MAP', "document.addEventListener(\n            'keyup'");
         ackAssert(keySection.includes("if (e.key === 'Enter')"), 'handles Enter while armed');
         ackAssert(keySection.includes('copySHA(mainBtn, updateMainLabel)'), 'Enter triggers copy of active format');
     });
