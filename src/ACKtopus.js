@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.106
+// @version      1.107
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -430,12 +430,24 @@
     let ackShiftPressed = false;
     const ackShiftAlternateRenderers = new Set();
 
+    function isMacKeyboardPlatform() {
+        const platform =
+            (typeof navigator !== 'undefined' && (navigator.userAgentData?.platform || navigator.platform)) || '';
+        return /\b(Mac|iPhone|iPad|iPod)\b/i.test(platform);
+    }
+
+    function shortcutLetter(key) {
+        return String(key || '').toUpperCase();
+    }
+
     function shortcutComboLabel(key) {
-        return `Alt+Shift+${String(key || '').toUpperCase()}`;
+        const letter = shortcutLetter(key);
+        return isMacKeyboardPlatform() ? `⌘⌥${letter}` : `Alt+Shift+${letter}`;
     }
 
     function shortcutAriaLabel(key) {
-        return `Alt+Shift+${String(key || '').toUpperCase()}`;
+        const letter = shortcutLetter(key);
+        return isMacKeyboardPlatform() ? `Meta+Alt+${letter}` : `Alt+Shift+${letter}`;
     }
 
     function withKeyboardShortcutHint(title, key) {
@@ -452,12 +464,20 @@
     }
 
     function matchesPostActionShortcut(e, key) {
+        const letter = String(key || '').toLowerCase();
+        const eventKey = String(e?.key || '').toLowerCase();
+        const eventCode = String(e?.code || '').toLowerCase();
+        const sameKey = eventKey === letter || eventCode === `key${letter}`;
+        if (!sameKey) return false;
+        if (isMacKeyboardPlatform()) {
+            return !!e?.metaKey && !!e?.altKey && !e.ctrlKey && !e.shiftKey;
+        }
         return (
             !!e?.altKey &&
             !!e?.shiftKey &&
             !e.ctrlKey &&
             !e.metaKey &&
-            String(e.key || '').toLowerCase() === String(key || '').toLowerCase()
+            sameKey
         );
     }
 
@@ -845,9 +865,54 @@
         }
     }
 
+    function findPostEditTargetInRoot(root) {
+        if (!root || root.nodeType !== 1) return null;
+        const containers = [];
+        const push = (el) => {
+            if (el && el.nodeType === 1 && !containers.includes(el)) containers.push(el);
+        };
+        push(root.closest?.(COMMENT_CONTAINER_SELECTOR));
+        push(root.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR));
+        if (root.matches?.(COMMENT_CONTAINER_SELECTOR) || root.matches?.(WIDE_COMMENT_CONTAINER_SELECTOR)) push(root);
+        qsa(root, COMMENT_CONTAINER_SELECTOR).forEach(push);
+        qsa(root, WIDE_COMMENT_CONTAINER_SELECTOR).forEach(push);
+
+        for (const container of containers) {
+            if (!isVisible(container)) continue;
+            const header =
+                container.querySelector?.('[data-testid="comment-header"], .timeline-comment-header, .review-comment-header') ||
+                container;
+            const menuTrigger =
+                header.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR) ||
+                container.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR);
+            if (menuTrigger && isVisible(menuTrigger)) return { container, header };
+        }
+        return null;
+    }
+
+    function findFocusedOrVisiblePostEditTarget() {
+        for (const root of getShortcutFocusRoots()) {
+            const target = findPostEditTargetInRoot(root);
+            if (target) return target;
+        }
+        const visibleRoots = [
+            ...qsa(document, COMMENT_CONTAINER_SELECTOR),
+            ...qsa(document, WIDE_COMMENT_CONTAINER_SELECTOR),
+        ].filter((el, idx, arr) => arr.indexOf(el) === idx && isInViewport(el));
+        for (const root of visibleRoots) {
+            const target = findPostEditTargetInRoot(root);
+            if (target) return target;
+        }
+        return null;
+    }
+
     function triggerFocusedOrVisibleEditPostShortcut() {
         addQuickCommentActions(document);
-        return pressAckButton(findFocusedOrVisibleShortcutButton('.ack-edit-post-btn'));
+        if (pressAckButton(findFocusedOrVisibleShortcutButton('.ack-edit-post-btn'))) return true;
+        const target = findFocusedOrVisiblePostEditTarget();
+        if (!target) return false;
+        triggerMenuEdit(target.container, target.header);
+        return true;
     }
 
     function triggerFocusedOrVisibleProofreadShortcut() {
@@ -23806,14 +23871,18 @@ RULES:
 
     ackTest('post edit/proofread shortcuts avoid Control and advertise their key hints', () => {
         const source = _ackSource;
-        ackAssert(source.includes("const EDIT_POST_SHORTCUT_KEY = 'e'"), 'edit uses Alt+Shift+E');
-        ackAssert(source.includes("const PROOFREAD_POST_SHORTCUT_KEY = 'p'"), 'proofread uses Alt+Shift+P');
-        ackAssert(source.includes('`Alt+Shift+${String(key'), 'post shortcut labels use Alt+Shift');
+        ackAssert(source.includes("const EDIT_POST_SHORTCUT_KEY = 'e'"), 'edit uses E shortcut');
+        ackAssert(source.includes("const PROOFREAD_POST_SHORTCUT_KEY = 'p'"), 'proofread uses P shortcut');
+        ackAssert(source.includes('`⌘⌥${letter}`'), 'macOS shortcut label uses Command+Option');
+        ackAssert(source.includes('`Alt+Shift+${letter}`'), 'non-mac shortcut label uses Alt+Shift');
         const matcher = sourceSection(source, 'function matchesPostActionShortcut', 'function notifyShiftAlternateRenderers');
-        ackAssert(matcher.includes('!!e?.altKey'), 'requires Alt');
-        ackAssert(matcher.includes('!!e?.shiftKey'), 'requires Shift');
+        ackAssert(matcher.includes('isMacKeyboardPlatform()'), 'has platform-specific shortcut matcher');
+        ackAssert(matcher.includes('eventCode === `key${letter}`'), 'matches physical key code for Option-modified mac keys');
+        ackAssert(matcher.includes('!!e?.metaKey') && matcher.includes('!e.shiftKey'), 'macOS shortcut uses Command+Option without Shift');
+        ackAssert(matcher.includes('!!e?.altKey'), 'requires Alt/Option');
+        ackAssert(matcher.includes('!!e?.shiftKey'), 'non-mac shortcut requires Shift');
         ackAssert(matcher.includes('!e.ctrlKey'), 'does not require or accept Control');
-        ackAssert(matcher.includes('!e.metaKey'), 'does not require or accept Command');
+        ackAssert(matcher.includes('!e.metaKey'), 'non-mac shortcut does not accept Command');
         const listener = sourceSection(
             source,
             "if (e.repeat) return;\n            if (matchesPostActionShortcut(e, EDIT_POST_SHORTCUT_KEY))",
@@ -23826,6 +23895,7 @@ RULES:
         );
         ackAssert(listener.includes('if (e.repeat) return'), 'does not repeat shortcuts while keys are held');
         ackAssert(source.includes('ack-edit-post-btn'), 'edit button is targetable by shortcut');
+        ackAssert(source.includes('findFocusedOrVisiblePostEditTarget()'), 'edit shortcut has native menu fallback');
         ackAssert(
             source.includes("withKeyboardShortcutHint('Proofread this comment', PROOFREAD_POST_SHORTCUT_KEY)"),
             'proofread button title includes shortcut hint',
@@ -24753,7 +24823,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
             // In view mode: edit + delete (proofread only during editing)
-            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
             ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
         } finally {
             root.remove();
@@ -24802,7 +24872,7 @@ RULES:
                     qa.querySelector('button[title="Expected author reply"]'),
                     'missing expected-author-reply button',
                 );
-                ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
+                ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
                 ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
             } finally {
                 root.remove();
@@ -24856,7 +24926,7 @@ RULES:
                 qa.querySelector('button[title="Expected author reply"]'),
                 'missing expected-author-reply button on pending comment',
             );
-            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
             ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
         } finally {
             root.remove();
@@ -24917,7 +24987,7 @@ RULES:
             addQuickCommentActions(root);
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
-            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
         } finally {
             // Restore original meta contents (or remove if we created them).
             if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
@@ -24960,7 +25030,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing rebuilt .ack-quick-actions');
             ackAssert(!qa.querySelector('button[title*="Cancel"]'), 'stale cancel button still present');
-            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button after rebuild');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button after rebuild');
         } finally {
             root.remove();
         }
@@ -25067,7 +25137,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
             ackAssert(badgesGroup.nextElementSibling === qa, 'quick-actions inserted after badgesGroup');
-            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
         } finally {
             if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
             if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
