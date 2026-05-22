@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.97
+// @version      1.98
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8773,6 +8773,7 @@ The prompt must ask for:
         return new Promise((resolve) => {
             const overlay = document.createElement('div');
             overlay.className = 'ack-diff-dialog-overlay';
+            overlay.tabIndex = -1;
             Object.assign(overlay.style, {
                 position: 'fixed',
                 inset: '0',
@@ -8783,6 +8784,9 @@ The prompt must ask for:
                 justifyContent: 'center',
             });
             const dialog = document.createElement('div');
+            dialog.tabIndex = -1;
+            dialog.setAttribute('role', 'dialog');
+            dialog.setAttribute('aria-modal', 'true');
             Object.assign(dialog.style, {
                 background: '#161b22',
                 border: '1px solid #30363d',
@@ -8792,6 +8796,7 @@ The prompt must ask for:
                 maxWidth: '900px',
                 maxHeight: '70vh',
                 overflow: 'auto',
+                outline: 'none',
                 color: '#c9d1d9',
                 fontSize: '13px',
                 lineHeight: '1.6',
@@ -8829,6 +8834,29 @@ The prompt must ask for:
 
             // Track revert state per diff entry
             const revertState = diff.map(() => false); // false = active (accept change), true = reverted
+
+            let settled = false;
+            const settle = (action, text) => {
+                if (settled) return;
+                settled = true;
+                window.removeEventListener('keydown', onDialogKeydown, true);
+                overlay.remove();
+                resolve({ action, text });
+            };
+            const acceptDialog = () => settle('edit', buildText());
+            const rejectDialog = () => settle(false, original);
+            const onDialogKeydown = (e) => {
+                if (!overlay.isConnected) return;
+                const isSubmit = e.key === 'Enter' && (e.metaKey || e.ctrlKey);
+                const isReject = e.key === 'Escape';
+                if (!isSubmit && !isReject) return;
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation?.();
+                if (isSubmit) acceptDialog();
+                else rejectDialog();
+            };
+            window.addEventListener('keydown', onDialogKeydown, true);
 
             // Build modified text from current revert state
             function buildText() {
@@ -8920,8 +8948,7 @@ The prompt must ask for:
                             renderSpan(span, d, i);
                             // If all changes reverted, auto-close as reject
                             if (checkAllReverted()) {
-                                overlay.remove();
-                                resolve({ action: false, text: original });
+                                rejectDialog();
                             }
                         });
                     }
@@ -9078,8 +9105,7 @@ The prompt must ask for:
                 fontSize: '12px',
             });
             rejectBtn.addEventListener('click', () => {
-                overlay.remove();
-                resolve({ action: false, text: original });
+                rejectDialog();
             });
 
             const acceptBtn = document.createElement('button');
@@ -9095,8 +9121,7 @@ The prompt must ask for:
                 fontSize: '12px',
             });
             acceptBtn.addEventListener('click', () => {
-                overlay.remove();
-                resolve({ action: 'edit', text: buildText() });
+                acceptDialog();
             });
 
             btnRow.appendChild(rejectBtn);
@@ -9105,11 +9130,11 @@ The prompt must ask for:
             overlay.appendChild(dialog);
             overlay.addEventListener('click', (e) => {
                 if (e.target === overlay) {
-                    overlay.remove();
-                    resolve({ action: false, text: original });
+                    rejectDialog();
                 }
             });
             document.body.appendChild(overlay);
+            dialog.focus({ preventScroll: true });
         });
     }
 
@@ -20086,7 +20111,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.97
+// @version      1.98
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22245,6 +22270,8 @@ RULES:
         ackAssert(fn.includes('ack-diff-side-after'), 'marks after pane for side-by-side checks');
         ackAssert(fn.includes('dataset.ackDiffChange'), 'marks colored side-by-side changes');
         ackAssert(fn.includes("d.type === 'add'") && fn.includes("d.type === 'del'"), 'side panes color only their own changed text');
+        ackAssert(fn.includes("window.addEventListener('keydown', onDialogKeydown, true)"), 'captures dialog shortcuts before page handlers');
+        ackAssert(fn.includes("dialog.focus({ preventScroll: true })"), 'focuses the diff dialog while open');
     });
 
     ackTest('showDiffDialog switches between readable diff modes', async () => {
@@ -22277,6 +22304,44 @@ RULES:
             ackEq(result.action, 'edit', 'accept still applies from readable modes');
         } finally {
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+        }
+    });
+
+    ackTest('showDiffDialog owns Cmd+Enter and Escape while open', async () => {
+        const host = document.createElement('form');
+        host.innerHTML = '<textarea>underlying draft</textarea>';
+        const ta = host.querySelector('textarea');
+        let underlyingKeydowns = 0;
+        ta.addEventListener('keydown', () => {
+            underlyingKeydowns++;
+        });
+        document.body.appendChild(host);
+        try {
+            const acceptPromise = showDiffDialog('old text', 'new text');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const acceptOverlay = document.querySelector('.ack-diff-dialog-overlay');
+            ackAssert(acceptOverlay, 'accept dialog overlay exists');
+            ackAssert(acceptOverlay.contains(document.activeElement), 'diff dialog receives focus');
+            const accepted = ta.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true, cancelable: true }),
+            );
+            ackEq(accepted, false, 'Cmd+Enter is prevented before reaching the underlying view');
+            const acceptResult = await acceptPromise;
+            ackEq(acceptResult.action, 'edit', 'Cmd+Enter accepts the diff dialog');
+            ackEq(underlyingKeydowns, 0, 'Cmd+Enter does not reach the underlying textarea');
+
+            const rejectPromise = showDiffDialog('old text', 'new text');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const rejected = ta.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+            );
+            ackEq(rejected, false, 'Escape is prevented before reaching the underlying view');
+            const rejectResult = await rejectPromise;
+            ackEq(rejectResult.action, false, 'Escape rejects the diff dialog');
+            ackEq(underlyingKeydowns, 0, 'Escape does not reach the underlying textarea');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            host.remove();
         }
     });
 
@@ -32575,9 +32640,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.97', () => {
+    ackTest('version bumped to 1.98', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.97' || _ackSource.includes('@version      1.97'), 'version is 1.97');
+        ackAssert(versionFromMeta === '1.98' || _ackSource.includes('@version      1.98'), 'version is 1.98');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
