@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.109
+// @version      1.110
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -12650,12 +12650,15 @@ Rules:
         return (btn?.textContent || '').replace(EDIT_SAVE_DIFF_EMOJI, '').trim();
     }
 
+    const EDIT_SAVE_LABEL_RE =
+        /^(update(?:\s+(?:comment|review|review comment|reply|conversation))?|save(?:\s+(?:edit|comment|changes|reply))?)$/i;
+
     function isEditSaveButton(btn) {
         const label = editButtonLabel(btn);
         return (
             btn?.classList?.contains('js-comment-update') ||
             btn?.matches?.('[data-testid="save-edit-button"], [data-testid="update-comment-button"]') ||
-            /^(update comment|update|save edit|save)$/i.test(label)
+            EDIT_SAVE_LABEL_RE.test(label)
         );
     }
 
@@ -33060,6 +33063,56 @@ RULES:
             form.querySelector('textarea').value = 'Edited PR body';
             ackEq(shouldConfirmEditSave(form), true, 'PR description edits require diff confirmation');
         } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('edit save handles Changes-view review comment update buttons', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <form action="/owner/repo/pull/123/review_comment/456/update">
+                <textarea style="width:200px;height:60px">Original review comment</textarea>
+                <button type="button">Cancel</button>
+                <button type="submit">Update review comment</button>
+            </form>
+        `;
+        document.body.appendChild(host);
+        const form = host.querySelector('form');
+        const ta = host.querySelector('textarea');
+        const saveBtn = [...host.querySelectorAll('button')].find(
+            (btn) => editButtonLabel(btn) === 'Update review comment',
+        );
+        let submitEvents = 0;
+        form.addEventListener('submit', (e) => {
+            submitEvents++;
+            e.preventDefault();
+        });
+        try {
+            trackEditForms(host);
+            ackAssert(isEditSaveButton(saveBtn), 'Changes-view update label is treated as edit save');
+            ackAssert(saveBtn.textContent.includes(EDIT_SAVE_DIFF_EMOJI), 'marks Changes-view update button');
+            ackEq(findEditForm(saveBtn), form, 'Changes-view update button resolves its edit form');
+            ta.value = 'Edited review comment';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            const ok = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            ackEq(ok, false, 'Changes-view dirty save is held for diff confirmation');
+            ackEq(submitEvents, 0, 'Changes-view dirty save does not submit before accepting');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const acceptBtn = [...document.querySelectorAll('button')].find(
+                (btn) => btn.textContent === 'Accept and update',
+            );
+            ackAssert(acceptBtn, 'Changes-view dirty save opens edit diff confirmation');
+            acceptBtn.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(submitEvents, 1, 'accepting Changes-view diff submits once');
+        } finally {
+            delete form._ackEditTracked;
+            delete form._ackEditDirty;
+            delete form._ackEditInitialValue;
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
             host.remove();
         }
     });
