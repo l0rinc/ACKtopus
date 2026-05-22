@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.98
+// @version      1.99
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8834,6 +8834,9 @@ The prompt must ask for:
 
             // Track revert state per diff entry
             const revertState = diff.map(() => false); // false = active (accept change), true = reverted
+            let navIndex = -1;
+            let navPrevBtn = null;
+            let navNextBtn = null;
 
             let settled = false;
             const settle = (action, text) => {
@@ -8849,14 +8852,77 @@ The prompt must ask for:
                 if (!overlay.isConnected) return;
                 const isSubmit = e.key === 'Enter' && (e.metaKey || e.ctrlKey);
                 const isReject = e.key === 'Escape';
-                if (!isSubmit && !isReject) return;
+                const isNextDiff = e.key === 'ArrowDown' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey;
+                const isPrevDiff = e.key === 'ArrowUp' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey;
+                if (!isSubmit && !isReject && !isNextDiff && !isPrevDiff) return;
                 e.preventDefault();
                 e.stopPropagation();
                 e.stopImmediatePropagation?.();
                 if (isSubmit) acceptDialog();
-                else rejectDialog();
+                else if (isReject) rejectDialog();
+                else if (isNextDiff) scrollDiffNav(1);
+                else if (isPrevDiff) scrollDiffNav(-1);
             };
             window.addEventListener('keydown', onDialogKeydown, true);
+
+            function getDiffNavTargets() {
+                return [...contentEl.querySelectorAll('[data-ack-diff-nav-target="1"]')].filter((el) => el.isConnected);
+            }
+
+            function clearDiffNavState() {
+                for (const el of getDiffNavTargets()) {
+                    delete el.dataset.ackDiffNavActive;
+                    el.style.boxShadow = '';
+                }
+            }
+
+            function markDiffNavTarget(el) {
+                el.dataset.ackDiffNavTarget = '1';
+                el.style.scrollMarginBlock = '35vh';
+            }
+
+            function updateDiffNavButtons() {
+                const hasTargets = getDiffNavTargets().length > 0;
+                for (const btn of [navPrevBtn, navNextBtn]) {
+                    if (!btn) continue;
+                    btn.disabled = !hasTargets;
+                    btn.style.opacity = hasTargets ? '1' : '0.45';
+                    btn.style.cursor = hasTargets ? 'pointer' : 'default';
+                }
+            }
+
+            function scrollTargetIntoDialog(target) {
+                const targetRect = target.getBoundingClientRect();
+                const dialogRect = dialog.getBoundingClientRect();
+                const top = Math.max(0, dialog.scrollTop + targetRect.top - dialogRect.top - dialog.clientHeight / 2 + targetRect.height / 2);
+                if (typeof dialog.scrollTo === 'function') {
+                    dialog.scrollTo({ top, behavior: 'smooth' });
+                } else if (typeof target.scrollIntoView === 'function') {
+                    target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                } else {
+                    dialog.scrollTop = top;
+                }
+            }
+
+            function scrollDiffNav(direction) {
+                const targets = getDiffNavTargets();
+                if (!targets.length) return;
+                clearDiffNavState();
+                navIndex = navIndex < 0 ? (direction > 0 ? 0 : targets.length - 1) : (navIndex + direction + targets.length) % targets.length;
+                const target = targets[navIndex];
+                target.dataset.ackDiffNavActive = '1';
+                target.style.boxShadow = '0 0 0 2px #58a6ff';
+                scrollTargetIntoDialog(target);
+            }
+
+            function resetDiffNav() {
+                navIndex = -1;
+                updateDiffNavButtons();
+            }
+
+            function lineAdvance(text) {
+                return (String(text || '').match(/\n/g) || []).length;
+            }
 
             // Build modified text from current revert state
             function buildText() {
@@ -8941,11 +9007,13 @@ The prompt must ask for:
                 for (let i = 0; i < diff.length; i++) {
                     const d = diff[i];
                     const span = document.createElement('span');
+                    span.dataset.ackDiffIndex = String(i);
                     renderSpan(span, d, i);
                     if (d.type !== 'same') {
                         span.addEventListener('click', () => {
                             revertState[i] = !revertState[i];
                             renderSpan(span, d, i);
+                            refreshWordDiffNavTargets();
                             // If all changes reverted, auto-close as reject
                             if (checkAllReverted()) {
                                 rejectDialog();
@@ -8954,10 +9022,32 @@ The prompt must ask for:
                     }
                     contentEl.appendChild(span);
                 }
+                refreshWordDiffNavTargets();
+            }
+
+            function refreshWordDiffNavTargets() {
+                const markedLines = new Set();
+                let line = 0;
+                for (let i = 0; i < diff.length; i++) {
+                    const d = diff[i];
+                    const span = contentEl.querySelector(`[data-ack-diff-index="${i}"]`);
+                    if (span) {
+                        delete span.dataset.ackDiffNavTarget;
+                        delete span.dataset.ackDiffNavActive;
+                        span.style.boxShadow = '';
+                    }
+                    if (span && d.type !== 'same' && !revertState[i] && !markedLines.has(line)) {
+                        markDiffNavTarget(span);
+                        markedLines.add(line);
+                    }
+                    line += lineAdvance(d.text);
+                }
+                resetDiffNav();
             }
 
             function renderGroupedView() {
                 contentEl.innerHTML = '';
+                let inChangeRun = false;
                 for (const d of groupedDiff(original, buildText())) {
                     const block = document.createElement('div');
                     block.textContent = d.text;
@@ -8973,6 +9063,12 @@ The prompt must ask for:
                     });
                     if (d.type === 'same' && !d.text.trim()) {
                         block.style.minHeight = '8px';
+                    }
+                    if (d.type === 'same') {
+                        inChangeRun = false;
+                    } else if (!inChangeRun) {
+                        markDiffNavTarget(block);
+                        inChangeRun = true;
                     }
                     contentEl.appendChild(block);
                 }
@@ -9020,7 +9116,10 @@ The prompt must ask for:
                         whiteSpace: 'pre-wrap',
                         overflowWrap: 'anywhere',
                     });
-                    for (const d of currentDiff) {
+                    let line = 0;
+                    const markedLines = new Set();
+                    for (let i = 0; i < currentDiff.length; i++) {
+                        const d = currentDiff[i];
                         if ((pane.side === 'before' && d.type === 'add') || (pane.side === 'after' && d.type === 'del')) {
                             continue;
                         }
@@ -9029,11 +9128,20 @@ The prompt must ask for:
                         if (pane.side === 'before' && d.type === 'del') {
                             span.dataset.ackDiffChange = 'del';
                             Object.assign(span.style, { background: '#3d1f1f', color: '#f85149' });
+                            if (!markedLines.has(line)) {
+                                markDiffNavTarget(span);
+                                markedLines.add(line);
+                            }
                         } else if (pane.side === 'after' && d.type === 'add') {
                             span.dataset.ackDiffChange = 'add';
                             Object.assign(span.style, { background: '#1a3a1a', color: '#3fb950' });
+                            if (currentDiff[i - 1]?.type !== 'del' && !markedLines.has(line)) {
+                                markDiffNavTarget(span);
+                                markedLines.add(line);
+                            }
                         }
                         pre.appendChild(span);
+                        line += lineAdvance(d.text);
                     }
                     wrap.appendChild(label);
                     wrap.appendChild(pre);
@@ -9054,6 +9162,7 @@ The prompt must ask for:
                 if (activeMode === 'word') renderWordView();
                 else if (activeMode === 'paragraph') renderGroupedView();
                 else renderSideBySideView();
+                resetDiffNav();
             }
 
             function setMode(mode) {
@@ -9086,6 +9195,32 @@ The prompt must ask for:
                 modeButtons.set(mode.key, btn);
                 modeRow.appendChild(btn);
             }
+            const navGroup = document.createElement('div');
+            navGroup.className = 'ack-diff-nav-group';
+            Object.assign(navGroup.style, { display: 'flex', gap: '6px', marginLeft: 'auto' });
+            const makeNavButton = (label, title, direction, className) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = className;
+                btn.textContent = label;
+                btn.title = title;
+                Object.assign(btn.style, {
+                    border: '1px solid #30363d',
+                    borderRadius: '6px',
+                    background: '#21262d',
+                    color: '#c9d1d9',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    padding: '4px 8px',
+                });
+                btn.addEventListener('click', () => scrollDiffNav(direction));
+                return btn;
+            };
+            navPrevBtn = makeNavButton('↑ Diff', 'Previous changed section (Cmd/Ctrl+Up)', -1, 'ack-diff-nav-prev');
+            navNextBtn = makeNavButton('↓ Diff', 'Next changed section (Cmd/Ctrl+Down)', 1, 'ack-diff-nav-next');
+            navGroup.appendChild(navPrevBtn);
+            navGroup.appendChild(navNextBtn);
+            modeRow.appendChild(navGroup);
             dialog.appendChild(modeRow);
             dialog.appendChild(contentEl);
             setMode(activeMode);
@@ -20111,7 +20246,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.98
+// @version      1.99
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22272,6 +22407,10 @@ RULES:
         ackAssert(fn.includes("d.type === 'add'") && fn.includes("d.type === 'del'"), 'side panes color only their own changed text');
         ackAssert(fn.includes("window.addEventListener('keydown', onDialogKeydown, true)"), 'captures dialog shortcuts before page handlers');
         ackAssert(fn.includes("dialog.focus({ preventScroll: true })"), 'focuses the diff dialog while open');
+        ackAssert(fn.includes('ack-diff-nav-prev'), 'has previous-diff navigation button');
+        ackAssert(fn.includes('ack-diff-nav-next'), 'has next-diff navigation button');
+        ackAssert(fn.includes("e.key === 'ArrowDown'") && fn.includes("e.key === 'ArrowUp'"), 'has diff navigation shortcuts');
+        ackAssert(fn.includes('scrollDiffNav(1)') && fn.includes('scrollDiffNav(-1)'), 'shortcuts jump between diff targets');
     });
 
     ackTest('showDiffDialog switches between readable diff modes', async () => {
@@ -22285,8 +22424,20 @@ RULES:
             ackAssert(!overlay.querySelector('[data-ack-diff-mode="sentence"]'), 'sentence mode is removed');
             const paragraphBtn = overlay.querySelector('[data-ack-diff-mode="paragraph"]');
             const sideBtn = overlay.querySelector('[data-ack-diff-mode="side"]');
+            const prevDiffBtn = overlay.querySelector('.ack-diff-nav-prev');
+            const nextDiffBtn = overlay.querySelector('.ack-diff-nav-next');
+            ackAssert(prevDiffBtn && nextDiffBtn, 'diff navigation buttons are shown');
+            nextDiffBtn.click();
+            ackAssert(overlay.querySelector('[data-ack-diff-nav-active="1"]'), 'next diff button selects a changed section');
             paragraphBtn.click();
             ackEq(paragraphBtn.dataset.active, '1', 'paragraph mode becomes active');
+            ackAssert(
+                overlay.querySelectorAll('[data-ack-diff-nav-target="1"]').length >= 2,
+                'paragraph mode has line-level changed section targets',
+            );
+            nextDiffBtn.click();
+            const activeParagraphTarget = overlay.querySelector('[data-ack-diff-nav-active="1"]');
+            ackAssert(activeParagraphTarget, 'next diff button works in paragraph mode');
             sideBtn.click();
             ackEq(sideBtn.dataset.active, '1', 'side-by-side mode becomes active');
             ackAssert(overlay.querySelector('.ack-diff-side-by-side'), 'side-by-side panes are rendered');
@@ -22307,7 +22458,7 @@ RULES:
         }
     });
 
-    ackTest('showDiffDialog owns Cmd+Enter and Escape while open', async () => {
+    ackTest('showDiffDialog owns modal keyboard shortcuts while open', async () => {
         const host = document.createElement('form');
         host.innerHTML = '<textarea>underlying draft</textarea>';
         const ta = host.querySelector('textarea');
@@ -22332,6 +22483,13 @@ RULES:
 
             const rejectPromise = showDiffDialog('old text', 'new text');
             await new Promise((resolve) => setTimeout(resolve, 0));
+            const navOverlay = document.querySelector('.ack-diff-dialog-overlay');
+            const arrowed = ta.dispatchEvent(
+                new KeyboardEvent('keydown', { key: 'ArrowDown', metaKey: true, bubbles: true, cancelable: true }),
+            );
+            ackEq(arrowed, false, 'Cmd+Down is prevented before reaching the underlying view');
+            ackAssert(navOverlay?.querySelector('[data-ack-diff-nav-active="1"]'), 'Cmd+Down jumps to a diff target');
+            ackEq(underlyingKeydowns, 0, 'Cmd+Down does not reach the underlying textarea');
             const rejected = ta.dispatchEvent(
                 new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
             );
@@ -32640,9 +32798,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.98', () => {
+    ackTest('version bumped to 1.99', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.98' || _ackSource.includes('@version      1.98'), 'version is 1.98');
+        ackAssert(versionFromMeta === '1.99' || _ackSource.includes('@version      1.99'), 'version is 1.99');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
