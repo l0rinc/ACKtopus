@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.115
+// @version      1.116
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -9804,8 +9804,6 @@ The prompt must ask for:
                 return stripGitHubMeta(s);
             };
 
-            const postProcessDetails = (text) => postProcessProofreadMarkdown(text);
-
             const findSubmitBtn = (container, ta) => {
                 // Safety: verify a submit button is safe before clicking — must not navigate
                 // to a different page (e.g. issue creation, settings).
@@ -10039,10 +10037,8 @@ The prompt must ask for:
                     let result = stripGitHubMeta(textForProofread);
                     const { system, user, parsed, noOp } = makePrompt(textForProofread);
                     if (noOp) {
-                        console.log(
-                            'ACKtopus: proofread: no mutable segments, running deterministic markdown post-processing only',
-                        );
-                        result = postProcessDetails(strippedOriginal);
+                        console.log('ACKtopus: proofread: no mutable segments, running URL-preservation pass only');
+                        result = postProcessProofreadMarkdown(strippedOriginal);
                     } else {
                         console.log('ACKtopus: proofread: calling LLM', {
                             provider,
@@ -10060,7 +10056,7 @@ The prompt must ask for:
                                 // Fallback for occasional model formatting drift: when there is a
                                 // single mutable segment, treat the whole response as that segment.
                                 const wrapped = `<s1>\n${llmClean}\n</s1>`;
-                                result = postProcessDetails(parsed.fromXML(wrapped));
+                                result = postProcessProofreadMarkdown(parsed.fromXML(wrapped));
                             } else {
                                 // Multi-segment fallback: retry once with stricter formatting instruction.
                                 const strictSystem =
@@ -10074,14 +10070,14 @@ The prompt must ask for:
                                     expected: parsed.mutableCount,
                                 });
                                 if (retryTagCount > 0) {
-                                    result = postProcessDetails(parsed.fromXML(retryClean));
+                                    result = postProcessProofreadMarkdown(parsed.fromXML(retryClean));
                                 } else {
                                     // Still malformed: keep original to avoid damaging mixed immutable/mutable content.
                                     result = strippedOriginal;
                                 }
                             }
                         } else {
-                            result = postProcessDetails(parsed.fromXML(llmClean));
+                            result = postProcessProofreadMarkdown(parsed.fromXML(llmClean));
                         }
                     }
                     ta.style.borderColor = oldBorder;
@@ -31221,8 +31217,10 @@ The prompt must ask for:
             'prompt handles alert conversions',
         );
         ackAssert(fn.includes('not a fixed list of heading names'), 'prompt covers generic markdown heading compaction');
-        ackAssert(source.includes('postProcessDetails'), 'postProcessDetails exists');
-        ackAssert(source.includes('postProcessDetails(parsed.fromXML'), 'applied to proofread results');
+        ackAssert(
+            source.includes('postProcessProofreadMarkdown(parsed.fromXML'),
+            'only URL-preservation post-processing is applied to proofread results',
+        );
         ackAssert(!source.includes('function applyProofreadAlertBlocks'), 'no deterministic alert conversion helper');
         ackAssert(!source.includes('function applyProofreadPRDescriptionHeadingPrefixes'), 'no deterministic heading conversion helper');
         ackAssert(!source.includes('function guessCodeFenceLanguage'), 'no static fence-language guessing');
@@ -31856,7 +31854,7 @@ The prompt must ask for:
         ackAssert(fn.includes('includeCommits: true'), 'reproducer includes commit metadata for commit-by-commit jobs');
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
-        ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a smaller Claude-safe source budget');
+        ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a bounded source budget');
         ackAssert(fn.includes('maxTokens: 4096'), 'reproducer uses a bounded output budget');
         ackAssert(fn.includes('requestLabel: recipe'), 'recipe LLM calls are labeled in error diagnostics');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
