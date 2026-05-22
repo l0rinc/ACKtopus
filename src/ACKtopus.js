@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.95
+// @version      1.96
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8693,26 +8693,27 @@ The prompt must ask for:
         }));
     }
 
-    function splitParagraphDiffUnits(text) {
+    function splitLineDiffUnits(text) {
         const value = String(text || '');
         if (!value) return [];
-        const units = [];
-        const separators = /\n{2,}/g;
-        let last = 0;
-        let match;
-        while ((match = separators.exec(value))) {
-            const end = match.index + match[0].length;
-            units.push(value.slice(last, end));
-            last = end;
-        }
-        if (last < value.length) units.push(value.slice(last));
-        return units;
+        return value.match(/[^\n]*\n|[^\n]+/g) || [value];
+    }
+
+    function splitParagraphDiffUnits(text) {
+        return splitLineDiffUnits(text);
     }
 
     function splitSentenceDiffUnits(text) {
-        const value = String(text || '');
-        if (!value) return [];
-        return value.match(/[^.!?\n]+[.!?]+[\])}"'`]*\s*|[^.!?\n]+(?:\n+|$)|\n+/g) || [value];
+        const units = [];
+        for (const line of splitLineDiffUnits(text)) {
+            const hasNewline = line.endsWith('\n');
+            const body = hasNewline ? line.slice(0, -1) : line;
+            if (body) {
+                units.push(...(body.match(/[^.!?]+[.!?]+[\])}"'`]*\s*|[^.!?]+/g) || [body]));
+            }
+            if (hasNewline) units.push('\n');
+        }
+        return units;
     }
 
     function groupedDiff(oldText, newText, unit) {
@@ -8974,9 +8975,10 @@ The prompt must ask for:
                     gap: '10px',
                     whiteSpace: 'normal',
                 });
+                const currentDiff = wordDiff(original, buildText());
                 const panes = [
-                    { label: 'Before', text: original },
-                    { label: 'After', text: buildText() },
+                    { label: 'Before', side: 'before', className: 'ack-diff-side-before' },
+                    { label: 'After', side: 'after', className: 'ack-diff-side-after' },
                 ];
                 for (const pane of panes) {
                     const wrap = document.createElement('div');
@@ -8989,7 +8991,7 @@ The prompt must ask for:
                         margin: '0 0 4px 0',
                     });
                     const pre = document.createElement('pre');
-                    pre.textContent = pane.text;
+                    pre.className = pane.className;
                     Object.assign(pre.style, {
                         background: '#0d1117',
                         border: '1px solid #30363d',
@@ -9005,6 +9007,21 @@ The prompt must ask for:
                         whiteSpace: 'pre-wrap',
                         overflowWrap: 'anywhere',
                     });
+                    for (const d of currentDiff) {
+                        if ((pane.side === 'before' && d.type === 'add') || (pane.side === 'after' && d.type === 'del')) {
+                            continue;
+                        }
+                        const span = document.createElement('span');
+                        span.textContent = d.text;
+                        if (pane.side === 'before' && d.type === 'del') {
+                            span.dataset.ackDiffChange = 'del';
+                            Object.assign(span.style, { background: '#3d1f1f', color: '#f85149' });
+                        } else if (pane.side === 'after' && d.type === 'add') {
+                            span.dataset.ackDiffChange = 'add';
+                            Object.assign(span.style, { background: '#1a3a1a', color: '#3fb950' });
+                        }
+                        pre.appendChild(span);
+                    }
                     wrap.appendChild(label);
                     wrap.appendChild(pre);
                     grid.appendChild(wrap);
@@ -9014,9 +9031,9 @@ The prompt must ask for:
 
             const modes = [
                 { key: 'word', label: 'Words', title: 'Word-level diff with click-to-revert changes' },
-                { key: 'sentence', label: 'Sentences', title: 'Sentence-level diff for reading larger rewrites' },
-                { key: 'paragraph', label: 'Paragraphs', title: 'Paragraph-level diff for broad structural changes' },
-                { key: 'side', label: 'Before/After', title: 'Read both versions side by side' },
+                { key: 'sentence', label: 'Sentences', title: 'Sentence-level diff that also splits at line endings' },
+                { key: 'paragraph', label: 'Paragraphs', title: 'Paragraph diff split at newlines' },
+                { key: 'side', label: 'Before/After', title: 'Read both versions side by side with changed text colored' },
             ];
             let activeMode = 'word';
             const modeButtons = new Map();
@@ -20085,7 +20102,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.95
+// @version      1.96
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20697,13 +20714,14 @@ RULES:
     });
 
     ackTest('groupedDiff supports sentence and paragraph readability modes', () => {
-        const sentence = groupedDiff('One stays. Two old.', 'One stays. Two new.', 'sentence');
+        const sentence = groupedDiff('One stays.\nTwo old.', 'One stays.\nTwo new.', 'sentence');
         ackAssert(sentence.some((d) => d.type === 'del' && d.text.includes('Two old.')), 'sentence diff removes old sentence');
         ackAssert(sentence.some((d) => d.type === 'add' && d.text.includes('Two new.')), 'sentence diff adds new sentence');
+        ackAssert(sentence.some((d) => d.type === 'same' && d.text.includes('\n')), 'sentence diff keeps line endings as boundaries');
 
-        const paragraph = groupedDiff('Intro.\n\nOld body.\n\nTail.', 'Intro.\n\nNew body.\n\nTail.', 'paragraph');
-        ackAssert(paragraph.some((d) => d.type === 'del' && d.text.includes('Old body.')), 'paragraph diff removes old paragraph');
-        ackAssert(paragraph.some((d) => d.type === 'add' && d.text.includes('New body.')), 'paragraph diff adds new paragraph');
+        const paragraph = groupedDiff('Intro.\nOld body.\nTail.', 'Intro.\nNew body.\nTail.', 'paragraph');
+        ackAssert(paragraph.some((d) => d.type === 'del' && d.text === 'Old body.\n'), 'paragraph diff removes old line');
+        ackAssert(paragraph.some((d) => d.type === 'add' && d.text === 'New body.\n'), 'paragraph diff adds new line');
     });
 
     // --- hasUnsavedCommentText ---
@@ -22244,6 +22262,10 @@ RULES:
         ackAssert(fn.includes('Paragraphs'), 'has paragraph diff mode');
         ackAssert(fn.includes('Before/After'), 'has side-by-side mode');
         ackAssert(fn.includes('renderSideBySideView'), 'renders before/after view');
+        ackAssert(fn.includes('ack-diff-side-before'), 'marks before pane for side-by-side checks');
+        ackAssert(fn.includes('ack-diff-side-after'), 'marks after pane for side-by-side checks');
+        ackAssert(fn.includes('dataset.ackDiffChange'), 'marks colored side-by-side changes');
+        ackAssert(fn.includes("d.type === 'add'") && fn.includes("d.type === 'del'"), 'side panes color only their own changed text');
     });
 
     ackTest('showDiffDialog switches between readable diff modes', async () => {
@@ -22264,6 +22286,14 @@ RULES:
             sideBtn.click();
             ackEq(sideBtn.dataset.active, '1', 'side-by-side mode becomes active');
             ackAssert(overlay.querySelector('.ack-diff-side-by-side'), 'side-by-side panes are rendered');
+            ackAssert(
+                overlay.querySelector('.ack-diff-side-before [data-ack-diff-change="del"]'),
+                'before pane colors removed text red',
+            );
+            ackAssert(
+                overlay.querySelector('.ack-diff-side-after [data-ack-diff-change="add"]'),
+                'after pane colors added text green',
+            );
             const acceptBtn = [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Accept');
             acceptBtn.click();
             const result = await promise;
@@ -32568,9 +32598,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.95', () => {
+    ackTest('version bumped to 1.96', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.95' || _ackSource.includes('@version      1.95'), 'version is 1.95');
+        ackAssert(versionFromMeta === '1.96' || _ackSource.includes('@version      1.96'), 'version is 1.96');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
