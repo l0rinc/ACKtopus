@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.105
+// @version      1.106
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -9475,8 +9475,13 @@ The prompt must ask for:
                         noOp: true,
                         stripped: text !== cleaned ? text : null,
                     };
+                const headingNormalizationRule =
+                    '- For GitHub comments and PR descriptions: prefer compact inline bold prefixes over Markdown headings or standalone label lines whenever the surrounding text remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. Never leave a bold prefix alone on a line when normal prose follows. If the heading is followed by block content such as a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line.';
+                const prDescriptionRule = isPRBody
+                    ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
+                    : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: match concise Bitcoin Core contributor style. Prefer compact prose or simple bold line prefixes such as `**Problem:**`, `**Fix:**`, and `**Notes:**` over markdown headings such as `### Problem`, `### Fix`, `#### Notes`, `## Summary`, or `High-level goal:`. If markdown headings are already present, rewrite them as bold prefixes only when the surrounding text still fits that structure; do not invent sections. When a heading is followed by normal prose, continue the text on the same line after the colon, for example `### Summary\\nThis PR changes...` becomes `**Summary:** This PR changes...`. This also applies when blank lines separate the heading from the prose, regardless of what follows that prose. Never leave `**Problem:**`, `**Fix:**`, `**Notes:**`, or similar bold prefixes alone on a line when normal prose follows. Do not fold the following block onto the prefix when it starts with a table, image, list, code fence, HTML block, or similar block content.\n- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. ${isPRBody ? 'Preserve markdown formatting except for the PR-description style normalization above.' : 'Preserve ALL markdown formatting.'} Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -21748,7 +21753,10 @@ RULES:
 
     ackTest('proofread prompt instructs LLM to preserve markdown formatting', () => {
         // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
-        ackAssert(_ackSource.includes('Preserve ALL markdown formatting'), 'prompt includes markdown preservation');
+        ackAssert(
+            _ackSource.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
+            'prompt includes markdown preservation with heading normalization',
+        );
     });
 
     // ============================================================================
@@ -22651,7 +22659,10 @@ RULES:
 
     ackTest('proofread system prompt instructs to preserve markdown', () => {
         // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
-        ackAssert(_ackSource.includes('Preserve ALL markdown formatting'), 'prompt says preserve markdown');
+        ackAssert(
+            _ackSource.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
+            'prompt says preserve markdown except compact heading normalization',
+        );
         ackAssert(
             _ackSource.includes(
                 'Keep the original sentence structure unless separating clauses clearly improves clarity',
@@ -26625,40 +26636,48 @@ RULES:
         );
     });
 
-    ackTest('PR-body proofreading follows Bitcoin Core PR-description style', () => {
+    ackTest('proofreading may compact markdown headings in comments and PR descriptions', () => {
         const source = _ackSource;
         const makePromptSection = source.slice(source.indexOf('const makePrompt'), source.indexOf('const cleanResult'));
-        ackAssert(makePromptSection.includes('concise Bitcoin Core contributor style'), 'mentions Bitcoin Core style');
         ackAssert(
-            makePromptSection.includes('`**Problem:**`') &&
-                makePromptSection.includes('`**Fix:**`') &&
-                makePromptSection.includes('`**Notes:**`'),
-            'prefers bold Problem/Fix/Notes prefixes',
+            makePromptSection.includes('For GitHub comments and PR descriptions'),
+            'heading compaction applies to comments and PR descriptions',
         );
-        ackAssert(makePromptSection.includes('over markdown headings such as `### Problem`'), 'discourages markdown section headings');
-        ackAssert(makePromptSection.includes('`#### Notes`'), 'discourages lower-level Notes headings');
         ackAssert(
-            makePromptSection.includes('continue the text on the same line after the colon'),
+            makePromptSection.includes('Markdown headings or standalone label lines'),
+            'handles generic headings and labels',
+        );
+        ackAssert(
+            makePromptSection.includes('compact inline bold prefixes'),
+            'prefers compact bold prefixes',
+        );
+        ackAssert(makePromptSection.includes('not a fixed list of heading names'), 'does not rely on enumerated examples');
+        ackAssert(makePromptSection.includes('Do not invent sections'), 'does not invent sections');
+        ackAssert(
+            makePromptSection.includes('continue that prose on the same line after the colon'),
             'folds following prose onto the bold prefix line',
         );
         ackAssert(
-            makePromptSection.includes('blank lines separate the heading from the prose'),
+            makePromptSection.includes('even when blank lines separated them'),
             'folds prose even after blank lines',
         );
         ackAssert(
-            makePromptSection.includes('regardless of what follows that prose'),
-            'does not special-case content after the first prose',
-        );
-        ackAssert(
-            makePromptSection.includes('Never leave `**Problem:**`, `**Fix:**`, `**Notes:**`'),
+            makePromptSection.includes('Never leave a bold prefix alone on a line when normal prose follows'),
             'prevents standalone bold prefixes when prose follows',
         );
         ackAssert(
-            makePromptSection.includes('table, image, list, code fence, HTML block'),
+            makePromptSection.includes('table, image, list, code fence, HTML block') &&
+                makePromptSection.includes('keep the block below it'),
             'keeps block content below heading-style prefixes',
         );
-        ackAssert(makePromptSection.includes('do not invent sections'), 'does not invent PR description sections');
-        ackAssert(makePromptSection.includes('Preserve markdown formatting except for the PR-description style normalization above'), 'allows PR-description style normalization');
+        ackAssert(
+            makePromptSection.includes('concise Bitcoin Core contributor style'),
+            'PR descriptions still get Bitcoin Core style guidance',
+        );
+        ackAssert(
+            makePromptSection.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
+            'allows heading-to-prefix normalization',
+        );
     });
 
     ackTest('diff selection fact-check uses expanded PR-context truncation budgets', () => {
@@ -30979,7 +30998,7 @@ RULES:
             DEFAULT_INSTRUCTIONS.proofread.includes('you may convert it to a GitHub alert block'),
             'prompt handles alert conversions',
         );
-        ackAssert(fn.includes('`#### Notes`'), 'PR-description prompt covers lower-level markdown headings');
+        ackAssert(fn.includes('not a fixed list of heading names'), 'prompt covers generic markdown heading compaction');
         ackAssert(source.includes('postProcessDetails'), 'postProcessDetails exists');
         ackAssert(source.includes('postProcessDetails(parsed.fromXML'), 'applied to proofread results');
         ackAssert(!source.includes('function applyProofreadAlertBlocks'), 'no deterministic alert conversion helper');
