@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.113
+// @version      1.115
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -85,7 +85,7 @@
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
     const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
     const LLM_REQUEST_TIMEOUT_MS = 180000;
-    const LLM_HIGH_CONTEXT_TIMEOUT_MS = 20 * 60 * 1000;
+    const LLM_HIGH_CONTEXT_TIMEOUT_MS = 600000;
     const GITHUB_GET_TIMEOUT_MS = 30000;
 
     function shellQuote(arg) {
@@ -918,6 +918,8 @@
 
     function triggerFocusedOrVisibleProofreadShortcut() {
         addDetailsButtons(document);
+        const activeTa = document.activeElement?.closest?.('textarea');
+        if (activeTa && !findEditForm(activeTa) && !activeTa.closest('.is-comment-editing')) return false;
         return pressAckButton(findFocusedOrVisibleShortcutButton('.ack-toolbar-proofread'));
     }
 
@@ -3886,6 +3888,7 @@
                 system,
                 messages: [{ role: 'user', content: userContent }],
             }),
+            streamBody: (body) => ({ ...body, stream: true }),
             validateBody: (model) => ({ model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
             parseText: (data) => data.content?.map((b) => b.text || '').join('') || '',
             parseUsage: (data) => [data.usage?.input_tokens, data.usage?.output_tokens],
@@ -3905,6 +3908,7 @@
                     { role: 'user', content: userContent },
                 ],
             }),
+            streamBody: (body) => ({ ...body, stream: true, stream_options: { include_usage: true } }),
             validateBody: (model) => ({
                 model,
                 max_completion_tokens: 5,
@@ -5484,6 +5488,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         timeoutMs,
         promptKey,
         requestLabel,
+        streaming,
     }) {
         const systemChars = String(system || '').length;
         const userChars = String(userContent || '').length;
@@ -5503,6 +5508,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             maxTokens: maxTokens || 4096,
             reasoningEffort: reasoningEffort || '',
             timeoutMs,
+            streaming: !!streaming,
             promptCacheKey: promptKey ? promptKey.slice(-12) : '',
         };
     }
@@ -5516,6 +5522,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             `body=${meta.requestBytes || meta.requestChars || 0}B`,
             `max=${meta.maxTokens || '?'}`,
             `timeout=${seconds}s`,
+            meta.streaming ? 'stream=true' : '',
+            meta.streamResponseChars != null ? `streamed=${meta.streamResponseChars}ch` : '',
+            meta.streamTextChars != null ? `text=${meta.streamTextChars}ch` : '',
             meta.elapsedMs != null ? `elapsed=${meta.elapsedMs}ms` : '',
         ]
             .filter(Boolean)
@@ -5527,6 +5536,112 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const err = new Error(message);
         err.ackLLMMeta = meta;
         return err;
+    }
+
+    function shouldStreamLLMRequest(provider, { timeoutMs = LLM_REQUEST_TIMEOUT_MS, maxTokens = 0 } = {}) {
+        if (provider !== 'claude' && provider !== 'openai') return false;
+        return timeoutMs > LLM_REQUEST_TIMEOUT_MS || maxTokens > 4096;
+    }
+
+    function createLLMStreamState(provider) {
+        return {
+            provider,
+            offset: 0,
+            buffer: '',
+            text: '',
+            inputTokens: undefined,
+            outputTokens: undefined,
+            done: false,
+        };
+    }
+
+    function appendLLMStreamText(state, text) {
+        const value = String(text || '');
+        if (value) state.text += value;
+    }
+
+    function parseLLMStreamEvent(provider, payload, state) {
+        const data = String(payload || '').trim();
+        if (!data) return;
+        if (data === '[DONE]') {
+            state.done = true;
+            return;
+        }
+        let obj;
+        try {
+            obj = JSON.parse(data);
+        } catch (e) {
+            throw new Error(`invalid stream JSON: ${data.slice(0, 200)}`);
+        }
+        if (obj?.error) {
+            const message =
+                obj.error.message || obj.error.error?.message || obj.error.type || JSON.stringify(obj.error).slice(0, 200);
+            throw new Error(message);
+        }
+        if (provider === 'claude') {
+            if (obj.type === 'message_start') {
+                state.inputTokens = obj.message?.usage?.input_tokens ?? state.inputTokens;
+                state.outputTokens = obj.message?.usage?.output_tokens ?? state.outputTokens;
+            } else if (obj.type === 'content_block_delta') {
+                appendLLMStreamText(state, obj.delta?.text);
+            } else if (obj.type === 'message_delta') {
+                state.outputTokens = obj.usage?.output_tokens ?? state.outputTokens;
+            } else if (obj.type === 'message_stop') {
+                state.done = true;
+            }
+            return;
+        }
+        if (provider === 'openai') {
+            if (obj.usage) {
+                state.inputTokens = obj.usage.prompt_tokens ?? state.inputTokens;
+                state.outputTokens = obj.usage.completion_tokens ?? state.outputTokens;
+            }
+            for (const choice of obj.choices || []) {
+                const delta = choice.delta || {};
+                const content = delta.content;
+                if (typeof content === 'string') {
+                    appendLLMStreamText(state, content);
+                } else if (Array.isArray(content)) {
+                    appendLLMStreamText(
+                        state,
+                        content
+                            .map((part) =>
+                                typeof part === 'string' ? part : part?.text || part?.content || part?.input_text || '',
+                            )
+                            .join(''),
+                    );
+                }
+                appendLLMStreamText(state, delta.refusal);
+            }
+        }
+    }
+
+    function consumeLLMStreamText(provider, responseText, state, { final = false } = {}) {
+        const full = String(responseText || '');
+        const chunk = full.slice(state.offset);
+        state.offset = full.length;
+        state.buffer += chunk;
+        let sep = state.buffer.search(/\r?\n\r?\n/);
+        while (sep >= 0) {
+            const block = state.buffer.slice(0, sep);
+            const separator = state.buffer.match(/\r?\n\r?\n/)[0];
+            state.buffer = state.buffer.slice(sep + separator.length);
+            const dataLines = block
+                .split(/\r?\n/)
+                .filter((line) => line.startsWith('data:'))
+                .map((line) => line.slice(5).trimStart());
+            if (dataLines.length) parseLLMStreamEvent(provider, dataLines.join('\n'), state);
+            sep = state.buffer.search(/\r?\n\r?\n/);
+        }
+        if (final && state.buffer.trim()) {
+            const dataLines = state.buffer
+                .split(/\r?\n/)
+                .filter((line) => line.startsWith('data:'))
+                .map((line) => line.slice(5).trimStart());
+            state.buffer = '';
+            if (dataLines.length) parseLLMStreamEvent(provider, dataLines.join('\n'), state);
+        }
+        return state;
     }
 
     // Single LLM call implementation driven by PROVIDER_API config.
@@ -5564,7 +5679,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
         const requestUrl = providerRequestUrl(api, model, cfg.key);
-        const requestBody = JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens }));
+        const streaming = !!api.streamBody && shouldStreamLLMRequest(provider, { timeoutMs, maxTokens });
+        const rawBody = api.body(model, system, userContent, { reasoningEffort, maxTokens });
+        const requestBody = JSON.stringify(streaming ? api.streamBody(rawBody) : rawBody);
         const requestMeta = buildLLMRequestMeta({
             provider,
             label,
@@ -5578,6 +5695,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             timeoutMs,
             promptKey,
             requestLabel,
+            streaming,
         });
         console.groupCollapsed(`ACKtopus: LLM request → ${label} (${model})`);
         console.log('metadata:', requestMeta);
@@ -5586,18 +5704,42 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
         if (maxTokens) console.log('max_tokens:', maxTokens);
         console.log('timeout_ms:', timeoutMs);
+        console.log('streaming:', streaming);
         console.log('request_chars:', requestBody.length);
         console.groupEnd();
         return new Promise((resolve, reject) => {
             const startedAt = Date.now();
-            const finishMeta = () => ({ ...requestMeta, elapsedMs: Date.now() - startedAt });
+            const streamState = streaming ? createLLMStreamState(provider) : null;
+            let settled = false;
+            const finishMeta = () => ({
+                ...requestMeta,
+                elapsedMs: Date.now() - startedAt,
+                ...(streamState
+                    ? { streamResponseChars: streamState.offset, streamTextChars: streamState.text.length }
+                    : {}),
+            });
             const rejectWithLoggedError = (kind, details, event = null) => {
+                if (settled) return;
+                settled = true;
                 const meta = finishMeta();
                 console.groupCollapsed(`ACKtopus: LLM ${kind} ✕ ${label} (${model})`);
                 console.log('metadata:', meta);
                 if (event) console.log('event:', event);
                 console.groupEnd();
                 reject(makeLLMRequestError(label, kind, details, meta));
+            };
+            const resolveWithText = (text, inputTokens, outputTokens) => {
+                if (settled) return;
+                settled = true;
+                if (inputTokens) addUsage(provider, inputTokens, outputTokens);
+                console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
+                console.log(text);
+                console.groupEnd();
+                if (promptKey) {
+                    GM_setValue(promptKey, text);
+                    recordCacheTimestamp(promptKey);
+                }
+                resolve(text);
             };
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -5606,27 +5748,37 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 data: requestBody,
                 timeout: timeoutMs,
                 fetch: false,
+                onprogress: (r) => {
+                    if (!streaming || settled) return;
+                    try {
+                        consumeLLMStreamText(provider, r.responseText, streamState);
+                    } catch (e) {
+                        rejectWithLoggedError('stream error', e?.message || String(e), e);
+                    }
+                },
                 onload: (r) => {
+                    if (settled) return;
                     if (r.status >= 200 && r.status < 300) {
+                        if (streaming) {
+                            try {
+                                consumeLLMStreamText(provider, r.responseText, streamState, { final: true });
+                            } catch (e) {
+                                rejectWithLoggedError('stream error', e?.message || String(e), e);
+                                return;
+                            }
+                            resolveWithText(streamState.text, streamState.inputTokens, streamState.outputTokens);
+                            return;
+                        }
                         let data;
                         try {
                             data = JSON.parse(r.responseText);
                         } catch (e) {
-                            reject(new Error(`${label}: invalid JSON response: ${r.responseText.slice(0, 100)}`));
+                            rejectWithLoggedError('invalid JSON response', r.responseText.slice(0, 100), e);
                             return;
                         }
                         const [inp, out] = api.parseUsage(data);
-                        if (inp) addUsage(provider, inp, out);
                         const text = api.parseText(data);
-                        console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inp}→${out} tokens)`);
-                        console.log(text);
-                        console.groupEnd();
-                        // Store in prompt cache
-                        if (promptKey) {
-                            GM_setValue(promptKey, text);
-                            recordCacheTimestamp(promptKey);
-                        }
-                        resolve(text);
+                        resolveWithText(text, inp, out);
                     } else {
                         rejectWithLoggedError(`${r.status}`, parseProviderError(r), r);
                     }
@@ -8608,23 +8760,6 @@ The prompt must ask for:
         return commits;
     }
 
-    async function fetchComparePatchForDraftPR() {
-        if (!isPRCreationPage()) return '';
-        try {
-            const patchUrl = `${location.origin}${location.pathname}.patch`;
-            const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-            const resp = await pageFetch(patchUrl, {
-                method: 'GET',
-                credentials: 'same-origin',
-                headers: { Accept: 'text/plain, text/x-patch, text/x-diff, */*' },
-            });
-            if (!resp.ok) return '';
-            return await resp.text();
-        } catch (_) {
-            return '';
-        }
-    }
-
     // Navigate to the next (+1) or previous (-1) commit in the list.
     // On commit list pages: scroll to and highlight the commit row.
     // On single-commit/changes pages: click GitHub's prev/next nav buttons.
@@ -9782,7 +9917,7 @@ The prompt must ask for:
             let taContainer = container;
 
             if (isToolbarProofreadBtn) {
-                // Toolbar proofread (for drafting new comments): use the textarea
+                // Toolbar proofread for existing edit forms: use the textarea
                 // associated with this markdown toolbar.
                 const toolbar = commentEl.closest(
                     'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"], .ack-toolbar-actions',
@@ -9843,6 +9978,12 @@ The prompt must ask for:
                 } else {
                     taSelector = 'textarea';
                 }
+                if (!isExistingPostEditForm(ta.closest('form')) && !ta.closest('.is-comment-editing')) {
+                    console.log('ACKtopus: proofread: toolbar textarea is a compose form, ignoring');
+                    stopSpin();
+                    setTimeout(() => restoreButton(), 500);
+                    return;
+                }
             } else {
                 // Quick-action proofread for existing comments is EDIT-MODE ONLY.
                 // It's too risky to proofread on the closed/view state.
@@ -9877,83 +10018,8 @@ The prompt must ask for:
                     selEnd = ta.selectionEnd;
                 const hasSelection = selStart !== selEnd;
                 const textToProofread = hasSelection ? ta.value.slice(selStart, selEnd) : ta.value;
-                const isDraftPRDescription =
-                    isPRCreationPage() &&
-                    !hasSelection &&
-                    ta.matches?.('textarea[name="pull_request[body]"], textarea#pull_request_body');
                 if (!textToProofread.trim()) {
-                    if (isDraftPRDescription) {
-                        const titleInput = document.querySelector(
-                            'input[name="pull_request[title]"], input#pull_request_title',
-                        );
-                        const titleText = titleInput?.value?.trim() || '';
-                        const pageCommits = parseCommitsFromPage()
-                            .map((c) => `${String(c.sha).slice(0, 8)} ${c.msg}`)
-                            .join('\n');
-                        const comparePatch = await fetchComparePatchForDraftPR();
-                        const system = `${SYSTEM_BASE}
-
-You are drafting a short GitHub pull request description for a new PR.
-
-Write exactly two short paragraphs in Markdown:
-- First paragraph: explain the problem, motivation, or gap being addressed.
-- Second paragraph: summarize the fix or approach taken.
-
-Rules:
-- Be concise and factual.
-- Do not use headings, bullet points, marketing language, or filler.
-- Use backticks for code identifiers, filenames, classes, and functions.
-- If the context is incomplete, stay conservative and avoid inventing specifics.
-- Output only the PR description text.`;
-                        const parts = [];
-                        if (titleText) parts.push(`Draft PR title:\n${titleText}`);
-                        if (pageCommits) parts.push(`Commit messages:\n${pageCommits.slice(0, 12000)}`);
-                        if (comparePatch) parts.push(`Compare patch:\n${comparePatch.slice(0, 120000)}`);
-                        const user = parts.join('\n\n');
-                        if (!user.trim()) {
-                            console.log(
-                                'ACKtopus: proofread: no compare context available for empty draft PR description',
-                            );
-                            stopSpin();
-                            return;
-                        }
-                        console.log('ACKtopus: proofread: generating draft PR description from compare context');
-                        const raw = await callLLM(provider, system, user);
-                        const generated = String(raw || '')
-                            .trim()
-                            .replace(/^```[a-z]*\n?|\n?```$/g, '')
-                            .trim();
-                        stopSpin('✅');
-                        const { action: accepted, text: finalText } = await showDiffDialog(
-                            '',
-                            generated,
-                            getTextareaDiffDialogOptions(taContainer, ta),
-                        );
-                        if (accepted === false) {
-                            setTimeout(() => restoreButton(), 500);
-                            return;
-                        }
-                        const freshTa = container.querySelector(taSelector) || ta;
-                        freshTa.focus();
-                        await setTextareaValueRobust(taContainer, freshTa, finalText || generated, taSelector);
-                        setTimeout(() => restoreButton(), 500);
-                        return;
-                    }
-                    console.log('ACKtopus: proofread: empty textarea/selection, generating draft reply/comment');
-                    const suggested = await suggestDraftReplyForTextarea(ta, {
-                        provider,
-                        taContainer,
-                        taSelector,
-                        title:
-                            commentEl.dataset.ackToolbarMode === 'suggest'
-                                ? 'Suggest a reply/comment in my style'
-                                : 'Suggest a reply/comment in my style',
-                    });
-                    if (suggested) {
-                        stopSpin('✅');
-                        setTimeout(() => restoreButton(), 500);
-                        return;
-                    }
+                    console.log('ACKtopus: proofread: empty textarea/selection, ignoring');
                     stopSpin();
                     return;
                 }
@@ -12125,7 +12191,7 @@ Rules:
             when: (ctx) => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose,
             fn: trackEditForms,
         },
-        { name: 'prTitleProofread', when: (ctx) => ctx.onPR || ctx.onCompose, fn: addPRTitleProofreadButton },
+        { name: 'prTitleProofread', when: (ctx) => ctx.onPR, fn: addPRTitleProofreadButton },
         {
             name: 'stickyEditToolbar',
             when: (ctx) => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose,
@@ -12819,6 +12885,20 @@ Rules:
         );
     }
 
+    function isPRCreationForm(form, path = location.pathname) {
+        return !!form && isPRCreationPage(path, form);
+    }
+
+    function isExistingPostEditForm(form, path = location.pathname) {
+        if (!form || isPRCreationForm(form, path)) return false;
+        if (form.matches?.(EDIT_FORM_SELECTOR)) return true;
+        if (!form.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) return false;
+        const action = form.getAttribute('action') || '';
+        if (/\/(?:issues|pull)\/\d+(?:\/|$)|\/issue_comments\/|\/review_comment\/|\/reviews\//.test(action))
+            return true;
+        return !!findEditSaveButton(form);
+    }
+
     function isEditCancelButton(btn) {
         const label = editButtonLabel(btn).toLowerCase();
         return (
@@ -12830,9 +12910,9 @@ Rules:
 
     function findEditForm(element) {
         const matched = element?.closest?.(EDIT_FORM_SELECTOR);
-        if (matched) return matched;
+        if (isExistingPostEditForm(matched)) return matched;
         const form = element?.closest?.('form');
-        if (form?.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) return form;
+        if (isExistingPostEditForm(form)) return form;
         return null;
     }
 
@@ -12881,6 +12961,7 @@ Rules:
             });
         }
         for (const form of forms) {
+            if (!isExistingPostEditForm(form)) continue;
             form._ackEditTracked = true;
             markEditSaveButtons(form);
             const ta = findEditTextarea(form);
@@ -13237,8 +13318,7 @@ Rules:
 
     // --- PR Title Proofread ---
     function findPRTitleDom() {
-        if (!isPRPage() && !isPRCreationPage())
-            return { headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null };
+        if (!isPRPage()) return { headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null };
         const draftInput = document.querySelector(
             'input[name="pull_request[title]"], input#pull_request_title, input[id*="pull_request_title"], ' +
                 'input[aria-label*="title" i], input[data-testid*="title" i]',
@@ -13326,7 +13406,7 @@ Rules:
     }
 
     function addPRTitleProofreadButton(root = document) {
-        if (!isPRPage() && !isPRCreationPage()) return;
+        if (!isPRPage()) return;
         // Ignore root parameter: PR header is unique; searching document is more robust
         // across GitHub re-renders and mutation subtrees.
         const { titleHost, titleTextEl, titleInputEl } = findPRTitleDom();
@@ -13468,7 +13548,7 @@ Rules:
             document.body.appendChild(buildConfigPanel());
             return;
         }
-        if (!isPRPage() && !isPRCreationPage()) return;
+        if (!isPRPage()) return;
 
         const provider = active;
         const pr = parsePageContext();
@@ -13503,19 +13583,15 @@ Rules:
                 parts.push(wrapPromptBlock('PR description', (ctx.description || draftBody).slice(0, 8000)));
             if (ctx.commitMessages || pageCommits)
                 parts.push(wrapPromptBlock('Commit messages', (ctx.commitMessages || pageCommits).slice(0, 12000)));
-            if (generateTitle) {
-                const comparePatch = await fetchComparePatchForDraftPR();
-                if (comparePatch) parts.push(wrapPromptBlock('Compare patch', comparePatch.slice(0, 120000)));
-            }
             const ctxBlock = parts.length
                 ? `\n\nContext (for understanding only; do NOT include extra explanation):\n\n${parts.join('\n\n')}`
                 : '';
 
             const system = generateTitle
-                ? `You are drafting a GitHub Pull Request title for a new PR.\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
+                ? `You are drafting a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
                 : `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
             const user = generateTitle
-                ? `Draft PR title is empty. Propose a concise title from the context below.${ctxBlock}`
+                ? `PR title is empty. Propose a concise title from the context below.${ctxBlock}`
                 : `Original title:\n${original}${ctxBlock}`;
             // Skip prompt cache for title proofreading. A wrong cache hit is very
             // confusing (it can return a title from a different prompt/PR).
@@ -15058,7 +15134,6 @@ Rules:
     const CHAT_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M3.25 3.25h9.5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H8l-3.25 2v-2H3.25a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1Z"/></svg>`;
     const FOLD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5.25 4.75 8 2l2.75 2.75"/><path d="M5.25 11.25 8 14l2.75-2.75"/><path d="M2 8h12"/></svg>`;
     const PROOFREAD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5 2.25h4.25L12 5v7.25a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z"/><path d="M9.25 2.25V5H12"/><path d="m5.9 9 1.25 1.25L10.1 7.3"/></svg>`;
-    const WAND_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="m9.75 2.25.35 1.05a1 1 0 0 0 .63.63l1.05.35-1.05.35a1 1 0 0 0-.63.63l-.35 1.05-.35-1.05a1 1 0 0 0-.63-.63l-1.05-.35 1.05-.35a1 1 0 0 0 .63-.63Z"/><path d="m5.1 6.4 4.5 4.5"/><path d="m3.25 12.75 1.2-3.05 1.85-1.85 1.85 1.85-1.85 1.85Z"/></svg>`;
     const _toolbarControlPressBound = new WeakSet();
 
     function getToolbarEditorRoot(toolbar) {
@@ -15111,16 +15186,10 @@ Rules:
     function updateToolbarProofreadButton(toolbar) {
         const btn = toolbar?.querySelector?.('.ack-toolbar-proofread');
         if (!btn) return;
-        const ta = getToolbarTextarea(toolbar);
-        const isEmpty = !String(ta?.value || '').trim();
-        const mode = isEmpty ? 'suggest' : 'proofread';
-        const nextHtml = isEmpty ? WAND_ICON : PROOFREAD_ICON;
+        const mode = 'proofread';
+        const nextHtml = PROOFREAD_ICON;
         if (btn.dataset.ackToolbarMode !== mode || !btn.querySelector('svg')) btn.innerHTML = nextHtml;
-        applyKeyboardShortcutHint(
-            btn,
-            isEmpty ? 'Suggest a reply/comment in your style' : 'Proofread this comment',
-            PROOFREAD_POST_SHORTCUT_KEY,
-        );
+        applyKeyboardShortcutHint(btn, 'Proofread this comment', PROOFREAD_POST_SHORTCUT_KEY);
         btn.dataset.ackToolbarMode = mode;
         if (toolbar.tagName === 'MARKDOWN-TOOLBAR') {
             const icon = btn.querySelector('svg');
@@ -15138,193 +15207,16 @@ Rules:
         ta.addEventListener('focus', refresh);
     }
 
-    function getCurrentUserStyleSamples(limit = 3) {
-        const currentUser = (
-            document.querySelector('meta[name="user-login"]')?.content ||
-            document.querySelector('meta[name="octolytics-actor-login"]')?.content ||
-            ''
-        )
-            .trim()
-            .toLowerCase();
-        if (!currentUser) return '';
-        const seen = new Set();
-        const samples = [];
-        for (const bodyEl of document.querySelectorAll(MARKDOWN_BODY_SELECTOR)) {
-            const author = (getCommentAuthor(bodyEl) || '').trim().toLowerCase();
-            if (!author || author !== currentUser) continue;
-            const text = String(bodyEl.innerText || bodyEl.textContent || '').trim();
-            if (!text || text.length < 8) continue;
-            if (seen.has(text)) continue;
-            seen.add(text);
-            samples.push(text);
-            if (samples.length >= limit) break;
-        }
-        return samples.join('\n---\n');
-    }
-
-    function getCurrentUserLogin() {
-        return (
-            document.querySelector('meta[name="user-login"]')?.content ||
-            document.querySelector('meta[name="octolytics-actor-login"]')?.content ||
-            ''
-        )
-            .trim()
-            .toLowerCase();
-    }
-
-    function getLatestThreadReplyTarget(threadRoot) {
-        if (!threadRoot) return null;
-        const bodies = [...threadRoot.querySelectorAll(MARKDOWN_BODY_SELECTOR)];
-        const currentUser = getCurrentUserLogin();
-        const comments = bodies
-            .map((bodyEl) => ({
-                bodyEl,
-                container:
-                    bodyEl.closest(COMMENT_CONTAINER_SELECTOR) ||
-                    bodyEl.closest('.timeline-comment-group, .review-thread-component, .js-discussion') ||
-                    null,
-                author: (getCommentAuthor(bodyEl) || '').trim(),
-                text: String(bodyEl.innerText || bodyEl.textContent || '').trim(),
-            }))
-            .filter((c) => c.text);
-        for (let i = comments.length - 1; i >= 0; i--) {
-            const c = comments[i];
-            if (!currentUser || c.author.toLowerCase() !== currentUser) return c;
-        }
-        return comments[comments.length - 1] || null;
-    }
-
-    function findReactionTriggerForComment(container) {
-        if (!container) return null;
-        return (
-            container
-                .querySelector(
-                    'details.js-reaction-popover-container, details.new-reactions-dropdown, details.js-comment-header-reaction-button, ' +
-                        'summary[aria-label*="reaction" i], summary[aria-label*="react" i], ' +
-                        'button[aria-label*="reaction" i], button[aria-label*="react" i], .octicon-smiley',
-                )
-                ?.closest?.('details, button, summary') || null
+    function isExistingPostEditToolbar(toolbar) {
+        const editorRoot = getToolbarEditorRoot(toolbar) || toolbar;
+        const form = editorRoot?.closest?.('form') || editorRoot?.querySelector?.('form') || null;
+        if (isExistingPostEditForm(form)) return true;
+        return !!(
+            editorRoot?.closest?.('.is-comment-editing, .edit-comment-hide, [data-testid="edit-comment-form"]') ||
+            editorRoot?.querySelector?.(
+                '.is-comment-editing textarea, .edit-comment-hide textarea, [data-testid="edit-comment-form"] textarea, form.js-comment-update textarea',
+            )
         );
-    }
-
-    async function suggestDraftReplyForTextarea(
-        ta,
-        { provider, taContainer, taSelector, title = 'Suggest a reply/comment in your style' } = {},
-    ) {
-        const page = parsePageContext();
-        const ctx = await fetchPRContext(page);
-        const container = taContainer || ta.closest(EXTENDED_COMMENT_CONTAINER_SELECTOR) || ta.parentElement;
-        const threadRoot = container?.closest(
-            '.js-discussion, .js-line-comments, [data-testid="review-thread"], .review-thread-component, .inline-comments, .js-resolvable-timeline-thread-container',
-        );
-        const bodyEl = container?.querySelector?.(MARKDOWN_BODY_SELECTOR) || null;
-        const threadContext = threadRoot
-            ? buildSelectionThreadContextFromRoot({ threadRoot, targetBodyEl: bodyEl })
-            : '';
-        const replyTarget = getLatestThreadReplyTarget(threadRoot);
-        const styleSamples = getCurrentUserStyleSamples();
-        let codeContext = '';
-        const diffFile = container?.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
-        if (diffFile) {
-            const fileName =
-                diffFile
-                    .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                    ?.textContent?.trim() || '';
-            const commentRow = container?.closest('tr.inline-comments, tr.js-inline-comments-container');
-            const tbody = commentRow?.closest('tbody') || diffFile.querySelector('tbody');
-            if (tbody) {
-                const codeRows = [
-                    ...tbody.querySelectorAll('tr:not(.inline-comments):not(.js-inline-comments-container)'),
-                ];
-                const targetRow = commentRow?.previousElementSibling;
-                let targetIdx = targetRow ? codeRows.indexOf(targetRow) : codeRows.length - 1;
-                const start = Math.max(0, targetIdx - 8);
-                const end = Math.min(codeRows.length, targetIdx + 5);
-                const lines = [];
-                for (let i = start; i < end; i++) {
-                    const row = codeRows[i];
-                    const lineNum = row.querySelector('[data-line-number]')?.getAttribute('data-line-number') || '';
-                    const code = row.querySelector('.blob-code, td.diff-text')?.textContent?.trimEnd() || '';
-                    lines.push(`${lineNum.padStart(4)}| ${code}${i === targetIdx ? ' <<<' : ''}`);
-                }
-                if (lines.length) codeContext = `Code context${fileName ? ` (${fileName})` : ''}:\n${lines.join('\n')}`;
-            }
-        }
-        const comparePatch = isPRCreationPage() ? await fetchComparePatchForDraftPR() : '';
-        const contextParts = [
-            ctx?.title ? `PR title:\n${ctx.title}` : '',
-            ctx?.description ? `PR description:\n${ctx.description.slice(0, 8000)}` : '',
-            ctx?.commitMessages ? `Commit messages:\n${ctx.commitMessages.slice(0, 12000)}` : '',
-            !ctx?.commitMessages
-                ? (() => {
-                      const pageCommits = parseCommitsFromPage()
-                          .map((c) => `${c.sha.slice(0, 8)} ${c.msg}`)
-                          .join('\n');
-                      return pageCommits ? `Commit messages:\n${pageCommits.slice(0, 12000)}` : '';
-                  })()
-                : '',
-            threadContext ? `Thread context:\n${threadContext}` : '',
-            codeContext,
-            comparePatch ? `Compare patch:\n${comparePatch.slice(0, 120000)}` : '',
-            styleSamples ? `Examples of my writing style on this page:\n${styleSamples.slice(0, 4000)}` : '',
-        ]
-            .filter(Boolean)
-            .join('\n\n');
-
-        const system = `${SYSTEM_BASE}
-
-You are drafting a GitHub review reply or comment for me.
-
-Write a best-guess response in my style, using the full available context.
-
-RULES:
-- Output only the suggested comment text in Markdown.
-- Be concise, technically grounded, and useful.
-- Match my style from the examples when available.
-- If this is a reply thread, reply to the current thread, not to the PR in general.
-- Prefer answering the latest relevant non-me comment in the thread.
-- It is fine to quote a short line from an earlier comment when that makes the reply clearer.
-- Only draft a written comment if it adds substantive new information.
-- If the right response is just agreement/acknowledgment that the latest change addressed the point, output exactly \`👍\` and nothing else.
-- Do not restate what was already said unless needed to add a new technical point.
-- If there is no direct question, write the most useful direct thread reply based on the latest code and prior comments.
-- Do not mention that this was generated.
-- Do not use markdown fences unless code is genuinely needed.`;
-        const user = [
-            title,
-            replyTarget ? `Comment to reply to:\n${replyTarget.author}: ${replyTarget.text}` : '',
-            contextParts,
-            'Draft reply/comment: currently empty.',
-        ]
-            .filter(Boolean)
-            .join('\n\n');
-
-        const raw = await callLLM(provider, system, user);
-        const generated = String(raw || '')
-            .trim()
-            .replace(/^```[a-z]*\n?|\n?```$/g, '')
-            .trim();
-        if (!generated) throw new Error('empty draft reply result');
-        if (/^👍$/u.test(generated) && replyTarget?.container) {
-            const reactionTrigger = findReactionTriggerForComment(replyTarget.container);
-            if (reactionTrigger) {
-                await applyReactionChoice(reactionTrigger, '+1');
-                return true;
-            }
-        }
-        const { action, text } = await showDiffDialog('', generated, getTextareaDiffDialogOptions(taContainer, ta));
-        if (action === false) return false;
-        if (/^👍$/u.test(String(text || generated).trim()) && replyTarget?.container) {
-            const reactionTrigger = findReactionTriggerForComment(replyTarget.container);
-            if (reactionTrigger) {
-                await applyReactionChoice(reactionTrigger, '+1');
-                return true;
-            }
-        }
-        const freshTa = taContainer.querySelector(taSelector) || ta;
-        freshTa.focus();
-        await setTextareaValueRobust(taContainer, freshTa, text || generated, taSelector);
-        return true;
     }
 
     function normalizeExpectedReplyResult(raw) {
@@ -15526,6 +15418,13 @@ RULES:
             }
 
             const hasRenderedToolbarIcon = (btn) => !!btn?.querySelector?.('svg, img, g-emoji, .Button-visual');
+            const removeToolbarButtons = (scope, selector) => {
+                scope.querySelectorAll(selector).forEach((btn) => {
+                    const item = btn.closest('.ack-toolbar-item');
+                    if (item && item.parentElement) item.remove();
+                    else btn.remove();
+                });
+            };
             const removeBrokenToolbarButtons = (scope, selector) => {
                 scope.querySelectorAll(selector).forEach((btn) => {
                     if (hasRenderedToolbarIcon(btn)) return;
@@ -15538,16 +15437,19 @@ RULES:
             const isEditToolbar = !!toolbar.closest(
                 'form.js-comment-update, [data-testid="edit-comment-form"], .is-comment-editing, .edit-comment-hide',
             );
+            const allowProofread = isEditToolbar || isExistingPostEditToolbar(toolbar);
+            if (!allowProofread) removeToolbarButtons(toolbar, '.ack-toolbar-proofread');
             let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
-            let hasProofreadBtn = !!toolbar.querySelector('.ack-toolbar-proofread');
+            let hasProofreadBtn = allowProofread && !!toolbar.querySelector('.ack-toolbar-proofread');
             const bindExistingToolbarButtons = () => {
                 const detailsBtn = toolbar.querySelector('.ack-details-btn');
                 const proofreadBtn = toolbar.querySelector('.ack-toolbar-proofread');
                 if (detailsBtn) bindToolbarControlPress(detailsBtn, () => wrapSelectionInDetails(toolbar));
-                if (proofreadBtn) bindToolbarControlPress(proofreadBtn, (btn) => runProofreadOnComment(btn));
+                if (allowProofread && proofreadBtn)
+                    bindToolbarControlPress(proofreadBtn, (btn) => runProofreadOnComment(btn));
             };
             bindExistingToolbarButtons();
-            if (hasDetailsBtn && hasProofreadBtn) return;
+            if (hasDetailsBtn && (!allowProofread || hasProofreadBtn)) return;
 
             const isActionBarToolbar = toolbar.tagName === 'MARKDOWN-TOOLBAR';
             if (isActionBarToolbar) toolbar.classList.add('ack-compact-md-toolbar');
@@ -15603,7 +15505,7 @@ RULES:
                 return toolbar;
             })();
 
-            if (insertionRoot !== toolbar && hasDetailsBtn !== hasProofreadBtn) {
+            if (allowProofread && insertionRoot !== toolbar && hasDetailsBtn !== hasProofreadBtn) {
                 insertionRoot.querySelectorAll(ackToolbarControlsSelector).forEach((el) => el.remove());
                 hasDetailsBtn = false;
                 hasProofreadBtn = false;
@@ -15633,7 +15535,7 @@ RULES:
                 );
             }
 
-            if (!hasProofreadBtn) {
+            if (allowProofread && !hasProofreadBtn) {
                 appendToolbarBtn(
                     makeToolbarBtn(
                         'ack-toolbar-proofread',
@@ -15643,8 +15545,10 @@ RULES:
                     ),
                 );
             }
-            bindToolbarProofreadState(toolbar);
-            updateToolbarProofreadButton(toolbar);
+            if (allowProofread) {
+                bindToolbarProofreadState(toolbar);
+                updateToolbarProofreadButton(toolbar);
+            }
         });
 
         qsa(root, 'form.js-comment-update, [data-testid="edit-comment-form"]').forEach((form) => {
@@ -20024,7 +19928,7 @@ RULES:
     }
 
     function isPRCreationPage(path = location.pathname, root = document) {
-        if (!/\/compare\/[^/]+\.\.\.?[^/]+/.test(path)) return false;
+        if (!/\/compare\/[^?]+\.{2,3}[^?]+/.test(path)) return false;
         return !!root?.querySelector?.(
             'input[name="pull_request[title]"], textarea[name="pull_request[body]"], ' +
                 'input#pull_request_title, textarea#pull_request_body',
@@ -22944,22 +22848,26 @@ RULES:
         ackAssert(proofFn.includes('showDiffDialog'), 'shows diff dialog');
     });
 
-    ackTest('empty compare-page PR description proofread generates a draft from compare context', () => {
+    ackTest('proofread ignores compose/new-post textareas', () => {
         const fn = _ackSource.slice(
             _ackSource.indexOf('async function runProofreadOnComment'),
             _ackSource.indexOf('// --- Start a review ---'),
         );
-        ackAssert(fn.includes('isDraftPRDescription'), 'detects empty draft PR description textareas on compare pages');
-        ackAssert(fn.includes('fetchComparePatchForDraftPR'), 'loads compare patch context for draft PR descriptions');
-        ackAssert(fn.includes('First paragraph: explain the problem'), 'generation prompt asks for problem first');
-        ackAssert(fn.includes('Second paragraph: summarize the fix'), 'generation prompt asks for fix summary second');
-        ackAssert(fn.includes('Draft PR title:'), 'includes draft PR title in generation context');
-        ackAssert(fn.includes('Commit messages:'), 'includes commit messages in generation context');
+        ackAssert(
+            fn.includes('toolbar textarea is a compose form, ignoring'),
+            'toolbar proofread exits on compose/new-post textareas',
+        );
+        ackAssert(
+            fn.includes('!isExistingPostEditForm(ta.closest') && fn.includes("!ta.closest('.is-comment-editing')"),
+            'toolbar proofread allows only existing edit forms',
+        );
+        ackAssert(!fn.includes('isDraftPRDescription'), 'does not special-case draft PR descriptions');
+        ackAssert(!fn.includes('suggestDraftReplyForTextarea(ta'), 'does not generate new comments from proofread');
     });
 
     ackTest('toolbar proofread resolves textarea via markdown-toolbar for attribute', () => {
         const section = _ackSource.slice(
-            _ackSource.indexOf('Toolbar proofread (for drafting new comments)'),
+            _ackSource.indexOf('Toolbar proofread for existing edit forms'),
             _ackSource.indexOf('Quick-action proofread for existing comments is EDIT-MODE ONLY'),
         );
         ackAssert(section.includes("toolbar?.tagName === 'MARKDOWN-TOOLBAR'"), 'checks for markdown-toolbar element');
@@ -22982,77 +22890,31 @@ RULES:
         );
     });
 
-    ackTest('empty toolbar proofread switches to wand-mode suggestion flow', () => {
+    ackTest('toolbar proofread remains edit-only instead of draft-generation mode', () => {
         const source = _ackSource;
         const toolbarFn = source.slice(
             source.indexOf('function updateToolbarProofreadButton'),
             source.indexOf('function bindToolbarProofreadState'),
         );
-        ackAssert(toolbarFn.includes('WAND_ICON'), 'uses wand icon for empty toolbar textarea');
-        ackAssert(
-            toolbarFn.includes('Suggest a reply/comment in your style'),
-            'empty toolbar title advertises reply suggestion',
-        );
+        ackAssert(toolbarFn.includes("const mode = 'proofread'"), 'toolbar proofread has one explicit mode');
+        ackAssert(!toolbarFn.includes('WAND_ICON'), 'empty toolbar textareas do not switch to draft mode');
         const proofFn = source.slice(
             source.indexOf('async function runProofreadOnComment'),
             source.indexOf('// --- Start a review ---'),
         );
-        ackAssert(proofFn.includes('suggestDraftReplyForTextarea'), 'empty proofread routes to draft reply generator');
-        ackAssert(
-            proofFn.includes('empty textarea/selection, generating draft reply/comment'),
-            'logs empty-to-suggestion path',
-        );
+        ackAssert(proofFn.includes('empty textarea/selection, ignoring'), 'empty proofread exits without drafting');
+        ackAssert(!proofFn.includes('suggestDraftReplyForTextarea(ta'), 'proofread does not draft replies/comments');
     });
 
-    ackTest('draft reply generator uses full context and style samples', () => {
-        const fn = _ackSource.slice(
-            _ackSource.indexOf('async function suggestDraftReplyForTextarea'),
-            _ackSource.indexOf('function addDetailsButtons'),
-        );
-        ackAssert(fn.includes('getCurrentUserStyleSamples'), 'uses visible authored comments as style samples');
-        ackAssert(fn.includes('getLatestThreadReplyTarget'), 'detects the latest thread comment to answer');
-        ackAssert(fn.includes('Comment to reply to:'), 'passes explicit reply target into prompt');
-        ackAssert(fn.includes('Thread context:'), 'includes thread context');
-        ackAssert(fn.includes('Code context'), 'includes nearby code context when available');
-        ackAssert(fn.includes('PR title:'), 'includes PR title context');
-        ackAssert(fn.includes('PR description:'), 'includes PR description context');
-        ackAssert(fn.includes('Commit messages:'), 'includes commit messages context');
-        ackAssert(fn.includes('Compare patch:'), 'includes compare patch context when available');
-        ackAssert(
-            fn.includes('Write a best-guess response in my style'),
-            'system prompt asks for style-matched reply drafting',
-        );
-        ackAssert(
-            fn.includes('reply to the current thread'),
-            'prompt says to answer the thread rather than draft a generic PR comment',
-        );
-        ackAssert(
-            fn.includes('latest relevant non-me comment'),
-            'prompt anchors on the latest external thread comment',
-        );
-        ackAssert(
-            fn.includes('Only draft a written comment if it adds substantive new information'),
-            'avoids generating redundant agreement comments',
-        );
-        ackAssert(fn.includes('nothing else.'), 'uses thumbs-up-only output for pure agreement');
-        ackAssert(fn.includes('Do not restate what was already said'), 'discourages repetitive replies');
-        ackAssert(fn.includes('findReactionTriggerForComment'), 'can map thumbs-up-only output to a reaction target');
-        ackAssert(
-            fn.includes("applyReactionChoice(reactionTrigger, '+1')"),
-            'uses native reaction flow for thumbs-up-only replies',
-        );
-    });
-
-    ackTest('PR title proofread supports compare-page draft forms', () => {
+    ackTest('PR title proofread stays off compare-page draft forms', () => {
         const source = _ackSource;
         const domFn = source.slice(
             source.indexOf('function findPRTitleDom'),
             source.indexOf('function getPRTitleText'),
         );
-        ackAssert(domFn.includes('input[name="pull_request[title]"]'), 'findPRTitleDom looks for draft PR title input');
         ackAssert(
-            domFn.includes('draftInput && isVisible(draftInput)'),
-            'findPRTitleDom prefers visible title input when editing',
+            domFn.includes('if (!isPRPage()) return'),
+            'findPRTitleDom exits before scanning compare-page draft title inputs',
         );
 
         const addFn = source.slice(
@@ -23060,41 +22922,38 @@ RULES:
             source.indexOf('async function applyPRTitleEdit'),
         );
         ackAssert(
-            addFn.includes('titleInputEl?.parentElement'),
-            'title proofread button can attach next to visible draft title input',
+            addFn.includes('if (!isPRPage()) return'),
+            'title proofread button is only added on existing PR pages',
         );
 
         const runFn = source.slice(
             source.indexOf('async function runProofreadOnPRTitle'),
             source.indexOf('function addQuickCommentActions'),
         );
-        ackAssert(
-            runFn.includes('!isPRPage() && !isPRCreationPage()'),
-            'title proofread runs on compare/new-PR pages too',
-        );
+        ackAssert(runFn.includes('if (!isPRPage()) return'), 'title proofread runner ignores compare/new-PR pages');
         ackAssert(!runFn.includes('if (!pr) return;'), 'title proofread does not require an existing PR object');
         ackAssert(
             runFn.includes('parseCommitsFromPage()'),
-            'draft title proofread can use page commit messages as context',
+            'title proofread can use page commit messages as context',
         );
         ackAssert(
             runFn.includes('textarea[name="pull_request[body]"]'),
-            'draft title proofread can use current description draft as context',
+            'title proofread can use a visible title/body edit form as context',
         );
     });
 
-    ackTest('empty PR title proofread can generate title from compare context', () => {
+    ackTest('PR title proofread no longer offers compare-page title generation', () => {
         const runFn = _ackSource.slice(
             _ackSource.indexOf('async function runProofreadOnPRTitle'),
             _ackSource.indexOf('function addQuickCommentActions'),
         );
         ackAssert(runFn.includes('const generateTitle = !original'), 'detects empty title generation mode');
-        ackAssert(runFn.includes('fetchComparePatchForDraftPR()'), 'uses compare patch when generating empty titles');
-        ackAssert(runFn.includes('Draft PR title is empty'), 'empty-title prompt is explicit');
         ackAssert(
-            runFn.includes('drafting a GitHub Pull Request title for a new PR'),
-            'uses dedicated title-generation system prompt',
+            runFn.includes('if (!isPRPage()) return'),
+            'empty-title generation is constrained to existing PR pages',
         );
+        ackAssert(!runFn.includes('fetchComparePatchForDraftPR'), 'does not fetch compare patches for title generation');
+        ackAssert(!runFn.includes('Draft PR title is empty'), 'does not expose compare-page draft title prompting');
     });
 
     ackTest('parseCommitsFromPage falls back to SSR commits on compare pages', () => {
@@ -23869,11 +23728,12 @@ RULES:
         ackAssert(fn.includes('runDocInjectors(ctx)'), 'attribute observer re-runs doc injectors');
     });
 
-    ackTest('proofread uses setTextareaValue/setTextareaValueRobust for React-compatible textarea updates', () => {
+    ackTest('proofread edit mode uses React-compatible textarea updates', () => {
         const source = _ackSource;
         const proofreadSection = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         const setterCalls = (proofreadSection.match(/setTextareaValue(Robust)?\(/g) || []).length;
-        ackAssert(setterCalls >= 4, 'proofread uses setTextareaValue/Robust in both paths (' + setterCalls + ' calls)');
+        ackAssert(setterCalls >= 3, 'proofread uses setTextareaValueRobust for full and selection edits (' + setterCalls + ' calls)');
+        ackAssert(proofreadSection.includes('setTextareaValueRobust'), 'proofread uses the robust textarea setter');
         // Must NOT use raw nativeSetter or execCommand
         const stripComments = (s) => s.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
         const stripped = stripComments(proofreadSection);
@@ -24060,6 +23920,17 @@ RULES:
         ackAssert(source.includes('applyKeyboardShortcutHint('), 'buttons get title shortcut hints');
         ackAssert(source.includes('ackShortcutHint'), 'buttons record their shortcut hint');
         ackAssert(source.includes('aria-keyshortcuts'), 'buttons expose keyboard shortcuts to accessibility APIs');
+    });
+
+    ackTest('proofread shortcut does not activate while composing a new post', () => {
+        const fn = _ackSource.slice(
+            _ackSource.indexOf('function triggerFocusedOrVisibleProofreadShortcut'),
+            _ackSource.indexOf("document.addEventListener(\n        'keydown'", _ackSource.indexOf('function triggerFocusedOrVisibleProofreadShortcut')),
+        );
+        ackAssert(fn.includes('const activeTa = document.activeElement'), 'checks the focused textarea first');
+        ackAssert(fn.includes('!findEditForm(activeTa)'), 'non-edit textareas are excluded');
+        ackAssert(fn.includes("!activeTa.closest('.is-comment-editing')"), 'edit-mode textareas remain allowed');
+        ackAssert(fn.includes('return false'), 'shortcut exits instead of falling back to another visible proofread button');
     });
 
     ackTest('SHA_FORMATS entries have hardcoded hotkey letters', () => {
@@ -24476,7 +24347,8 @@ RULES:
     ackTest('addDetailsButtons injects fold/proofread into markdown-toolbar ActionBar', () => {
         const root = document.createElement('div');
         root.innerHTML = `
-	          <div class="js-previewable-comment-form">
+	          <form class="js-comment-update">
+	          <div class="js-previewable-comment-form is-comment-editing">
 	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
 	              <action-bar role="toolbar" class="ActionBar overflow-visible">
 	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
@@ -24486,6 +24358,7 @@ RULES:
 	            </markdown-toolbar>
 	            <textarea id="comment-body"></textarea>
 	          </div>
+	          </form>
 	        `;
         addDetailsButtons(root);
 
@@ -24518,6 +24391,25 @@ RULES:
             itemContainer.lastElementChild?.querySelector?.('.ack-toolbar-proofread'),
             'proofread remains at the far right edge',
         );
+    });
+
+    ackTest('addDetailsButtons keeps compose toolbars free of proofread actions', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+	          <div class="js-previewable-comment-form">
+	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
+	              <action-bar role="toolbar" class="ActionBar overflow-visible">
+	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
+	                  <div class="ActionBar-item"><button type="button">Bold</button></div>
+	                </div>
+	              </action-bar>
+	            </markdown-toolbar>
+	            <textarea id="comment-body"></textarea>
+	          </div>
+	        `;
+        addDetailsButtons(root);
+        ackEq(root.querySelectorAll('.ack-details-btn').length, 1, 'details remains available in compose toolbar');
+        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 0, 'proofread is not injected into compose toolbar');
     });
 
     ackTest('edit toolbar buttons activate on pointerdown with keyboard click fallback', () => {
@@ -24562,7 +24454,8 @@ RULES:
     ackTest('addDetailsButtons repairs stale iconless ACKtopus ActionBar buttons', () => {
         const root = document.createElement('div');
         root.innerHTML = `
-	          <div class="js-previewable-comment-form">
+	          <form class="js-comment-update">
+	          <div class="js-previewable-comment-form is-comment-editing">
 	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
 	              <action-bar role="toolbar" class="ActionBar overflow-visible">
 	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
@@ -24573,6 +24466,7 @@ RULES:
 	            </markdown-toolbar>
 	            <textarea id="comment-body"></textarea>
 	          </div>
+	          </form>
 	        `;
         addDetailsButtons(root);
         ackAssert(root.querySelector('.ack-details-btn svg'), 'repairs stale empty details button icon');
@@ -24649,10 +24543,12 @@ RULES:
     ackTest('addDetailsButtons still injects into React formatting toolbar inside markdown editor', () => {
         const root = document.createElement('div');
         root.innerHTML = `
-	          <fieldset class="MarkdownEditor-module__fieldSet__RU0NL">
-	            <div class="Toolbar-module__toolbar__oK14P"></div>
-	            <textarea></textarea>
-	          </fieldset>
+	          <form class="js-comment-update">
+	            <fieldset class="MarkdownEditor-module__fieldSet__RU0NL is-comment-editing">
+	              <div class="Toolbar-module__toolbar__oK14P"></div>
+	              <textarea></textarea>
+	            </fieldset>
+	          </form>
 	        `;
         const toolbar = root.querySelector('[class*="Toolbar-module__toolbar"]');
         ackAssert(toolbar, 'expected test toolbar');
@@ -28287,7 +28183,7 @@ RULES:
     ackTest('PROVIDER_API config table drives callLLM and validateKey', () => {
         const source = _ackSource;
         ackAssert(source.includes('const PROVIDER_API = {'), 'PROVIDER_API config exists');
-        // Both providers configured
+        // All providers configured
         const config = source.slice(source.indexOf('const PROVIDER_API'), source.indexOf('// Provider branding'));
         ackAssert(config.includes('claude:'), 'claude provider configured');
         ackAssert(config.includes('openai:'), 'openai provider configured');
@@ -28297,6 +28193,9 @@ RULES:
             const count = (config.match(new RegExp(field, 'g')) || []).length;
             ackAssert(count >= 3, `${field} present for all providers (found ${count})`);
         }
+        ackAssert(PROVIDER_API.claude.streamBody({}).stream === true, 'Claude requests can be streamed');
+        ackAssert(PROVIDER_API.openai.streamBody({}).stream === true, 'OpenAI requests can be streamed');
+        ackEq(PROVIDER_API.gemini.streamBody, undefined, 'Gemini stays on its existing non-streaming endpoint');
     });
 
     ackTest('Gemini provider uses Gemini API host and x-goog-api-key header', () => {
@@ -28634,6 +28533,7 @@ RULES:
         const host = document.createElement('div');
         host.innerHTML = '<input name="pull_request[title]"><textarea name="pull_request[body]"></textarea>';
         ackEq(isPRCreationPage('/bitcoin/bitcoin/compare/master...topic', host), true);
+        ackEq(isPRCreationPage('/bitcoin/bitcoin/compare/master...user/topic', host), true);
         ackEq(isPRCreationPage('/bitcoin/bitcoin/compare/master...topic', document.createElement('div')), false);
         ackEq(isPRCreationPage('/bitcoin/bitcoin/pull/123', host), false);
     });
@@ -29810,6 +29710,9 @@ RULES:
         ackAssert(fn.includes('timeout_ms'), 'logs the configured request timeout');
         ackAssert(fn.includes('timeout: timeoutMs'), 'uses an explicit LLM transport timeout');
         ackAssert(fn.includes('fetch: false'), 'keeps LLM calls on GM_xmlhttpRequest XHR mode');
+        ackAssert(fn.includes('onprogress:'), 'streams long Claude/OpenAI responses through progress chunks');
+        ackAssert(source.includes('function shouldStreamLLMRequest'), 'has explicit streaming gate');
+        ackAssert(source.includes('stream=true'), 'streaming mode is included in request-error metadata');
         const formatted = formatTransportErrorDetails({
             status: 0,
             statusText: 'error',
@@ -29827,14 +29730,70 @@ RULES:
             requestBytes: 12345,
             maxTokens: 4096,
             timeoutMs: LLM_HIGH_CONTEXT_TIMEOUT_MS,
+            streaming: true,
+            streamResponseChars: 4321,
+            streamTextChars: 123,
             elapsedMs: 30001,
         });
         ackAssert(err.message.includes('label=reimplementation'), 'error includes recipe/request label');
         ackAssert(err.message.includes('model=claude-opus-4-7'), 'error includes model');
         ackAssert(err.message.includes('input≈2200t'), 'error includes approximate input tokens');
         ackAssert(err.message.includes('body=12345B'), 'error includes body size');
+        ackAssert(err.message.includes('stream=true'), 'error includes streaming mode');
+        ackAssert(err.message.includes('streamed=4321ch'), 'error includes streamed response size');
+        ackAssert(err.message.includes('text=123ch'), 'error includes streamed text size');
         ackAssert(err.message.includes('elapsed=30001ms'), 'error includes elapsed time');
         ackEq(err.ackLLMMeta.model, 'claude-opus-4-7', 'error keeps structured metadata');
+    });
+
+    ackTest('LLM streaming parser handles Claude and OpenAI SSE chunks', () => {
+        ackEq(
+            shouldStreamLLMRequest('claude', { timeoutMs: LLM_HIGH_CONTEXT_TIMEOUT_MS, maxTokens: 4096 }),
+            true,
+            'streams high-timeout Claude calls',
+        );
+        ackEq(
+            shouldStreamLLMRequest('openai', { timeoutMs: LLM_REQUEST_TIMEOUT_MS, maxTokens: 32768 }),
+            true,
+            'streams high-output OpenAI calls',
+        );
+        ackEq(
+            shouldStreamLLMRequest('gemini', { timeoutMs: LLM_HIGH_CONTEXT_TIMEOUT_MS, maxTokens: 32768 }),
+            false,
+            'does not stream providers without an SSE parser',
+        );
+
+        const claude = createLLMStreamState('claude');
+        const claudeStart =
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}\n\n' +
+            'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel';
+        consumeLLMStreamText('claude', claudeStart, claude);
+        ackEq(claude.text, '', 'does not parse incomplete Claude event');
+        consumeLLMStreamText(
+            'claude',
+            claudeStart +
+                'lo"}}\n\n' +
+                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}\n\n' +
+                'data: {"type":"message_delta","usage":{"output_tokens":3}}\n\n' +
+                'data: {"type":"message_stop"}\n\n',
+            claude,
+            { final: true },
+        );
+        ackEq(claude.text, 'Hello world', 'combines Claude text deltas');
+        ackEq(claude.inputTokens, 12, 'keeps Claude input usage');
+        ackEq(claude.outputTokens, 3, 'keeps Claude output usage');
+
+        const openai = createLLMStreamState('openai');
+        const openaiText =
+            'data: {"choices":[{"delta":{"content":"Hi "}}]}\n\n' +
+            'data: {"choices":[{"delta":{"content":"there"}}]}\n\n' +
+            'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}}\n\n' +
+            'data: [DONE]\n\n';
+        consumeLLMStreamText('openai', openaiText, openai, { final: true });
+        ackEq(openai.text, 'Hi there', 'combines OpenAI text deltas');
+        ackEq(openai.inputTokens, 7, 'keeps OpenAI input usage');
+        ackEq(openai.outputTokens, 2, 'keeps OpenAI output usage');
+        ackEq(openai.done, true, 'marks OpenAI stream done');
     });
 
     ackTest('comment/code mismatches fixed', () => {
@@ -33281,6 +33240,35 @@ RULES:
             ackEq(findEditForm(saveBtn), form, 'save button resolves generic PR description edit form');
             form.querySelector('textarea').value = 'Edited PR body';
             ackEq(shouldConfirmEditSave(form), true, 'PR description edits require diff confirmation');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('trackEditForms ignores compare-page PR creation forms', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <form action="/owner/repo/pulls">
+                <input name="pull_request[title]" value="Draft title">
+                <textarea name="pull_request[body]">Draft PR body</textarea>
+                <button type="submit">Create pull request</button>
+            </form>
+        `;
+        const form = host.querySelector('form');
+        try {
+            ackEq(
+                isPRCreationForm(form, '/owner/repo/compare/master...topic/with/slash'),
+                true,
+                'detects compare-page PR creation form with branch slashes',
+            );
+            ackEq(
+                isExistingPostEditForm(form, '/owner/repo/compare/master...topic/with/slash'),
+                false,
+                'creation form is not an existing post edit form',
+            );
+            trackEditForms(host);
+            ackEq(form._ackEditTracked, undefined, 'does not track create-PR form for edit diff confirmation');
+            ackEq(form.querySelector('.ack-edit-diff-marker'), null, 'does not mark create-PR submit button');
         } finally {
             host.remove();
         }

@@ -118,7 +118,7 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Revealing hidden conversations, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
 - Navigating long PRs by comment, file, and commit
 - Reviewing with LLM chat, local reproducer prompts, maintainer summaries, commit lightbulbs, selection helpers, and cached PR/commit infographics
-- Proofreading comments, PR descriptions, selected prose, and draft PR text with a diff preview before applying changes
+- Proofreading comments, PR descriptions, and selected prose with a diff preview before applying changes
 - Starting/submitting pending GitHub reviews from the Conversation tab
 - Keeping a personal PR review queue
 
@@ -253,15 +253,15 @@ ACKtopus adds small action buttons on comments to speed up common tasks:
 - **Expected author reply**: simulate the likely author response for your own pending/review comments
 - **Proofread**: improve clarity/grammar without changing meaning, keep replies friendly and professional, preserve intentional spacing, and prefer simple punctuation over em dashes or double-hyphen punctuation (available while editing; it won’t auto-edit a closed comment). It can compact Markdown headings or standalone label lines into inline bold prefixes when the surrounding comment or PR description still fits that structure, folding following prose onto the same prefix line and leaving block content such as tables, lists, images, code fences, or HTML blocks below the prefix. For PR descriptions, it also nudges the text toward concise Bitcoin Core contributor style. The proofread prompt asks the model to preserve structural blank-line separators around protected Markdown/HTML blocks so collapsibles and fences do not accumulate empty lines. When clearly useful, it can also convert `Note`/`Tip`/`Important`/`Warning`/`Caution` lead-ins to GitHub alerts and upgrade generic collapsible summaries.
 - During proofreading, ACKtopus rewrites GitHub commit-diff line-range URLs through `redirect.github.com` so `#diff-...Lx-Ly` fragments survive GitHub Markdown rendering, and briefly marks the proofread button with `🔗` when that happens.
-- **Edit / Delete**: shortcuts to GitHub’s native actions (in delete confirmations, **Enter deletes** and **Escape cancels**). On macOS, **⌘⌥E** edits the focused post, or the first visible post if focus is elsewhere; **⌘⌥P** proofreads or suggests for the focused editor, or the first visible editor. On other platforms, use **Alt+Shift+E** and **Alt+Shift+P**.
+- **Edit / Delete**: shortcuts to GitHub’s native actions (in delete confirmations, **Enter deletes** and **Escape cancels**). On macOS, **⌘⌥E** edits the focused post, or the first visible post if focus is elsewhere; **⌘⌥P** proofreads the focused existing edit form, or the first visible existing edit form. On other platforms, use **Alt+Shift+E** and **Alt+Shift+P**.
 
 Proofread and edit-review dialogs can switch between word and before/after views; word mode still supports click-to-revert changes, and before/after keeps both full texts while coloring only the changed text. While the diff dialog is open, **Cmd/Ctrl+Enter** accepts it, **Esc** rejects it, and **Cmd/Ctrl+Up/Down** jumps between changed sections without submitting the underlying GitHub form. While editing a comment or PR description, **Cmd/Ctrl+Escape** clicks GitHub's native cancel button.
 
 Inline review comments also get a quick link back to the Changes tab when ACKtopus can identify the review comment id, and pending comments get a readable “just now (pending)” timestamp. When editing an existing comment or PR description, ACKtopus marks the save/update button with `🧾` and shows the same switchable diff dialog against the previous version before submitting changes; **Accept and update** submits, while **Reject** returns to editing. Clicking a native save/update button without changing the text is treated as **Cancel** (no server update), so the content stays byte-for-byte unchanged. For comment editing, ACKtopus prefers the nearby native `edit_form` fragment when it is already available, and otherwise falls back to it when GitHub’s action menu is slow or incomplete.
 
-### PR creation proofreading
+### Compose forms
 
-On compare-based **new PR** pages, ACKtopus adds proofreading to the draft title and body editors. If the draft body is empty, the proofread flow can generate a short two-paragraph PR description from the draft title, commit messages, and compare patch.
+ACKtopus does not activate proofreading while drafting a new PR, issue, or comment. Proofreading is limited to existing comments and PR descriptions that are already in edit mode, so compose forms are left to GitHub's native flow.
 
 ### Wrap selection in collapsible details
 
