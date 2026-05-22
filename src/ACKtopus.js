@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.102
+// @version      1.103
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -12592,13 +12592,23 @@ Rules:
         return ta.value === initial;
     }
 
-    function findEditCancelButton(form) {
-        if (!form) return null;
+    function findEditCancelButton(root) {
+        if (!root) return null;
         return (
-            form.querySelector('button.js-comment-cancel-button, button[data-testid="cancel-edit-button"]') ||
-            [...form.querySelectorAll('button')].find((b) => /^cancel$/i.test((b.textContent || '').trim())) ||
+            root.querySelector('button.js-comment-cancel-button, button[data-testid="cancel-edit-button"]') ||
+            [...root.querySelectorAll('button')].find((b) => /^cancel$/i.test((b.textContent || '').trim())) ||
             null
         );
+    }
+
+    function cancelEditForm(form, sourceEl = null) {
+        const editRoot = form || sourceEl?.closest?.('.is-comment-editing') || sourceEl?.closest?.(EDIT_FORM_SELECTOR);
+        const cancelBtn = findEditCancelButton(editRoot);
+        if (!cancelBtn) return false;
+        const container = cancelBtn.closest(COMMENT_CONTAINER_SELECTOR) || sourceEl?.closest?.(COMMENT_CONTAINER_SELECTOR);
+        if (container) schedulePostEditRefresh(container);
+        cancelBtn.click();
+        return true;
     }
 
     function editDiffBypassActive(form) {
@@ -12763,23 +12773,30 @@ Rules:
     );
 
     // Ctrl/Cmd+Enter in edit-mode textareas can submit without a native form submit
-    // event in some GitHub UI variants. Schedule refresh so quick-actions rebuild.
+    // event in some GitHub UI variants. Ctrl/Cmd+Escape mirrors that shortcut
+    // by canceling the active edit form before GitHub sees the key.
     document.addEventListener(
         'keydown',
         (e) => {
-            if (e.key !== 'Enter') return;
+            const isSubmitShortcut = e.key === 'Enter';
+            const isCancelShortcut = e.key === 'Escape';
+            if (!isSubmitShortcut && !isCancelShortcut) return;
             if (!e.ctrlKey && !e.metaKey) return;
             const ta = e.target?.closest?.('textarea');
             if (!ta) return;
             const form = findEditForm(ta);
             if (!form && !ta.closest('.is-comment-editing')) return;
+            if (isCancelShortcut) {
+                if (!cancelEditForm(form, ta)) return;
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                return;
+            }
             if (editDiffBypassActive(form)) return;
             if (isNoOpEditSave(form)) {
-                const cancelBtn = findEditCancelButton(form);
-                if (cancelBtn) {
+                if (cancelEditForm(form, ta)) {
                     e.preventDefault();
                     e.stopImmediatePropagation();
-                    cancelBtn.click();
                     return;
                 }
             }
@@ -20050,7 +20067,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.102
+// @version      1.103
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -32601,9 +32618,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.102', () => {
+    ackTest('version bumped to 1.103', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.102' || _ackSource.includes('@version      1.102'), 'version is 1.102');
+        ackAssert(versionFromMeta === '1.103' || _ackSource.includes('@version      1.103'), 'version is 1.103');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32691,6 +32708,61 @@ RULES:
             delete form._ackEditDirty;
             delete form._ackEditInitialValue;
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            host.remove();
+        }
+    });
+
+    ackTest('Cmd/Ctrl+Escape cancels active edit form', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <form class="js-comment-update">
+                    <textarea style="width:200px;height:60px">Edited text</textarea>
+                    <button type="button" class="js-comment-cancel-button">Cancel</button>
+                    <button type="submit" class="js-comment-update">Update comment</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const form = host.querySelector('form');
+        const ta = host.querySelector('textarea');
+        const cancelBtn = host.querySelector('button.js-comment-cancel-button');
+        let cancelClicks = 0;
+        let targetKeydowns = 0;
+        cancelBtn.addEventListener('click', () => cancelClicks++);
+        ta.addEventListener('keydown', () => targetKeydowns++);
+        try {
+            trackEditForms(host);
+            const ok = ta.dispatchEvent(
+                new KeyboardEvent('keydown', {
+                    key: 'Escape',
+                    metaKey: true,
+                    bubbles: true,
+                    cancelable: true,
+                }),
+            );
+            ackEq(ok, false, 'Cmd+Escape is prevented');
+            ackEq(cancelClicks, 1, 'Cmd+Escape clicks Cancel once');
+            ackEq(targetKeydowns, 0, 'Cmd+Escape does not reach the textarea');
+            const ctrlOk = ta.dispatchEvent(
+                new KeyboardEvent('keydown', {
+                    key: 'Escape',
+                    ctrlKey: true,
+                    bubbles: true,
+                    cancelable: true,
+                }),
+            );
+            ackEq(ctrlOk, false, 'Ctrl+Escape is prevented');
+            ackEq(cancelClicks, 2, 'Ctrl+Escape clicks Cancel once');
+            ackEq(targetKeydowns, 0, 'Ctrl+Escape does not reach the textarea');
+            ackAssert(form._ackEditTracked, 'edit form was tracked');
+        } finally {
+            delete form._ackEditTracked;
+            delete form._ackEditDirty;
+            delete form._ackEditInitialValue;
             host.remove();
         }
     });
