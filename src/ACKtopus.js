@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.91
+// @version      1.92
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -566,6 +566,13 @@
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
+    const EDIT_FORM_SELECTOR =
+        'form.js-comment-update, [data-testid="edit-comment-form"], form.js-issue-update, ' +
+        'form[action*="/issue_comments/"][action*="/update"], form[action*="/review_comment/"][action*="/update"], ' +
+        'form[action*="/reviews/"][action*="/update"]';
+    const EDIT_BODY_TEXTAREA_SELECTOR =
+        'textarea[name="issue[body]"], textarea[name="pull_request[body]"], textarea#issue_body, textarea#pull_request_body';
+    const EDIT_SAVE_DIFF_EMOJI = '🧾';
     const EXTENDED_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_SELECTOR + ', .js-comment, .js-line-comments, .inline-comment-form-container';
     const WIDE_COMMENT_CONTAINER_SELECTOR =
@@ -8636,7 +8643,7 @@ The prompt must ask for:
         return { hasChanges, text: finalText, html: parts.join('') };
     }
 
-    function showDiffDialog(original, corrected) {
+    function showDiffDialog(original, corrected, opts = {}) {
         const diff = wordDiff(original, corrected);
         const hasChanges = diff.some((d) => d.type !== 'same');
         if (!hasChanges) return Promise.resolve({ action: 'unchanged', text: corrected });
@@ -8644,6 +8651,7 @@ The prompt must ask for:
 
         return new Promise((resolve) => {
             const overlay = document.createElement('div');
+            overlay.className = 'ack-diff-dialog-overlay';
             Object.assign(overlay.style, {
                 position: 'fixed',
                 inset: '0',
@@ -8667,7 +8675,7 @@ The prompt must ask for:
                 lineHeight: '1.6',
             });
             const heading = document.createElement('div');
-            heading.textContent = 'Proofreading changes - click diffs to revert';
+            heading.textContent = opts.title || 'Proofreading changes - click diffs to revert';
             Object.assign(heading.style, { fontWeight: '600', fontSize: '14px', marginBottom: '12px' });
             dialog.appendChild(heading);
 
@@ -8789,7 +8797,7 @@ The prompt must ask for:
             Object.assign(btnRow.style, { marginTop: '14px', display: 'flex', gap: '8px', justifyContent: 'flex-end' });
 
             const rejectBtn = document.createElement('button');
-            rejectBtn.textContent = 'Reject';
+            rejectBtn.textContent = opts.rejectLabel || 'Reject';
             Object.assign(rejectBtn.style, {
                 padding: '6px 20px',
                 background: '#21262d',
@@ -8805,8 +8813,8 @@ The prompt must ask for:
             });
 
             const acceptBtn = document.createElement('button');
-            acceptBtn.textContent = 'Accept';
-            acceptBtn.title = 'Apply changes to the textarea (you can review before submitting)';
+            acceptBtn.textContent = opts.acceptLabel || 'Accept';
+            acceptBtn.title = opts.acceptTitle || 'Apply changes to the textarea (you can review before submitting)';
             Object.assign(acceptBtn.style, {
                 padding: '6px 20px',
                 background: '#238636',
@@ -12348,18 +12356,85 @@ Rules:
     // If the user didn't edit anything, treat Save/Update as Cancel to keep
     // the original comment unchanged.
     const _trackedEditTextareas = new WeakSet();
+
+    function editButtonLabel(btn) {
+        return (btn?.textContent || '').replace(EDIT_SAVE_DIFF_EMOJI, '').trim();
+    }
+
+    function isEditSaveButton(btn) {
+        const label = editButtonLabel(btn);
+        return (
+            btn?.classList?.contains('js-comment-update') ||
+            btn?.matches?.('[data-testid="save-edit-button"], [data-testid="update-comment-button"]') ||
+            /^(update comment|update|save edit|save)$/i.test(label)
+        );
+    }
+
+    function isEditCancelButton(btn) {
+        const label = editButtonLabel(btn).toLowerCase();
+        return (
+            label === 'cancel' ||
+            btn?.classList?.contains('js-comment-cancel-button') ||
+            btn?.matches?.('[data-testid="cancel-edit-button"]')
+        );
+    }
+
+    function findEditForm(element) {
+        const matched = element?.closest?.(EDIT_FORM_SELECTOR);
+        if (matched) return matched;
+        const form = element?.closest?.('form');
+        if (form?.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) return form;
+        return null;
+    }
+
+    function findEditTextarea(form) {
+        if (!form) return null;
+        return [...form.querySelectorAll('textarea')].find(isVisible) || form.querySelector('textarea');
+    }
+
+    function findEditSaveButton(form) {
+        return [...(form?.querySelectorAll?.('button[type="submit"], button') || [])].find(isEditSaveButton) || null;
+    }
+
+    function markEditSaveButtons(form) {
+        for (const btn of form?.querySelectorAll?.('button[type="submit"], button') || []) {
+            if (!isEditSaveButton(btn)) continue;
+            if (!btn.querySelector('.ack-edit-diff-marker')) {
+                const marker = document.createElement('span');
+                marker.className = 'ack-edit-diff-marker';
+                marker.textContent = ` ${EDIT_SAVE_DIFF_EMOJI}`;
+                marker.setAttribute('aria-hidden', 'true');
+                btn.appendChild(marker);
+            }
+            btn.dataset.ackEditDiffMarked = 'true';
+            const title = 'ACKtopus: shows a diff before submitting this edit';
+            const baseTitle = (btn.title || '').replace(/\s*\.?\s*ACKtopus: shows a diff before submitting this edit\.?$/, '').trim();
+            btn.title = baseTitle ? `${baseTitle}. ${title}` : title;
+        }
+    }
+
     function trackEditForms(root = document) {
         if (!root) return;
         const forms = new Set();
-        if (root.matches?.('form.js-comment-update, [data-testid="edit-comment-form"]')) forms.add(root);
-        const closest = root.closest?.('form.js-comment-update, [data-testid="edit-comment-form"]');
+        if (root.matches?.(EDIT_FORM_SELECTOR)) forms.add(root);
+        if (root.matches?.('form') && root.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) forms.add(root);
+        const closest = root.closest?.(EDIT_FORM_SELECTOR);
         if (closest) forms.add(closest);
+        const bodyTaForm = root.closest?.('form')?.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)
+            ? root.closest('form')
+            : null;
+        if (bodyTaForm) forms.add(bodyTaForm);
         if (root.querySelectorAll) {
-            qsa(root, 'form.js-comment-update, [data-testid="edit-comment-form"]').forEach((f) => forms.add(f));
+            qsa(root, EDIT_FORM_SELECTOR).forEach((f) => forms.add(f));
+            qsa(root, EDIT_BODY_TEXTAREA_SELECTOR).forEach((ta) => {
+                const form = ta.closest('form');
+                if (form) forms.add(form);
+            });
         }
         for (const form of forms) {
             form._ackEditTracked = true;
-            const ta = form.querySelector('textarea');
+            markEditSaveButtons(form);
+            const ta = findEditTextarea(form);
             if (!ta) continue;
             if (typeof form._ackEditInitialValue !== 'string') {
                 form._ackEditInitialValue = ta.value || '';
@@ -12377,7 +12452,7 @@ Rules:
 
     function isNoOpEditSave(form) {
         if (!form?._ackEditTracked) return false;
-        const ta = form.querySelector('textarea');
+        const ta = findEditTextarea(form);
         if (!ta) return false;
         const initial = typeof form._ackEditInitialValue === 'string' ? form._ackEditInitialValue : '';
         return ta.value === initial;
@@ -12390,6 +12465,65 @@ Rules:
             [...form.querySelectorAll('button')].find((b) => /^cancel$/i.test((b.textContent || '').trim())) ||
             null
         );
+    }
+
+    function editDiffBypassActive(form) {
+        return !!form?._ackEditDiffAcceptedUntil && Date.now() < form._ackEditDiffAcceptedUntil;
+    }
+
+    function markEditDiffAccepted(form) {
+        if (form) form._ackEditDiffAcceptedUntil = Date.now() + 3000;
+    }
+
+    function shouldConfirmEditSave(form) {
+        if (!form?._ackEditTracked) return false;
+        const ta = findEditTextarea(form);
+        if (!ta) return false;
+        if (typeof form._ackEditInitialValue !== 'string') return false;
+        return ta.value !== form._ackEditInitialValue;
+    }
+
+    async function confirmEditSave(form, submitter = null) {
+        if (!form || form._ackEditDiffConfirming) return false;
+        if (editDiffBypassActive(form)) return true;
+        if (!form._ackEditTracked) return true;
+        const ta = findEditTextarea(form);
+        if (!ta) return true;
+        const original = typeof form._ackEditInitialValue === 'string' ? form._ackEditInitialValue : null;
+        if (original === null) return true;
+        const current = ta.value || '';
+        if (current === original) {
+            const cancelBtn = findEditCancelButton(form);
+            if (cancelBtn) {
+                cancelBtn.click();
+                return false;
+            }
+            return true;
+        }
+        form._ackEditDiffConfirming = true;
+        try {
+            const { action, text } = await showDiffDialog(original, current, {
+                title: 'Review edit before updating - click diffs to revert',
+                rejectLabel: 'Reject',
+                acceptLabel: 'Accept and update',
+                acceptTitle: 'Submit this edited post',
+            });
+            if (action === false) {
+                ta.focus();
+                return false;
+            }
+            if (action !== 'unchanged' && typeof text === 'string' && text !== current) {
+                setTextareaValue(ta, text);
+            }
+            markEditDiffAccepted(form);
+            const saveBtn = submitter?.isConnected ? submitter : findEditSaveButton(form);
+            if (saveBtn?.isConnected) saveBtn.click();
+            else if (typeof form.requestSubmit === 'function') form.requestSubmit();
+            else form.submit?.();
+            return false;
+        } finally {
+            form._ackEditDiffConfirming = false;
+        }
     }
 
     function schedulePostEditRefresh(container) {
@@ -12420,8 +12554,14 @@ Rules:
     document.addEventListener(
         'submit',
         (e) => {
-            const form = e.target.closest?.('form.js-comment-update, [data-testid="edit-comment-form"]');
+            const form = findEditForm(e.target);
             if (!form) return;
+            if (editDiffBypassActive(form)) {
+                const container = form.closest(COMMENT_CONTAINER_SELECTOR);
+                if (container) schedulePostEditRefresh(container);
+                invalidatePRContext();
+                return;
+            }
             // No-op edit-save guard: if the user didn't change anything in the edit
             // textarea, treat submit as cancel to preserve the original markdown.
             if (isNoOpEditSave(form)) {
@@ -12432,6 +12572,12 @@ Rules:
                     cancelBtn.click();
                     return;
                 }
+            }
+            if (shouldConfirmEditSave(form)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                confirmEditSave(form, e.submitter || findEditSaveButton(form));
+                return;
             }
             const container = form.closest(COMMENT_CONTAINER_SELECTOR);
             if (container) schedulePostEditRefresh(container);
@@ -12444,20 +12590,19 @@ Rules:
         (e) => {
             const btn = e.target.closest?.('button');
             if (!btn) return;
-            const text = btn.textContent.trim().toLowerCase();
-            const isCancel =
-                text === 'cancel' ||
-                btn.classList.contains('js-comment-cancel-button') ||
-                btn.matches('[data-testid="cancel-edit-button"]');
-            const isSave =
-                btn.classList.contains('js-comment-update') ||
-                btn.matches('[data-testid="save-edit-button"], [data-testid="update-comment-button"]') ||
-                /^(update comment|save edit|save)$/i.test(btn.textContent.trim());
+            const isCancel = isEditCancelButton(btn);
+            const isSave = isEditSaveButton(btn);
             if (!isCancel && !isSave) return;
             let form = null;
             if (isSave) {
-                form = btn.closest('form.js-comment-update, [data-testid="edit-comment-form"]');
+                form = findEditForm(btn);
                 if (!form) return; // avoid matching unrelated "Save" buttons
+                if (editDiffBypassActive(form)) {
+                    const container = btn.closest(COMMENT_CONTAINER_SELECTOR);
+                    if (container) schedulePostEditRefresh(container);
+                    invalidatePRContext();
+                    return;
+                }
                 // No-op edit-save guard: if the user did not change the textarea,
                 // treat Save as Cancel to preserve the original comment markdown.
                 if (isNoOpEditSave(form)) {
@@ -12468,6 +12613,12 @@ Rules:
                         cancelBtn.click();
                         return;
                     }
+                }
+                if (shouldConfirmEditSave(form)) {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    confirmEditSave(form, btn);
+                    return;
                 }
             }
             const container = btn.closest(COMMENT_CONTAINER_SELECTOR);
@@ -12486,8 +12637,9 @@ Rules:
             if (!e.ctrlKey && !e.metaKey) return;
             const ta = e.target?.closest?.('textarea');
             if (!ta) return;
-            if (!ta.closest('.js-comment-update, [data-testid="edit-comment-form"], .is-comment-editing')) return;
-            const form = ta.closest('form.js-comment-update, [data-testid="edit-comment-form"]');
+            const form = findEditForm(ta);
+            if (!form && !ta.closest('.is-comment-editing')) return;
+            if (editDiffBypassActive(form)) return;
             if (isNoOpEditSave(form)) {
                 const cancelBtn = findEditCancelButton(form);
                 if (cancelBtn) {
@@ -12496,6 +12648,12 @@ Rules:
                     cancelBtn.click();
                     return;
                 }
+            }
+            if (shouldConfirmEditSave(form)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                confirmEditSave(form, findEditSaveButton(form));
+                return;
             }
             const container = ta.closest(COMMENT_CONTAINER_SELECTOR);
             if (container) schedulePostEditRefresh(container);
@@ -12511,7 +12669,7 @@ Rules:
         (e) => {
             const ta = e.target?.closest?.('textarea');
             if (!ta) return;
-            const form = ta.closest('form.js-comment-update, [data-testid="edit-comment-form"]');
+            const form = findEditForm(ta);
             if (!form) return;
             trackEditForms(form);
         },
@@ -19758,7 +19916,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.91
+// @version      1.92
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -32174,9 +32332,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.91', () => {
+    ackTest('version bumped to 1.92', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.91' || _ackSource.includes('@version      1.91'), 'version is 1.91');
+        ackAssert(versionFromMeta === '1.92' || _ackSource.includes('@version      1.92'), 'version is 1.92');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -32196,7 +32354,7 @@ RULES:
         ackAssert(!fn.includes('container.querySelector'), 'does NOT use stale container ref');
     });
 
-    ackTest('no-op edit save is treated as cancel (prevents markdown loss)', () => {
+    ackTest('edit save shows diff before submitting dirty textarea', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
         host.style.left = '-99999px';
@@ -32222,6 +32380,7 @@ RULES:
         });
         try {
             trackEditForms(host);
+            ackAssert(saveBtn.textContent.includes(EDIT_SAVE_DIFF_EMOJI), 'save button is marked as diff-confirmed');
             ackEq(isNoOpEditSave(form), true, 'unchanged edit is detected as no-op');
             const ok = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
             ackEq(ok, false, 'no-op save click is prevented');
@@ -32233,13 +32392,59 @@ RULES:
             ackEq(isNoOpEditSave(form), false, 'edited textarea is not treated as no-op');
             cancelClicks = 0;
             const ok2 = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            ackEq(ok2, true, 'dirty save click is not prevented');
+            ackEq(ok2, false, 'dirty save click is held for diff confirmation');
             ackEq(cancelClicks, 0, 'cancel not clicked on dirty save');
-            ackEq(submitEvents, 1, 'dirty save still submits once');
+            ackEq(submitEvents, 0, 'dirty save does not submit before accepting the diff');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const acceptBtn = [...document.querySelectorAll('button')].find(
+                (btn) => btn.textContent === 'Accept and update',
+            );
+            ackAssert(acceptBtn, 'dirty save opens edit diff confirmation');
+            const rejectBtn = [...document.querySelectorAll('button')].find((btn) => btn.textContent === 'Reject');
+            ackAssert(rejectBtn, 'dirty save dialog has reject button');
+            rejectBtn.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(submitEvents, 0, 'rejecting the diff keeps editing without submitting');
+            ackEq(ta.value, 'Hello **world**!!', 'rejecting keeps the edited text in place');
+
+            const ok3 = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            ackEq(ok3, false, 'dirty save can be retried after rejecting');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const acceptBtn2 = [...document.querySelectorAll('button')].find(
+                (btn) => btn.textContent === 'Accept and update',
+            );
+            ackAssert(acceptBtn2, 'retry opens edit diff confirmation again');
+            acceptBtn2.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(submitEvents, 1, 'accepting the diff submits once');
         } finally {
             delete form._ackEditTracked;
             delete form._ackEditDirty;
             delete form._ackEditInitialValue;
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            host.remove();
+        }
+    });
+
+    ackTest('trackEditForms handles PR description edit forms', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <form action="/owner/repo/issues/123">
+                <textarea name="issue[body]">Original PR body</textarea>
+                <button type="button">Cancel</button>
+                <button type="submit">Update comment</button>
+            </form>
+        `;
+        const form = host.querySelector('form');
+        const saveBtn = host.querySelector('button[type="submit"]');
+        try {
+            trackEditForms(host);
+            ackEq(form._ackEditInitialValue, 'Original PR body', 'captures PR description original body');
+            ackAssert(saveBtn.textContent.includes(EDIT_SAVE_DIFF_EMOJI), 'marks PR description update button');
+            ackEq(findEditForm(saveBtn), form, 'save button resolves generic PR description edit form');
+            form.querySelector('textarea').value = 'Edited PR body';
+            ackEq(shouldConfirmEditSave(form), true, 'PR description edits require diff confirmation');
+        } finally {
             host.remove();
         }
     });
