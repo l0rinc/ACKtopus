@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.110
+// @version      1.111
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -547,6 +547,7 @@
         'details.details-overlay summary, summary.timeline-comment-action';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
+    const NATIVE_DIALOG_ROOT_SELECTOR = 'details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
@@ -1377,6 +1378,22 @@
             container: textarea?.closest?.('form') || liveTaContainer || liveContainer || document,
             textarea,
         };
+    }
+
+    function closestNativeDialogRoot(...elements) {
+        for (const el of elements) {
+            const root = el?.closest?.(NATIVE_DIALOG_ROOT_SELECTOR);
+            if (!root || !document.body.contains(root)) continue;
+            if (root.classList?.contains('ack-diff-dialog-overlay')) continue;
+            if (isAckOwnedReviewControl(root)) continue;
+            return root;
+        }
+        return null;
+    }
+
+    function getTextareaDiffDialogOptions(taContainer, ta) {
+        const mount = closestNativeDialogRoot(ta, taContainer);
+        return mount ? { mount } : {};
     }
 
     function waitForNextPaint() {
@@ -8757,6 +8774,7 @@ The prompt must ask for:
         const lineCounts = countDiffLines(original, corrected);
 
         return new Promise((resolve) => {
+            const mount = opts.mount && document.body.contains(opts.mount) ? opts.mount : document.body;
             const overlay = document.createElement('div');
             overlay.className = 'ack-diff-dialog-overlay';
             overlay.tabIndex = -1;
@@ -8787,6 +8805,10 @@ The prompt must ask for:
                 fontSize: '13px',
                 lineHeight: '1.6',
             });
+            const stopDialogEvent = (e) => e.stopPropagation();
+            for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                dialog.addEventListener(eventName, stopDialogEvent);
+            }
             const heading = document.createElement('div');
             heading.textContent = opts.title || 'Proofreading changes - click diffs to revert';
             Object.assign(heading.style, { fontWeight: '600', fontSize: '14px', marginBottom: '12px' });
@@ -9218,12 +9240,16 @@ The prompt must ask for:
             btnRow.appendChild(acceptBtn);
             dialog.appendChild(btnRow);
             overlay.appendChild(dialog);
+            overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
+            overlay.addEventListener('mousedown', (e) => e.stopPropagation());
+            overlay.addEventListener('mouseup', (e) => e.stopPropagation());
             overlay.addEventListener('click', (e) => {
+                e.stopPropagation();
                 if (e.target === overlay) {
                     rejectDialog();
                 }
             });
-            document.body.appendChild(overlay);
+            mount.appendChild(overlay);
             dialog.focus({ preventScroll: true });
         });
     }
@@ -9771,7 +9797,11 @@ Rules:
                             .replace(/^```[a-z]*\n?|\n?```$/g, '')
                             .trim();
                         stopSpin('✅');
-                        const { action: accepted, text: finalText } = await showDiffDialog('', generated);
+                        const { action: accepted, text: finalText } = await showDiffDialog(
+                            '',
+                            generated,
+                            getTextareaDiffDialogOptions(taContainer, ta),
+                        );
                         if (accepted === false) {
                             setTimeout(() => restoreButton(), 500);
                             return;
@@ -9866,7 +9896,11 @@ Rules:
                     showLinkRewriteMarker(linkRewriteCount);
 
                     // Compare stripped original vs LLM result (footer removal is transparent)
-                    const { action: accepted, text: finalText } = await showDiffDialog(strippedOriginal, result);
+                    const { action: accepted, text: finalText } = await showDiffDialog(
+                        strippedOriginal,
+                        result,
+                        getTextareaDiffDialogOptions(taContainer, ta),
+                    );
                     console.log('ACKtopus: proofread: diff dialog result', {
                         accepted,
                         finalLen: (finalText || '').length,
@@ -10052,11 +10086,7 @@ Rules:
     }
 
     function findNativeReviewDialog() {
-        const dialogRoots = [
-            ...document.querySelectorAll(
-                'details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]',
-            ),
-        ].filter(isVisible);
+        const dialogRoots = [...document.querySelectorAll(NATIVE_DIALOG_ROOT_SELECTOR)].filter(isVisible);
         for (const root of dialogRoots) {
             if (isAckOwnedReviewControl(root)) continue;
             const hasReviewTextarea = !![...root.querySelectorAll('textarea')].find(isVisible);
@@ -15155,7 +15185,7 @@ RULES:
                 return true;
             }
         }
-        const { action, text } = await showDiffDialog('', generated);
+        const { action, text } = await showDiffDialog('', generated, getTextareaDiffDialogOptions(taContainer, ta));
         if (action === false) return false;
         if (/^👍$/u.test(String(text || generated).trim()) && replyTarget?.container) {
             const reactionTrigger = findReactionTriggerForComment(replyTarget.container);
@@ -22422,10 +22452,39 @@ RULES:
         ackAssert(fn.includes("d.type === 'add'") && fn.includes("d.type === 'del'"), 'side panes color only their own changed text');
         ackAssert(fn.includes("window.addEventListener('keydown', onDialogKeydown, true)"), 'captures dialog shortcuts before page handlers');
         ackAssert(fn.includes("dialog.focus({ preventScroll: true })"), 'focuses the diff dialog while open');
+        ackAssert(fn.includes('opts.mount'), 'can mount inside a native GitHub dialog');
+        ackAssert(fn.includes("dialog.addEventListener(eventName, stopDialogEvent)"), 'stops diff dialog clicks from bubbling');
         ackAssert(fn.includes('ack-diff-nav-prev'), 'has previous-diff navigation button');
         ackAssert(fn.includes('ack-diff-nav-next'), 'has next-diff navigation button');
         ackAssert(fn.includes("e.key === 'ArrowDown'") && fn.includes("e.key === 'ArrowUp'"), 'has diff navigation shortcuts');
         ackAssert(fn.includes('scrollDiffNav(1)') && fn.includes('scrollDiffNav(-1)'), 'shortcuts jump between diff targets');
+    });
+
+    ackTest('showDiffDialog can stay inside native review dialogs', async () => {
+        const nativeDialog = document.createElement('div');
+        nativeDialog.setAttribute('role', 'dialog');
+        nativeDialog.innerHTML = '<textarea>review summary</textarea>';
+        document.body.appendChild(nativeDialog);
+        let bodyClicks = 0;
+        const onBodyClick = () => {
+            bodyClicks++;
+        };
+        document.body.addEventListener('click', onBodyClick);
+        try {
+            const promise = showDiffDialog('old text', 'new text', { mount: nativeDialog });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const overlay = nativeDialog.querySelector('.ack-diff-dialog-overlay');
+            ackAssert(overlay, 'diff dialog overlay is mounted inside the native dialog');
+            const acceptBtn = [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Accept');
+            acceptBtn.click();
+            const result = await promise;
+            ackEq(result.action, 'edit', 'accept still resolves normally');
+            ackEq(bodyClicks, 0, 'diff dialog click does not bubble to native outside-click handlers');
+        } finally {
+            document.body.removeEventListener('click', onBodyClick);
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            nativeDialog.remove();
+        }
     });
 
     ackTest('showDiffDialog switches between readable diff modes', async () => {
@@ -22781,6 +22840,17 @@ RULES:
             'fallback finds nearby markdown-toolbar[for]',
         );
         ackAssert(section.includes("querySelectorAll?.('textarea')"), 'fallback scans textareas within editor root');
+    });
+
+    ackTest('toolbar proofread keeps diff dialog inside native review dialogs', () => {
+        const proofFn = _ackSource.slice(
+            _ackSource.indexOf('async function runProofreadOnComment'),
+            _ackSource.indexOf('// --- Start a review ---'),
+        );
+        ackAssert(
+            proofFn.includes('getTextareaDiffDialogOptions(taContainer, ta)'),
+            'proofread passes the textarea dialog mount into showDiffDialog',
+        );
     });
 
     ackTest('empty toolbar proofread switches to wand-mode suggestion flow', () => {
