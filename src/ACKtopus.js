@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.92
+// @version      1.93
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8589,6 +8589,36 @@ The prompt must ask for:
         }));
     }
 
+    function splitParagraphDiffUnits(text) {
+        const value = String(text || '');
+        if (!value) return [];
+        const units = [];
+        const separators = /\n{2,}/g;
+        let last = 0;
+        let match;
+        while ((match = separators.exec(value))) {
+            const end = match.index + match[0].length;
+            units.push(value.slice(last, end));
+            last = end;
+        }
+        if (last < value.length) units.push(value.slice(last));
+        return units;
+    }
+
+    function splitSentenceDiffUnits(text) {
+        const value = String(text || '');
+        if (!value) return [];
+        return value.match(/[^.!?\n]+[.!?]+[\])}"'`]*\s*|[^.!?\n]+(?:\n+|$)|\n+/g) || [value];
+    }
+
+    function groupedDiff(oldText, newText, unit) {
+        const split = unit === 'paragraph' ? splitParagraphDiffUnits : splitSentenceDiffUnits;
+        return Diff.diffArrays(split(oldText), split(newText)).map((d) => ({
+            type: d.added ? 'add' : d.removed ? 'del' : 'same',
+            text: d.value.join(''),
+        }));
+    }
+
     function countDiffLines(oldText, newText) {
         const countLines = (text) => {
             const normalized = String(text || '').replace(/\r\n/g, '\n');
@@ -8667,7 +8697,8 @@ The prompt must ask for:
                 border: '1px solid #30363d',
                 borderRadius: '12px',
                 padding: '20px',
-                maxWidth: '600px',
+                width: 'min(900px, calc(100vw - 32px))',
+                maxWidth: '900px',
                 maxHeight: '70vh',
                 overflow: 'auto',
                 color: '#c9d1d9',
@@ -8688,11 +8719,46 @@ The prompt must ask for:
             });
             dialog.appendChild(summary);
 
-            const diffEl = document.createElement('div');
-            Object.assign(diffEl.style, { fontFamily: 'monospace', whiteSpace: 'pre-wrap', fontSize: '12px' });
+            const modeRow = document.createElement('div');
+            modeRow.className = 'ack-diff-mode-row';
+            Object.assign(modeRow.style, {
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: '6px',
+                margin: '0 0 12px 0',
+            });
+
+            const contentEl = document.createElement('div');
+            contentEl.className = 'ack-diff-view';
+            Object.assign(contentEl.style, {
+                fontFamily: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+                whiteSpace: 'pre-wrap',
+                fontSize: '12px',
+            });
 
             // Track revert state per diff entry
             const revertState = diff.map(() => false); // false = active (accept change), true = reverted
+
+            // Build modified text from current revert state
+            function buildText() {
+                const parts = [];
+                for (let i = 0; i < diff.length; i++) {
+                    const d = diff[i];
+                    if (d.type === 'same') {
+                        parts.push(d.text);
+                        continue;
+                    }
+                    if (d.type === 'del') {
+                        // Include deleted text only if reverted (user wants to keep it)
+                        if (revertState[i]) parts.push(d.text);
+                    } else {
+                        // add
+                        // Include added text only if NOT reverted (user accepts the addition)
+                        if (!revertState[i]) parts.push(d.text);
+                    }
+                }
+                return parts.join('');
+            }
 
             function renderSpan(span, d, idx) {
                 if (d.type === 'same') {
@@ -8751,47 +8817,146 @@ The prompt must ask for:
                 return buildText() === original;
             }
 
-            const spans = [];
-            for (let i = 0; i < diff.length; i++) {
-                const d = diff[i];
-                const span = document.createElement('span');
-                renderSpan(span, d, i);
-                if (d.type !== 'same') {
-                    span.addEventListener('click', () => {
-                        revertState[i] = !revertState[i];
-                        renderSpan(span, d, i);
-                        // If all changes reverted, auto-close as reject
-                        if (checkAllReverted()) {
-                            overlay.remove();
-                            resolve({ action: false, text: original });
-                        }
-                    });
-                }
-                spans.push(span);
-                diffEl.appendChild(span);
-            }
-            dialog.appendChild(diffEl);
-
-            // Build modified text from current revert state
-            function buildText() {
-                const parts = [];
+            function renderWordView() {
+                contentEl.innerHTML = '';
                 for (let i = 0; i < diff.length; i++) {
                     const d = diff[i];
-                    if (d.type === 'same') {
-                        parts.push(d.text);
-                        continue;
+                    const span = document.createElement('span');
+                    renderSpan(span, d, i);
+                    if (d.type !== 'same') {
+                        span.addEventListener('click', () => {
+                            revertState[i] = !revertState[i];
+                            renderSpan(span, d, i);
+                            // If all changes reverted, auto-close as reject
+                            if (checkAllReverted()) {
+                                overlay.remove();
+                                resolve({ action: false, text: original });
+                            }
+                        });
                     }
-                    if (d.type === 'del') {
-                        // Include deleted text only if reverted (user wants to keep it)
-                        if (revertState[i]) parts.push(d.text);
-                    } else {
-                        // add
-                        // Include added text only if NOT reverted (user accepts the addition)
-                        if (!revertState[i]) parts.push(d.text);
-                    }
+                    contentEl.appendChild(span);
                 }
-                return parts.join('');
             }
+
+            function renderGroupedView(unit) {
+                contentEl.innerHTML = '';
+                for (const d of groupedDiff(original, buildText(), unit)) {
+                    const block = document.createElement('div');
+                    block.textContent = d.text;
+                    Object.assign(block.style, {
+                        whiteSpace: 'pre-wrap',
+                        overflowWrap: 'anywhere',
+                        margin: d.type === 'same' ? '0' : '0 0 8px 0',
+                        padding: d.type === 'same' ? '0' : '7px 8px',
+                        borderRadius: d.type === 'same' ? '0' : '4px',
+                        background: d.type === 'del' ? '#3d1f1f' : d.type === 'add' ? '#1a3a1a' : 'transparent',
+                        color: d.type === 'del' ? '#f85149' : d.type === 'add' ? '#3fb950' : '#c9d1d9',
+                        textDecoration: d.type === 'del' ? 'line-through' : 'none',
+                    });
+                    if (d.type === 'same' && !d.text.trim()) {
+                        block.style.minHeight = '8px';
+                    }
+                    contentEl.appendChild(block);
+                }
+            }
+
+            function renderSideBySideView() {
+                contentEl.innerHTML = '';
+                const grid = document.createElement('div');
+                grid.className = 'ack-diff-side-by-side';
+                Object.assign(grid.style, {
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                    gap: '10px',
+                    whiteSpace: 'normal',
+                });
+                const panes = [
+                    { label: 'Before', text: original },
+                    { label: 'After', text: buildText() },
+                ];
+                for (const pane of panes) {
+                    const wrap = document.createElement('div');
+                    const label = document.createElement('div');
+                    label.textContent = pane.label;
+                    Object.assign(label.style, {
+                        color: '#8b949e',
+                        fontSize: '11px',
+                        fontWeight: '600',
+                        margin: '0 0 4px 0',
+                    });
+                    const pre = document.createElement('pre');
+                    pre.textContent = pane.text;
+                    Object.assign(pre.style, {
+                        background: '#0d1117',
+                        border: '1px solid #30363d',
+                        borderRadius: '4px',
+                        color: '#c9d1d9',
+                        fontFamily: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+                        fontSize: '12px',
+                        lineHeight: '1.45',
+                        margin: '0',
+                        minHeight: '140px',
+                        overflow: 'auto',
+                        padding: '8px',
+                        whiteSpace: 'pre-wrap',
+                        overflowWrap: 'anywhere',
+                    });
+                    wrap.appendChild(label);
+                    wrap.appendChild(pre);
+                    grid.appendChild(wrap);
+                }
+                contentEl.appendChild(grid);
+            }
+
+            const modes = [
+                { key: 'word', label: 'Words', title: 'Word-level diff with click-to-revert changes' },
+                { key: 'sentence', label: 'Sentences', title: 'Sentence-level diff for reading larger rewrites' },
+                { key: 'paragraph', label: 'Paragraphs', title: 'Paragraph-level diff for broad structural changes' },
+                { key: 'side', label: 'Before/After', title: 'Read both versions side by side' },
+            ];
+            let activeMode = 'word';
+            const modeButtons = new Map();
+
+            function renderActiveMode() {
+                if (activeMode === 'word') renderWordView();
+                else if (activeMode === 'sentence') renderGroupedView('sentence');
+                else if (activeMode === 'paragraph') renderGroupedView('paragraph');
+                else renderSideBySideView();
+            }
+
+            function setMode(mode) {
+                activeMode = mode;
+                for (const [key, btn] of modeButtons) {
+                    const active = key === mode;
+                    btn.dataset.active = active ? '1' : '0';
+                    btn.style.background = active ? '#30363d' : '#21262d';
+                    btn.style.color = active ? '#fff' : '#c9d1d9';
+                    btn.style.borderColor = active ? '#8b949e' : '#30363d';
+                }
+                renderActiveMode();
+            }
+
+            for (const mode of modes) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'ack-diff-mode-btn';
+                btn.dataset.ackDiffMode = mode.key;
+                btn.textContent = mode.label;
+                btn.title = mode.title;
+                Object.assign(btn.style, {
+                    border: '1px solid #30363d',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    padding: '4px 8px',
+                });
+                btn.addEventListener('click', () => setMode(mode.key));
+                modeButtons.set(mode.key, btn);
+                modeRow.appendChild(btn);
+            }
+            dialog.appendChild(modeRow);
+            dialog.appendChild(contentEl);
+            setMode(activeMode);
 
             const btnRow = document.createElement('div');
             Object.assign(btnRow.style, { marginTop: '14px', display: 'flex', gap: '8px', justifyContent: 'flex-end' });
@@ -19916,7 +20081,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.92
+// @version      1.93
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20525,6 +20690,16 @@ RULES:
     ackTest('countDiffLines summarizes added and removed line counts', () => {
         const counts = countDiffLines('one\ntwo\n', 'one\nthree\nfour\n');
         ackDeepEq(counts, { added: 2, removed: 1 }, 'counts added and removed lines separately');
+    });
+
+    ackTest('groupedDiff supports sentence and paragraph readability modes', () => {
+        const sentence = groupedDiff('One stays. Two old.', 'One stays. Two new.', 'sentence');
+        ackAssert(sentence.some((d) => d.type === 'del' && d.text.includes('Two old.')), 'sentence diff removes old sentence');
+        ackAssert(sentence.some((d) => d.type === 'add' && d.text.includes('Two new.')), 'sentence diff adds new sentence');
+
+        const paragraph = groupedDiff('Intro.\n\nOld body.\n\nTail.', 'Intro.\n\nNew body.\n\nTail.', 'paragraph');
+        ackAssert(paragraph.some((d) => d.type === 'del' && d.text.includes('Old body.')), 'paragraph diff removes old paragraph');
+        ackAssert(paragraph.some((d) => d.type === 'add' && d.text.includes('New body.')), 'paragraph diff adds new paragraph');
     });
 
     // --- hasUnsavedCommentText ---
@@ -22048,7 +22223,7 @@ RULES:
         ackDeepEq(result, { action: 'unchanged', text: 'hello world' }, 'same words = no changes');
     });
 
-    ackTest('showDiffDialog source has two buttons: Reject and Accept', () => {
+    ackTest('showDiffDialog source has accept/reject buttons and readability modes', () => {
         const source = _ackSource;
         ackAssert(source.includes("'Reject'"), 'has Reject button');
         ackAssert(source.includes("'Accept'"), 'has Accept button');
@@ -22060,6 +22235,38 @@ RULES:
             fn.includes('+${lineCounts.added}') && fn.includes('-${lineCounts.removed}'),
             'renders + and - line counts in the dialog',
         );
+        ackAssert(fn.includes('ack-diff-mode-row'), 'renders diff mode controls');
+        ackAssert(fn.includes('Sentences'), 'has sentence diff mode');
+        ackAssert(fn.includes('Paragraphs'), 'has paragraph diff mode');
+        ackAssert(fn.includes('Before/After'), 'has side-by-side mode');
+        ackAssert(fn.includes('renderSideBySideView'), 'renders before/after view');
+    });
+
+    ackTest('showDiffDialog switches between readable diff modes', async () => {
+        const promise = showDiffDialog('First old sentence.\n\nSecond paragraph.', 'First new sentence.\n\nSecond paragraph expanded.');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const overlay = document.querySelector('.ack-diff-dialog-overlay');
+        try {
+            ackAssert(overlay, 'diff dialog overlay exists');
+            const modes = [...overlay.querySelectorAll('.ack-diff-mode-btn')].map((btn) => btn.textContent);
+            ackDeepEq(modes, ['Words', 'Sentences', 'Paragraphs', 'Before/After'], 'all diff modes are shown');
+            const sentenceBtn = overlay.querySelector('[data-ack-diff-mode="sentence"]');
+            const paragraphBtn = overlay.querySelector('[data-ack-diff-mode="paragraph"]');
+            const sideBtn = overlay.querySelector('[data-ack-diff-mode="side"]');
+            sentenceBtn.click();
+            ackEq(sentenceBtn.dataset.active, '1', 'sentence mode becomes active');
+            paragraphBtn.click();
+            ackEq(paragraphBtn.dataset.active, '1', 'paragraph mode becomes active');
+            sideBtn.click();
+            ackEq(sideBtn.dataset.active, '1', 'side-by-side mode becomes active');
+            ackAssert(overlay.querySelector('.ack-diff-side-by-side'), 'side-by-side panes are rendered');
+            const acceptBtn = [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Accept');
+            acceptBtn.click();
+            const result = await promise;
+            ackEq(result.action, 'edit', 'accept still applies from readable modes');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+        }
     });
 
     ackTest('renderInlineProofreadResult builds inline Diff and Result blocks', () => {
@@ -32332,9 +32539,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.92', () => {
+    ackTest('version bumped to 1.93', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.92' || _ackSource.includes('@version      1.92'), 'version is 1.92');
+        ackAssert(versionFromMeta === '1.93' || _ackSource.includes('@version      1.93'), 'version is 1.93');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -33773,6 +33980,7 @@ RULES:
         ANALYSIS_MODES,
         LLM_MODELS,
         wordDiff,
+        groupedDiff,
         hasUnsavedCommentText,
         isProviderAvailable,
         buildCommitPrefix,
