@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.111
+// @version      1.112
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -5445,12 +5445,103 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.length ? parts.join(', ') : Object.prototype.toString.call(event);
     }
 
+    function estimateLLMTokens(text) {
+        const value = String(text || '');
+        if (!value) return 0;
+        const roughWordsAndSymbols = (value.match(/[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/g) || []).length;
+        return Math.max(1, Math.ceil(value.length / 4), Math.ceil(roughWordsAndSymbols * 0.75));
+    }
+
+    function textByteLength(text) {
+        const value = String(text || '');
+        try {
+            return new TextEncoder().encode(value).length;
+        } catch (_) {
+            return value.length;
+        }
+    }
+
+    function safeRequestUrlForLog(url) {
+        try {
+            const parsed = new URL(url);
+            if (parsed.search) parsed.search = '?...';
+            return parsed.toString();
+        } catch (_) {
+            return String(url || '').replace(/([?&](?:key|api_key)=)[^&]+/gi, '$1...');
+        }
+    }
+
+    function buildLLMRequestMeta({
+        provider,
+        label,
+        model,
+        url,
+        system,
+        userContent,
+        requestBody,
+        reasoningEffort,
+        maxTokens,
+        timeoutMs,
+        promptKey,
+        requestLabel,
+    }) {
+        const systemChars = String(system || '').length;
+        const userChars = String(userContent || '').length;
+        const bodyChars = String(requestBody || '').length;
+        return {
+            label,
+            provider,
+            model,
+            requestLabel: requestLabel || '',
+            endpoint: safeRequestUrlForLog(url),
+            systemChars,
+            userChars,
+            inputChars: systemChars + userChars,
+            approxInputTokens: estimateLLMTokens(`${system || ''}\n${userContent || ''}`),
+            requestChars: bodyChars,
+            requestBytes: textByteLength(requestBody),
+            maxTokens: maxTokens || 4096,
+            reasoningEffort: reasoningEffort || '',
+            timeoutMs,
+            promptCacheKey: promptKey ? promptKey.slice(-12) : '',
+        };
+    }
+
+    function summarizeLLMRequestMeta(meta) {
+        const seconds = meta.timeoutMs ? Math.round(meta.timeoutMs / 1000) : '?';
+        return [
+            meta.requestLabel ? `label=${meta.requestLabel}` : '',
+            `model=${meta.model || '?'}`,
+            `input≈${meta.approxInputTokens || 0}t`,
+            `body=${meta.requestBytes || meta.requestChars || 0}B`,
+            `max=${meta.maxTokens || '?'}`,
+            `timeout=${seconds}s`,
+            meta.elapsedMs != null ? `elapsed=${meta.elapsedMs}ms` : '',
+        ]
+            .filter(Boolean)
+            .join(', ');
+    }
+
+    function makeLLMRequestError(label, kind, details, meta) {
+        const message = `${label} ${kind}: ${details} [${summarizeLLMRequestMeta(meta)}]`;
+        const err = new Error(message);
+        err.ackLLMMeta = meta;
+        return err;
+    }
+
     // Single LLM call implementation driven by PROVIDER_API config.
     function callLLM(
         provider,
         system,
         userContent,
-        { skipCache = false, modelOverride = '', reasoningEffort = '', maxTokens = 0, timeoutMs = LLM_REQUEST_TIMEOUT_MS } = {},
+        {
+            skipCache = false,
+            modelOverride = '',
+            reasoningEffort = '',
+            maxTokens = 0,
+            timeoutMs = LLM_REQUEST_TIMEOUT_MS,
+            requestLabel = '',
+        } = {},
     ) {
         // Check prompt-level cache first (exact same prompt → cached response)
         const llmCfg = getLLMConfig();
@@ -5472,19 +5563,45 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!cfg?.key) return Promise.reject(new Error(`${provider} has no API key`));
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
+        const requestUrl = providerRequestUrl(api, model, cfg.key);
+        const requestBody = JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens }));
+        const requestMeta = buildLLMRequestMeta({
+            provider,
+            label,
+            model,
+            url: requestUrl,
+            system,
+            userContent,
+            requestBody,
+            reasoningEffort,
+            maxTokens,
+            timeoutMs,
+            promptKey,
+            requestLabel,
+        });
         console.groupCollapsed(`ACKtopus: LLM request → ${label} (${model})`);
+        console.log('metadata:', requestMeta);
         console.log('system:', system);
         console.log('user:', userContent);
         if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
         if (maxTokens) console.log('max_tokens:', maxTokens);
         console.log('timeout_ms:', timeoutMs);
-        const requestBody = JSON.stringify(api.body(model, system, userContent, { reasoningEffort, maxTokens }));
         console.log('request_chars:', requestBody.length);
         console.groupEnd();
         return new Promise((resolve, reject) => {
+            const startedAt = Date.now();
+            const finishMeta = () => ({ ...requestMeta, elapsedMs: Date.now() - startedAt });
+            const rejectWithLoggedError = (kind, details, event = null) => {
+                const meta = finishMeta();
+                console.groupCollapsed(`ACKtopus: LLM ${kind} ✕ ${label} (${model})`);
+                console.log('metadata:', meta);
+                if (event) console.log('event:', event);
+                console.groupEnd();
+                reject(makeLLMRequestError(label, kind, details, meta));
+            };
             GM_xmlhttpRequest({
                 method: 'POST',
-                url: providerRequestUrl(api, model, cfg.key),
+                url: requestUrl,
                 headers: api.headers(cfg.key),
                 data: requestBody,
                 timeout: timeoutMs,
@@ -5510,11 +5627,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         }
                         resolve(text);
                     } else {
-                        reject(new Error(`${label} ${r.status}: ${parseProviderError(r)}`));
+                        rejectWithLoggedError(`${r.status}`, parseProviderError(r), r);
                     }
                 },
-                onerror: (e) => reject(new Error(`${label} network error: ${formatTransportErrorDetails(e)}`)),
-                ontimeout: (e) => reject(new Error(`${label} request timed out: ${formatTransportErrorDetails(e)}`)),
+                onerror: (e) => rejectWithLoggedError('network error', formatTransportErrorDetails(e), e),
+                ontimeout: (e) => rejectWithLoggedError('request timed out', formatTransportErrorDetails(e), e),
             });
         });
     }
@@ -7746,7 +7863,7 @@ The prompt must ask for:
                         omitHeadMetadata: true,
                         maxChars: REPRODUCER_CONTEXT_MAX_CHARS,
                     },
-                    maxTokens: 12000,
+                    maxTokens: 4096,
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
                         'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from the base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must frame the task as an independent reinvention from the problem description and base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the base commit/branch the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
@@ -7916,6 +8033,14 @@ The prompt must ask for:
                     const fullContext = await gatherRecipeContext((msg) => {
                         setAssistantText(assistantMsg, msg);
                     }, recipeCfg.contextOptions || {});
+                    console.log('ACKtopus: recipe context', {
+                        recipe,
+                        contextChars: fullContext.length,
+                        contextApproxTokens: estimateLLMTokens(fullContext),
+                        contextTruncated: fullContext.includes('## Context Size Notice'),
+                        contextOptions: recipeCfg.contextOptions || {},
+                        maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
+                    });
                     const extraInstr = (getLLMConfig().instructions[recipe] || DEFAULT_INSTRUCTIONS[recipe]).trim();
                     const promptRecipe = isPromptRecipe(recipe);
                     const copyableRecipe = isCopyableRecipe(recipe);
@@ -7962,6 +8087,7 @@ The prompt must ask for:
                         reasoningEffort: getHighContextReasoningEffort(provider),
                         maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
                         timeoutMs: getHighContextTimeoutMs(provider),
+                        requestLabel: recipe,
                     });
                     let patchAttachment = '';
                     if (recipe === 'audio_walkthrough' && recipeCfg.appendPatchAttachment) {
@@ -16440,6 +16566,7 @@ RULES:
             modelOverride: extraContext ? getHighContextModelOverride(provider) : '',
             reasoningEffort: extraContext ? getHighContextReasoningEffort(provider) : '',
             maxTokens: extraContext ? getHighContextMaxTokens(provider) : 0,
+            requestLabel: 'lightbulb-review-aid',
         });
         return parseLLMJsonObject(raw);
     }
@@ -16473,6 +16600,7 @@ RULES:
             modelOverride: (extraContext || fullPatch) ? getHighContextModelOverride(provider) : '',
             reasoningEffort: (extraContext || fullPatch) ? getHighContextReasoningEffort(provider) : '',
             maxTokens: (extraContext || fullPatch) ? getHighContextMaxTokens(provider) : 0,
+            requestLabel: 'commit-explain',
         });
         return parseLLMJsonObject(raw);
     }
@@ -26683,6 +26811,7 @@ RULES:
         ackAssert(fn.includes('console.groupCollapsed'), 'uses collapsed group for request');
         ackAssert(fn.includes('LLM request'), 'logs request');
         ackAssert(fn.includes('LLM response'), 'logs response');
+        ackAssert(fn.includes("console.log('metadata:'"), 'logs request metadata');
         ackAssert(fn.includes("console.log('system:'"), 'logs system prompt');
         ackAssert(fn.includes("console.log('user:'"), 'logs user prompt');
     });
@@ -29674,6 +29803,8 @@ RULES:
         const fn = source.slice(source.indexOf('function callLLM('), source.indexOf('function fetchPatch'));
         ackAssert(source.includes('function formatTransportErrorDetails'), 'has transport error formatter');
         ackAssert(fn.includes('formatTransportErrorDetails(e)'), 'uses structured transport error details');
+        ackAssert(source.includes('function buildLLMRequestMeta'), 'builds structured request metadata');
+        ackAssert(source.includes('function makeLLMRequestError'), 'adds request metadata to errors');
         ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
         ackAssert(fn.includes('timeout_ms'), 'logs the configured request timeout');
         ackAssert(fn.includes('timeout: timeoutMs'), 'uses an explicit LLM transport timeout');
@@ -29687,6 +29818,21 @@ RULES:
         ackAssert(formatted.includes('status=0'), 'includes status');
         ackAssert(formatted.includes('error={"code":"network"}'), 'includes structured nested error');
         ackAssert(formatted.includes('finalUrl=https://api.anthropic.com/v1/messages'), 'includes target URL');
+        const err = makeLLMRequestError('Claude', 'network error', 'status=408', {
+            requestLabel: 'reimplementation',
+            model: 'claude-opus-4-7',
+            approxInputTokens: 2200,
+            requestBytes: 12345,
+            maxTokens: 4096,
+            timeoutMs: 600000,
+            elapsedMs: 30001,
+        });
+        ackAssert(err.message.includes('label=reimplementation'), 'error includes recipe/request label');
+        ackAssert(err.message.includes('model=claude-opus-4-7'), 'error includes model');
+        ackAssert(err.message.includes('input≈2200t'), 'error includes approximate input tokens');
+        ackAssert(err.message.includes('body=12345B'), 'error includes body size');
+        ackAssert(err.message.includes('elapsed=30001ms'), 'error includes elapsed time');
+        ackEq(err.ackLLMMeta.model, 'claude-opus-4-7', 'error keeps structured metadata');
     });
 
     ackTest('comment/code mismatches fixed', () => {
@@ -31750,7 +31896,8 @@ RULES:
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
         ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a smaller Claude-safe source budget');
-        ackAssert(fn.includes('maxTokens: 12000'), 'reproducer uses a bounded output budget');
+        ackAssert(fn.includes('maxTokens: 4096'), 'reproducer uses a bounded output budget');
+        ackAssert(fn.includes('requestLabel: recipe'), 'recipe LLM calls are labeled in error diagnostics');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
         ackAssert(fn.includes('the actual outcome-focused no-peek local reproducer prompt'), 'generates the direct no-peek prompt');
         ackAssert(fn.includes('Internal generation constraint'), 'keeps prompt-generation guard internal');
