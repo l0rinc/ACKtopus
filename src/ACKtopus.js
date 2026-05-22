@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.96
+// @version      1.97
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8703,22 +8703,8 @@ The prompt must ask for:
         return splitLineDiffUnits(text);
     }
 
-    function splitSentenceDiffUnits(text) {
-        const units = [];
-        for (const line of splitLineDiffUnits(text)) {
-            const hasNewline = line.endsWith('\n');
-            const body = hasNewline ? line.slice(0, -1) : line;
-            if (body) {
-                units.push(...(body.match(/[^.!?]+[.!?]+[\])}"'`]*\s*|[^.!?]+/g) || [body]));
-            }
-            if (hasNewline) units.push('\n');
-        }
-        return units;
-    }
-
-    function groupedDiff(oldText, newText, unit) {
-        const split = unit === 'paragraph' ? splitParagraphDiffUnits : splitSentenceDiffUnits;
-        return Diff.diffArrays(split(oldText), split(newText)).map((d) => ({
+    function groupedDiff(oldText, newText) {
+        return Diff.diffArrays(splitParagraphDiffUnits(oldText), splitParagraphDiffUnits(newText)).map((d) => ({
             type: d.added ? 'add' : d.removed ? 'del' : 'same',
             text: d.value.join(''),
         }));
@@ -8943,9 +8929,9 @@ The prompt must ask for:
                 }
             }
 
-            function renderGroupedView(unit) {
+            function renderGroupedView() {
                 contentEl.innerHTML = '';
-                for (const d of groupedDiff(original, buildText(), unit)) {
+                for (const d of groupedDiff(original, buildText())) {
                     const block = document.createElement('div');
                     block.textContent = d.text;
                     Object.assign(block.style, {
@@ -9031,7 +9017,6 @@ The prompt must ask for:
 
             const modes = [
                 { key: 'word', label: 'Words', title: 'Word-level diff with click-to-revert changes' },
-                { key: 'sentence', label: 'Sentences', title: 'Sentence-level diff that also splits at line endings' },
                 { key: 'paragraph', label: 'Paragraphs', title: 'Paragraph diff split at newlines' },
                 { key: 'side', label: 'Before/After', title: 'Read both versions side by side with changed text colored' },
             ];
@@ -9040,8 +9025,7 @@ The prompt must ask for:
 
             function renderActiveMode() {
                 if (activeMode === 'word') renderWordView();
-                else if (activeMode === 'sentence') renderGroupedView('sentence');
-                else if (activeMode === 'paragraph') renderGroupedView('paragraph');
+                else if (activeMode === 'paragraph') renderGroupedView();
                 else renderSideBySideView();
             }
 
@@ -20102,7 +20086,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.96
+// @version      1.97
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -20713,13 +20697,8 @@ RULES:
         ackDeepEq(counts, { added: 2, removed: 1 }, 'counts added and removed lines separately');
     });
 
-    ackTest('groupedDiff supports sentence and paragraph readability modes', () => {
-        const sentence = groupedDiff('One stays.\nTwo old.', 'One stays.\nTwo new.', 'sentence');
-        ackAssert(sentence.some((d) => d.type === 'del' && d.text.includes('Two old.')), 'sentence diff removes old sentence');
-        ackAssert(sentence.some((d) => d.type === 'add' && d.text.includes('Two new.')), 'sentence diff adds new sentence');
-        ackAssert(sentence.some((d) => d.type === 'same' && d.text.includes('\n')), 'sentence diff keeps line endings as boundaries');
-
-        const paragraph = groupedDiff('Intro.\nOld body.\nTail.', 'Intro.\nNew body.\nTail.', 'paragraph');
+    ackTest('groupedDiff supports paragraph readability mode', () => {
+        const paragraph = groupedDiff('Intro.\nOld body.\nTail.', 'Intro.\nNew body.\nTail.');
         ackAssert(paragraph.some((d) => d.type === 'del' && d.text === 'Old body.\n'), 'paragraph diff removes old line');
         ackAssert(paragraph.some((d) => d.type === 'add' && d.text === 'New body.\n'), 'paragraph diff adds new line');
     });
@@ -22258,7 +22237,7 @@ RULES:
             'renders + and - line counts in the dialog',
         );
         ackAssert(fn.includes('ack-diff-mode-row'), 'renders diff mode controls');
-        ackAssert(fn.includes('Sentences'), 'has sentence diff mode');
+        ackAssert(!fn.includes('Sentences'), 'sentence diff mode is not shown');
         ackAssert(fn.includes('Paragraphs'), 'has paragraph diff mode');
         ackAssert(fn.includes('Before/After'), 'has side-by-side mode');
         ackAssert(fn.includes('renderSideBySideView'), 'renders before/after view');
@@ -22275,12 +22254,10 @@ RULES:
         try {
             ackAssert(overlay, 'diff dialog overlay exists');
             const modes = [...overlay.querySelectorAll('.ack-diff-mode-btn')].map((btn) => btn.textContent);
-            ackDeepEq(modes, ['Words', 'Sentences', 'Paragraphs', 'Before/After'], 'all diff modes are shown');
-            const sentenceBtn = overlay.querySelector('[data-ack-diff-mode="sentence"]');
+            ackDeepEq(modes, ['Words', 'Paragraphs', 'Before/After'], 'all diff modes are shown');
+            ackAssert(!overlay.querySelector('[data-ack-diff-mode="sentence"]'), 'sentence mode is removed');
             const paragraphBtn = overlay.querySelector('[data-ack-diff-mode="paragraph"]');
             const sideBtn = overlay.querySelector('[data-ack-diff-mode="side"]');
-            sentenceBtn.click();
-            ackEq(sentenceBtn.dataset.active, '1', 'sentence mode becomes active');
             paragraphBtn.click();
             ackEq(paragraphBtn.dataset.active, '1', 'paragraph mode becomes active');
             sideBtn.click();
@@ -32598,9 +32575,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.96', () => {
+    ackTest('version bumped to 1.97', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.96' || _ackSource.includes('@version      1.96'), 'version is 1.96');
+        ackAssert(versionFromMeta === '1.97' || _ackSource.includes('@version      1.97'), 'version is 1.97');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
