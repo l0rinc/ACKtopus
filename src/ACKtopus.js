@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.108
+// @version      1.109
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8689,23 +8689,6 @@ The prompt must ask for:
         }));
     }
 
-    function splitLineDiffUnits(text) {
-        const value = String(text || '');
-        if (!value) return [];
-        return value.match(/[^\n]*\n|[^\n]+/g) || [value];
-    }
-
-    function splitParagraphDiffUnits(text) {
-        return splitLineDiffUnits(text);
-    }
-
-    function groupedDiff(oldText, newText) {
-        return Diff.diffArrays(splitParagraphDiffUnits(oldText), splitParagraphDiffUnits(newText)).map((d) => ({
-            type: d.added ? 'add' : d.removed ? 'del' : 'same',
-            text: d.value.join(''),
-        }));
-    }
-
     function sideBySideDiff(oldText, newText) {
         return Diff.diffChars(String(oldText || ''), String(newText || '')).map((d) => ({
             type: d.added ? 'add' : d.removed ? 'del' : 'same',
@@ -9048,35 +9031,6 @@ The prompt must ask for:
                 resetDiffNav();
             }
 
-            function renderGroupedView() {
-                contentEl.innerHTML = '';
-                let inChangeRun = false;
-                for (const d of groupedDiff(original, buildText())) {
-                    const block = document.createElement('div');
-                    block.textContent = d.text;
-                    Object.assign(block.style, {
-                        whiteSpace: 'pre-wrap',
-                        overflowWrap: 'anywhere',
-                        margin: d.type === 'same' ? '0' : '0 0 8px 0',
-                        padding: d.type === 'same' ? '0' : '7px 8px',
-                        borderRadius: d.type === 'same' ? '0' : '4px',
-                        background: d.type === 'del' ? '#3d1f1f' : d.type === 'add' ? '#1a3a1a' : 'transparent',
-                        color: d.type === 'del' ? '#f85149' : d.type === 'add' ? '#3fb950' : '#c9d1d9',
-                        textDecoration: d.type === 'del' ? 'line-through' : 'none',
-                    });
-                    if (d.type === 'same' && !d.text.trim()) {
-                        block.style.minHeight = '8px';
-                    }
-                    if (d.type === 'same') {
-                        inChangeRun = false;
-                    } else if (!inChangeRun) {
-                        markDiffNavTarget(block);
-                        inChangeRun = true;
-                    }
-                    contentEl.appendChild(block);
-                }
-            }
-
             function renderSideBySideView() {
                 contentEl.innerHTML = '';
                 const grid = document.createElement('div');
@@ -9155,7 +9109,6 @@ The prompt must ask for:
 
             const modes = [
                 { key: 'word', label: 'Words', title: 'Word-level diff with click-to-revert changes' },
-                { key: 'paragraph', label: 'Paragraphs', title: 'Paragraph diff split at newlines' },
                 { key: 'side', label: 'Before/After', title: 'Read both versions side by side with changed text colored' },
             ];
             let activeMode = 'word';
@@ -9163,7 +9116,6 @@ The prompt must ask for:
 
             function renderActiveMode() {
                 if (activeMode === 'word') renderWordView();
-                else if (activeMode === 'paragraph') renderGroupedView();
                 else renderSideBySideView();
                 resetDiffNav();
             }
@@ -20919,12 +20871,6 @@ RULES:
         ackDeepEq(counts, { added: 2, removed: 1 }, 'counts added and removed lines separately');
     });
 
-    ackTest('groupedDiff supports paragraph readability mode', () => {
-        const paragraph = groupedDiff('Intro.\nOld body.\nTail.', 'Intro.\nNew body.\nTail.');
-        ackAssert(paragraph.some((d) => d.type === 'del' && d.text === 'Old body.\n'), 'paragraph diff removes old line');
-        ackAssert(paragraph.some((d) => d.type === 'add' && d.text === 'New body.\n'), 'paragraph diff adds new line');
-    });
-
     // --- hasUnsavedCommentText ---
 
     ackTest('hasUnsavedCommentText returns false when no textareas have content', () => {
@@ -22463,7 +22409,7 @@ RULES:
         );
         ackAssert(fn.includes('ack-diff-mode-row'), 'renders diff mode controls');
         ackAssert(!fn.includes('Sentences'), 'sentence diff mode is not shown');
-        ackAssert(fn.includes('Paragraphs'), 'has paragraph diff mode');
+        ackAssert(!fn.includes('Paragraphs'), 'paragraph diff mode is not shown');
         ackAssert(fn.includes('Before/After'), 'has side-by-side mode');
         ackAssert(fn.includes('renderSideBySideView'), 'renders before/after view');
         ackAssert(fn.includes('sideBySideDiff(original, buildText())'), 'side view uses exact diff ranges');
@@ -22486,24 +22432,15 @@ RULES:
         try {
             ackAssert(overlay, 'diff dialog overlay exists');
             const modes = [...overlay.querySelectorAll('.ack-diff-mode-btn')].map((btn) => btn.textContent);
-            ackDeepEq(modes, ['Words', 'Paragraphs', 'Before/After'], 'all diff modes are shown');
+            ackDeepEq(modes, ['Words', 'Before/After'], 'all diff modes are shown');
             ackAssert(!overlay.querySelector('[data-ack-diff-mode="sentence"]'), 'sentence mode is removed');
-            const paragraphBtn = overlay.querySelector('[data-ack-diff-mode="paragraph"]');
+            ackAssert(!overlay.querySelector('[data-ack-diff-mode="paragraph"]'), 'paragraph mode is removed');
             const sideBtn = overlay.querySelector('[data-ack-diff-mode="side"]');
             const prevDiffBtn = overlay.querySelector('.ack-diff-nav-prev');
             const nextDiffBtn = overlay.querySelector('.ack-diff-nav-next');
             ackAssert(prevDiffBtn && nextDiffBtn, 'diff navigation buttons are shown');
             nextDiffBtn.click();
             ackAssert(overlay.querySelector('[data-ack-diff-nav-active="1"]'), 'next diff button selects a changed section');
-            paragraphBtn.click();
-            ackEq(paragraphBtn.dataset.active, '1', 'paragraph mode becomes active');
-            ackAssert(
-                overlay.querySelectorAll('[data-ack-diff-nav-target="1"]').length >= 2,
-                'paragraph mode has line-level changed section targets',
-            );
-            nextDiffBtn.click();
-            const activeParagraphTarget = overlay.querySelector('[data-ack-diff-nav-active="1"]');
-            ackAssert(activeParagraphTarget, 'next diff button works in paragraph mode');
             sideBtn.click();
             ackEq(sideBtn.dataset.active, '1', 'side-by-side mode becomes active');
             ackAssert(overlay.querySelector('.ack-diff-side-by-side'), 'side-by-side panes are rendered');
@@ -26736,7 +26673,7 @@ RULES:
             'heading compaction applies to comments and PR descriptions',
         );
         ackAssert(
-            makePromptSection.includes('Markdown headings or standalone label lines'),
+            makePromptSection.includes('Markdown headings') && makePromptSection.includes('standalone label lines'),
             'handles generic headings and labels',
         );
         ackAssert(
@@ -34491,7 +34428,6 @@ RULES:
         ANALYSIS_MODES,
         LLM_MODELS,
         wordDiff,
-        groupedDiff,
         hasUnsavedCommentText,
         isProviderAvailable,
         buildCommitPrefix,
