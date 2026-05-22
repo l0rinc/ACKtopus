@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.107
+// @version      1.108
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8869,7 +8869,7 @@ The prompt must ask for:
             window.addEventListener('keydown', onDialogKeydown, true);
 
             function getDiffNavTargets() {
-                return [...contentEl.querySelectorAll('[data-ack-diff-nav-target="1"]')].filter((el) => el.isConnected);
+                return [...contentEl.querySelectorAll('[data-ack-diff-nav-target="1"]')];
             }
 
             function clearDiffNavState() {
@@ -9541,7 +9541,7 @@ The prompt must ask for:
                         stripped: text !== cleaned ? text : null,
                     };
                 const headingNormalizationRule =
-                    '- For GitHub comments and PR descriptions: prefer compact inline bold prefixes over Markdown headings or standalone label lines whenever the surrounding text remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. Never leave a bold prefix alone on a line when normal prose follows. If the heading is followed by block content such as a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line.';
+                    '- Heading compaction is a required proofreading style change, not optional cleanup. For GitHub comments and PR descriptions, replace Markdown headings (any line that starts with one or more # characters) or standalone label lines with compact inline bold prefixes whenever the result remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. Do not leave a Markdown heading unchanged merely because its words are grammatical. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. If several paragraphs or later bullets follow, fold only the first normal prose block onto the prefix line and keep the rest below. Later block content does not prevent compaction. If the first following content is a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line. Never leave a bold prefix alone on a line when normal prose follows.';
                 const prDescriptionRule = isPRBody
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
@@ -12804,9 +12804,27 @@ Rules:
         );
     }
 
+    function getEditCancelRoots(form, sourceEl = null) {
+        const roots = [];
+        const push = (el) => {
+            if (el && el.nodeType === 1 && !roots.includes(el)) roots.push(el);
+        };
+        push(form);
+        push(sourceEl?.closest?.('.is-comment-editing'));
+        push(sourceEl?.closest?.(EDIT_FORM_SELECTOR));
+        push(sourceEl?.closest?.('form'));
+        push(sourceEl?.closest?.('[data-testid="edit-comment-form"]'));
+        push(sourceEl?.closest?.('[data-testid="markdown-editor"]'));
+        push(sourceEl?.closest?.('[class*="MarkdownEditor-module__container"]'));
+        let el = sourceEl?.parentElement || null;
+        for (let i = 0; i < 8 && el && el !== document.body; i++, el = el.parentElement) {
+            if (el.querySelector?.('textarea') && findEditCancelButton(el)) push(el);
+        }
+        return roots;
+    }
+
     function cancelEditForm(form, sourceEl = null) {
-        const editRoot = form || sourceEl?.closest?.('.is-comment-editing') || sourceEl?.closest?.(EDIT_FORM_SELECTOR);
-        const cancelBtn = findEditCancelButton(editRoot);
+        const cancelBtn = getEditCancelRoots(form, sourceEl).map(findEditCancelButton).find((btn) => btn && isVisible(btn));
         if (!cancelBtn) return false;
         const container = cancelBtn.closest(COMMENT_CONTAINER_SELECTOR) || sourceEl?.closest?.(COMMENT_CONTAINER_SELECTOR);
         if (container) schedulePostEditRefresh(container);
@@ -12988,13 +13006,13 @@ Rules:
             const ta = e.target?.closest?.('textarea');
             if (!ta) return;
             const form = findEditForm(ta);
-            if (!form && !ta.closest('.is-comment-editing')) return;
             if (isCancelShortcut) {
                 if (!cancelEditForm(form, ta)) return;
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 return;
             }
+            if (!form && !ta.closest('.is-comment-editing')) return;
             if (editDiffBypassActive(form)) return;
             if (isNoOpEditSave(form)) {
                 if (cancelEditForm(form, ta)) {
@@ -22435,9 +22453,9 @@ RULES:
         const source = _ackSource;
         ackAssert(source.includes("'Reject'"), 'has Reject button');
         ackAssert(source.includes("'Accept'"), 'has Accept button');
-        ackAssert(source.includes("action: 'edit'"), 'Accept resolves with action edit');
-        ackAssert(source.includes('action: false'), 'Reject resolves with action false');
         const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
+        ackAssert(fn.includes("settle('edit', buildText())"), 'Accept resolves with action edit');
+        ackAssert(fn.includes('settle(false, original)'), 'Reject resolves with action false');
         ackAssert(fn.includes('countDiffLines(original, corrected)'), 'computes line-based diff counts');
         ackAssert(
             fn.includes('+${lineCounts.added}') && fn.includes('-${lineCounts.removed}'),
@@ -26560,10 +26578,14 @@ RULES:
         );
         ackAssert(teardown.includes('invalidatePRContext'), 'invalidated on PR navigation');
         ackAssert(teardown.includes('lastInjectedPath'), 'same-PR page changes also trigger teardown');
-        // Proofread submit paths (both EDIT and VIEW modes)
-        const proofFn = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
-        const matches = proofFn.match(/invalidatePRContext/g) || [];
-        ackAssert(matches.length >= 2, `invalidated in both proofread submit paths (found ${matches.length})`);
+        // Native edit save paths after proofreading or manual edits.
+        const editSaveSection = sourceSection(
+            source,
+            '// Capture-phase listeners for edit form submit (save) and cancel.',
+            '// Ensure edit forms are tracked as soon as their textarea receives focus',
+        );
+        const matches = editSaveSection.match(/invalidatePRContext/g) || [];
+        ackAssert(matches.length >= 3, `invalidated in edit save submit/click paths (found ${matches.length})`);
     });
 
     ackTest('same-URL force-push live updates trigger toolbar refresh', () => {
@@ -26721,6 +26743,15 @@ RULES:
             makePromptSection.includes('compact inline bold prefixes'),
             'prefers compact bold prefixes',
         );
+        ackAssert(makePromptSection.includes('required proofreading style change'), 'heading compaction is mandatory');
+        ackAssert(
+            makePromptSection.includes('any line that starts with one or more # characters'),
+            'detects markdown heading syntax generically',
+        );
+        ackAssert(
+            makePromptSection.includes('Do not leave a Markdown heading unchanged merely because its words are grammatical'),
+            'prevents unchanged grammatical headings',
+        );
         ackAssert(makePromptSection.includes('not a fixed list of heading names'), 'does not rely on enumerated examples');
         ackAssert(makePromptSection.includes('Do not invent sections'), 'does not invent sections');
         ackAssert(
@@ -26730,6 +26761,10 @@ RULES:
         ackAssert(
             makePromptSection.includes('even when blank lines separated them'),
             'folds prose even after blank lines',
+        );
+        ackAssert(
+            makePromptSection.includes('Later block content does not prevent compaction'),
+            'later bullets or tables do not block heading compaction',
         );
         ackAssert(
             makePromptSection.includes('Never leave a bold prefix alone on a line when normal prose follows'),
@@ -28592,7 +28627,7 @@ RULES:
         const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('checkAllReverted'), 'has checkAllReverted function');
         ackAssert(fn.includes('buildText() === original'), 'compares buildText to original');
-        ackAssert(fn.includes('action: false, text: original'), 'resolves as reject when all reverted');
+        ackAssert(fn.includes('rejectDialog()'), 'resolves as reject when all reverted');
     });
 
     ackTest('wrapSelectionInDetails inserts template at cursor when no selection', () => {
@@ -33115,6 +33150,46 @@ RULES:
             ta.value = 'Original _markdown_ plus edit';
             ta.dispatchEvent(new Event('input', { bubbles: true }));
             ackEq(isNoOpEditSave(form), false, 'later edits are allowed to submit');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('Cmd/Ctrl+Escape cancels React-style edit boxes with buttons outside form', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <div class="ActivityThread">
+                <div data-testid="markdown-editor">
+                    <textarea style="width:200px;height:60px">Edited text</textarea>
+                </div>
+                <div>
+                    <button type="button">Cancel</button>
+                    <button type="button">Update comment</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const ta = host.querySelector('textarea');
+        const cancelBtn = [...host.querySelectorAll('button')].find((btn) => btn.textContent === 'Cancel');
+        let cancelClicks = 0;
+        let targetKeydowns = 0;
+        cancelBtn.addEventListener('click', () => cancelClicks++);
+        ta.addEventListener('keydown', () => targetKeydowns++);
+        try {
+            const ok = ta.dispatchEvent(
+                new KeyboardEvent('keydown', {
+                    key: 'Escape',
+                    metaKey: true,
+                    bubbles: true,
+                    cancelable: true,
+                }),
+            );
+            ackEq(ok, false, 'Cmd+Escape is prevented for React-style edit box');
+            ackEq(cancelClicks, 1, 'Cmd+Escape clicks external Cancel once');
+            ackEq(targetKeydowns, 0, 'Cmd+Escape does not reach the textarea');
         } finally {
             host.remove();
         }
