@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.100
+// @version      1.101
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -9343,7 +9343,7 @@ The prompt must ask for:
                         stripped: text !== cleaned ? text : null,
                     };
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: match concise Bitcoin Core contributor style. Prefer compact prose or simple bold line prefixes such as `**Problem:**`, `**Fix:**`, and `**Notes:**` over markdown headings such as `### Problem`, `### Fix`, `#### Notes`, `## Summary`, or `High-level goal:`. If markdown headings are already present, rewrite them as bold prefixes only when the surrounding text still fits that structure; do not invent sections.\n- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. ${isPRBody ? 'Preserve markdown formatting except for the PR-description style normalization above.' : 'Preserve ALL markdown formatting.'} Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: match concise Bitcoin Core contributor style. Prefer compact prose or simple bold line prefixes such as `**Problem:**`, `**Fix:**`, and `**Notes:**` over markdown headings such as `### Problem`, `### Fix`, `#### Notes`, `## Summary`, or `High-level goal:`. If markdown headings are already present, rewrite them as bold prefixes only when the surrounding text still fits that structure; do not invent sections. When a heading is followed by normal prose, continue the text on the same line after the colon, for example `### Summary\\nThis PR changes...` becomes `**Summary:** This PR changes...`. Do not fold the following block onto the prefix when it starts with a table, image, list, code fence, HTML block, or similar block content.\n- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. ${isPRBody ? 'Preserve markdown formatting except for the PR-description style normalization above.' : 'Preserve ALL markdown formatting.'} Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -20050,7 +20050,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.100
+// @version      1.101
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26407,6 +26407,14 @@ RULES:
         );
         ackAssert(makePromptSection.includes('over markdown headings such as `### Problem`'), 'discourages markdown section headings');
         ackAssert(makePromptSection.includes('`#### Notes`'), 'discourages lower-level Notes headings');
+        ackAssert(
+            makePromptSection.includes('continue the text on the same line after the colon'),
+            'folds following prose onto the bold prefix line',
+        );
+        ackAssert(
+            makePromptSection.includes('table, image, list, code fence, HTML block'),
+            'keeps block content below heading-style prefixes',
+        );
         ackAssert(makePromptSection.includes('do not invent sections'), 'does not invent PR description sections');
         ackAssert(makePromptSection.includes('Preserve markdown formatting except for the PR-description style normalization above'), 'allows PR-description style normalization');
     });
@@ -32581,9 +32589,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.100', () => {
+    ackTest('version bumped to 1.101', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.100' || _ackSource.includes('@version      1.100'), 'version is 1.100');
+        ackAssert(versionFromMeta === '1.101' || _ackSource.includes('@version      1.101'), 'version is 1.101');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
