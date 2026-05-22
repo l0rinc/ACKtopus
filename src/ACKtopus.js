@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.103
+// @version      1.104
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -425,8 +425,41 @@
     const SHIFT_COPY_HINT = '📋';
     const SHIFT_REVEAL_HINT = '📂';
     const SHIFT_REVERSE_HINT = '⬆';
+    const EDIT_POST_SHORTCUT_KEY = 'e';
+    const PROOFREAD_POST_SHORTCUT_KEY = 'p';
     let ackShiftPressed = false;
     const ackShiftAlternateRenderers = new Set();
+
+    function shortcutComboLabel(key) {
+        return `Alt+Shift+${String(key || '').toUpperCase()}`;
+    }
+
+    function shortcutAriaLabel(key) {
+        return `Alt+Shift+${String(key || '').toUpperCase()}`;
+    }
+
+    function withKeyboardShortcutHint(title, key) {
+        const label = shortcutComboLabel(key);
+        const text = String(title || '').trim();
+        return text.includes(`[${label}]`) ? text : `${text} [${label}]`;
+    }
+
+    function applyKeyboardShortcutHint(btn, title, key) {
+        if (!btn) return;
+        btn.title = withKeyboardShortcutHint(title, key);
+        btn.setAttribute('aria-keyshortcuts', shortcutAriaLabel(key));
+        btn.dataset.ackShortcutHint = shortcutComboLabel(key);
+    }
+
+    function matchesPostActionShortcut(e, key) {
+        return (
+            !!e?.altKey &&
+            !!e?.shiftKey &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            String(e.key || '').toLowerCase() === String(key || '').toLowerCase()
+        );
+    }
 
     function notifyShiftAlternateRenderers() {
         for (const render of [...ackShiftAlternateRenderers]) {
@@ -747,6 +780,99 @@
             return true;
         }
     }
+
+    function isInViewport(el) {
+        if (!isVisible(el)) return false;
+        const rect = el.getBoundingClientRect?.();
+        if (!rect) return false;
+        const width = window.innerWidth || document.documentElement.clientWidth || 0;
+        const height = window.innerHeight || document.documentElement.clientHeight || 0;
+        return rect.bottom > 0 && rect.right > 0 && rect.top < height && rect.left < width;
+    }
+
+    function getShortcutFocusRoots() {
+        const roots = [];
+        const push = (el) => {
+            if (el && !roots.includes(el)) roots.push(el);
+        };
+        const active = document.activeElement;
+        if (active && active !== document.body && active !== document.documentElement) {
+            push(active.closest?.(EDIT_FORM_SELECTOR));
+            push(active.closest?.(EXTENDED_COMMENT_CONTAINER_SELECTOR));
+            push(active.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR));
+            push(active.closest?.('form'));
+            push(active);
+        }
+        try {
+            const node = window.getSelection?.()?.anchorNode;
+            const el = node?.nodeType === 1 ? node : node?.parentElement;
+            push(el?.closest?.(EXTENDED_COMMENT_CONTAINER_SELECTOR));
+            push(el?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR));
+        } catch (_) {}
+        return roots;
+    }
+
+    function findFocusedOrVisibleShortcutButton(selector) {
+        for (const root of getShortcutFocusRoots()) {
+            const btn = [...(root.querySelectorAll?.(selector) || [])].find(isVisible);
+            if (btn) return btn;
+        }
+        const buttons = [...document.querySelectorAll(selector)].filter(isVisible);
+        return buttons.find(isInViewport) || buttons[0] || null;
+    }
+
+    function pressAckButton(btn) {
+        if (!btn) return false;
+        try {
+            const EventCtor = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+            btn.dispatchEvent(
+                new EventCtor('pointerdown', {
+                    bubbles: true,
+                    cancelable: true,
+                    button: 0,
+                    buttons: 1,
+                    pointerType: 'mouse',
+                }),
+            );
+            return true;
+        } catch (_) {
+            try {
+                btn.click();
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+    }
+
+    function triggerFocusedOrVisibleEditPostShortcut() {
+        addQuickCommentActions(document);
+        return pressAckButton(findFocusedOrVisibleShortcutButton('.ack-edit-post-btn'));
+    }
+
+    function triggerFocusedOrVisibleProofreadShortcut() {
+        addDetailsButtons(document);
+        return pressAckButton(findFocusedOrVisibleShortcutButton('.ack-toolbar-proofread'));
+    }
+
+    document.addEventListener(
+        'keydown',
+        (e) => {
+            if (e.repeat) return;
+            if (matchesPostActionShortcut(e, EDIT_POST_SHORTCUT_KEY)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                triggerFocusedOrVisibleEditPostShortcut();
+                return;
+            }
+            if (matchesPostActionShortcut(e, PROOFREAD_POST_SHORTCUT_KEY)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                triggerFocusedOrVisibleProofreadShortcut();
+            }
+        },
+        true,
+    );
 
     // GitHub sometimes uses relative data-url values for live timeline updates.
     // On some Turbo navigation states this can resolve incorrectly and spam 404s
@@ -13533,14 +13659,26 @@ Rules:
                             }),
                         );
                     }
-                    actionContainer.appendChild(
-                        makeIconBtn('✏️', 'Edit comment', () => {
+                    const editBtn = makeIconBtn(
+                        '✏️',
+                        withKeyboardShortcutHint(
+                            isPRBody ? 'Edit PR description' : 'Edit comment',
+                            EDIT_POST_SHORTCUT_KEY,
+                        ),
+                        () => {
                             // Edit is behind a lazily-rendered kebab menu
                             // (<include-fragment>). Open the menu and then click
                             // Edit with retries so we don't race the fragment.
                             triggerMenuEdit(container, header);
-                        }),
+                        },
                     );
+                    editBtn.classList.add('ack-edit-post-btn');
+                    applyKeyboardShortcutHint(
+                        editBtn,
+                        isPRBody ? 'Edit PR description' : 'Edit comment',
+                        EDIT_POST_SHORTCUT_KEY,
+                    );
+                    actionContainer.appendChild(editBtn);
 
                     if (!isPRBody) {
                         actionContainer.appendChild(
@@ -14768,10 +14906,15 @@ Rules:
         if (!btn) return;
         const ta = getToolbarTextarea(toolbar);
         const isEmpty = !String(ta?.value || '').trim();
+        const mode = isEmpty ? 'suggest' : 'proofread';
         const nextHtml = isEmpty ? WAND_ICON : PROOFREAD_ICON;
-        if ((btn.innerHTML || '').trim() !== nextHtml.trim()) btn.innerHTML = nextHtml;
-        btn.title = isEmpty ? 'Suggest a reply/comment in your style' : 'Proofread this comment';
-        btn.dataset.ackToolbarMode = isEmpty ? 'suggest' : 'proofread';
+        if (btn.dataset.ackToolbarMode !== mode || !btn.querySelector('svg')) btn.innerHTML = nextHtml;
+        applyKeyboardShortcutHint(
+            btn,
+            isEmpty ? 'Suggest a reply/comment in your style' : 'Proofread this comment',
+            PROOFREAD_POST_SHORTCUT_KEY,
+        );
+        btn.dataset.ackToolbarMode = mode;
         if (toolbar.tagName === 'MARKDOWN-TOOLBAR') {
             const icon = btn.querySelector('svg');
             if (icon) icon.classList.add('Button-visual');
@@ -15285,8 +15428,11 @@ RULES:
 
             if (!hasProofreadBtn) {
                 appendToolbarBtn(
-                    makeToolbarBtn('ack-toolbar-proofread', PROOFREAD_ICON, 'Proofread this comment', (btn) =>
-                        runProofreadOnComment(btn),
+                    makeToolbarBtn(
+                        'ack-toolbar-proofread',
+                        PROOFREAD_ICON,
+                        withKeyboardShortcutHint('Proofread this comment', PROOFREAD_POST_SHORTCUT_KEY),
+                        (btn) => runProofreadOnComment(btn),
                     ),
                 );
             }
@@ -15359,7 +15505,7 @@ RULES:
                 '.ack-toolbar-proofread',
                 'ack-toolbar-proofread',
                 PROOFREAD_ICON,
-                'Proofread this comment',
+                withKeyboardShortcutHint('Proofread this comment', PROOFREAD_POST_SHORTCUT_KEY),
                 (btn) => runProofreadOnComment(btn),
             );
             bindToolbarProofreadState(row);
@@ -23423,7 +23569,8 @@ RULES:
         // Cancel button in edit mode
         ackAssert(source.includes("makeIconBtn('❌', 'Cancel edit'"), 'shows cancel button while editing');
         // Edit button in view mode
-        ackAssert(source.includes("makeIconBtn('✏️', 'Edit comment'"), 'shows edit button in view mode');
+        ackAssert(source.includes('ack-edit-post-btn'), 'shows edit shortcut button in view mode');
+        ackAssert(source.includes('withKeyboardShortcutHint('), 'edit/proofread buttons show shortcut hints');
         // Delete hidden during edit: delete button is only inside the else branch (not editing)
         const editBranch = source.slice(source.indexOf('if (isEditing)'), source.indexOf('} else if (author)'));
         const editBlock = editBranch.slice(0, editBranch.indexOf('} else {'));
@@ -23609,6 +23756,37 @@ RULES:
         );
         // Window blur also cancels (screenshot steals focus)
         ackAssert(sourceIncludesLoose(source, "window.addEventListener('blur'"), 'blur event cancels hints');
+    });
+
+    ackTest('post edit/proofread shortcuts avoid Control and advertise their key hints', () => {
+        const source = _ackSource;
+        ackAssert(source.includes("const EDIT_POST_SHORTCUT_KEY = 'e'"), 'edit uses Alt+Shift+E');
+        ackAssert(source.includes("const PROOFREAD_POST_SHORTCUT_KEY = 'p'"), 'proofread uses Alt+Shift+P');
+        ackAssert(source.includes('`Alt+Shift+${String(key'), 'post shortcut labels use Alt+Shift');
+        const matcher = sourceSection(source, 'function matchesPostActionShortcut', 'function notifyShiftAlternateRenderers');
+        ackAssert(matcher.includes('!!e?.altKey'), 'requires Alt');
+        ackAssert(matcher.includes('!!e?.shiftKey'), 'requires Shift');
+        ackAssert(matcher.includes('!e.ctrlKey'), 'does not require or accept Control');
+        ackAssert(matcher.includes('!e.metaKey'), 'does not require or accept Command');
+        const listener = sourceSection(
+            source,
+            "if (e.repeat) return;\n            if (matchesPostActionShortcut(e, EDIT_POST_SHORTCUT_KEY))",
+            '// GitHub sometimes uses relative data-url values',
+        );
+        ackAssert(listener.includes('triggerFocusedOrVisibleEditPostShortcut();'), 'keydown triggers edit shortcut');
+        ackAssert(
+            listener.includes('triggerFocusedOrVisibleProofreadShortcut();'),
+            'keydown triggers proofread shortcut',
+        );
+        ackAssert(listener.includes('if (e.repeat) return'), 'does not repeat shortcuts while keys are held');
+        ackAssert(source.includes('ack-edit-post-btn'), 'edit button is targetable by shortcut');
+        ackAssert(
+            source.includes("withKeyboardShortcutHint('Proofread this comment', PROOFREAD_POST_SHORTCUT_KEY)"),
+            'proofread button title includes shortcut hint',
+        );
+        ackAssert(source.includes('applyKeyboardShortcutHint('), 'buttons get title shortcut hints');
+        ackAssert(source.includes('ackShortcutHint'), 'buttons record their shortcut hint');
+        ackAssert(source.includes('aria-keyshortcuts'), 'buttons expose keyboard shortcuts to accessibility APIs');
     });
 
     ackTest('SHA_FORMATS entries have hardcoded hotkey letters', () => {
@@ -24529,7 +24707,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
             // In view mode: edit + delete (proofread only during editing)
-            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
             ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
         } finally {
             root.remove();
@@ -24578,7 +24756,7 @@ RULES:
                     qa.querySelector('button[title="Expected author reply"]'),
                     'missing expected-author-reply button',
                 );
-                ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+                ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
                 ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
             } finally {
                 root.remove();
@@ -24632,7 +24810,7 @@ RULES:
                 qa.querySelector('button[title="Expected author reply"]'),
                 'missing expected-author-reply button on pending comment',
             );
-            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
             ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
         } finally {
             root.remove();
@@ -24693,7 +24871,7 @@ RULES:
             addQuickCommentActions(root);
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
-            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
         } finally {
             // Restore original meta contents (or remove if we created them).
             if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
@@ -24736,7 +24914,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing rebuilt .ack-quick-actions');
             ackAssert(!qa.querySelector('button[title*="Cancel"]'), 'stale cancel button still present');
-            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button after rebuild');
+            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button after rebuild');
         } finally {
             root.remove();
         }
@@ -24843,7 +25021,7 @@ RULES:
             const qa = header.querySelector('.ack-quick-actions');
             ackAssert(qa, 'missing .ack-quick-actions');
             ackAssert(badgesGroup.nextElementSibling === qa, 'quick-actions inserted after badgesGroup');
-            ackAssert(qa.querySelector('button[title="Edit comment"]'), 'missing edit button');
+            ackAssert(qa.querySelector('button[title="Edit comment [Alt+Shift+E]"]'), 'missing edit button');
         } finally {
             if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
             if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
