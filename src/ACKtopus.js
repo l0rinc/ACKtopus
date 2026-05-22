@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.94
+// @version      1.95
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -204,6 +204,110 @@
             return `https://redirect.github.com/${owner}/${repo}/commit/${sha}${fragment}`;
         });
         return { text: out, count };
+    }
+
+    function countLeadingBlankLines(lines) {
+        let n = 0;
+        for (const line of lines || []) {
+            if (String(line).trim() !== '') break;
+            n++;
+        }
+        return n;
+    }
+
+    function countTrailingBlankLines(lines) {
+        let n = 0;
+        for (let j = (lines || []).length - 1; j >= 0; j--) {
+            if (String(lines[j]).trim() !== '') break;
+            n++;
+        }
+        return n;
+    }
+
+    function maxConsecutiveBlankLines(lines) {
+        let max = 0;
+        let run = 0;
+        for (const line of lines || []) {
+            if (String(line).trim() === '') {
+                run++;
+                if (run > max) max = run;
+            } else {
+                run = 0;
+            }
+        }
+        return max;
+    }
+
+    function countBlankLines(lines) {
+        let n = 0;
+        for (const line of lines || []) {
+            if (String(line).trim() === '') n++;
+        }
+        return n;
+    }
+
+    function clampBlankRuns(lines, maxRun) {
+        if (maxRun < 0) return lines;
+        const out = [];
+        let run = 0;
+        for (const line of lines) {
+            if (String(line).trim() === '') {
+                run++;
+                if (run <= maxRun) out.push('');
+            } else {
+                run = 0;
+                out.push(line);
+            }
+        }
+        return out;
+    }
+
+    function clampTotalBlankLines(lines, maxTotal) {
+        if (maxTotal < 0) return lines;
+        const out = [];
+        let blanks = 0;
+        for (const line of lines) {
+            if (String(line).trim() === '') {
+                if (blanks < maxTotal) {
+                    out.push('');
+                    blanks++;
+                }
+            } else {
+                out.push(line);
+            }
+        }
+        return out;
+    }
+
+    function normalizeProofreadMutableSegment(text, originalLines) {
+        const original = Array.isArray(originalLines) ? originalLines : String(originalLines || '').split('\n');
+        if (original.every((line) => String(line).trim() === '')) {
+            return original.join('\n');
+        }
+
+        // Preserve leading/trailing blank lines exactly. Blank lines are
+        // structural in Markdown/CommonMark (eg, they terminate blockquotes
+        // and lists). In particular, blockquotes support "lazy continuation"
+        // lines: removing the blank line after a `>` quote can pull the next
+        // paragraph into the quote even if it doesn't start with `>`.
+        const lead = countLeadingBlankLines(original);
+        const trail = countTrailingBlankLines(original);
+        const coreStart = Math.min(lead, original.length);
+        const coreEnd = Math.max(coreStart, original.length - trail);
+        const originalCore = original.slice(coreStart, coreEnd);
+        const maxInteriorBlankRun = maxConsecutiveBlankLines(originalCore);
+        const maxInteriorBlankCount = countBlankLines(originalCore);
+        const lines = String(text || '')
+            .replace(/\r\n/g, '\n')
+            .split('\n');
+        while (lines.length && lines[0].trim() === '') lines.shift();
+        while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+        const core = clampTotalBlankLines(clampBlankRuns(lines, maxInteriorBlankRun), maxInteriorBlankCount);
+        const out = [];
+        for (let k = 0; k < lead; k++) out.push('');
+        out.push(...core);
+        for (let k = 0; k < trail; k++) out.push('');
+        return out.join('\n');
     }
 
     function postProcessProofreadMarkdown(text) {
@@ -9225,89 +9329,6 @@ The prompt must ask for:
                 const fromXML = (response) => {
                     // Parse each <sN>...</sN> from the response
                     const corrected = {};
-                    const countLeadingBlank = (lines) => {
-                        let n = 0;
-                        for (const line of lines) {
-                            if (String(line).trim() !== '') break;
-                            n++;
-                        }
-                        return n;
-                    };
-                    const countTrailingBlank = (lines) => {
-                        let n = 0;
-                        for (let j = lines.length - 1; j >= 0; j--) {
-                            if (String(lines[j]).trim() !== '') break;
-                            n++;
-                        }
-                        return n;
-                    };
-                    const maxConsecutiveBlankLines = (lines) => {
-                        let max = 0;
-                        let run = 0;
-                        for (const line of lines) {
-                            if (String(line).trim() === '') {
-                                run++;
-                                if (run > max) max = run;
-                            } else {
-                                run = 0;
-                            }
-                        }
-                        return max;
-                    };
-                    const clampBlankRuns = (lines, maxRun) => {
-                        if (maxRun < 0) return lines;
-                        const out = [];
-                        let run = 0;
-                        for (const line of lines) {
-                            if (String(line).trim() === '') {
-                                run++;
-                                if (run <= maxRun) out.push('');
-                            } else {
-                                run = 0;
-                                out.push(line);
-                            }
-                        }
-                        return out;
-                    };
-                    const countBlankLines = (lines) => {
-                        let n = 0;
-                        for (const line of lines) {
-                            if (String(line).trim() === '') n++;
-                        }
-                        return n;
-                    };
-                    const clampTotalBlankLines = (lines, maxTotal) => {
-                        if (maxTotal < 0) return lines;
-                        const out = [];
-                        let blanks = 0;
-                        for (const line of lines) {
-                            if (String(line).trim() === '') {
-                                if (blanks < maxTotal) {
-                                    out.push('');
-                                    blanks++;
-                                }
-                            } else {
-                                out.push(line);
-                            }
-                        }
-                        return out;
-                    };
-                    const normalizeBlankEdges = (text, { lead, trail, maxInteriorBlankRun, maxInteriorBlankCount }) => {
-                        const lines = String(text || '')
-                            .replace(/\r\n/g, '\n')
-                            .split('\n');
-                        while (lines.length && lines[0].trim() === '') lines.shift();
-                        while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
-                        const core = clampTotalBlankLines(
-                            clampBlankRuns(lines, maxInteriorBlankRun),
-                            maxInteriorBlankCount,
-                        );
-                        const out = [];
-                        for (let k = 0; k < lead; k++) out.push('');
-                        out.push(...core);
-                        for (let k = 0; k < trail; k++) out.push('');
-                        return out.join('\n');
-                    };
                     for (let i = 1; i <= mutableCount; i++) {
                         // Be permissive about whitespace/newlines and tag casing.
                         // Some models use CRLF, add extra spacing, or vary capitalization.
@@ -9316,24 +9337,7 @@ The prompt must ask for:
                         if (m) {
                             const originalLines = segments.find((s) => s.index === i)?.lines || [];
                             const original = originalLines.join('\n');
-                            // Preserve leading/trailing blank lines exactly. Blank lines are
-                            // structural in Markdown/CommonMark (eg, they terminate blockquotes
-                            // and lists). In particular, blockquotes support "lazy continuation"
-                            // lines: removing the blank line after a `>` quote can pull the next
-                            // paragraph into the quote even if it doesn't start with `>`.
-                            const lead = countLeadingBlank(originalLines);
-                            const trail = countTrailingBlank(originalLines);
-                            const coreStart = Math.min(lead, originalLines.length);
-                            const coreEnd = Math.max(coreStart, originalLines.length - trail);
-                            const originalCore = originalLines.slice(coreStart, coreEnd);
-                            const maxInteriorBlankRun = maxConsecutiveBlankLines(originalCore);
-                            const maxInteriorBlankCount = countBlankLines(originalCore);
-                            const result = normalizeBlankEdges(m[1], {
-                                lead,
-                                trail,
-                                maxInteriorBlankRun,
-                                maxInteriorBlankCount,
-                            });
+                            const result = normalizeProofreadMutableSegment(m[1], originalLines);
                             // Reject segments that grew significantly (LLM added content).
                             // Allow up to 30% growth or 50 chars (whichever is larger) so the
                             // LLM has room to wrap technical identifiers in backticks and to
@@ -20081,7 +20085,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.94
+// @version      1.95
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22443,26 +22447,41 @@ RULES:
         // Structural: we cannot directly call splitSegments/fromXML (they are nested),
         // so ensure the blank-edge normalization logic is present in source.
         const fn = _ackSource.slice(_ackSource.indexOf('const fromXML'), _ackSource.indexOf('return { segments'));
-        ackAssert(fn.includes('countLeadingBlank'), 'counts leading blank lines');
-        ackAssert(fn.includes('countTrailingBlank'), 'counts trailing blank lines');
-        ackAssert(fn.includes('normalizeBlankEdges'), 're-applies blank edges around corrected text');
+        ackAssert(fn.includes('normalizeProofreadMutableSegment'), 'normalizes corrected mutable segments');
+        const helper = _ackSource.slice(
+            _ackSource.indexOf('function normalizeProofreadMutableSegment'),
+            _ackSource.indexOf('function postProcessProofreadMarkdown'),
+        );
+        ackAssert(helper.includes('countLeadingBlankLines'), 'counts leading blank lines');
+        ackAssert(helper.includes('countTrailingBlankLines'), 'counts trailing blank lines');
         ackAssert(
-            fn.includes('lazy continuation') || fn.includes('blockquotes'),
+            helper.includes('lazy continuation') || helper.includes('blockquotes'),
             'documents Markdown structural risk (lazy continuation / blockquotes)',
         );
     });
 
     ackTest('proofread fromXML clamps extra interior blank lines to original structure', () => {
-        const fn = _ackSource.slice(_ackSource.indexOf('const fromXML'), _ackSource.indexOf('return { segments'));
-        ackAssert(fn.includes('maxConsecutiveBlankLines'), 'computes original interior blank-run cap');
-        ackAssert(fn.includes('countBlankLines'), 'counts original interior blank lines');
-        ackAssert(fn.includes('clampBlankRuns'), 'clamps LLM-introduced blank-line growth');
-        ackAssert(fn.includes('clampTotalBlankLines'), 'clamps total interior blank-line growth');
-        ackAssert(fn.includes('maxInteriorBlankRun'), 'passes interior blank-line cap into normalizeBlankEdges');
-        ackAssert(
-            fn.includes('maxInteriorBlankCount'),
-            'passes interior blank-line count cap into normalizeBlankEdges',
+        const helper = _ackSource.slice(
+            _ackSource.indexOf('function normalizeProofreadMutableSegment'),
+            _ackSource.indexOf('function postProcessProofreadMarkdown'),
         );
+        ackAssert(helper.includes('maxConsecutiveBlankLines'), 'computes original interior blank-run cap');
+        ackAssert(helper.includes('countBlankLines'), 'counts original interior blank lines');
+        ackAssert(helper.includes('clampBlankRuns'), 'clamps LLM-introduced blank-line growth');
+        ackAssert(helper.includes('clampTotalBlankLines'), 'clamps total interior blank-line growth');
+        ackAssert(helper.includes('maxInteriorBlankRun'), 'passes interior blank-line cap into normalizer');
+        ackAssert(
+            helper.includes('maxInteriorBlankCount'),
+            'passes interior blank-line count cap into normalizer',
+        );
+    });
+
+    ackTest('proofread normalization preserves blank-only details separators exactly', () => {
+        ackEq(normalizeProofreadMutableSegment('\n\n\n\n', ['']), '', 'single blank separator does not grow');
+        ackEq(normalizeProofreadMutableSegment('\n\n\n\n', ['', '']), '\n', 'two blank separators do not grow');
+        const detailsTail = ['```', normalizeProofreadMutableSegment('\n\n\n\n\n', ['']), '</details>'].join('\n');
+        ackAssert(!detailsTail.includes('\n\n\n\n</details>'), 'does not create large blank run before closing details');
+        ackEq(detailsTail, '```\n\n</details>', 'keeps exactly one blank line before closing details');
     });
 
     ackTest('proofread falls back when LLM omits <sN> tags', () => {
@@ -32549,9 +32568,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.94', () => {
+    ackTest('version bumped to 1.95', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.94' || _ackSource.includes('@version      1.94'), 'version is 1.94');
+        ackAssert(versionFromMeta === '1.95' || _ackSource.includes('@version      1.95'), 'version is 1.95');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -34009,6 +34028,7 @@ RULES:
         BRAILLE,
         rewriteProofreadCommitDiffUrls,
         postProcessProofreadMarkdown,
+        normalizeProofreadMutableSegment,
         showDiffDialog,
         COPY_ICON,
         CHECK_ICON,
