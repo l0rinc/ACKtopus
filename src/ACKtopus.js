@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.112
+// @version      1.113
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -85,7 +85,7 @@
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
     const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
     const LLM_REQUEST_TIMEOUT_MS = 180000;
-    const LLM_HIGH_CONTEXT_TIMEOUT_MS = 600000;
+    const LLM_HIGH_CONTEXT_TIMEOUT_MS = 20 * 60 * 1000;
     const GITHUB_GET_TIMEOUT_MS = 30000;
 
     function shellQuote(arg) {
@@ -5605,6 +5605,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 headers: api.headers(cfg.key),
                 data: requestBody,
                 timeout: timeoutMs,
+                fetch: false,
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         let data;
@@ -29808,6 +29809,7 @@ RULES:
         ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
         ackAssert(fn.includes('timeout_ms'), 'logs the configured request timeout');
         ackAssert(fn.includes('timeout: timeoutMs'), 'uses an explicit LLM transport timeout');
+        ackAssert(fn.includes('fetch: false'), 'keeps LLM calls on GM_xmlhttpRequest XHR mode');
         const formatted = formatTransportErrorDetails({
             status: 0,
             statusText: 'error',
@@ -29824,7 +29826,7 @@ RULES:
             approxInputTokens: 2200,
             requestBytes: 12345,
             maxTokens: 4096,
-            timeoutMs: 600000,
+            timeoutMs: LLM_HIGH_CONTEXT_TIMEOUT_MS,
             elapsedMs: 30001,
         });
         ackAssert(err.message.includes('label=reimplementation'), 'error includes recipe/request label');
