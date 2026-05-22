@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.104
+// @version      1.105
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8641,6 +8641,13 @@ The prompt must ask for:
         }));
     }
 
+    function sideBySideDiff(oldText, newText) {
+        return Diff.diffChars(String(oldText || ''), String(newText || '')).map((d) => ({
+            type: d.added ? 'add' : d.removed ? 'del' : 'same',
+            text: d.value,
+        }));
+    }
+
     function countDiffLines(oldText, newText) {
         const countLines = (text) => {
             const normalized = String(text || '').replace(/\r\n/g, '\n');
@@ -9015,7 +9022,7 @@ The prompt must ask for:
                     gap: '10px',
                     whiteSpace: 'normal',
                 });
-                const currentDiff = wordDiff(original, buildText());
+                const currentDiff = sideBySideDiff(original, buildText());
                 const panes = [
                     { label: 'Before', side: 'before', className: 'ack-diff-side-before' },
                     { label: 'After', side: 'after', className: 'ack-diff-side-after' },
@@ -22368,6 +22375,7 @@ RULES:
         ackAssert(fn.includes('Paragraphs'), 'has paragraph diff mode');
         ackAssert(fn.includes('Before/After'), 'has side-by-side mode');
         ackAssert(fn.includes('renderSideBySideView'), 'renders before/after view');
+        ackAssert(fn.includes('sideBySideDiff(original, buildText())'), 'side view uses exact diff ranges');
         ackAssert(fn.includes('ack-diff-side-before'), 'marks before pane for side-by-side checks');
         ackAssert(fn.includes('ack-diff-side-after'), 'marks after pane for side-by-side checks');
         ackAssert(fn.includes('dataset.ackDiffChange'), 'marks colored side-by-side changes');
@@ -22420,6 +22428,33 @@ RULES:
             acceptBtn.click();
             const result = await promise;
             ackEq(result.action, 'edit', 'accept still applies from readable modes');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+        }
+    });
+
+    ackTest('showDiffDialog before/after panes preserve exact original and corrected text', async () => {
+        const original = '### Problem\n\nOld body.\n\n### Fix\n\nOld fix.\n';
+        const corrected = '**Problem:** Old body.\n\n**Fix:** Old fix.\n';
+        const promise = showDiffDialog(original, corrected);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const overlay = document.querySelector('.ack-diff-dialog-overlay');
+        try {
+            ackAssert(overlay, 'diff dialog overlay exists');
+            overlay.querySelector('[data-ack-diff-mode="side"]').click();
+            const before = overlay.querySelector('.ack-diff-side-before');
+            const after = overlay.querySelector('.ack-diff-side-after');
+            ackEq(before.textContent, original, 'before pane preserves exact original text');
+            ackEq(after.textContent, corrected, 'after pane preserves exact corrected text');
+            ackAssert(
+                before.querySelector('[data-ack-diff-change="del"]'),
+                'before pane still highlights removed text',
+            );
+            ackAssert(after.querySelector('[data-ack-diff-change="add"]'), 'after pane still highlights added text');
+            const rejectBtn = [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Reject');
+            rejectBtn.click();
+            const result = await promise;
+            ackEq(result.action, false, 'reject closes exact-pane test dialog');
         } finally {
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
         }
