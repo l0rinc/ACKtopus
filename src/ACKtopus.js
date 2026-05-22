@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.99
+// @version      1.100
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -103,96 +103,8 @@
         return `REMOTE=$(git remote | grep -qx ${preferredArg} && echo ${preferredArg} || echo ${fallbackArg})`;
     }
 
-    // Deterministic markdown post-processor used after proofreading:
-    // - upgrades "Note/Tip/Important/Warning/Caution" lead-ins to GitHub alerts
-    // - preserves GitHub commit-diff line ranges through Markdown rendering
-    // `<details><summary>` labels are left entirely to the model.
-    const PROOFREAD_ALERT_KIND_MAP = {
-        note: 'NOTE',
-        tip: 'TIP',
-        important: 'IMPORTANT',
-        warning: 'WARNING',
-        caution: 'CAUTION',
-    };
-
-    function applyProofreadAlertBlocks(text) {
-        const lines = String(text || '')
-            .replace(/\r\n/g, '\n')
-            .split('\n');
-        const out = [];
-        let inFence = false;
-        let fenceMarker = '';
-        const isFenceLine = (line) => {
-            const trimmed = String(line || '').trimStart();
-            const open = trimmed.match(/^(`{3,}|~{3,})/);
-            if (!open) return null;
-            return open[1].charAt(0).repeat(open[1].length);
-        };
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const trimmed = line.trim();
-            const fence = isFenceLine(line);
-            if (fence) {
-                if (!inFence) {
-                    inFence = true;
-                    fenceMarker = fence;
-                } else if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
-                    inFence = false;
-                    fenceMarker = '';
-                }
-                out.push(line);
-                continue;
-            }
-            if (inFence) {
-                out.push(line);
-                continue;
-            }
-
-            if (/^\s*>/.test(line)) {
-                out.push(line);
-                continue;
-            }
-
-            // Promote "Note/Tip/Important/Warning/Caution" lead-ins even without
-            // a trailing colon; this lets proofreading upgrade terse prose callouts
-            // to GitHub alerts when that improves readability.
-            const m = line.match(/^\s*(?:\*\*)?\s*(note|tip|important|warning|caution)(?:\*\*)?\s*:?\s*(.*)$/i);
-            if (!m) {
-                out.push(line);
-                continue;
-            }
-
-            const kind = PROOFREAD_ALERT_KIND_MAP[m[1].toLowerCase()];
-            if (!kind) {
-                out.push(line);
-                continue;
-            }
-
-            const body = [];
-            const firstBody = (m[2] || '').trimEnd();
-            if (firstBody) body.push(firstBody);
-            let j = i + 1;
-            for (; j < lines.length; j++) {
-                const next = lines[j];
-                const nextTrim = next.trim();
-                if (!nextTrim) break;
-                if (/^\s*[-*+]\s+/.test(next) || /^\s*\d+[.)]\s+/.test(next) || /^\s*#{1,6}\s+/.test(next)) break;
-                if (/^\s*>/.test(next)) break;
-                if (isFenceLine(next)) break;
-                body.push(next.trimEnd());
-            }
-            if (body.length === 0) {
-                out.push(line);
-                continue;
-            }
-
-            out.push(`> [!${kind}]`);
-            for (const bLine of body) out.push(`> ${bLine.trimStart()}`);
-            i = j - 1;
-        }
-        return out.join('\n');
-    }
+    // Post-proofread processing is intentionally limited to mechanical URL
+    // preservation. Prose/style markdown changes belong in the LLM prompt.
 
     const GITHUB_COMMIT_DIFF_LINE_URL_RE =
         /\bhttps:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-fA-F]{40})(#diff-[A-Za-z0-9]+L\d+-L\d+)\b/g;
@@ -206,116 +118,8 @@
         return { text: out, count };
     }
 
-    function countLeadingBlankLines(lines) {
-        let n = 0;
-        for (const line of lines || []) {
-            if (String(line).trim() !== '') break;
-            n++;
-        }
-        return n;
-    }
-
-    function countTrailingBlankLines(lines) {
-        let n = 0;
-        for (let j = (lines || []).length - 1; j >= 0; j--) {
-            if (String(lines[j]).trim() !== '') break;
-            n++;
-        }
-        return n;
-    }
-
-    function maxConsecutiveBlankLines(lines) {
-        let max = 0;
-        let run = 0;
-        for (const line of lines || []) {
-            if (String(line).trim() === '') {
-                run++;
-                if (run > max) max = run;
-            } else {
-                run = 0;
-            }
-        }
-        return max;
-    }
-
-    function countBlankLines(lines) {
-        let n = 0;
-        for (const line of lines || []) {
-            if (String(line).trim() === '') n++;
-        }
-        return n;
-    }
-
-    function clampBlankRuns(lines, maxRun) {
-        if (maxRun < 0) return lines;
-        const out = [];
-        let run = 0;
-        for (const line of lines) {
-            if (String(line).trim() === '') {
-                run++;
-                if (run <= maxRun) out.push('');
-            } else {
-                run = 0;
-                out.push(line);
-            }
-        }
-        return out;
-    }
-
-    function clampTotalBlankLines(lines, maxTotal) {
-        if (maxTotal < 0) return lines;
-        const out = [];
-        let blanks = 0;
-        for (const line of lines) {
-            if (String(line).trim() === '') {
-                if (blanks < maxTotal) {
-                    out.push('');
-                    blanks++;
-                }
-            } else {
-                out.push(line);
-            }
-        }
-        return out;
-    }
-
-    function normalizeProofreadMutableSegment(text, originalLines) {
-        const original = Array.isArray(originalLines) ? originalLines : String(originalLines || '').split('\n');
-        if (original.every((line) => String(line).trim() === '')) {
-            return original.join('\n');
-        }
-
-        // Preserve leading/trailing blank lines exactly. Blank lines are
-        // structural in Markdown/CommonMark (eg, they terminate blockquotes
-        // and lists). In particular, blockquotes support "lazy continuation"
-        // lines: removing the blank line after a `>` quote can pull the next
-        // paragraph into the quote even if it doesn't start with `>`.
-        const lead = countLeadingBlankLines(original);
-        const trail = countTrailingBlankLines(original);
-        const coreStart = Math.min(lead, original.length);
-        const coreEnd = Math.max(coreStart, original.length - trail);
-        const originalCore = original.slice(coreStart, coreEnd);
-        const maxInteriorBlankRun = maxConsecutiveBlankLines(originalCore);
-        const maxInteriorBlankCount = countBlankLines(originalCore);
-        const lines = String(text || '')
-            .replace(/\r\n/g, '\n')
-            .split('\n');
-        while (lines.length && lines[0].trim() === '') lines.shift();
-        while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
-        const core = clampTotalBlankLines(clampBlankRuns(lines, maxInteriorBlankRun), maxInteriorBlankCount);
-        const out = [];
-        for (let k = 0; k < lead; k++) out.push('');
-        out.push(...core);
-        for (let k = 0; k < trail; k++) out.push('');
-        return out.join('\n');
-    }
-
     function postProcessProofreadMarkdown(text) {
-        // Keep this pipeline deterministic and conservative.
-        let out = String(text || '');
-        out = applyProofreadAlertBlocks(out);
-        out = rewriteProofreadCommitDiffUrls(out).text;
-        return out;
+        return rewriteProofreadCommitDiffUrls(String(text || '')).text;
     }
 
     // Build a shell-ready argument list for the PR's changed C/C++ paths so
@@ -4303,6 +4107,7 @@ Wrap technical identifiers in single backticks if they aren't already: function 
 Do not change technical meaning unless it is factually incorrect.
 Do not change quoted text (lines starting with >) in any way. Those are someone else's words, so copy them verbatim.
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
+Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.
 Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or double-hyphen ("--") punctuation. Preserve command-line flags such as \`--connect\`, quoted text, and any double hyphens that were already present in the original text.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
@@ -9496,9 +9301,8 @@ The prompt must ask for:
                         const re = new RegExp(`<s${i}>\\s*([\\s\\S]*?)\\s*<\\/s${i}>`, 'i');
                         const m = response.match(re);
                         if (m) {
-                            const originalLines = segments.find((s) => s.index === i)?.lines || [];
-                            const original = originalLines.join('\n');
-                            const result = normalizeProofreadMutableSegment(m[1], originalLines);
+                            const original = (segments.find((s) => s.index === i)?.lines || []).join('\n');
+                            const result = m[1];
                             // Reject segments that grew significantly (LLM added content).
                             // Allow up to 30% growth or 50 chars (whichever is larger) so the
                             // LLM has room to wrap technical identifiers in backticks and to
@@ -9539,7 +9343,7 @@ The prompt must ask for:
                         stripped: text !== cleaned ? text : null,
                     };
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: match concise Bitcoin Core contributor style. Prefer compact prose or simple bold line prefixes such as `**Problem:**` and `**Fix:**` over markdown headings such as `### Problem`, `### Fix`, `## Summary`, or `High-level goal:`. If markdown headings are already present, rewrite them as bold prefixes only when the surrounding text still fits that structure; do not invent sections.\n- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. ${isPRBody ? 'Preserve markdown formatting except for the PR-description style normalization above.' : 'Preserve ALL markdown formatting.'} Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${isPRBody ? '- For PR descriptions: match concise Bitcoin Core contributor style. Prefer compact prose or simple bold line prefixes such as `**Problem:**`, `**Fix:**`, and `**Notes:**` over markdown headings such as `### Problem`, `### Fix`, `#### Notes`, `## Summary`, or `High-level goal:`. If markdown headings are already present, rewrite them as bold prefixes only when the surrounding text still fits that structure; do not invent sections.\n- For PR descriptions: pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.\n' : ''}\n\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. ${isPRBody ? 'Preserve markdown formatting except for the PR-description style normalization above.' : 'Preserve ALL markdown formatting.'} Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -20246,7 +20050,7 @@ RULES:
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.99
+// @version      1.100
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22673,45 +22477,19 @@ RULES:
         ackAssert(fn.includes('corrected[s.index]'), 'uses corrected content for mutable segments');
     });
 
-    ackTest('proofread fromXML preserves leading/trailing blank lines (prevents blockquote bleed)', () => {
-        // Structural: we cannot directly call splitSegments/fromXML (they are nested),
-        // so ensure the blank-edge normalization logic is present in source.
-        const fn = _ackSource.slice(_ackSource.indexOf('const fromXML'), _ackSource.indexOf('return { segments'));
-        ackAssert(fn.includes('normalizeProofreadMutableSegment'), 'normalizes corrected mutable segments');
-        const helper = _ackSource.slice(
-            _ackSource.indexOf('function normalizeProofreadMutableSegment'),
-            _ackSource.indexOf('function postProcessProofreadMarkdown'),
-        );
-        ackAssert(helper.includes('countLeadingBlankLines'), 'counts leading blank lines');
-        ackAssert(helper.includes('countTrailingBlankLines'), 'counts trailing blank lines');
+    ackTest('proofread prompt handles blank-line preservation without deterministic normalization', () => {
+        const promptSection = _ackSource.slice(_ackSource.indexOf('proofread: `'), _ackSource.indexOf('CONFIG_INSTRUCTION_DEFS'));
+        const makePromptSection = _ackSource.slice(_ackSource.indexOf('const makePrompt'), _ackSource.indexOf('const cleanResult'));
         ackAssert(
-            helper.includes('lazy continuation') || helper.includes('blockquotes'),
-            'documents Markdown structural risk (lazy continuation / blockquotes)',
+            promptSection.includes('Do not add empty lines around fenced code blocks'),
+            'default prompt forbids extra empty lines around protected blocks',
         );
-    });
-
-    ackTest('proofread fromXML clamps extra interior blank lines to original structure', () => {
-        const helper = _ackSource.slice(
-            _ackSource.indexOf('function normalizeProofreadMutableSegment'),
-            _ackSource.indexOf('function postProcessProofreadMarkdown'),
-        );
-        ackAssert(helper.includes('maxConsecutiveBlankLines'), 'computes original interior blank-run cap');
-        ackAssert(helper.includes('countBlankLines'), 'counts original interior blank lines');
-        ackAssert(helper.includes('clampBlankRuns'), 'clamps LLM-introduced blank-line growth');
-        ackAssert(helper.includes('clampTotalBlankLines'), 'clamps total interior blank-line growth');
-        ackAssert(helper.includes('maxInteriorBlankRun'), 'passes interior blank-line cap into normalizer');
         ackAssert(
-            helper.includes('maxInteriorBlankCount'),
-            'passes interior blank-line count cap into normalizer',
+            makePromptSection.includes('Do not add empty lines around fenced code blocks'),
+            'XML prompt forbids extra empty lines around protected blocks',
         );
-    });
-
-    ackTest('proofread normalization preserves blank-only details separators exactly', () => {
-        ackEq(normalizeProofreadMutableSegment('\n\n\n\n', ['']), '', 'single blank separator does not grow');
-        ackEq(normalizeProofreadMutableSegment('\n\n\n\n', ['', '']), '\n', 'two blank separators do not grow');
-        const detailsTail = ['```', normalizeProofreadMutableSegment('\n\n\n\n\n', ['']), '</details>'].join('\n');
-        ackAssert(!detailsTail.includes('\n\n\n\n</details>'), 'does not create large blank run before closing details');
-        ackEq(detailsTail, '```\n\n</details>', 'keeps exactly one blank line before closing details');
+        ackAssert(!_ackSource.includes('function normalizeProofreadMutableSegment'), 'no deterministic blank-line normalizer');
+        ackAssert(!makePromptSection.includes('normalizeProofreadMutableSegment'), 'fromXML does not normalize LLM output');
     });
 
     ackTest('proofread falls back when LLM omits <sN> tags', () => {
@@ -26621,8 +26399,14 @@ RULES:
         const source = _ackSource;
         const makePromptSection = source.slice(source.indexOf('const makePrompt'), source.indexOf('const cleanResult'));
         ackAssert(makePromptSection.includes('concise Bitcoin Core contributor style'), 'mentions Bitcoin Core style');
-        ackAssert(makePromptSection.includes('`**Problem:**`') && makePromptSection.includes('`**Fix:**`'), 'prefers bold Problem/Fix prefixes');
+        ackAssert(
+            makePromptSection.includes('`**Problem:**`') &&
+                makePromptSection.includes('`**Fix:**`') &&
+                makePromptSection.includes('`**Notes:**`'),
+            'prefers bold Problem/Fix/Notes prefixes',
+        );
         ackAssert(makePromptSection.includes('over markdown headings such as `### Problem`'), 'discourages markdown section headings');
+        ackAssert(makePromptSection.includes('`#### Notes`'), 'discourages lower-level Notes headings');
         ackAssert(makePromptSection.includes('do not invent sections'), 'does not invent PR description sections');
         ackAssert(makePromptSection.includes('Preserve markdown formatting except for the PR-description style normalization above'), 'allows PR-description style normalization');
     });
@@ -30931,39 +30715,38 @@ RULES:
         ackAssert(fn.includes('ta.selectionEnd = summaryEnd'), 'reselects summary label end');
     });
 
-    ackTest('proofread uses deterministic post-processing for collapsibles and alerts', () => {
+    ackTest('proofread leaves markdown style rewrites to the prompt', () => {
         const source = _ackSource;
-        // LLM prompt should NOT contain bespoke collapsible rewriting rules.
-        // Alerts are deterministic post-process transforms; collapsible summaries are left to the model.
         const fn = source.slice(
             source.indexOf('async function runProofreadOnComment'),
             source.indexOf('// --- Start a review ---'),
         );
-        ackAssert(!fn.includes('COLLAPSIBLE SECTIONS'), 'no LLM instruction for collapsible sections');
-        // Deterministic post-processor exists and is applied to results
-        ackAssert(source.includes('postProcessDetails'), 'postProcessDetails exists');
-        ackAssert(source.includes('postProcessDetails(parsed.fromXML'), 'applied to proofread results');
-        const helpers = source.slice(
-            source.indexOf('const PROOFREAD_ALERT_KIND_MAP'),
-            source.indexOf('function postProcessProofreadMarkdown'),
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('When a collapsible section uses a generic summary'),
+            'prompt handles collapsible summaries',
         );
         ackAssert(
-            helpers.includes('PROOFREAD_ALERT_KIND_MAP'),
-            'maps Note/Tip/Important/Warning/Caution to GitHub alerts',
+            DEFAULT_INSTRUCTIONS.proofread.includes('you may convert it to a GitHub alert block'),
+            'prompt handles alert conversions',
         );
+        ackAssert(fn.includes('`#### Notes`'), 'PR-description prompt covers lower-level markdown headings');
+        ackAssert(source.includes('postProcessDetails'), 'postProcessDetails exists');
+        ackAssert(source.includes('postProcessDetails(parsed.fromXML'), 'applied to proofread results');
+        ackAssert(!source.includes('function applyProofreadAlertBlocks'), 'no deterministic alert conversion helper');
+        ackAssert(!source.includes('function applyProofreadPRDescriptionHeadingPrefixes'), 'no deterministic heading conversion helper');
         ackAssert(!source.includes('function guessCodeFenceLanguage'), 'no static fence-language guessing');
     });
 
-    ackTest('postProcessProofreadMarkdown converts explicit NOTE marker to GitHub alert', () => {
+    ackTest('postProcessProofreadMarkdown leaves explicit NOTE marker unchanged', () => {
         const input = 'Note: Keep this deterministic and reproducible.';
         const out = postProcessProofreadMarkdown(input);
-        ackEq(out, '> [!NOTE]\n> Keep this deterministic and reproducible.');
+        ackEq(out, input);
     });
 
-    ackTest('postProcessProofreadMarkdown converts Note lead-in without colon to GitHub alert', () => {
-        const input = 'Note this should be treated as a callout.';
+    ackTest('postProcessProofreadMarkdown leaves markdown headings unchanged', () => {
+        const input = '#### Notes\nKeep this as returned by the model.';
         const out = postProcessProofreadMarkdown(input);
-        ackEq(out, '> [!NOTE]\n> this should be treated as a callout.');
+        ackEq(out, input);
     });
 
     ackTest('postProcessProofreadMarkdown leaves details summaries unchanged', () => {
@@ -31040,7 +30823,7 @@ RULES:
         }
     });
 
-    ackTest('diff selection proofread also runs deterministic markdown post-processing', () => {
+    ackTest('diff selection proofread also preserves commit-diff line links', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function runDiffSelectionLLM'),
@@ -31049,7 +30832,7 @@ RULES:
         ackAssert(fn.includes("mode === 'proofread'"), 'has proofread branch');
         ackAssert(
             fn.includes('postProcessProofreadMarkdown(result.trim())'),
-            'applies deterministic post-processing to selection proofread output',
+            'runs proofread link-preservation pass on selection output',
         );
     });
 
@@ -32798,9 +32581,9 @@ RULES:
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.99', () => {
+    ackTest('version bumped to 1.100', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.99' || _ackSource.includes('@version      1.99'), 'version is 1.99');
+        ackAssert(versionFromMeta === '1.100' || _ackSource.includes('@version      1.100'), 'version is 1.100');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -34258,7 +34041,6 @@ RULES:
         BRAILLE,
         rewriteProofreadCommitDiffUrls,
         postProcessProofreadMarkdown,
-        normalizeProofreadMutableSegment,
         showDiffDialog,
         COPY_ICON,
         CHECK_ICON,
