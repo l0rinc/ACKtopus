@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.119
+// @version      1.120
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4534,6 +4534,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     function getAnalysisMode(path = location.pathname) {
         if (/\/pull\/\d+\/commits\/[0-9a-f]+/.test(path)) return ANALYSIS_MODES.commit;
         if (/\/pull\/\d+\/changes\/[0-9a-f]+/.test(path)) return ANALYSIS_MODES.commit;
+        if (/\/commit\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path)) return ANALYSIS_MODES.commit;
         if (/\/pull\/\d+\/commits\/?$/.test(path)) return ANALYSIS_MODES.commits;
         return ANALYSIS_MODES.pr;
     }
@@ -6275,7 +6276,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function fetchCommitPatch(pr, sha) {
-        if (!pr || !sha) return Promise.resolve('');
+        if (!pr?.owner || !pr?.repo || !sha) return Promise.resolve('');
         const key = commitPatchCacheKey(pr, sha);
         const cached = _commitPatchCache.get(key);
         if (cached) {
@@ -7234,41 +7235,63 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return parts.join('\n\n');
     }
 
+    function currentCommitRepoContext(path = location.pathname) {
+        return parsePR(path) || parseGitHubRepoPath(path) || currentGitHubRepo(document, path);
+    }
+
+    function commitContextUrl(ctx, sha, path = location.pathname) {
+        if (!ctx?.owner || !ctx?.repo || !sha) return location.href;
+        if (ctx.pr) {
+            return `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/${path.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
+        }
+        return `https://github.com/${ctx.owner}/${ctx.repo}/commit/${sha}`;
+    }
+
     async function gatherSingleCommitContext(onProgress = () => {}, opts = {}) {
         const { includePatch = true, includeComments = true } = opts;
         const pr = parsePR();
-        if (!pr) return '';
+        const ctx = currentCommitRepoContext();
+        if (!ctx) return '';
         const sha = pathCommitSha();
         if (!sha) return '';
         const shortSha = sha.slice(0, 8);
-        const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
-        const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
-        const parts = [`# Commit from PR: ${commitUrl}`];
+        const commitUrl = commitContextUrl(ctx, sha);
+        const prUrl = pr ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}` : '';
+        const parts = [pr ? `# Commit from PR: ${commitUrl}` : `# Commit: ${commitUrl}`];
 
-        onProgress('Reading PR description...');
+        onProgress(pr ? 'Reading PR description...' : 'Reading commit metadata...');
         let prTitle = '';
         let description = '';
-        try {
-            const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
-            prTitle = prData.title || '';
-            description = prData.body || '';
-        } catch (_) {
-            prTitle =
-                getPRTitleText() ||
-                document
-                    .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
-                    ?.textContent?.trim() ||
-                '';
-            const bodyEl = document.querySelector('#issue-body, [data-testid="issue-body"]');
-            description = bodyEl?.innerText?.trim() || '';
+        if (pr) {
+            try {
+                const prData = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+                prTitle = prData.title || '';
+                description = prData.body || '';
+            } catch (_) {
+                prTitle =
+                    getPRTitleText() ||
+                    document
+                        .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
+                        ?.textContent?.trim() ||
+                    '';
+                const bodyEl = document.querySelector('#issue-body, [data-testid="issue-body"]');
+                description = bodyEl?.innerText?.trim() || '';
+            }
         }
 
         let commitSummary = '';
-        try {
-            const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
-            const cur = commits.find((c) => c.sha?.startsWith(sha) || sha.startsWith(c.sha || ''));
-            commitSummary = cur?.commit?.message || cur?.msg || '';
-        } catch (_) {}
+        if (pr) {
+            try {
+                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+                const cur = commits.find((c) => c.sha?.startsWith(sha) || sha.startsWith(c.sha || ''));
+                commitSummary = cur?.commit?.message || cur?.msg || '';
+            } catch (_) {}
+        } else {
+            try {
+                const commit = await gmFetch(`https://api.github.com/repos/${ctx.owner}/${ctx.repo}/commits/${sha}`);
+                commitSummary = commit?.commit?.message || '';
+            } catch (_) {}
+        }
         if (!commitSummary) {
             commitSummary =
                 document
@@ -7276,7 +7299,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     ?.textContent?.trim() || '';
         }
 
-        const meta = [`* PR: ${prUrl}`];
+        const meta = pr ? [`* PR: ${prUrl}`] : [`* Repository: https://github.com/${ctx.owner}/${ctx.repo}`];
         if (prTitle) meta.push(`* PR title: ${prTitle}`);
         if (commitSummary) meta.push(`* Commit: ${shortSha} ${commitSummary.split('\n')[0]}`);
         parts.push(`## Metadata\n${meta.join('\n')}`);
@@ -7286,7 +7309,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (includePatch) {
             onProgress('Fetching commit patch...');
             try {
-                const patch = await fetchCommitPatch(pr, sha);
+                const patch = await fetchCommitPatch(ctx, sha);
                 if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
             } catch (_) {}
         }
@@ -7420,16 +7443,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     async function gatherSingleCommitPatchContext(onProgress = () => {}) {
-        const pr = parsePR();
-        if (!pr) return '';
+        const ctx = currentCommitRepoContext();
+        if (!ctx) return '';
         const sha = pathCommitSha();
         if (!sha) return '';
-        const commitUrl = `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}/${location.pathname.includes('/changes/') ? 'changes' : 'commits'}/${sha}`;
-        const parts = [`# Commit patch from PR: ${commitUrl}`];
+        const commitUrl = commitContextUrl(ctx, sha);
+        const parts = [ctx.pr ? `# Commit patch from PR: ${commitUrl}` : `# Commit patch: ${commitUrl}`];
 
         onProgress('Fetching commit patch...');
         try {
-            const patch = await fetchCommitPatch(pr, sha);
+            const patch = await fetchCommitPatch(ctx, sha);
             if (patch) parts.push(`## Commit Patch\n\`\`\`patch\n${patch}\n\`\`\``);
         } catch (_) {}
 
@@ -20120,6 +20143,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return /\/issues\/\d+/.test(path);
     }
 
+    function isCommitPage(path = location.pathname) {
+        return /\/[^/]+\/[^/]+\/commit\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path);
+    }
+
     function isPRCreationPage(path = location.pathname, root = document) {
         if (!/\/compare\/[^?]+\.{2,3}[^?]+/.test(path)) return false;
         return !!root?.querySelector?.(
@@ -20134,7 +20161,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function isToolbarPage(path = location.pathname) {
-        return isPRPage(path) || isIssuePage(path) || isComparePage(path);
+        return isPRPage(path) || isIssuePage(path) || isComparePage(path) || isCommitPage(path);
     }
 
     function parseIssue(path = location.pathname) {
@@ -20676,6 +20703,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('returns commit mode for /pull/N/changes/<sha>', () => {
         ackEq(getAnalysisMode('/bitcoin/bitcoin/pull/123/changes/abc123def456'), 'commit');
+    });
+
+    ackTest('returns commit mode for standalone /commit/<sha>', () => {
+        ackEq(getAnalysisMode('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), 'commit');
     });
 
     // --- cacheKey ---
@@ -28754,10 +28785,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(isIssuePage('/bitcoin/bitcoin'), false);
     });
 
-    ackTest('isToolbarPage detects PR, issue, and compare URLs', () => {
+    ackTest('isCommitPage detects standalone commit URLs', () => {
+        ackEq(isCommitPage('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), true);
+        ackEq(isCommitPage('/bitcoin/bitcoin/pull/123/commits/a3f596f'), false);
+        ackEq(isCommitPage('/bitcoin/bitcoin/commits/a3f596f'), false);
+    });
+
+    ackTest('isToolbarPage detects PR, issue, compare, and commit URLs', () => {
         ackEq(isToolbarPage('/bitcoin/bitcoin/pull/123'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin/issues/34645'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin/compare/abc123...def456'), true);
+        ackEq(isToolbarPage('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin'), false);
         ackEq(isToolbarPage('/bitcoin/bitcoin/pulls'), false);
     });
@@ -29142,9 +29180,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function scrollToAndHighlight'),
         );
         ackAssert(fn.includes('# Commit from PR:'), 'labels copied context as a commit from a PR');
+        ackAssert(fn.includes('# Commit:'), 'labels standalone commit context');
+        ackAssert(fn.includes('currentCommitRepoContext()'), 'supports PR and standalone commit repository context');
+        ackAssert(
+            source.includes('return parsePR(path) || parseGitHubRepoPath(path) || currentGitHubRepo(document, path)'),
+            'uses the standalone commit URL repository as fallback',
+        );
         ackAssert(fn.includes('## PR Description'), 'includes PR description');
         ackAssert(fn.includes('## Commit Patch'), 'includes current commit patch');
-        ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
+        ackAssert(fn.includes('fetchCommitPatch(ctx, sha)'), 'fetches only the current commit patch');
         ackAssert(!fn.includes('## Commits ('), 'does not include full PR commit list');
         ackAssert(fn.includes('gatherVisibleComments().filter'), 'filters visible comments for current commit');
         ackAssert(fn.includes('## Visible Comments ('), 'includes filtered visible comments section');
@@ -29796,8 +29840,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function gatherSingleCommitPatchContext'),
             source.indexOf('async function gatherRecipeContext'),
         );
-        ackAssert(fn.includes('# Commit patch from PR:'), 'labels copied output as a single commit patch');
-        ackAssert(fn.includes('fetchCommitPatch(pr, sha)'), 'fetches only the current commit patch');
+        ackAssert(fn.includes('# Commit patch from PR:'), 'labels PR output as a single commit patch');
+        ackAssert(fn.includes('# Commit patch:'), 'labels standalone commit output as a single commit patch');
+        ackAssert(fn.includes('currentCommitRepoContext()'), 'uses PR or standalone repo context');
+        ackAssert(fn.includes('fetchCommitPatch(ctx, sha)'), 'fetches only the current commit patch');
         ackAssert(
             !fn.includes('gatherFullPRContext(onProgress, {includePatch: true, includeComments: false})'),
             'does not fall back to full PR patch context',
@@ -34931,6 +34977,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         getAnalysisMode,
         isPRPage,
         isIssuePage,
+        isCommitPage,
         isToolbarPage,
         parseIssue,
         parsePageContext,
