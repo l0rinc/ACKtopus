@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.117
+// @version      1.118
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4291,24 +4291,24 @@ A short checklist that verifies split/squash equivalence, grounded GitHub URLs, 
         audio_walkthrough: `Write one self-contained, outcome-focused direct prompt for an audio-enabled PR-review agent.
 
 # Goal
-Produce a prompt that the user can paste directly into an audio-enabled ChatGPT-style review assistant. The target assistant must investigate the PR itself from the supplied ACKtopus context, the ACKtopus-attached patch, and GitHub/internet access before the audio conversation starts. It should not ask a separate local coding agent to prepare a handoff first. If the same prompt is pasted into a local coding agent instead, it may use the local checkout too, but the primary target is the audio agent doing its own investigation.
+Produce a prompt that the user can paste directly into an audio-enabled ChatGPT-style review assistant. The target assistant must investigate the PR itself from the supplied PR context, attached patch, and GitHub/internet access before the audio conversation starts. It should not ask a separate local coding agent to prepare a handoff first. If the same prompt is pasted into a local coding agent instead, it may use the local checkout too, but the primary target is the audio agent doing its own investigation.
 
 # Success criteria
 - The generated prompt addresses the audio review assistant directly: "you are the agent who will investigate and then discuss this PR with me".
 - The prompt says the current changes represent a PR the user is reviewing and the user wants to ask spoken follow-up questions about it.
-- The target assistant must use supplied ACKtopus context, the ACKtopus-attached patch, GitHub PR pages, commit pages, review threads, comments, related PRs/issues, tests, docs, and CI/benchmark evidence where available.
+- The target assistant must use supplied PR context, the attached patch, GitHub PR pages, commit pages, review threads, comments, related PRs/issues, tests, docs, and CI/benchmark evidence where available.
 - The target assistant must identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before saying it is ready.
 - The target assistant must build an internal, question-ready understanding of every commit and meaningful line: problem, behavior change, invariants, tests/evidence, risks, and why the implementation is shaped that way.
 - The target assistant should not output a long handoff document immediately. It should do the investigation and then respond only with the exact OK-only gate once it has enough data to start the audio conversation.
 - The later audio discussion should start from first principles with minimal jargon, then progressively go deeper as the user asks questions.
 - The prompt must require GitHub links as evidence anchors during later discussion: PR URL, commit URLs, file/line URLs, important review threads, related issues/PRs, and evidence links for non-obvious claims.
-- The prompt must not ask the assistant to print the full patch, raw PR comments, raw review threads, or a source dump. ACKtopus will attach the actual PR patch after the generated prompt; use that patch as source evidence without copying it back.
+- The prompt must not ask the assistant to print the full patch, raw PR comments, raw review threads, or a source dump. The actual PR patch may be attached after the generated prompt; use that patch as source evidence without copying it back.
 - The target assistant must mark missing evidence instead of guessing. If browsing/GitHub access is unavailable, it should say what data is missing and ask the user to provide it before claiming readiness.
 
 # Constraints
 - Keep the prompt focused on the outcome: the same audio-enabled assistant investigates first and then becomes ready for a detailed spoken PR-review discussion.
 - Do not introduce a separate local-agent handoff step.
-- The prompt may say that if it is pasted into a local coding agent, that agent can use the local checkout, but the generated prompt must still be usable directly in an audio-enabled ChatGPT interface with GitHub/internet access and the ACKtopus-attached patch.
+- The prompt may say that if it is pasted into a local coding agent, that agent can use the local checkout, but the generated prompt must still be usable directly in an audio-enabled ChatGPT interface with GitHub/internet access and an attached PR patch.
 - The generated prompt must end with this exact final line: "Respond with OK only once you have all the data and can start the audio conversation"
 - Do not ask the target assistant to post anything, push anything, or rewrite history.
 - Do not ask for a terse summary before readiness. The purpose is maximum usable context for follow-up questioning during audio mode.
@@ -4322,7 +4322,7 @@ Output exactly one prompt, ready to paste into an audio-enabled ChatGPT-style re
 Explain that the assistant is the audio discussion partner, the current change is a PR under review, and it must investigate first before saying OK.
 
 ## Inputs
-List the evidence the assistant should use: ACKtopus context, ACKtopus-attached patch, PR URL/base metadata, GitHub PR description, commits, files, review comments, review threads, CI, benchmarks, related links, and local repo/tools if this prompt is being run by a local agent.
+List the evidence the assistant should use: supplied PR context, attached patch, PR URL/base metadata, GitHub PR description, commits, files, review comments, review threads, CI, benchmarks, related links, and local repo/tools if this prompt is being run by a local agent.
 
 ## Investigation Plan
 Tell the assistant to investigate the PR, every commit, meaningful changed lines, review-comment-derived hard parts, tests/docs, and evidence links before responding.
@@ -7706,14 +7706,63 @@ The prompt must ask for:
         return ensureAudioGuideReadyGate(extra ? `${body}\n\n${extra}` : body);
     }
 
+    function buildAudioGuideBriefingPrompt(pr = parsePR(), pageUrl = location.href) {
+        const prUrl = pr ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}` : String(pageUrl || '').split('#')[0];
+        return `You are a local investigation agent preparing a self-contained PR-review briefing for an audio-enabled assistant.
+
+The final briefing you write will be pasted into a separate audio chat that may not have local checkout access, browsing, the patch, the PR description, or PR comments. Do not output another prompt. Output the actual briefing package the audio assistant can read before discussion starts.
+
+Use the source material the user provides separately: PR URL, PR description, patch, commit list/messages, review comments, review threads, CI, benchmark notes, related issues/PRs, and any local checkout or tools available to you.
+${prUrl ? `Current PR URL: ${prUrl}` : ''}
+
+## Mission
+Investigate the PR deeply enough that the resulting briefing lets a less capable audio assistant answer spoken follow-up questions without rediscovering the PR from scratch.
+
+## Investigation
+* Inspect the PR description, commits, patch, review comments, review threads, tests, docs, CI/benchmark evidence, and related links.
+* If you have a local checkout, inspect the relevant code paths directly and run cheap targeted commands when useful.
+* Identify the hardest, riskiest, most subtle, or most disputed parts first, especially issues raised in PR comments.
+* Mark missing evidence instead of guessing. If required source material is absent, list exactly what is missing.
+
+## Briefing Output
+Write a self-contained briefing with these sections:
+
+### One-minute story
+Explain the problem, the shape of the solution, and why the PR matters.
+
+### Glossary
+Define project-specific terms, acronyms, subsystems, and code concepts needed for audio discussion.
+
+### Commit-by-commit walkthrough
+For each commit, explain what changed, why it changed, important code paths, invariants, tests/evidence, and review risk.
+
+### Hard parts and reviewer concerns
+Map the main PR-comment concerns to the relevant commits/files, explain what is settled vs unresolved, and include evidence links where available.
+
+### Code and behavior map
+Explain the main files/functions/classes touched, the before/after behavior, edge cases, and what could break.
+
+### Verification
+List tests, benchmarks, CI signals, manual reproduction steps, and gaps.
+
+### Open questions
+List questions the user may want to ask during audio review.
+
+### Evidence links
+Collect PR, commit, file/line, review-thread, related issue/PR, CI, benchmark, and documentation links used for non-obvious claims.
+
+## Style
+Start from first principles, then go deeper. Use concise paragraphs and short bullets. Do not dump the raw patch, raw comments, or raw review threads. Quote only short snippets when necessary. Distinguish evidence from inference.`;
+    }
+
     function formatAudioGuidePatchAttachment(patch, pr = parsePR()) {
         const text = String(patch || '').replace(/\r\n/g, '\n').trimEnd();
         if (!text) return '';
         const prUrl = pr ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}` : '';
         return [
-            '## ACKtopus-Attached PR Patch',
+            '## Attached PR Patch',
             prUrl ? `Source PR: ${prUrl}` : '',
-            'This patch was fetched by ACKtopus and inserted after the prompt was generated. Use it as source evidence for the audio-guide investigation. Do not copy the raw patch back unless the user explicitly asks.',
+            'This patch was inserted after the prompt was generated. Use it as source evidence for the audio-guide investigation. Do not copy the raw patch back unless the user explicitly asks.',
             '```patch',
             text,
             '```',
@@ -8109,8 +8158,10 @@ The prompt must ask for:
                     },
                     appendPatchAttachment: true,
                     promptDetailsTitle: 'Generated audio guide prompt',
+                    promptOnlyDetailsTitle: 'Audio briefing prompt',
+                    promptOnlyPrompt: () => buildAudioGuideBriefingPrompt(parsePR(), location.href),
                     finalTask:
-                        `Now write one outcome-focused direct audio-guide prompt for an audio-enabled ChatGPT-style PR-review assistant. The assistant itself must investigate the PR, every commit, meaningful changed lines, commit messages, tests, docs, PR comments, review threads, and available GitHub evidence before the audio conversation starts. Do not route this through a separate local coding agent or ask for a local agent to write a handoff document first. The generated prompt may include a fallback saying that if it is pasted into a local coding agent, that agent can also use the local checkout, but the primary target is the audio assistant doing its own investigation from the supplied ACKtopus context, the ACKtopus-attached patch, and GitHub/internet access. The prompt should press the assistant to identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before saying it is ready. Require GitHub links for further lookup and later spoken answers. Do not ask the assistant to print or duplicate the raw patch, raw comments, or raw review-thread dump. ACKtopus will append the fetched PR patch after the generated prompt, so refer to it as the ACKtopus-attached PR patch below and instruct the assistant to use it as source evidence, not to copy it back. The generated prompt must instruct the assistant to respond only with the exact OK-only gate after it has gathered enough data to start the audio conversation. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context, removes the local-agent handoff indirection, and satisfies the requested output format.`,
+                        `Now write one outcome-focused direct audio-guide prompt for an audio-enabled ChatGPT-style PR-review assistant. The assistant itself must investigate the PR, every commit, meaningful changed lines, commit messages, tests, docs, PR comments, review threads, and available GitHub evidence before the audio conversation starts. Do not route this through a separate local coding agent or ask for a local agent to write a handoff document first. The generated prompt may include a fallback saying that if it is pasted into a local coding agent, that agent can also use the local checkout, but the primary target is the audio assistant doing its own investigation from the supplied PR context, the attached PR patch, and GitHub/internet access. The prompt should press the assistant to identify the most difficult, risky, subtle, or disputed areas from the PR comments and investigate those areas deeply before saying it is ready. Require GitHub links for further lookup and later spoken answers. Do not ask the assistant to print or duplicate the raw patch, raw comments, or raw review-thread dump. The fetched PR patch will be appended after the generated prompt, so refer to it as the attached PR patch below and instruct the assistant to use it as source evidence, not to copy it back. The generated prompt must instruct the assistant to respond only with the exact OK-only gate after it has gathered enough data to start the audio conversation. The generated prompt must end with this exact final line: "${AUDIO_GUIDE_READY_GATE}" Before finalizing, verify the generated prompt is grounded in the source context, removes the local-agent handoff indirection, and satisfies the requested output format.`,
                 },
                 maintainer_summary: {
                     label: 'Maintainer summary',
@@ -8249,6 +8300,30 @@ The prompt must ask for:
                 } else if (recipeCfg?.fullPRContext) {
                     const prForRecipe = parsePR();
                     if (!prForRecipe) throw new Error('this recipe is only available on pull request pages');
+                    if (copyPromptOnly && recipeCfg.promptOnlyPrompt) {
+                        const prompt =
+                            typeof recipeCfg.promptOnlyPrompt === 'function'
+                                ? recipeCfg.promptOnlyPrompt()
+                                : recipeCfg.promptOnlyPrompt;
+                        stopSpin();
+                        setAssistantHtml(
+                            assistantMsg,
+                            renderMarkdown(`Copied the ${recipeCfg.label} prompt to clipboard.`),
+                            prompt,
+                        );
+                        await copyTextWithSpinner(assistantMsg._ackCopyBtn, prompt);
+                        setAssistantPromptDetails(
+                            assistantMsg,
+                            recipeCfg.promptOnlyDetailsTitle || recipeCfg.promptDetailsTitle,
+                            prompt,
+                            {
+                                open: true,
+                            },
+                        );
+                        history.push({ role: 'assistant', content: prompt });
+                        messages.scrollTop = messages.scrollHeight;
+                        return;
+                    }
                     const fullContext = await gatherRecipeContext((msg) => {
                         setAssistantText(assistantMsg, msg);
                     }, recipeCfg.contextOptions || {});
@@ -32214,7 +32289,9 @@ The prompt must ask for:
         ackAssert(prompt.includes('difficult, risky, subtle, or disputed areas'), 'focuses hard parts');
         ackAssert(prompt.includes('GitHub links'), 'requires GitHub links');
         ackAssert(prompt.includes('should not output a long handoff document immediately'), 'does not dump handoff first');
-        ackAssert(prompt.includes('ACKtopus will attach the actual PR patch'), 'patch is attached by ACKtopus');
+        ackAssert(prompt.includes('The actual PR patch may be attached after the generated prompt'), 'patch may be attached after the prompt');
+        ackAssert(!prompt.includes('ACKtopus context'), 'does not mention ACKtopus context');
+        ackAssert(!prompt.includes('ACKtopus-attached'), 'does not mention ACKtopus-attached inputs');
         ackAssert(prompt.includes('without copying it back'), 'attached patch is evidence, not output');
         ackAssert(prompt.includes('raw PR comments'), 'forbids comment dump');
         ackAssert(prompt.includes('If browsing/GitHub access is unavailable'), 'handles missing direct investigation access');
@@ -32251,13 +32328,16 @@ The prompt must ask for:
         ackAssert(fn.includes('Do not route this through a separate local coding agent'), 'recipe removes local-agent hop');
         ackAssert(fn.includes('if it is pasted into a local coding agent'), 'recipe keeps local-agent fallback');
         ackAssert(fn.includes('respond only with the exact OK-only gate'), 'audio prompt waits to start audio mode');
+        ackAssert(fn.includes('promptOnlyPrompt: () => buildAudioGuideBriefingPrompt'), 'shift-copy uses local briefing prompt');
         ackAssert(fn.includes("sourceContextLabel: 'FULL PR CONTEXT SOURCE MATERIAL (PATCH ATTACHED AFTER GENERATED PROMPT)'"), 'audio guide source label explains patch attachment');
         ackAssert(fn.includes('includePatch: false'), 'audio guide source context omits the patch before LLM generation');
         ackAssert(fn.includes('appendPatchAttachment: true'), 'audio guide recipe requests deterministic patch attachment');
         ackAssert(fn.includes('Do not ask the assistant to print or duplicate the raw patch'), 'audio guide recipe excludes raw source dumps');
-        ackAssert(fn.includes('ACKtopus-attached PR patch below'), 'audio guide recipe refers to the patch attachment');
+        ackAssert(fn.includes('attached PR patch below'), 'audio guide recipe refers to the patch attachment');
+        ackAssert(!fn.includes('ACKtopus-attached PR patch below'), 'audio guide recipe avoids ACKtopus-specific attachment wording');
         ackAssert(fn.includes('promptDetailsTitle'), 'prompt recipes can name their prompt preview');
         ackAssert(fn.includes('formatLLMPromptPreview(system, userContent)'), 'audio guide prompt is inspectable');
+        ackAssert(fn.includes('copyPromptOnly && recipeCfg.promptOnlyPrompt'), 'prompt-only path can use recipe-specific prompt');
         ackAssert(fn.includes('fetchPatch(prForRecipe)'), 'audio guide fetches the patch after prompt generation');
         ackAssert(fn.includes('formatAudioGuidePatchAttachment'), 'audio guide formats a deterministic patch attachment');
         ackAssert(fn.includes('appendBeforeAudioGuideReadyGate(result, patchAttachment)'), 'audio guide appends patch before final OK-only gate');
@@ -32286,9 +32366,25 @@ The prompt must ask for:
             repo: 'bitcoin',
             pr: '1',
         });
-        ackAssert(patchAttachment.includes('## ACKtopus-Attached PR Patch'), 'patch attachment has a stable heading');
+        ackAssert(patchAttachment.includes('## Attached PR Patch'), 'patch attachment has a stable heading');
+        ackAssert(!patchAttachment.includes('ACKtopus'), 'patch attachment avoids userscript-specific wording');
         ackAssert(patchAttachment.includes('https://github.com/bitcoin/bitcoin/pull/1'), 'patch attachment includes source PR URL');
         ackAssert(patchAttachment.includes('```patch'), 'patch attachment uses a patch code fence');
+    });
+
+    ackTest('audio guide shift prompt builds a local briefing task without ACKtopus wording', () => {
+        const prompt = buildAudioGuideBriefingPrompt(
+            { owner: 'bitcoin', repo: 'bitcoin', pr: '24423' },
+            'https://github.com/bitcoin/bitcoin/issues/24423',
+        );
+        ackAssert(prompt.includes('local investigation agent'), 'targets the local investigation agent');
+        ackAssert(prompt.includes('self-contained PR-review briefing'), 'asks for a briefing, not a generated prompt');
+        ackAssert(prompt.includes('Do not output another prompt'), 'prevents one more prompt-indirection layer');
+        ackAssert(prompt.includes('audio-enabled assistant'), 'briefing is for the later audio assistant');
+        ackAssert(prompt.includes('source material the user provides separately'), 'expects independently supplied evidence');
+        ackAssert(prompt.includes('PR description, patch, commit list/messages, review comments'), 'names expected supplied inputs');
+        ackAssert(prompt.includes('https://github.com/bitcoin/bitcoin/pull/24423'), 'includes current PR URL when available');
+        ackAssert(!prompt.includes('ACKtopus'), 'does not reference ACKtopus');
     });
 
     ackTest('providerBtn hidden in compact mode, settingsBtn gets full border-radius', () => {
