@@ -115,7 +115,7 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Tracking ACK/Concept ACK/NACK signals and jumping back to the source comments
 - Copying ACKs, checkout commands, range-diffs, local pre-push range-diffs, and focused test/format commands
 - Copying PR, issue, commit, patch, comment, and visible discussion context to the clipboard
-- Revealing hidden conversations, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
+- Revealing hidden conversations, issue timeline items, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
 - Navigating long PRs by comment, file, and commit
 - Reviewing with LLM chat, local reproducer prompts, maintainer summaries, commit lightbulbs, selection helpers, and cached PR/commit infographics
 - Proofreading comments, PR descriptions, and selected prose with a diff preview before applying changes
@@ -157,11 +157,11 @@ These three commands are generated with the PR’s exact changed C/C++ file path
 
 The expand control can run three related actions:
 
-- **Show hidden**: loads hidden conversation/comment pagination
+- **Show hidden**: loads hidden conversation/comment pagination and issue timeline “Load more” items
 - **Show resolved**: expands resolved review threads
 - **Open collapsed**: opens minimized comments, outdated sections, and “Load diff” buttons for large diffs
 
-The context-copy dropdown also has **Reveal all**, which walks through hidden conversations, resolved threads, collapsed sections, and deferred diffs before copying.
+The context-copy dropdown also has **Reveal all**, which walks through hidden conversations, issue timeline items, resolved threads, collapsed sections, and deferred diffs before copying.
 
 ### 💬 Comment navigation
 

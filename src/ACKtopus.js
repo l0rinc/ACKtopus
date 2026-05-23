@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.116
+// @version      1.117
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1766,9 +1766,38 @@
     // in some views (buttons now appear directly under `.discussion-item-header`).
     const AJAX_PAGINATION_BTN_SELECTOR = '.ajax-pagination-form .ajax-pagination-btn, .ajax-pagination-btn';
     const HIDDEN_CONVERSATION_SELECTOR = '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form';
+    const ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR =
+        'button[data-testid^="issue-timeline-load-more-"], ' +
+        '[data-testid^="issue-timeline-load-more-container-"] button';
+
+    function isIssueTimelineLoadMoreButton(btn) {
+        if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+        if (btn.getAttribute('data-loading') === 'true') return false;
+        const testId = btn.getAttribute('data-testid') || '';
+        const label = (btn.textContent || '').trim();
+        return /^issue-timeline-load-more-/.test(testId) || /^load\s+more$/i.test(label);
+    }
+
+    function getIssueTimelineLoadMoreButtons() {
+        const seen = new Set();
+        return [...document.querySelectorAll(ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR)].filter((btn) => {
+            if (seen.has(btn) || !isIssueTimelineLoadMoreButton(btn)) return false;
+            seen.add(btn);
+            return true;
+        });
+    }
+
+    function getIssueTimelineLoadMoreCount() {
+        let total = 0;
+        document.querySelectorAll('[data-testid^="issue-timeline-load-more-container-"]').forEach((el) => {
+            const m = (el.textContent || '').match(/(\d+)\s+remaining\s+items?/i);
+            if (m) total += parseInt(m[1], 10);
+        });
+        return total;
+    }
 
     function getHiddenCount() {
-        let total = 0;
+        let total = getIssueTimelineLoadMoreCount();
         document.querySelectorAll(HIDDEN_CONVERSATION_SELECTOR).forEach((el) => {
             const m = (el.textContent || '').match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
             if (m) total += parseInt(m[1], 10);
@@ -1780,6 +1809,13 @@
         return total;
     }
 
+    function getHiddenActionCount() {
+        const hiddenCount = getHiddenCount();
+        if (hiddenCount > 0) return hiddenCount;
+        const { paginationBtns, timelineLoadMore } = getLoadableElements();
+        return paginationBtns.length + timelineLoadMore.length;
+    }
+
     function getCollapsedSectionCount() {
         const { minimized, outdated, loadDiffs } = getLoadableElements();
         return minimized.length + outdated.length + loadDiffs.length;
@@ -1787,11 +1823,12 @@
 
     function getRevealAllState() {
         const hiddenCount = getHiddenCount();
-        const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+        const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
         const resolved = getCollapsedResolved();
         return {
             hiddenCount,
             paginationBtns,
+            timelineLoadMore,
             minimized,
             outdated,
             loadDiffs,
@@ -1799,6 +1836,7 @@
             total:
                 hiddenCount +
                 paginationBtns.length +
+                timelineLoadMore.length +
                 minimized.length +
                 outdated.length +
                 loadDiffs.length +
@@ -1808,6 +1846,7 @@
 
     function getLoadableElements() {
         const paginationBtns = [...document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR)];
+        const timelineLoadMore = getIssueTimelineLoadMoreButtons();
         const minimized = [
             ...document.querySelectorAll(
                 '.minimized-comment .timeline-comment-header,' +
@@ -1820,7 +1859,7 @@
             .filter((el) => /^load\s*diff$/i.test(el.textContent.trim()))
             .map((el) => el.closest('button'))
             .filter(Boolean);
-        return { paginationBtns, minimized, outdated, loadDiffs };
+        return { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs };
     }
 
     async function showCollapsedSections(btn) {
@@ -1903,6 +1942,8 @@
             document.querySelector(
                 '.js-review-hidden-comment-ids,' +
                     '.ajax-pagination-btn,' +
+                    '[data-testid^="issue-timeline-load-more-container-"],' +
+                    'button[data-testid^="issue-timeline-load-more-"],' +
                     '.ajax-pagination-form,' +
                     '.minimized-comment,' +
                     '.outdated-comment details:not([open]):not([data-resolved])',
@@ -1921,9 +1962,14 @@
             ? null
             : startBrailleAnimation((frame) => {
                   const count = getHiddenCount();
-                  const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+                  const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
                   const remaining =
-                      count || paginationBtns.length + minimized.length + outdated.length + loadDiffs.length;
+                      count ||
+                      paginationBtns.length +
+                          timelineLoadMore.length +
+                          minimized.length +
+                          outdated.length +
+                          loadDiffs.length;
                   btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
               }, 100);
 
@@ -1950,19 +1996,22 @@
                     return;
                 }
 
-                const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+                const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
                 if (
                     paginationBtns.length === 0 &&
+                    timelineLoadMore.length === 0 &&
                     minimized.length === 0 &&
                     outdated.length === 0 &&
                     loadDiffs.length === 0
                 )
                     break;
 
-                const scrollTarget = paginationBtns[0] || minimized[0] || outdated[0] || loadDiffs[0];
+                const scrollTarget =
+                    paginationBtns[0] || timelineLoadMore[0] || minimized[0] || outdated[0] || loadDiffs[0];
                 if (scrollTarget) scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
                 paginationBtns.forEach((b) => b.click());
+                timelineLoadMore.forEach((b) => b.click());
                 minimized.forEach((h) => h.click());
                 outdated.forEach((d) => d.setAttribute('open', ''));
                 loadDiffs.forEach((b) => b.click());
@@ -1972,9 +2021,14 @@
             finish('✓ all loaded', '✓');
             // After the success message fades, recheck -- disable if nothing left
             setTimeout(() => {
-                const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+                const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
                 const hiddenRemaining =
-                    getHiddenCount() + paginationBtns.length + minimized.length + outdated.length + loadDiffs.length;
+                    getHiddenCount() +
+                    paginationBtns.length +
+                    timelineLoadMore.length +
+                    minimized.length +
+                    outdated.length +
+                    loadDiffs.length;
                 const resolvedRemaining = getCollapsedResolved().length;
                 if (hiddenRemaining === 0 && resolvedRemaining > 0) {
                     GM_setValue('expandToolbarAction', 'resolved');
@@ -2438,9 +2492,10 @@
 
         for (let attempt = 0; attempt < 20; attempt++) {
             if (lt.signal.aborted) break;
-            const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+            const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
             if (
                 paginationBtns.length === 0 &&
+                timelineLoadMore.length === 0 &&
                 minimized.length === 0 &&
                 outdated.length === 0 &&
                 loadDiffs.length === 0
@@ -2451,6 +2506,7 @@
                 break;
             }
             paginationBtns.forEach((b) => b.click());
+            timelineLoadMore.forEach((b) => b.click());
             minimized.forEach((h) => h.click());
             outdated.forEach((d) => d.setAttribute('open', ''));
             loadDiffs.forEach((b) => b.click());
@@ -2501,20 +2557,28 @@
     }
 
     function getReviewCommentRevealState() {
-        const { paginationBtns, minimized, outdated, loadDiffs } = getLoadableElements();
+        const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
         const resolved = getCollapsedResolved();
         return {
             paginationBtns,
+            timelineLoadMore,
             minimized,
             outdated,
             loadDiffs,
             resolved,
-            total: paginationBtns.length + minimized.length + outdated.length + loadDiffs.length + resolved.length,
+            total:
+                paginationBtns.length +
+                timelineLoadMore.length +
+                minimized.length +
+                outdated.length +
+                loadDiffs.length +
+                resolved.length,
         };
     }
 
     function openReviewCommentRevealState(state) {
         state.paginationBtns.forEach((b) => b.click());
+        state.timelineLoadMore.forEach((b) => b.click());
         state.resolved.forEach((item) => item.click());
         state.minimized.forEach((h) => h.click());
         state.outdated.forEach((d) => d.setAttribute('open', ''));
@@ -2524,6 +2588,7 @@
     function scrollToReviewCommentRevealWork(state) {
         const target =
             state.paginationBtns[0] ||
+            state.timelineLoadMore[0] ||
             state.resolved[0]?.el ||
             state.minimized[0] ||
             state.outdated[0] ||
@@ -2566,7 +2631,8 @@
                 popup.textContent = `Opening collapsed sections to find linked review comment... ${state.total} remaining`;
                 if (attempt === 0 || attempt % 4 === 0) scrollToReviewCommentRevealWork(state);
                 openReviewCommentRevealState(state);
-                if (await ackSleep(state.paginationBtns.length > 0 ? 1800 : 700)) return false;
+                if (await ackSleep(state.paginationBtns.length + state.timelineLoadMore.length > 0 ? 1800 : 700))
+                    return false;
             }
 
             if (popup) popup.textContent = 'Could not find linked review comment after opening collapsed sections';
@@ -12285,18 +12351,16 @@ The prompt must ask for:
             focusVisibleDeleteCommentConfirmButton();
             if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
             runDocInjectors(ctx);
+            const hiddenLoaderSelector =
+                '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn, ' +
+                ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR;
             const hiddenLoadersChanged =
                 ctx.onToolbar &&
                 [...mutations].some((m) =>
                     [...m.addedNodes, ...m.removedNodes].some(
                         (n) =>
                             n.nodeType === 1 &&
-                            (n.matches?.(
-                                '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn',
-                            ) ||
-                                n.querySelector?.(
-                                    '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn',
-                                )),
+                            (n.matches?.(hiddenLoaderSelector) || n.querySelector?.(hiddenLoaderSelector)),
                     ),
                 );
             if (hiddenLoadersChanged) {
@@ -18393,7 +18457,7 @@ The prompt must ask for:
                   const remaining = getRevealAllState().total;
                   btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
               });
-        const popup = makeStatusPopup('Revealing hidden conversations, resolved threads, and collapsed sections...');
+        const popup = makeStatusPopup('Revealing hidden timeline items, resolved threads, and collapsed sections...');
         const finish = (msg, shortMsg, ok = false) => {
             if (stopAnim) stopAnim();
             if (stopCompactSpin) stopCompactSpin(shortMsg || msg);
@@ -18420,8 +18484,8 @@ The prompt must ask for:
                 }
                 lastTotal = state.total;
                 const phase =
-                    state.hiddenCount + state.paginationBtns.length > 0
-                        ? 'hidden conversations'
+                    state.hiddenCount + state.paginationBtns.length + state.timelineLoadMore.length > 0
+                        ? 'hidden timeline items'
                         : state.resolved.length > 0
                           ? 'resolved threads'
                           : 'collapsed sections';
@@ -18434,6 +18498,7 @@ The prompt must ask for:
                 if (round === 0 || openedCount - lastScrolledAt >= 10) {
                     const scrollTarget =
                         state.paginationBtns[0] ||
+                        state.timelineLoadMore[0] ||
                         state.resolved[0]?.el ||
                         state.minimized[0] ||
                         state.outdated[0] ||
@@ -18442,8 +18507,9 @@ The prompt must ask for:
                     lastScrolledAt = openedCount;
                 }
 
-                if (state.hiddenCount + state.paginationBtns.length > 0) {
+                if (state.hiddenCount + state.paginationBtns.length + state.timelineLoadMore.length > 0) {
                     state.paginationBtns.forEach((b) => b.click());
+                    state.timelineLoadMore.forEach((b) => b.click());
                 } else if (state.resolved.length > 0) {
                     state.resolved.forEach((item) => item.click());
                 } else {
@@ -18452,7 +18518,7 @@ The prompt must ask for:
                     state.loadDiffs.forEach((b) => b.click());
                 }
 
-                const waitMs = state.paginationBtns.length > 0 ? 1800 : 700;
+                const waitMs = state.paginationBtns.length + state.timelineLoadMore.length > 0 ? 1800 : 700;
                 await ackSleep(waitMs);
             }
 
@@ -18638,7 +18704,7 @@ The prompt must ask for:
         };
         renderRevealItem();
         revealItem.title =
-            'Reveal hidden conversations, resolved threads, and collapsed sections before copying context';
+            'Reveal hidden timeline items, resolved threads, and collapsed sections before copying context';
         revealItem.addEventListener('mouseenter', () => (revealItem.style.background = '#30363d'));
         revealItem.addEventListener('mouseleave', () => (revealItem.style.background = 'transparent'));
         revealItem.addEventListener('click', () => {
@@ -19008,8 +19074,8 @@ The prompt must ask for:
                 key: 'hidden',
                 emoji: '📦',
                 label: 'Show hidden',
-                tip: 'Load hidden conversations/comments',
-                count: () => getHiddenCount(),
+                tip: 'Load hidden conversations/comments and issue timeline items',
+                count: () => getHiddenActionCount(),
                 run: (btn) => showHidden(btn),
             },
             {
@@ -25449,16 +25515,39 @@ The prompt must ask for:
         );
         ackAssert(block.includes('.ajax-pagination-btn'), 'includes .ajax-pagination-btn');
         ackAssert(block.includes('.ajax-pagination-form'), 'keeps legacy .ajax-pagination-form support');
+        ackAssert(block.includes('issue-timeline-load-more'), 'includes React issue timeline load-more buttons');
         ackAssert(source.includes('HIDDEN_CONVERSATION_SELECTOR'), 'has shared hidden-conversation selector');
         const fn = source.slice(
             source.indexOf('function getHiddenCount'),
             source.indexOf('function getLoadableElements'),
         );
         ackAssert(fn.includes('AJAX_PAGINATION_BTN_SELECTOR'), 'getHiddenCount uses shared selector constant');
+        ackAssert(fn.includes('getIssueTimelineLoadMoreCount()'), 'getHiddenCount includes issue timeline load-more counts');
         ackAssert(
             fn.includes('hidden\\s+(?:items|conversations)'),
             'counts both hidden items and hidden conversations',
         );
+    });
+
+    ackTest('showHidden detects React issue timeline load-more items', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div data-testid="issue-timeline-load-more-container-load-top">
+                <h3><span data-testid="issue-timeline-load-more-count-load-top">23</span><span> remaining <span>items</span></span></h3>
+                <button aria-disabled="false" data-testid="issue-timeline-load-more-load-top" type="button">
+                    <span><span><div>Load more</div></span></span>
+                </button>
+            </div>`;
+        const beforeCount = getHiddenCount();
+        document.body.appendChild(host);
+        try {
+            const btn = host.querySelector('button');
+            const state = getLoadableElements();
+            ackAssert(state.timelineLoadMore.includes(btn), 'finds React issue timeline load-more button');
+            ackEq(getHiddenCount(), beforeCount + 23, 'counts React issue timeline remaining items');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('context copy dropdown includes unified reveal-all action', () => {
@@ -25475,10 +25564,11 @@ The prompt must ask for:
     ackTest('childList observer refreshes toolbar when hidden loaders appear later', () => {
         const source = _ackSource;
         const fn = source.slice(
-            source.indexOf('const hiddenLoadersChanged'),
+            source.indexOf('const hiddenLoaderSelector'),
             source.indexOf('if (ctx.onPR && hadRemovals)'),
         );
         ackAssert(fn.includes('hiddenLoadersChanged'), 'detects hidden loader mutations');
+        ackAssert(fn.includes('ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR'), 'detects React issue timeline loader mutations');
         ackAssert(
             fn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
             'refreshes toolbar when hidden conversation loaders appear',
@@ -25525,10 +25615,10 @@ The prompt must ask for:
         ackAssert(fn.includes('openedCount'), 'tracks how many items were opened');
         ackAssert(fn.includes('openedCount - lastScrolledAt >= 10'), 'only scrolls after substantial progress');
         ackAssert(
-            fn.includes('state.paginationBtns.length > 0 ? 1800 : 700'),
-            'wait is shorter when no hidden-page fetch is involved',
+            fn.includes('state.paginationBtns.length + state.timelineLoadMore.length > 0 ? 1800 : 700'),
+            'wait is shorter when no hidden-page or timeline fetch is involved',
         );
-        ackAssert(fn.includes("? 'hidden conversations'"), 'reveals hidden conversations first');
+        ackAssert(fn.includes("? 'hidden timeline items'"), 'reveals hidden timeline items first');
         ackAssert(fn.includes("? 'resolved threads'"), 'then reveals resolved threads');
         ackAssert(
             fn.includes('else {\n                    state.minimized.forEach'),
