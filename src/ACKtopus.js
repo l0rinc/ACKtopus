@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.121
+// @version      1.122
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -84,6 +84,8 @@
     const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
     const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
+    const LLM_DEFAULT_MAX_TOKENS = 16384;
+    const REPRODUCER_MAX_TOKENS = LLM_DEFAULT_MAX_TOKENS;
     const LLM_REQUEST_TIMEOUT_MS = 180000;
     const LLM_HIGH_CONTEXT_TIMEOUT_MS = 600000;
     const GITHUB_GET_TIMEOUT_MS = 30000;
@@ -4020,9 +4022,9 @@
                 'content-type': 'application/json',
                 'anthropic-dangerous-direct-browser-access': 'true',
             }),
-            body: (model, system, userContent, { maxTokens = 4096 } = {}) => ({
+            body: (model, system, userContent, { maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) => ({
                 model,
-                max_tokens: maxTokens || 4096,
+                max_tokens: maxTokens || LLM_DEFAULT_MAX_TOKENS,
                 system,
                 messages: [{ role: 'user', content: userContent }],
             }),
@@ -4030,6 +4032,7 @@
             validateBody: (model) => ({ model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
             parseText: (data) => data.content?.map((b) => b.text || '').join('') || '',
             parseUsage: (data) => [data.usage?.input_tokens, data.usage?.output_tokens],
+            parseFinishReason: (data) => data.stop_reason || '',
         },
         openai: {
             url: 'https://api.openai.com/v1/chat/completions',
@@ -4037,9 +4040,9 @@
                 Authorization: `Bearer ${key}`,
                 'Content-Type': 'application/json',
             }),
-            body: (model, system, userContent, { reasoningEffort = 'none', maxTokens = 4096 } = {}) => ({
+            body: (model, system, userContent, { reasoningEffort = 'none', maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) => ({
                 model,
-                max_completion_tokens: maxTokens || 4096,
+                max_completion_tokens: maxTokens || LLM_DEFAULT_MAX_TOKENS,
                 reasoning_effort: reasoningEffort || 'none',
                 messages: [
                     { role: 'developer', content: system },
@@ -4055,6 +4058,7 @@
             }),
             parseText: (data) => data.choices?.[0]?.message?.content || '',
             parseUsage: (data) => [data.usage?.prompt_tokens, data.usage?.completion_tokens],
+            parseFinishReason: (data) => data.choices?.map((choice) => choice.finish_reason).find(Boolean) || '',
         },
         gemini: {
             url: (model) =>
@@ -4063,10 +4067,10 @@
                 'Content-Type': 'application/json',
                 'x-goog-api-key': key,
             }),
-            body: (model, system, userContent, { maxTokens = 4096 } = {}) => ({
+            body: (model, system, userContent, { maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) => ({
                 systemInstruction: { parts: [{ text: system }] },
                 contents: [{ role: 'user', parts: [{ text: userContent }] }],
-                generationConfig: { maxOutputTokens: maxTokens || 4096 },
+                generationConfig: { maxOutputTokens: maxTokens || LLM_DEFAULT_MAX_TOKENS },
             }),
             validateBody: () => ({
                 contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
@@ -4087,6 +4091,7 @@
                         : undefined);
                 return [input, output];
             },
+            parseFinishReason: (data) => data.candidates?.map((candidate) => candidate.finishReason).find(Boolean) || '',
         },
     };
 
@@ -5645,7 +5650,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             approxInputTokens: estimateLLMTokens(`${system || ''}\n${userContent || ''}`),
             requestChars: bodyChars,
             requestBytes: textByteLength(requestBody),
-            maxTokens: maxTokens || 4096,
+            maxTokens: maxTokens || LLM_DEFAULT_MAX_TOKENS,
             reasoningEffort: reasoningEffort || '',
             timeoutMs,
             streaming: !!streaming,
@@ -5665,6 +5670,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             meta.streaming ? 'stream=true' : '',
             meta.streamResponseChars != null ? `streamed=${meta.streamResponseChars}ch` : '',
             meta.streamTextChars != null ? `text=${meta.streamTextChars}ch` : '',
+            meta.responseChars != null ? `response=${meta.responseChars}ch` : '',
+            meta.finishReason ? `finish=${meta.finishReason}` : '',
             meta.elapsedMs != null ? `elapsed=${meta.elapsedMs}ms` : '',
         ]
             .filter(Boolean)
@@ -5678,9 +5685,14 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return err;
     }
 
-    function shouldStreamLLMRequest(provider, { timeoutMs = LLM_REQUEST_TIMEOUT_MS, maxTokens = 0 } = {}) {
+    function isLLMTruncatedFinishReason(reason) {
+        const value = String(reason || '').toLowerCase();
+        return value === 'length' || (value.includes('max') && value.includes('token'));
+    }
+
+    function shouldStreamLLMRequest(provider, { timeoutMs = LLM_REQUEST_TIMEOUT_MS, maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) {
         if (provider !== 'claude' && provider !== 'openai') return false;
-        return timeoutMs > LLM_REQUEST_TIMEOUT_MS || maxTokens > 4096;
+        return timeoutMs > LLM_REQUEST_TIMEOUT_MS || (maxTokens || LLM_DEFAULT_MAX_TOKENS) > 4096;
     }
 
     function createLLMStreamState(provider) {
@@ -5691,6 +5703,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             text: '',
             inputTokens: undefined,
             outputTokens: undefined,
+            finishReason: '',
             done: false,
         };
     }
@@ -5725,6 +5738,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             } else if (obj.type === 'content_block_delta') {
                 appendLLMStreamText(state, obj.delta?.text);
             } else if (obj.type === 'message_delta') {
+                state.finishReason = obj.delta?.stop_reason || state.finishReason;
                 state.outputTokens = obj.usage?.output_tokens ?? state.outputTokens;
             } else if (obj.type === 'message_stop') {
                 state.done = true;
@@ -5737,6 +5751,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 state.outputTokens = obj.usage.completion_tokens ?? state.outputTokens;
             }
             for (const choice of obj.choices || []) {
+                state.finishReason = choice.finish_reason || state.finishReason;
                 const delta = choice.delta || {};
                 const content = delta.content;
                 if (typeof content === 'string') {
@@ -5819,8 +5834,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
         const requestUrl = providerRequestUrl(api, model, cfg.key);
-        const streaming = !!api.streamBody && shouldStreamLLMRequest(provider, { timeoutMs, maxTokens });
-        const rawBody = api.body(model, system, userContent, { reasoningEffort, maxTokens });
+        const effectiveMaxTokens = maxTokens || LLM_DEFAULT_MAX_TOKENS;
+        const streaming = !!api.streamBody && shouldStreamLLMRequest(provider, { timeoutMs, maxTokens: effectiveMaxTokens });
+        const rawBody = api.body(model, system, userContent, { reasoningEffort, maxTokens: effectiveMaxTokens });
         const requestBody = JSON.stringify(streaming ? api.streamBody(rawBody) : rawBody);
         const requestMeta = buildLLMRequestMeta({
             provider,
@@ -5831,7 +5847,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             userContent,
             requestBody,
             reasoningEffort,
-            maxTokens,
+            maxTokens: effectiveMaxTokens,
             timeoutMs,
             promptKey,
             requestLabel,
@@ -5842,7 +5858,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         console.log('system:', system);
         console.log('user:', userContent);
         if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
-        if (maxTokens) console.log('max_tokens:', maxTokens);
+        console.log('max_tokens:', effectiveMaxTokens);
         console.log('timeout_ms:', timeoutMs);
         console.log('streaming:', streaming);
         console.log('request_chars:', requestBody.length);
@@ -5868,18 +5884,34 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 console.groupEnd();
                 reject(makeLLMRequestError(label, kind, details, meta));
             };
-            const resolveWithText = (text, inputTokens, outputTokens) => {
+            const resolveWithText = (text, inputTokens, outputTokens, finishReason = '') => {
                 if (settled) return;
+                const responseText = String(text || '');
+                const meta = {
+                    ...finishMeta(),
+                    responseChars: responseText.length,
+                    finishReason: String(finishReason || ''),
+                };
+                if (isLLMTruncatedFinishReason(finishReason)) {
+                    settled = true;
+                    console.groupCollapsed(`ACKtopus: LLM response truncated ✕ ${label} (${model})`);
+                    console.log('metadata:', meta);
+                    console.log('partial_response:', responseText);
+                    console.groupEnd();
+                    reject(makeLLMRequestError(label, 'response truncated', `finish_reason=${finishReason}`, meta));
+                    return;
+                }
                 settled = true;
                 if (inputTokens) addUsage(provider, inputTokens, outputTokens);
                 console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
-                console.log(text);
+                console.log('metadata:', meta);
+                console.log(responseText);
                 console.groupEnd();
                 if (promptKey) {
-                    GM_setValue(promptKey, text);
+                    GM_setValue(promptKey, responseText);
                     recordCacheTimestamp(promptKey);
                 }
-                resolve(text);
+                resolve(responseText);
             };
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -5906,7 +5938,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                                 rejectWithLoggedError('stream error', e?.message || String(e), e);
                                 return;
                             }
-                            resolveWithText(streamState.text, streamState.inputTokens, streamState.outputTokens);
+                            resolveWithText(
+                                streamState.text,
+                                streamState.inputTokens,
+                                streamState.outputTokens,
+                                streamState.finishReason,
+                            );
                             return;
                         }
                         let data;
@@ -5918,7 +5955,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         }
                         const [inp, out] = api.parseUsage(data);
                         const text = api.parseText(data);
-                        resolveWithText(text, inp, out);
+                        const finishReason = api.parseFinishReason?.(data) || '';
+                        resolveWithText(text, inp, out, finishReason);
                     } else {
                         rejectWithLoggedError(`${r.status}`, parseProviderError(r), r);
                     }
@@ -7771,7 +7809,6 @@ The prompt must ask for:
 - restrained colors suitable for a software review document.`;
         const raw = await callLLM('openai', system, user, {
             reasoningEffort: 'high',
-            maxTokens: 4096,
         });
         const prompt = cleanInfographicImagePrompt(raw);
         if (!prompt) throw new Error('OpenAI did not return an image prompt');
@@ -8227,7 +8264,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         omitHeadMetadata: true,
                         maxChars: REPRODUCER_CONTEXT_MAX_CHARS,
                     },
-                    maxTokens: 4096,
+                    maxTokens: REPRODUCER_MAX_TOKENS,
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
                         'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from the base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must frame the task as an independent reinvention from the problem description and base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the base commit/branch the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
@@ -20653,7 +20690,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.121
+// @version      1.122
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -30071,6 +30108,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('callLLM rejects truncated provider responses before caching', async () => {
+        const origReq = GM_xmlhttpRequest;
+        const origParsePageContext = parsePageContext;
+        const origPageKind = pageKind;
+        const system = 'system prompt for truncation';
+        const user = 'user prompt for truncation';
+        let promptKey = '';
+        try {
+            parsePageContext = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+            pageKind = () => 'pull';
+            GM_setValue('llm_claude_key', 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            promptKey = buildPromptCacheKey('claude', LLM_MODELS.claude, system, user);
+            if (typeof GM_deleteValue === 'function') GM_deleteValue(promptKey);
+
+            GM_xmlhttpRequest = ({ onload }) => {
+                const payload = {
+                    content: [{ text: 'partial-response' }],
+                    usage: { input_tokens: 1, output_tokens: 4096 },
+                    stop_reason: 'max_tokens',
+                };
+                onload?.({ status: 200, responseText: JSON.stringify(payload) });
+            };
+
+            let err = null;
+            try {
+                await callLLM('claude', system, user, { maxTokens: 4096 });
+            } catch (e) {
+                err = e;
+            }
+            ackAssert(err, 'truncated response should reject');
+            ackAssert(err.message.includes('response truncated'), 'reports truncation clearly');
+            ackEq(GM_getValue(promptKey, null), null, 'does not cache partial truncated response');
+        } finally {
+            if (promptKey && typeof GM_deleteValue === 'function') GM_deleteValue(promptKey);
+            GM_xmlhttpRequest = origReq;
+            parsePageContext = origParsePageContext;
+            pageKind = origPageKind;
+        }
+    });
+
     ackTest('findUserAckSha excludes NACK types', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -30113,6 +30191,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('formatTransportErrorDetails(e)'), 'uses structured transport error details');
         ackAssert(source.includes('function buildLLMRequestMeta'), 'builds structured request metadata');
         ackAssert(source.includes('function makeLLMRequestError'), 'adds request metadata to errors');
+        ackAssert(source.includes('const LLM_DEFAULT_MAX_TOKENS = 16384'), 'defaults LLM output budget to 16k');
         ackAssert(fn.includes('request_chars'), 'logs request size for debugging oversized prompt failures');
         ackAssert(fn.includes('timeout_ms'), 'logs the configured request timeout');
         ackAssert(fn.includes('timeout: timeoutMs'), 'uses an explicit LLM transport timeout');
@@ -30120,6 +30199,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('onprogress:'), 'streams long Claude/OpenAI responses through progress chunks');
         ackAssert(source.includes('function shouldStreamLLMRequest'), 'has explicit streaming gate');
         ackAssert(source.includes('stream=true'), 'streaming mode is included in request-error metadata');
+        ackAssert(source.includes('response truncated'), 'reports max-token truncation as an error');
+        ackAssert(source.includes('finishReason'), 'tracks provider finish reasons');
         const formatted = formatTransportErrorDetails({
             status: 0,
             statusText: 'error',
@@ -30154,6 +30235,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('LLM streaming parser handles Claude and OpenAI SSE chunks', () => {
+        ackEq(shouldStreamLLMRequest('claude'), true, 'streams default high-output Claude calls');
         ackEq(
             shouldStreamLLMRequest('claude', { timeoutMs: LLM_HIGH_CONTEXT_TIMEOUT_MS, maxTokens: 4096 }),
             true,
@@ -30181,7 +30263,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             claudeStart +
                 'lo"}}\n\n' +
                 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}\n\n' +
-                'data: {"type":"message_delta","usage":{"output_tokens":3}}\n\n' +
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n' +
                 'data: {"type":"message_stop"}\n\n',
             claude,
             { final: true },
@@ -30189,18 +30271,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(claude.text, 'Hello world', 'combines Claude text deltas');
         ackEq(claude.inputTokens, 12, 'keeps Claude input usage');
         ackEq(claude.outputTokens, 3, 'keeps Claude output usage');
+        ackEq(claude.finishReason, 'end_turn', 'keeps Claude finish reason');
 
         const openai = createLLMStreamState('openai');
         const openaiText =
             'data: {"choices":[{"delta":{"content":"Hi "}}]}\n\n' +
             'data: {"choices":[{"delta":{"content":"there"}}]}\n\n' +
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n' +
             'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}}\n\n' +
             'data: [DONE]\n\n';
         consumeLLMStreamText('openai', openaiText, openai, { final: true });
         ackEq(openai.text, 'Hi there', 'combines OpenAI text deltas');
         ackEq(openai.inputTokens, 7, 'keeps OpenAI input usage');
         ackEq(openai.outputTokens, 2, 'keeps OpenAI output usage');
+        ackEq(openai.finishReason, 'stop', 'keeps OpenAI finish reason');
         ackEq(openai.done, true, 'marks OpenAI stream done');
+        ackEq(isLLMTruncatedFinishReason('length'), true, 'OpenAI length finish reason is truncation');
+        ackEq(isLLMTruncatedFinishReason('MAX_TOKENS'), true, 'Gemini max token finish reason is truncation');
+        ackEq(isLLMTruncatedFinishReason('end_turn'), false, 'Claude normal stop is not truncation');
     });
 
     ackTest('comment/code mismatches fixed', () => {
@@ -32352,7 +32440,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
         ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
         ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a bounded source budget');
-        ackAssert(fn.includes('maxTokens: 4096'), 'reproducer uses a bounded output budget');
+        ackAssert(fn.includes('maxTokens: REPRODUCER_MAX_TOKENS'), 'reproducer uses a larger bounded output budget');
         ackAssert(fn.includes('requestLabel: recipe'), 'recipe LLM calls are labeled in error diagnostics');
         ackAssert(fn.includes('recipeCfg.finalTask'), 'recipe prompt puts source material before final task');
         ackAssert(fn.includes('the actual outcome-focused no-peek local reproducer prompt'), 'generates the direct no-peek prompt');
@@ -33589,9 +33677,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.121', () => {
+    ackTest('version bumped to 1.122', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.121' || _ackSource.includes('@version      1.121'), 'version is 1.121');
+        ackAssert(versionFromMeta === '1.122' || _ackSource.includes('@version      1.122'), 'version is 1.122');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
