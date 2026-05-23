@@ -533,6 +533,11 @@
         'form[action*="/reviews/"][action*="/update"]';
     const EDIT_BODY_TEXTAREA_SELECTOR =
         'textarea[name="issue[body]"], textarea[name="pull_request[body]"], textarea#issue_body, textarea#pull_request_body';
+    const EDIT_SCOPE_SELECTOR =
+        EDIT_FORM_SELECTOR +
+        ', .is-comment-editing, .edit-comment-hide, [data-testid="markdown-editor"], ' +
+        '[class*="MarkdownEditor-module__container"], [class*="ActivityThread"], [data-testid="review-thread"], ' +
+        '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]';
     const EDIT_SAVE_DIFF_EMOJI = '🧾';
     const EXTENDED_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_SELECTOR + ', .js-comment, .js-line-comments, .inline-comment-form-container';
@@ -10616,10 +10621,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function submitPendingReview(pr, { event, body } = {}) {
         if (!pr) throw new Error('not on a PR page');
         const eventValue = String(event || 'COMMENT').toUpperCase();
+        const { dialog } = await prepareNativeReviewDialog({ event: eventValue, body });
+
+        const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
+        if (!submitBtn) throw new Error('native submit review button not found');
+        submitBtn.click();
+        return { state: eventValue };
+    }
+
+    async function prepareNativeReviewDialog({ event = 'COMMENT', body = '' } = {}) {
+        const eventValue = String(event || 'COMMENT').toUpperCase();
         await openReviewDialog(eventValue);
         const dialog = await waitForElement(document, () => findNativeReviewDialog(), 'submit review dialog', 12, 150);
         if (!dialog) throw new Error('native submit review dialog not found');
-
         const nativeEventValue =
             {
                 COMMENT: 'comment',
@@ -10648,12 +10662,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (reviewBody) {
             setTextareaValue(reviewBody, String(body || ''));
             await ackSleep(50);
+            reviewBody.focus();
         }
 
-        const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
-        if (!submitBtn) throw new Error('native submit review button not found');
-        submitBtn.click();
-        return { state: eventValue };
+        return { dialog, reviewBody, eventValue };
     }
 
     function getGitHubVerifiedFetchNonce() {
@@ -11369,14 +11381,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .replace(/\s+/g, ' ')
                 .trim() || 'btn';
         submitBtn.classList.add('ack-submit-review-btn');
-        submitBtn.textContent = 'Submit review';
-        submitBtn.title = 'Submit the pending review; Comment still posts a regular reply';
+        submitBtn.textContent = 'Review';
+        submitBtn.title = 'Open the pending review dialog and move this text into the review body';
         submitBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
             if (submitBtn.dataset.ackRunning) return;
-            const pr = parsePR();
-            if (!pr) return;
 
             submitBtn.dataset.ackRunning = '1';
             submitBtn.disabled = true;
@@ -11388,24 +11398,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const mainTa = form.querySelector('textarea#new_comment_field, textarea[name="comment[body]"]');
                 const rawBody = mainTa?.value || '';
                 const body = rawBody.trim() ? rawBody : '';
-                await submitPendingReview(pr, { event: 'COMMENT', body });
+                await prepareNativeReviewDialog({ event: 'COMMENT', body });
                 stopSpin('✅');
-                submitBtn.textContent = '✅';
-                _ackPendingReviewActive = false;
-                unmarkCommentButtonsPending();
-                invalidatePRContext();
-                if (mainTa && body) setTextareaValue(mainTa, '');
-                ackSetTimeout(() => {
-                    if (_ackTesting) return;
-                    suppressUnsavedCommentWarningOnce();
-                    location.reload();
-                }, 300);
+                submitBtn.textContent = origText;
+                submitBtn.disabled = false;
+                delete submitBtn.dataset.ackRunning;
             } catch (err) {
                 stopSpin('❌');
                 submitBtn.textContent = origText;
                 submitBtn.disabled = false;
                 delete submitBtn.dataset.ackRunning;
-                console.warn('ACKtopus: submit review failed:', err?.message || err);
+                console.warn('ACKtopus: open review dialog failed:', err?.message || err);
             }
         });
 
@@ -13103,16 +13106,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return !!form && isPRCreationPage(path, form);
     }
 
-    function isExistingPostEditForm(form, path = location.pathname) {
-        if (!form || isPRCreationForm(form, path)) return false;
-        if (form.matches?.(EDIT_FORM_SELECTOR)) return true;
-        if (!form.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) return false;
-        const action = form.getAttribute('action') || '';
-        if (/\/(?:issues|pull)\/\d+(?:\/|$)|\/issue_comments\/|\/review_comment\/|\/reviews\//.test(action))
-            return true;
-        return !!findEditSaveButton(form);
-    }
-
     function isEditCancelButton(btn) {
         const label = editButtonLabel(btn).toLowerCase();
         return (
@@ -13122,14 +13115,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
-    function findEditForm(element) {
-        const matched = element?.closest?.(EDIT_FORM_SELECTOR);
-        if (isExistingPostEditForm(matched)) return matched;
-        const form = element?.closest?.('form');
-        if (isExistingPostEditForm(form)) return form;
-        return null;
-    }
-
     function findEditTextarea(form) {
         if (!form) return null;
         return [...form.querySelectorAll('textarea')].find(isVisible) || form.querySelector('textarea');
@@ -13137,6 +13122,58 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function findEditSaveButton(form) {
         return [...(form?.querySelectorAll?.('button[type="submit"], button') || [])].find(isEditSaveButton) || null;
+    }
+
+    function findEditCancelButton(root) {
+        if (!root) return null;
+        return (
+            root.querySelector('button.js-comment-cancel-button, button[data-testid="cancel-edit-button"]') ||
+            [...root.querySelectorAll('button')].find((b) => /^cancel$/i.test((b.textContent || '').trim())) ||
+            null
+        );
+    }
+
+    function isExistingPostEditForm(form, path = location.pathname) {
+        if (!form || form === document || form === document.body || !form.querySelector) return false;
+        const ownerForm = form.matches?.('form') ? form : form.closest?.('form');
+        if (ownerForm && isPRCreationForm(ownerForm, path)) return false;
+        if (form.matches?.(EDIT_FORM_SELECTOR)) return true;
+
+        const ta = findEditTextarea(form);
+        if (!ta) return false;
+
+        const action = form.getAttribute?.('action') || ownerForm?.getAttribute?.('action') || '';
+        if (/\/(?:issues|pull)\/\d+(?:\/|$)|\/issue_comments\/|\/review_comment\/|\/reviews\//.test(action))
+            return !!findEditSaveButton(form);
+
+        if (form.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) return !!findEditSaveButton(form);
+
+        const hasReactEditShell = !!(
+            form.matches?.(
+                '.is-comment-editing, .edit-comment-hide, [data-testid="edit-comment-form"], ' +
+                    '[class*="ActivityThread"], [data-testid="review-thread"], ' +
+                    '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]',
+            ) ||
+            form.querySelector?.(
+                '.is-comment-editing textarea, .edit-comment-hide textarea, [data-testid="edit-comment-form"] textarea, ' +
+                    '[data-testid="markdown-editor"] textarea, [class*="MarkdownEditor-module__container"] textarea',
+            )
+        );
+        return hasReactEditShell && !!findEditSaveButton(form) && !!findEditCancelButton(form);
+    }
+
+    function findEditForm(element) {
+        const matched = element?.closest?.(EDIT_FORM_SELECTOR);
+        if (isExistingPostEditForm(matched)) return matched;
+        const form = element?.closest?.('form');
+        if (isExistingPostEditForm(form)) return form;
+
+        let el = element?.nodeType === 1 ? element : element?.parentElement || null;
+        for (let i = 0; i < 12 && el && el !== document.body; i++, el = el.parentElement) {
+            if (!el.matches?.(EDIT_SCOPE_SELECTOR) && !el.querySelector?.(EDIT_SCOPE_SELECTOR)) continue;
+            if (isExistingPostEditForm(el)) return el;
+        }
+        return null;
     }
 
     function markEditSaveButtons(form) {
@@ -13159,20 +13196,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function trackEditForms(root = document) {
         if (!root) return;
         const forms = new Set();
-        if (root.matches?.(EDIT_FORM_SELECTOR)) forms.add(root);
-        if (root.matches?.('form') && root.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)) forms.add(root);
-        const closest = root.closest?.(EDIT_FORM_SELECTOR);
-        if (closest) forms.add(closest);
-        const bodyTaForm = root.closest?.('form')?.querySelector?.(EDIT_BODY_TEXTAREA_SELECTOR)
-            ? root.closest('form')
-            : null;
-        if (bodyTaForm) forms.add(bodyTaForm);
+        const pushScope = (el) => {
+            const scope = findEditForm(el) || (isExistingPostEditForm(el) ? el : null);
+            if (scope) forms.add(scope);
+        };
+        pushScope(root);
+        const closest = root.closest?.(EDIT_SCOPE_SELECTOR);
+        if (closest) pushScope(closest);
+        const closestForm = root.closest?.('form');
+        if (closestForm) pushScope(closestForm);
         if (root.querySelectorAll) {
-            qsa(root, EDIT_FORM_SELECTOR).forEach((f) => forms.add(f));
+            qsa(root, EDIT_SCOPE_SELECTOR).forEach(pushScope);
             qsa(root, EDIT_BODY_TEXTAREA_SELECTOR).forEach((ta) => {
-                const form = ta.closest('form');
-                if (form) forms.add(form);
+                pushScope(ta);
             });
+            qsa(root, 'textarea, button[type="submit"], button').forEach(pushScope);
         }
         for (const form of forms) {
             if (!isExistingPostEditForm(form)) continue;
@@ -13200,15 +13238,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!ta) return false;
         const initial = typeof form._ackEditInitialValue === 'string' ? form._ackEditInitialValue : '';
         return ta.value === initial;
-    }
-
-    function findEditCancelButton(root) {
-        if (!root) return null;
-        return (
-            root.querySelector('button.js-comment-cancel-button, button[data-testid="cancel-edit-button"]') ||
-            [...root.querySelectorAll('button')].find((b) => /^cancel$/i.test((b.textContent || '').trim())) ||
-            null
-        );
     }
 
     function getEditCancelRoots(form, sourceEl = null) {
@@ -13243,8 +13272,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return !!form?._ackEditDiffAcceptedUntil && Date.now() < form._ackEditDiffAcceptedUntil;
     }
 
-    function markEditDiffAccepted(form) {
-        if (form) form._ackEditDiffAcceptedUntil = Date.now() + 3000;
+    function markEditDiffAccepted(form, submittedText = null) {
+        if (!form) return;
+        form._ackEditDiffAcceptedUntil = Date.now() + 3000;
+        if (typeof submittedText === 'string') {
+            form._ackEditInitialValue = submittedText;
+            form._ackEditDirty = false;
+        }
     }
 
     function shouldConfirmEditSave(form) {
@@ -13287,7 +13321,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (action !== 'unchanged' && typeof text === 'string' && text !== current) {
                 setTextareaValue(ta, text);
             }
-            markEditDiffAccepted(form);
+            markEditDiffAccepted(form, ta.value || '');
             const saveBtn = submitter?.isConnected ? submitter : findEditSaveButton(form);
             if (saveBtn?.isConnected) saveBtn.click();
             else if (typeof form.requestSubmit === 'function') form.requestSubmit();
@@ -15423,6 +15457,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function isExistingPostEditToolbar(toolbar) {
         const editorRoot = getToolbarEditorRoot(toolbar) || toolbar;
+        if (findEditForm(toolbar) || findEditForm(editorRoot) || findEditForm(getToolbarTextarea(toolbar))) return true;
         const form = editorRoot?.closest?.('form') || editorRoot?.querySelector?.('form') || null;
         if (isExistingPostEditForm(form)) return true;
         return !!(
@@ -15648,9 +15683,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
             };
             removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread');
-            const isEditToolbar = !!toolbar.closest(
-                'form.js-comment-update, [data-testid="edit-comment-form"], .is-comment-editing, .edit-comment-hide',
-            );
+            const isEditToolbar = !!findEditForm(toolbar);
             const allowProofread = isEditToolbar || isExistingPostEditToolbar(toolbar);
             if (!allowProofread) removeToolbarButtons(toolbar, '.ack-toolbar-proofread');
             let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
@@ -15765,7 +15798,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         });
 
-        qsa(root, 'form.js-comment-update, [data-testid="edit-comment-form"]').forEach((form) => {
+        const fallbackScopes = new Set();
+        const addFallbackScope = (el) => {
+            const scope = findEditForm(el) || (isExistingPostEditForm(el) ? el : null);
+            if (scope) fallbackScopes.add(scope);
+        };
+        addFallbackScope(root);
+        qsa(root, `${EDIT_SCOPE_SELECTOR}, textarea, button`).forEach(addFallbackScope);
+        fallbackScopes.forEach((form) => {
             const usableToolbar = [...qsa(form, toolbarSelector)].find(
                 (tb) => tb !== form && isVisible(tb) && !!getToolbarTextarea(tb),
             );
@@ -30989,16 +31029,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('addSubmitReviewButtonToConversation injects button for pending reviews on the main PR form', () => {
+    ackTest('addSubmitReviewButtonToConversation opens review dialog with main comment body', async () => {
         const origIsConv = isPRConversationPage;
         const origPending = _ackPendingReviewActive;
         const origHasPendingChanges = hasPendingReviewChanges;
         const origSyncPending = syncPendingReviewState;
+        const origPrepareDialog = prepareNativeReviewDialog;
         try {
             isPRConversationPage = () => true;
             _ackPendingReviewActive = true;
             hasPendingReviewChanges = () => true;
             syncPendingReviewState = () => {};
+            let prepared = null;
+            prepareNativeReviewDialog = async (args) => {
+                prepared = args;
+                return { dialog: document.createElement('div'), reviewBody: null, eventValue: args.event };
+            };
 
             const host = document.createElement('div');
             host.style.position = 'absolute';
@@ -31019,12 +31065,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             try {
                 addSubmitReviewButtonToConversation(host);
                 const submitBtn = host.querySelector('.ack-submit-review-btn');
-                ackAssert(submitBtn, 'injects Submit review button');
-                ackEq(submitBtn.textContent, 'Submit review');
-                ackAssert(host.querySelector('.ack-submit-review-wrap'), 'leaves submit review wrapper');
+                ackAssert(submitBtn, 'injects Review button');
+                ackEq(submitBtn.textContent, 'Review');
+                ackEq(
+                    submitBtn.title,
+                    'Open the pending review dialog and move this text into the review body',
+                    'explains that the button opens the dialog instead of submitting',
+                );
+                ackAssert(host.querySelector('.ack-submit-review-wrap'), 'leaves review wrapper');
                 ackAssert(
                     !submitBtn.classList.contains('btn-primary'),
-                    'Submit review is styled as a secondary action',
+                    'Review is styled as a secondary action',
                 );
                 const commentBtn = host.querySelector('#partial-new-comment-form-actions button[type="submit"]');
                 ackAssert(
@@ -31032,16 +31083,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     'leaves native Comment button as the primary action',
                 );
                 ackEq(commentBtn.textContent.trim(), 'Comment', 'does not relabel the Comment button');
-                const fn = _ackSource.slice(
-                    _ackSource.indexOf('function addSubmitReviewButtonToConversation'),
-                    _ackSource.indexOf('// --- Auto-prefill commit hash in new comments'),
+                const ok = submitBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                ackEq(ok, false, 'ACKtopus Review button click is handled without form submission');
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                ackDeepEq(prepared, { event: 'COMMENT', body: 'hello' }, 'opens review dialog with main comment text');
+                ackEq(
+                    host.querySelector('#new_comment_field').value,
+                    'hello',
+                    'keeps the main textarea untouched until the user submits the native review dialog',
                 );
                 ackAssert(
-                    sourceIncludesLoose(fn, "submitPendingReview(pr, {event: 'COMMENT', body})"),
-                    'submits the pending review via the native-dialog helper',
-                );
-                ackAssert(
-                    !fn.includes('commentBtn.disabled = true'),
+                    !_ackSource
+                        .slice(
+                            _ackSource.indexOf('function addSubmitReviewButtonToConversation'),
+                            _ackSource.indexOf('// --- Auto-prefill commit hash in new comments'),
+                        )
+                        .includes('commentBtn.disabled = true'),
                     'leaves Comment button enabled during submit so a regular reply is always available',
                 );
             } finally {
@@ -31052,6 +31109,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackPendingReviewActive = origPending;
             hasPendingReviewChanges = origHasPendingChanges;
             syncPendingReviewState = origSyncPending;
+            prepareNativeReviewDialog = origPrepareDialog;
             addSubmitReviewButtonToConversation(document);
         }
     });
@@ -33485,10 +33543,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             acceptBtn2.click();
             await new Promise((resolve) => setTimeout(resolve, 0));
             ackEq(submitEvents, 1, 'accepting the diff submits once');
+            ackEq(form._ackEditInitialValue, 'Hello **world**!!', 'accepted edit becomes the new no-op baseline');
+            ackEq(form._ackEditDirty, false, 'accepted edit clears the dirty flag');
+            delete form._ackEditDiffAcceptedUntil;
+            ackEq(isNoOpEditSave(form), true, 'same text after accepted edit is treated as no-op');
+            ackEq(shouldConfirmEditSave(form), false, 'same text after accepted edit does not show the old diff');
         } finally {
             delete form._ackEditTracked;
             delete form._ackEditDirty;
             delete form._ackEditInitialValue;
+            delete form._ackEditDiffAcceptedUntil;
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
             host.remove();
         }
@@ -33714,6 +33778,79 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(ok, false, 'Cmd+Escape is prevented for React-style edit box');
             ackEq(cancelClicks, 1, 'Cmd+Escape clicks external Cancel once');
             ackEq(targetKeydowns, 0, 'Cmd+Escape does not reach the textarea');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('React-style edit boxes show diff before external Update buttons submit', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <div class="ActivityThread">
+                <div data-testid="markdown-editor">
+                    <textarea style="width:200px;height:60px">Original comment</textarea>
+                </div>
+                <div>
+                    <button type="button">Cancel</button>
+                    <button type="button">Update comment</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const ta = host.querySelector('textarea');
+        const saveBtn = [...host.querySelectorAll('button')].find((btn) => editButtonLabel(btn) === 'Update comment');
+        let updateClicks = 0;
+        saveBtn.addEventListener('click', () => updateClicks++);
+        try {
+            trackEditForms(host);
+            const scope = findEditForm(saveBtn);
+            ackAssert(scope, 'external Update button resolves a React edit scope');
+            ackAssert(scope._ackEditTracked, 'React edit scope is tracked');
+            ackAssert(saveBtn.textContent.includes(EDIT_SAVE_DIFF_EMOJI), 'marks external Update button');
+            ta.value = 'Edited comment';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            const ok = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            ackEq(ok, false, 'external dirty Update is held for diff confirmation');
+            ackEq(updateClicks, 0, 'underlying Update handler is not called before accepting');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const acceptBtn = [...document.querySelectorAll('button')].find(
+                (btn) => btn.textContent === 'Accept and update',
+            );
+            ackAssert(acceptBtn, 'external dirty Update opens edit diff confirmation');
+            acceptBtn.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(updateClicks, 1, 'accepting the diff clicks external Update once');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            host.remove();
+        }
+    });
+
+    ackTest('React-style edit boxes get proofreading toolbar buttons', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <div class="ActivityThread">
+                <div data-testid="markdown-editor">
+                    <div class="MarkdownToolbar-module__toolbar__abc"></div>
+                    <textarea style="width:200px;height:60px">Original comment</textarea>
+                </div>
+                <div>
+                    <button type="button">Cancel</button>
+                    <button type="button">Update comment</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            trackEditForms(host);
+            addDetailsButtons(host);
+            ackAssert(host.querySelector('.ack-toolbar-proofread'), 'injects proofreading button in React edit toolbar');
         } finally {
             host.remove();
         }
