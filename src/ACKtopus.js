@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.118
+// @version      1.119
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3365,6 +3365,8 @@
             if (pr) {
                 try {
                     const url = new URL(link.href, location.origin);
+                    url.searchParams.set('pr', pr.pr);
+                    link.setAttribute('href', sameOriginPath(url));
                     sessionStorage.setItem('ack-compare-pr:' + url.pathname, pr.pr);
                 } catch (_) {}
             }
@@ -3470,6 +3472,23 @@
         return /\bCompare\s*&\s*pull request\b/i.test(label);
     }
 
+    function sameOriginPath(url) {
+        const parsed = url instanceof URL ? url : new URL(url, location.origin);
+        return parsed.origin === location.origin ? `${parsed.pathname}${parsed.search}${parsed.hash}` : parsed.href;
+    }
+
+    function parseComparePrParam(search = location.search) {
+        let value = '';
+        try {
+            value = new URLSearchParams(String(search || '').replace(/^\?/, '')).get('pr') || '';
+        } catch (_) {
+            value = '';
+        }
+        if (!/^[1-9]\d*$/.test(value)) return 0;
+        const num = Number(value);
+        return Number.isSafeInteger(num) ? num : 0;
+    }
+
     function rewriteLocalRepoCompareHref(rawHref, opts = {}) {
         const href = String(rawHref || '').trim();
         const match = href.match(/^(?:https?:\/\/github\.com)?\/([^/?#]+)\/([^/?#]+)\/compare\/([^?#]+)(?:\?[^#]*)?(#.*)?$/);
@@ -3538,8 +3557,9 @@
 
     async function autoCollapseCompareFiles() {
         if (!location.pathname.includes('/compare/')) return;
+        const compareLocationKey = `${location.pathname}${location.search}`;
         // Reset if navigated to a different compare page
-        if (_comparePath && _comparePath !== location.pathname) {
+        if (_comparePath && _comparePath !== compareLocationKey) {
             if (_compareObserver) {
                 _compareObserver.disconnect();
                 _compareObserver = null;
@@ -3548,7 +3568,7 @@
             const style = document.getElementById('ack-compare-collapse');
             if (style) style.remove();
         }
-        _comparePath = location.pathname;
+        _comparePath = compareLocationKey;
         if (_compareActive) return;
 
         const m = location.pathname.match(/\/([^/]+)\/([^/]+)\/compare\/([0-9a-f]+)\.{2,3}([0-9a-f]+)/);
@@ -3556,7 +3576,9 @@
         _compareActive = true;
         const [, owner, repo, baseSha, headSha] = m;
         console.log('ACKtopus: compare page detected, base:', baseSha.slice(0, 8), 'head:', headSha.slice(0, 8));
+        document.querySelectorAll('.ack-compare-status').forEach((el) => el.remove());
         const statusPopup = makeStatusPopup(`Compare: resolving PR for ${headSha.slice(0, 8)}...`);
+        statusPopup.className = 'ack-compare-status';
         const setCompareStatus = (text) => {
             if (statusPopup?.isConnected) statusPopup.textContent = text;
         };
@@ -3569,6 +3591,37 @@
                 } catch (_) {}
             }, 2200);
         };
+        const showComparePrMissingStatus = () => {
+            if (!statusPopup?.isConnected) return;
+            statusPopup.textContent = '';
+            Object.assign(statusPopup.style, {
+                border: '1px solid #d29922',
+                background: '#2d2108',
+                color: '#f0d98c',
+                maxWidth: '420px',
+            });
+            const title = document.createElement('div');
+            title.textContent = '⚠ Compare: PR not detected';
+            Object.assign(title.style, { fontWeight: '600', marginBottom: '6px' });
+            const body = document.createElement('div');
+            body.textContent =
+                'ACKtopus could not tell which PR owns this compare range, so it did not collapse unrelated files. Add ?pr=1234 to the URL, or open the compare link from the PR page.';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.textContent = 'Dismiss';
+            Object.assign(close.style, {
+                marginTop: '10px',
+                padding: '3px 8px',
+                border: '1px solid #8b949e',
+                borderRadius: '6px',
+                background: '#161b22',
+                color: '#c9d1d9',
+                cursor: 'pointer',
+                fontSize: '12px',
+            });
+            close.addEventListener('click', () => statusPopup.remove());
+            statusPopup.append(title, body, close);
+        };
 
         // Helper: gmFetch with timeout (old force-push SHAs can hang)
         function gmFetchTimeout(url, ms = 10000) {
@@ -3579,22 +3632,26 @@
         }
 
         // Find the PR this commit belongs to.
-        // Strategy 1: sessionStorage (set by enhanceForcePushLinks on the PR page -- instant, always works)
-        // Strategy 2: commits/{sha}/pulls API (works for reachable commits)
-        // Strategy 3: referrer URL (fallback, trusts same-repo PR links)
-        let prNum;
+        // Strategy 1: explicit ?pr=1234 URL parameter.
+        // Strategy 2: sessionStorage (set by enhanceForcePushLinks on the PR page -- instant, always works)
+        // Strategy 3: commits/{sha}/pulls API (works for reachable commits)
+        // Strategy 4: referrer URL (fallback, trusts same-repo PR links)
+        let prNum = parseComparePrParam();
+        if (prNum) console.log('ACKtopus: compare -- PR #' + prNum + ' (from URL ?pr)');
 
-        // Try sessionStorage first (keyed by both two-dot and three-dot paths)
-        for (const dots of ['...', '..']) {
-            if (prNum) break;
-            const key = 'ack-compare-pr:' + `/${owner}/${repo}/compare/${baseSha}${dots}${headSha}`;
-            try {
-                const stored = sessionStorage.getItem(key);
-                if (stored) {
-                    prNum = Number(stored);
-                    console.log('ACKtopus: compare -- PR #' + prNum + ' (from sessionStorage)');
-                }
-            } catch (_) {}
+        // Try sessionStorage next (keyed by both two-dot and three-dot paths)
+        if (!prNum) {
+            for (const dots of ['...', '..']) {
+                if (prNum) break;
+                const key = 'ack-compare-pr:' + `/${owner}/${repo}/compare/${baseSha}${dots}${headSha}`;
+                try {
+                    const stored = sessionStorage.getItem(key);
+                    if (stored) {
+                        prNum = Number(stored);
+                        console.log('ACKtopus: compare -- PR #' + prNum + ' (from sessionStorage)');
+                    }
+                } catch (_) {}
+            }
         }
 
         // Try commits/pulls API with both SHAs
@@ -3634,8 +3691,7 @@
                 '(referrer:',
                 document.referrer.slice(0, 80) + ')',
             );
-            finishCompareStatus('Compare: no matching PR found');
-            _compareActive = false;
+            showComparePrMissingStatus();
             return;
         }
         console.log('ACKtopus: compare -- PR #' + prNum);
@@ -26464,7 +26520,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('appendChild(badge)'), 'adds visual badge to enhanced links');
         ackAssert(fn.includes('sessionStorage.setItem'), 'stores PR number in sessionStorage');
         ackAssert(fn.includes('ack-compare-pr:'), 'uses namespaced sessionStorage key');
+        ackAssert(fn.includes("url.searchParams.set('pr', pr.pr)"), 'adds PR number as a durable URL parameter');
+        ackAssert(fn.includes('sameOriginPath(url)'), 'writes the compare link back with the PR parameter');
         ackAssert(fn.includes('parsePR'), 'extracts current PR number');
+    });
+
+    ackTest('compare PR query parameter parser accepts only positive PR numbers', () => {
+        ackEq(parseComparePrParam('?pr=1234'), 1234);
+        ackEq(parseComparePrParam('pr=5678&x=1'), 5678);
+        ackEq(parseComparePrParam('?x=1&pr=42'), 42);
+        ackEq(parseComparePrParam('?pr=0'), 0);
+        ackEq(parseComparePrParam('?pr=-1'), 0);
+        ackEq(parseComparePrParam('?pr=abc'), 0);
+        ackEq(parseComparePrParam('?x=1'), 0);
     });
 
     ackTest('local repo compare href rewrite targets the current repo base', () => {
@@ -26579,15 +26647,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('autoCollapseCompareFiles uses sessionStorage-first PR detection', () => {
+    ackTest('autoCollapseCompareFiles uses explicit PR query parameter before fallbacks', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function autoCollapseCompareFiles'),
             source.indexOf('// --- LLM Config'),
         );
-        ackAssert(!fn.includes('ack-compare-banner'), 'no banner UI');
         ackAssert(fn.includes('_compareActive'), 'uses flag to prevent re-entry');
-        ackAssert(fn.includes('sessionStorage.getItem'), 'checks sessionStorage first');
+        ackAssert(fn.includes('parseComparePrParam()'), 'checks explicit ?pr=1234 first');
+        ackAssert(fn.includes('from URL ?pr'), 'logs URL parameter source');
+        ackAssert(fn.includes('sessionStorage.getItem'), 'checks sessionStorage after explicit URL parameter');
         ackAssert(fn.includes('ack-compare-pr:'), 'reads namespaced sessionStorage key');
         ackAssert(fn.includes('from sessionStorage'), 'logs sessionStorage source');
         ackAssert(fn.includes('commits/pulls'), 'falls back to commits/pulls API');
@@ -26600,6 +26669,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('collapseNewFiles'), 'uses incremental collapse function');
         ackAssert(fn.includes('debounceTimer'), 'debounces observer for burst loading');
         ackAssert(fn.includes('ack-compare-collapse'), 'injects CSS style element for collapse');
+        ackAssert(fn.includes('showComparePrMissingStatus'), 'shows a visible missing-PR warning');
+        ackAssert(fn.includes('Compare: PR not detected'), 'warning title is explicit');
+        ackAssert(fn.includes('Add ?pr=1234 to the URL'), 'warning explains manual recovery');
         ackAssert(fn.includes('CSS.escape'), 'escapes paths for CSS attribute selectors');
         ackAssert(fn.includes('display: none !important'), 'hides diff content via CSS');
     });
