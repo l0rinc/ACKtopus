@@ -29793,7 +29793,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('buildPromptCacheKey('), 'uses buildPromptCacheKey helper');
         ackAssert(fn.includes('LLM prompt cache hit'), 'logs cache hits');
         ackAssert(fn.includes('skipCache'), 'supports skipCache parameter');
-        ackAssert(fn.includes('GM_setValue(promptKey, text)'), 'stores result in cache');
+        ackAssert(fn.includes('GM_setValue(promptKey, responseText)'), 'stores result in cache');
         // Verify buildPromptCacheKey hashes the prompt
         const helper = source.slice(
             source.indexOf('function buildPromptCacheKey'),
@@ -30093,7 +30093,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 onload?.({ status: 200, responseText: JSON.stringify(payload) });
             };
 
-            const result = await callLLM('claude', 'system prompt', 'user prompt');
+            const result = await callLLM('claude', 'system prompt', 'user prompt', { maxTokens: 4096 });
             ackEq(result, 'live-response', 'cache disabled should not return cached value');
             ackEq(networkCalls, 1, 'cache disabled should still call network');
             ackEq(
@@ -31453,7 +31453,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes("waitForElement(document, () => findNativeReviewDialog(), 'submit review dialog', 40, 150)"),
             'waits for React dialog mount',
         );
-        ackAssert(fn.includes('[popover]'), 'searches modern popover dialogs');
+        const nativeDialogFn = source.slice(
+            source.indexOf('function getNativeDialogRoots'),
+            source.indexOf('function findNativeReviewSubmitButton'),
+        );
+        ackAssert(fn.includes('findNativeReviewDialog()'), 'submits through native review dialog lookup');
+        ackAssert(nativeDialogFn.includes('[popover]'), 'searches modern popover dialogs');
     });
 
     ackTest('findVisibleDeleteCommentConfirmButton finds danger Delete button in open dialog', () => {
@@ -34218,8 +34223,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 onload?.({ status: 200, responseText: JSON.stringify(payload) });
             };
 
-            const first = await callLLM('claude', 'system prompt', 'user prompt');
-            const second = await callLLM('claude', 'system prompt', 'user prompt');
+            const first = await callLLM('claude', 'system prompt', 'user prompt', { maxTokens: 4096 });
+            const second = await callLLM('claude', 'system prompt', 'user prompt', { maxTokens: 4096 });
             ackEq(first, 'cached-response', 'first call should parse provider response');
             ackEq(second, 'cached-response', 'second call should return identical cached text');
             ackEq(networkCalls, 1, 'second call should hit prompt cache and avoid network');
@@ -34261,7 +34266,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 onload?.({ status: 200, responseText: JSON.stringify(payload) });
             };
 
-            const result = await callLLM('claude', 'system prompt', 'user prompt', { skipCache: true });
+            const result = await callLLM('claude', 'system prompt', 'user prompt', { skipCache: true, maxTokens: 4096 });
             ackEq(result, 'live-response', 'skipCache should return live provider response');
             ackEq(networkCalls, 1, 'skipCache should force exactly one network request');
             ackEq(
