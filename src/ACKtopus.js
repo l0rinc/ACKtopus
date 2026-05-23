@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.120
+// @version      1.121
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -561,7 +561,9 @@
         'details.details-overlay summary, summary.timeline-comment-action';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
-    const NATIVE_DIALOG_ROOT_SELECTOR = 'details-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"]';
+    const NATIVE_DIALOG_ROOT_SELECTOR =
+        'details-dialog, modal-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"], ' +
+        '[popover], anchored-position[popover], [class*="Dialog-module__"], [class*="Overlay-module__"], .prc-Dialog-Dialog';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
@@ -10506,24 +10508,78 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function isAckOwnedReviewControl(el) {
         return !!el?.closest?.(
-            '#acktopus-buttons, #acktopus-analysis, ' + '.ack-submit-review-wrap, .ack-config-overlay',
+            '#acktopus-buttons, #acktopus-analysis, ' +
+                '.ack-submit-review-wrap, .ack-config-overlay, .ack-diff-dialog-overlay',
         );
     }
 
+    function querySelectorAllSafe(root, selector) {
+        try {
+            return [...(root?.querySelectorAll?.(selector) || [])];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function hasNativeReviewDialogControls(root, { loose = false } = {}) {
+        if (!root || root.nodeType !== 1) return false;
+        const hasReviewTextarea = !![...root.querySelectorAll('textarea')].find(isVisible);
+        const hasSpecificReviewTextarea = !!root.querySelector(
+            'textarea#pull_request_review_body, textarea[name="pull_request_review[body]"], [data-testid="review-body"] textarea',
+        );
+        const hasReviewSubmit = !![...root.querySelectorAll('button, [role="button"]')].find((btn) => {
+            if (!isVisible(btn)) return false;
+            const text = (btn.textContent || '').trim();
+            return /^(submit\s*review|comment\s*review|approve|request changes|comment)$/i.test(text);
+        });
+        const hasReviewChoices = !!root.querySelector(
+            'input[name="reviewEvent"], input[name="pull_request_review[event]"], input[type="radio"][value="comment"], input[type="radio"][value="approve"], input[type="radio"][value="request changes"]',
+        );
+        if (loose) return hasReviewTextarea || hasReviewSubmit || hasReviewChoices;
+        return hasReviewChoices || hasSpecificReviewTextarea || (hasReviewSubmit && hasReviewTextarea);
+    }
+
+    function getNativeDialogRoots() {
+        const roots = [];
+        const push = (el) => {
+            if (!el || el.nodeType !== 1) return;
+            if (roots.includes(el)) return;
+            if (isAckOwnedReviewControl(el)) return;
+            if (isVisible(el)) roots.push(el);
+        };
+
+        querySelectorAllSafe(document, NATIVE_DIALOG_ROOT_SELECTOR).forEach(push);
+        querySelectorAllSafe(document, ':popover-open').forEach(push);
+        querySelectorAllSafe(document, 'dialog[open], modal-dialog[open], details-dialog[open]').forEach(push);
+
+        const controlSelector =
+            'textarea#pull_request_review_body, textarea[name="pull_request_review[body]"], [data-testid="review-body"] textarea, ' +
+            'input[name="reviewEvent"], input[name="pull_request_review[event]"], button, [role="button"]';
+        for (const control of querySelectorAllSafe(document, controlSelector)) {
+            if (!isVisible(control) || isAckOwnedReviewControl(control)) continue;
+            const text = (control.textContent || '').trim();
+            const isReviewSpecificControl =
+                control.matches?.(
+                    'textarea#pull_request_review_body, textarea[name="pull_request_review[body]"], [data-testid="review-body"] textarea, input[name="reviewEvent"], input[name="pull_request_review[event]"]',
+                ) || /^(submit\s*review|comment\s*review|approve|request changes)$/i.test(text);
+            if (!isReviewSpecificControl) continue;
+            for (let el = control; el && el !== document.body; el = el.parentElement) {
+                if (!isVisible(el) || isAckOwnedReviewControl(el)) continue;
+                if (hasNativeReviewDialogControls(el)) {
+                    push(el);
+                    break;
+                }
+            }
+        }
+
+        return roots;
+    }
+
     function findNativeReviewDialog() {
-        const dialogRoots = [...document.querySelectorAll(NATIVE_DIALOG_ROOT_SELECTOR)].filter(isVisible);
+        const dialogRoots = getNativeDialogRoots();
         for (const root of dialogRoots) {
             if (isAckOwnedReviewControl(root)) continue;
-            const hasReviewTextarea = !![...root.querySelectorAll('textarea')].find(isVisible);
-            const hasReviewSubmit = !![...root.querySelectorAll('button, [role="button"]')].find((btn) => {
-                if (!isVisible(btn)) return false;
-                const text = (btn.textContent || '').trim();
-                return /^(submit\s*review|approve|request changes|comment)$/i.test(text);
-            });
-            const hasReviewChoices = !!root.querySelector(
-                'input[name="reviewEvent"], input[name="pull_request_review[event]"], input[type="radio"][value="comment"], input[type="radio"][value="approve"], input[type="radio"][value="request changes"]',
-            );
-            if (hasReviewTextarea || hasReviewSubmit || hasReviewChoices) {
+            if (hasNativeReviewDialogControls(root, { loose: true })) {
                 return root;
             }
         }
@@ -10643,7 +10699,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function prepareNativeReviewDialog({ event = 'COMMENT', body = '' } = {}) {
         const eventValue = String(event || 'COMMENT').toUpperCase();
         await openReviewDialog(eventValue);
-        const dialog = await waitForElement(document, () => findNativeReviewDialog(), 'submit review dialog', 12, 150);
+        const dialog = await waitForElement(document, () => findNativeReviewDialog(), 'submit review dialog', 40, 150);
         if (!dialog) throw new Error('native submit review dialog not found');
         const nativeEventValue =
             {
@@ -20597,7 +20653,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.103
+// @version      1.121
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -31270,6 +31326,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('findNativeReviewDialog detects modern popover review dialogs', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div popover="auto" style="display:block;width:320px;height:220px">
+                <div class="prc-Dialog-Dialog">
+                    <label><input type="radio" name="reviewEvent" value="comment"> Comment</label>
+                    <textarea name="pull_request_review[body]" style="display:block;width:200px;height:60px"></textarea>
+                    <button type="button">Comment review</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const dialog = host.querySelector('[popover]');
+            try {
+                dialog.showPopover?.();
+            } catch (_) {}
+            ackEq(findNativeReviewDialog(), dialog, 'returns popover review dialog');
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('submitPendingReview supports reviewEvent radios and generic dialog textarea', () => {
         const source = _ackSource;
         const start = source.indexOf('async function submitPendingReview(pr');
@@ -31280,6 +31361,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes("[...dialog.querySelectorAll('textarea')].find(isVisible)"),
             'falls back to generic visible textarea inside dialog',
         );
+        ackAssert(
+            fn.includes("waitForElement(document, () => findNativeReviewDialog(), 'submit review dialog', 40, 150)"),
+            'waits for React dialog mount',
+        );
+        ackAssert(fn.includes('[popover]'), 'searches modern popover dialogs');
     });
 
     ackTest('findVisibleDeleteCommentConfirmButton finds danger Delete button in open dialog', () => {
@@ -33503,9 +33589,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.103', () => {
+    ackTest('version bumped to 1.121', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.103' || _ackSource.includes('@version      1.103'), 'version is 1.103');
+        ackAssert(versionFromMeta === '1.121' || _ackSource.includes('@version      1.121'), 'version is 1.121');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
