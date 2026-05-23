@@ -122,6 +122,15 @@
         return rewriteProofreadCommitDiffUrls(String(text || '')).text;
     }
 
+    function unwrapProofreadXmlSectionContent(content) {
+        let result = String(content || '');
+        if (result.startsWith('\r\n')) result = result.slice(2);
+        else if (result.startsWith('\n')) result = result.slice(1);
+        if (result.endsWith('\r\n')) result = result.slice(0, -2);
+        else if (result.endsWith('\n')) result = result.slice(0, -1);
+        return result;
+    }
+
     // Build a shell-ready argument list for the PR's changed C/C++ paths so
     // copied formatter/tidy/IWYU commands are concrete and runnable as-is.
     function getChangedCppPathArgs() {
@@ -4447,6 +4456,7 @@ Do not change technical meaning unless it is factually incorrect.
 Do not change quoted text (lines starting with >) in any way. Those are someone else's words, so copy them verbatim.
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
 Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.
+Blank lines after blockquotes are semantic in GitHub Markdown. Preserve them so following prose does not become part of the quote.
 Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or double-hyphen ("--") punctuation. Preserve command-line flags such as \`--connect\`, quoted text, and any double hyphens that were already present in the original text.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
@@ -9961,11 +9971,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     for (let i = 1; i <= mutableCount; i++) {
                         // Be permissive about whitespace/newlines and tag casing.
                         // Some models use CRLF, add extra spacing, or vary capitalization.
-                        const re = new RegExp(`<s${i}>\\s*([\\s\\S]*?)\\s*<\\/s${i}>`, 'i');
+                        const re = new RegExp(`<s${i}>([\\s\\S]*?)<\\/s${i}>`, 'i');
                         const m = response.match(re);
                         if (m) {
                             const original = (segments.find((s) => s.index === i)?.lines || []).join('\n');
-                            const result = m[1];
+                            const result = unwrapProofreadXmlSectionContent(m[1]);
                             // Reject segments that grew significantly (LLM added content).
                             // Allow up to 30% growth or 50 chars (whichever is larger) so the
                             // LLM has room to wrap technical identifiers in backticks and to
@@ -10011,7 +10021,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Blank lines after blockquotes are semantic in GitHub Markdown; preserve them so following prose does not become part of the quote. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -23076,6 +23086,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             makePromptSection.includes('Do not add empty lines around fenced code blocks'),
             'XML prompt forbids extra empty lines around protected blocks',
         );
+        ackAssert(
+            promptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown'),
+            'default prompt preserves blockquote separators',
+        );
+        ackAssert(
+            makePromptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown') ||
+                makePromptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown; preserve them'),
+            'XML prompt preserves blockquote separators',
+        );
+        ackAssert(
+            _ackSource.includes('unwrapProofreadXmlSectionContent(m[1])'),
+            'XML section parsing unwraps wrapper newlines without stripping user blank lines',
+        );
+        ackAssert(
+            !_ackSource.includes('new RegExp(`<s${i}>\\\\s*([\\\\s\\\\S]*?)\\\\s*<\\\\/s${i}>`'),
+            'XML section parsing does not greedily trim semantic whitespace',
+        );
         ackAssert(!_ackSource.includes('function normalizeProofreadMutableSegment'), 'no deterministic blank-line normalizer');
         ackAssert(!makePromptSection.includes('normalizeProofreadMutableSegment'), 'fromXML does not normalize LLM output');
     });
@@ -31596,6 +31623,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const input = 'Note: Keep this deterministic and reproducible.';
         const out = postProcessProofreadMarkdown(input);
         ackEq(out, input);
+    });
+
+    ackTest('proofread XML unwrap preserves blockquote separator blank lines', () => {
+        ackEq(
+            unwrapProofreadXmlSectionContent('\n\nThe follow-up paragraph\n'),
+            '\nThe follow-up paragraph',
+            'preserves the semantic blank line after an immutable blockquote segment',
+        );
+        ackEq(
+            unwrapProofreadXmlSectionContent('\nThe follow-up paragraph\n'),
+            'The follow-up paragraph',
+            'removes only ACKtopus wrapper newlines around normal section content',
+        );
     });
 
     ackTest('postProcessProofreadMarkdown leaves markdown headings unchanged', () => {
