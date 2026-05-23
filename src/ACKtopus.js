@@ -30162,7 +30162,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function autoCollapseCompareFiles') + 800,
         );
         ackAssert(fn.includes('_comparePath'), 'tracks compare pathname');
-        ackAssert(fn.includes('_comparePath !== location.pathname'), 'detects pathname change');
+        ackAssert(fn.includes('_comparePath !== compareLocationKey'), 'detects compare location change');
+        ackAssert(fn.includes('location.search'), 'includes query string in compare location key');
         ackAssert(fn.includes('_compareActive = false'), 'resets active state on path change');
         // Also check tryInject resets _comparePath
         const start = source.indexOf('function tryInject()');
@@ -30500,9 +30501,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('addStartReviewButtons injects button only on review_comment/create reply forms', () => {
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
+        const origDetectPending = detectPendingReview;
+        const origHasPendingChanges = hasPendingReviewChanges;
         try {
             isPRPage = () => true;
             _ackPendingReviewActive = false;
+            detectPendingReview = () => false;
+            hasPendingReviewChanges = () => false;
             const host = document.createElement('div');
             host.style.position = 'absolute';
             host.style.left = '-99999px';
@@ -30538,15 +30543,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             isPRPage = origIsPRPage;
             _ackPendingReviewActive = origPending;
+            detectPendingReview = origDetectPending;
+            hasPendingReviewChanges = origHasPendingChanges;
         }
     });
 
     ackTest('addStartReviewButtons injects into React reply forms using inReplyTo', () => {
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
+        const origDetectPending = detectPendingReview;
+        const origHasPendingChanges = hasPendingReviewChanges;
         try {
             isPRPage = () => true;
             _ackPendingReviewActive = false;
+            detectPendingReview = () => false;
+            hasPendingReviewChanges = () => false;
             const host = document.createElement('div');
             host.style.position = 'absolute';
             host.style.left = '-99999px';
@@ -30572,15 +30583,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             isPRPage = origIsPRPage;
             _ackPendingReviewActive = origPending;
+            detectPendingReview = origDetectPending;
+            hasPendingReviewChanges = origHasPendingChanges;
         }
     });
 
     ackTest('addStartReviewButtons injects into reply forms without review_comment/create action', () => {
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
+        const origDetectPending = detectPendingReview;
+        const origHasPendingChanges = hasPendingReviewChanges;
         try {
             isPRPage = () => true;
             _ackPendingReviewActive = false;
+            detectPendingReview = () => false;
+            hasPendingReviewChanges = () => false;
             const host = document.createElement('div');
             host.style.position = 'absolute';
             host.style.left = '-99999px';
@@ -30612,6 +30629,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             isPRPage = origIsPRPage;
             _ackPendingReviewActive = origPending;
+            detectPendingReview = origDetectPending;
+            hasPendingReviewChanges = origHasPendingChanges;
         }
     });
 
@@ -30719,6 +30738,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const origIsPRPage = isPRPage;
         const origPending = _ackPendingReviewActive;
         const origReadPending = readViewerPendingReviewFromSSR;
+        const origDetectPending = detectPendingReview;
+        const origHasPendingChanges = hasPendingReviewChanges;
         try {
             isPRPage = () => true;
             readViewerPendingReviewFromSSR = () => ({ id: 'pending-review', comments: [] });
@@ -30737,6 +30758,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             `;
             document.body.appendChild(host);
             try {
+                detectPendingReview = (root = document) => root === host;
+                hasPendingReviewChanges = () => false;
                 _ackPendingReviewActive = detectPendingReview(host) && hasPendingReviewChanges(host);
                 addStartReviewButtons(host);
                 ackEq(_ackPendingReviewActive, false, 'no pending mode when review exists but has no pending comments');
@@ -30753,6 +30776,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             isPRPage = origIsPRPage;
             _ackPendingReviewActive = origPending;
             readViewerPendingReviewFromSSR = origReadPending;
+            detectPendingReview = origDetectPending;
+            hasPendingReviewChanges = origHasPendingChanges;
             unmarkCommentButtonsPending();
         }
     });
