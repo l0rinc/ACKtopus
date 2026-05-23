@@ -9748,6 +9748,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             mount.appendChild(overlay);
             dialog.focus({ preventScroll: true });
+            scrollDiffNav(1);
         });
     }
 
@@ -22808,6 +22809,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const prevDiffBtn = overlay.querySelector('.ack-diff-nav-prev');
             const nextDiffBtn = overlay.querySelector('.ack-diff-nav-next');
             ackAssert(prevDiffBtn && nextDiffBtn, 'diff navigation buttons are shown');
+            ackAssert(
+                overlay.querySelector('[data-ack-diff-nav-active="1"]'),
+                'diff dialog opens at the first changed section',
+            );
             nextDiffBtn.click();
             ackAssert(overlay.querySelector('[data-ack-diff-nav-active="1"]'), 'next diff button selects a changed section');
             sideBtn.click();
