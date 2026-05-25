@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.123
+// @version      1.124
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -6578,6 +6578,88 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     const NAV_QUERY_RE =
         /^\/find\b|where (?:did|do|is|are|was|were)\b|find (?:where|the comment|my comment|the code)|which comment|take me to|show me where|navigate to/i;
 
+    function parseNavigationMatches(raw, itemCount = Infinity) {
+        const text = String(raw || '').trim();
+        if (!text) throw new Error('empty navigation response');
+
+        const stripFences = (value) =>
+            String(value || '')
+                .trim()
+                .replace(/^```(?:json)?\s*/i, '')
+                .replace(/\s*```$/i, '')
+                .trim();
+        const isValidIndex = (index) => Number.isInteger(index) && index >= 0 && index < itemCount;
+        const normalize = (value, fallbackReason = '') => {
+            const index =
+                typeof value === 'number'
+                    ? value
+                    : typeof value === 'string'
+                      ? Number.parseInt(value, 10)
+                      : Number.parseInt(
+                            value?.index ?? value?.ref ?? value?.id ?? value?.item ?? value?.match ?? value?.result,
+                            10,
+                        );
+            if (!isValidIndex(index)) return null;
+            const reason =
+                typeof value === 'object' && value
+                    ? String(value.reason || value.match || value.text || fallbackReason || '').trim()
+                    : String(fallbackReason || '').trim();
+            return { index, reason };
+        };
+        const normalizeCollection = (parsed) => {
+            const source = Array.isArray(parsed)
+                ? parsed
+                : parsed && typeof parsed === 'object'
+                  ? parsed.matches || parsed.results || parsed.items || parsed.indices || parsed.refs
+                  : null;
+            if (!Array.isArray(source)) throw new Error('navigation response was not an array');
+            const out = [];
+            const seen = new Set();
+            for (const entry of source) {
+                const match = normalize(entry);
+                if (!match || seen.has(match.index)) continue;
+                seen.add(match.index);
+                out.push(match);
+            }
+            return out;
+        };
+        const tryParseJson = (candidate) => normalizeCollection(JSON.parse(stripFences(candidate)));
+
+        try {
+            return tryParseJson(text);
+        } catch (_) {}
+
+        const cleaned = stripFences(text);
+        for (const [startChar, endChar] of [
+            ['[', ']'],
+            ['{', '}'],
+        ]) {
+            const start = cleaned.indexOf(startChar);
+            const end = cleaned.lastIndexOf(endChar);
+            if (start >= 0 && end > start) {
+                try {
+                    return tryParseJson(cleaned.slice(start, end + 1));
+                } catch (_) {}
+            }
+        }
+
+        const out = [];
+        const seen = new Set();
+        const addIndex = (index, reason) => {
+            if (!isValidIndex(index) || seen.has(index)) return;
+            seen.add(index);
+            out.push({ index, reason: String(reason || '').trim() });
+        };
+        const refRe = /\[(?:ref:)?(\d+)\]/gi;
+        let m;
+        while ((m = refRe.exec(text))) addIndex(Number.parseInt(m[1], 10), 'referenced by navigation answer');
+        const indexRe = /\b(?:index|item|result)\s*[:#]?\s*(\d+)\b/gi;
+        while ((m = indexRe.exec(text))) addIndex(Number.parseInt(m[1], 10), 'referenced by navigation answer');
+        if (out.length) return out;
+
+        throw new Error('could not parse navigation matches');
+    }
+
     function getCommentPermalinkEl(container) {
         return (
             container?.querySelector?.(
@@ -8366,12 +8448,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
                     let matches = [];
                     try {
-                        const cleaned = result
-                            .trim()
-                            .replace(/^```json\n?|\n?```$/g, '')
-                            .trim();
-                        matches = JSON.parse(cleaned);
-                    } catch (_) {
+                        matches = parseNavigationMatches(result, chatPageIndex.length);
+                    } catch (e) {
+                        console.warn('ACKtopus: could not parse navigation results:', e?.message || e, result);
                         setAssistantText(assistantMsg, 'Could not parse navigation results.', '#f85149');
                         return;
                     }
@@ -20719,7 +20798,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.123
+// @version      1.124
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -28895,6 +28974,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('review coach'), 'quiz system prompt mentions review coach');
     });
 
+    ackTest('chat navigation parser accepts JSON and citation-shaped results', () => {
+        ackEq(parseNavigationMatches('[{"index":2,"reason":"mentions HaveCoin"}]', 5)[0].index, 2, 'parses JSON array');
+        ackEq(
+            parseNavigationMatches('```json\n{"matches":[{"index":3,"reason":"Andrew comment"}]}\n```', 5)[0].index,
+            3,
+            'parses fenced object wrapper',
+        );
+        ackEq(
+            parseNavigationMatches('Andrew mentioned this in [ref:4] while discussing HaveCoin.', 7)[0].index,
+            4,
+            'falls back to ref citations in prose',
+        );
+        ackEq(
+            parseNavigationMatches('Results: item 1 and index 9', 3).map((m) => m.index).join(','),
+            '1',
+            'drops out-of-range indices',
+        );
+    });
+
     ackTest('gatherChatContext accepts pageIndex and annotates comments with [ref:N]', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gatherChatContext'), source.indexOf('// --- Page Index'));
@@ -33734,9 +33832,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.123', () => {
+    ackTest('version bumped to 1.124', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.123' || _ackSource.includes('@version      1.123'), 'version is 1.123');
+        ackAssert(versionFromMeta === '1.124' || _ackSource.includes('@version      1.124'), 'version is 1.124');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
