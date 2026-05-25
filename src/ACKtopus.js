@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.122
+// @version      1.123
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -10251,7 +10251,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } else {
                     taSelector = 'textarea';
                 }
-                if (!isExistingPostEditForm(ta.closest('form')) && !ta.closest('.is-comment-editing')) {
+                if (
+                    !isExistingPostEditForm(ta.closest('form')) &&
+                    !ta.closest('.is-comment-editing') &&
+                    !isProofreadableComposeTextarea(ta)
+                ) {
                     console.log('ACKtopus: proofread: toolbar textarea is a compose form, ignoring');
                     stopSpin();
                     setTimeout(() => restoreButton(), 500);
@@ -15572,6 +15576,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
+    function isProofreadableComposeTextarea(ta, path = location.pathname) {
+        if (!ta || ta.closest?.('#acktopus-analysis, #acktopus-queue, .ack-config-overlay, .ack-diff-dialog-overlay'))
+            return false;
+        const form = ta.closest?.('form') || null;
+        const isPRCreation = form ? isPRCreationForm(form, path) : isPRCreationPage(path, document);
+        if (!isPRPage(path) && !isIssuePage(path) && !isPRCreation) return false;
+
+        const editorRoot =
+            ta.closest?.(
+                'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
+                    '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
+                    '.js-review-body, [data-testid="review-body"], .review-changes-modal, ' +
+                    '.CommentBox, [class*="CommentBox-module__commentBoxContainer__"]',
+            ) ||
+            form ||
+            null;
+        if (!editorRoot) return false;
+        return true;
+    }
+
+    function isProofreadableComposeToolbar(toolbar, path = location.pathname) {
+        return isProofreadableComposeTextarea(getToolbarTextarea(toolbar), path);
+    }
+
     function normalizeExpectedReplyResult(raw) {
         try {
             const parsed = parseLLMJsonObject(raw);
@@ -15719,7 +15747,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function addDetailsButtons(root = document) {
+    function addDetailsButtons(root = document, path = location.pathname) {
         const toolbarSelector =
             'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]';
         const ackToolbarControlsSelector =
@@ -15788,7 +15816,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread');
             const isEditToolbar = !!findEditForm(toolbar);
-            const allowProofread = isEditToolbar || isExistingPostEditToolbar(toolbar);
+            const allowProofread =
+                isEditToolbar || isExistingPostEditToolbar(toolbar) || isProofreadableComposeToolbar(toolbar, path);
             if (!allowProofread) removeToolbarButtons(toolbar, '.ack-toolbar-proofread');
             let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
             let hasProofreadBtn = allowProofread && !!toolbar.querySelector('.ack-toolbar-proofread');
@@ -20690,7 +20719,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.122
+// @version      1.123
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -24782,23 +24811,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('addDetailsButtons keeps compose toolbars free of proofread actions', () => {
+    ackTest('addDetailsButtons allows manual proofreading in compose toolbars', () => {
         const root = document.createElement('div');
         root.innerHTML = `
-	          <div class="js-previewable-comment-form">
-	            <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
-	              <action-bar role="toolbar" class="ActionBar overflow-visible">
-	                <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
-	                  <div class="ActionBar-item"><button type="button">Bold</button></div>
-	                </div>
-	              </action-bar>
-	            </markdown-toolbar>
-	            <textarea id="comment-body"></textarea>
-	          </div>
-	        `;
-        addDetailsButtons(root);
+              <div class="js-previewable-comment-form">
+                <markdown-toolbar class="CommentBox-toolbar" for="comment-body">
+                  <action-bar role="toolbar" class="ActionBar overflow-visible">
+                    <div data-target="action-bar.itemContainer" class="ActionBar-item-container">
+                      <div class="ActionBar-item"><button type="button">Bold</button></div>
+                    </div>
+                  </action-bar>
+                </markdown-toolbar>
+                <textarea id="comment-body"></textarea>
+              </div>
+            `;
+        addDetailsButtons(root, '/bitcoin-core/leveldb-subtree/pull/61');
         ackEq(root.querySelectorAll('.ack-details-btn').length, 1, 'details remains available in compose toolbar');
-        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 0, 'proofread is not injected into compose toolbar');
+        ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 1, 'proofread is injected into compose toolbar');
     });
 
     ackTest('edit toolbar buttons activate on pointerdown with keyboard click fallback', () => {
@@ -24997,6 +25026,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             helper.includes("toolbar?.classList?.contains('ack-toolbar-actions')"),
             'fallback action rows resolve to the surrounding edit form',
+        );
+    });
+
+    ackTest('compose proofread guard allows PR, issue, and new-PR editors', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+              <form>
+                <div class="js-previewable-comment-form">
+                  <textarea id="compose-body" name="comment[body]"></textarea>
+                </div>
+              </form>
+              <form id="new-pr-form">
+                <textarea name="pull_request[body]"></textarea>
+              </form>
+            `;
+        const commentTa = root.querySelector('#compose-body');
+        const prTa = root.querySelector('textarea[name="pull_request[body]"]');
+        ackEq(isProofreadableComposeTextarea(commentTa, '/bitcoin-core/leveldb-subtree/pull/61'), true, 'allows PR comment compose');
+        ackEq(isProofreadableComposeTextarea(commentTa, '/bitcoin-core/leveldb-subtree/issues/61'), true, 'allows issue comment compose');
+        ackEq(
+            isProofreadableComposeTextarea(prTa, '/l0rinc/bitcoin/compare/master...topic'),
+            true,
+            'allows new PR description compose',
         );
     });
 
@@ -33682,9 +33734,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.122', () => {
+    ackTest('version bumped to 1.123', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.122' || _ackSource.includes('@version      1.122'), 'version is 1.122');
+        ackAssert(versionFromMeta === '1.123' || _ackSource.includes('@version      1.123'), 'version is 1.123');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
