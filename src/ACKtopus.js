@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.125
+// @version      1.126
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -9402,6 +9402,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 alignItems: 'center',
                 justifyContent: 'center',
             });
+            if (_ackTesting && !opts.showDuringSelfTests) {
+                overlay.dataset.ackSelfTestHidden = '1';
+                overlay.style.opacity = '0';
+                overlay.style.pointerEvents = 'none';
+            }
             const dialog = document.createElement('div');
             dialog.tabIndex = -1;
             dialog.setAttribute('role', 'dialog');
@@ -20798,7 +20803,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.125
+// @version      1.126
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -22967,6 +22972,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('ack-diff-nav-next'), 'has next-diff navigation button');
         ackAssert(fn.includes("e.key === 'ArrowDown'") && fn.includes("e.key === 'ArrowUp'"), 'has diff navigation shortcuts');
         ackAssert(fn.includes('scrollDiffNav(1)') && fn.includes('scrollDiffNav(-1)'), 'shortcuts jump between diff targets');
+        ackAssert(fn.includes('dataset.ackSelfTestHidden'), 'hides self-test diff dialogs');
+        ackAssert(fn.includes('!opts.showDuringSelfTests'), 'self-test dialog hiding can be bypassed explicitly');
     });
 
     ackTest('showDiffDialog can stay inside native review dialogs', async () => {
@@ -33836,9 +33843,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.125', () => {
+    ackTest('version bumped to 1.126', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.125' || _ackSource.includes('@version      1.125'), 'version is 1.125');
+        ackAssert(versionFromMeta === '1.126' || _ackSource.includes('@version      1.126'), 'version is 1.126');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
