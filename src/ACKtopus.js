@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.124
+// @version      1.125
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -20798,7 +20798,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.124
+// @version      1.125
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -25239,7 +25239,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'makeStickyEditToolbar',
             'prefillCommitHash',
         ]) {
-            const re = new RegExp(`function\\s+${fn}\\s*\\(\\s*root\\s*=\\s*document\\s*\\)`);
+            const re = new RegExp(`function\\s+${fn}\\s*\\(\\s*root\\s*=\\s*document(?:\\s*[,)]|\\s*$)`);
             ackAssert(re.test(source), `${fn} accepts root parameter with document default`);
         }
     });
@@ -31608,7 +31608,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function findNativeReviewSubmitButton'),
         );
         ackAssert(fn.includes('findNativeReviewDialog()'), 'submits through native review dialog lookup');
-        ackAssert(nativeDialogFn.includes('[popover]'), 'searches modern popover dialogs');
+        ackAssert(
+            source.includes("const NATIVE_DIALOG_ROOT_SELECTOR") && source.includes('[popover]'),
+            'defines modern popover dialog root selector',
+        );
+        ackAssert(nativeDialogFn.includes('NATIVE_DIALOG_ROOT_SELECTOR'), 'searches modern popover dialogs');
     });
 
     ackTest('findVisibleDeleteCommentConfirmButton finds danger Delete button in open dialog', () => {
@@ -33832,9 +33836,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.124', () => {
+    ackTest('version bumped to 1.125', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.124' || _ackSource.includes('@version      1.124'), 'version is 1.124');
+        ackAssert(versionFromMeta === '1.125' || _ackSource.includes('@version      1.125'), 'version is 1.125');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
