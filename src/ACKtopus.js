@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.126
+// @version      1.127
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3976,7 +3976,7 @@
 
     const LLM_MODELS = {
         claude: 'claude-sonnet-4-6',
-        claude_high_context: 'claude-opus-4-7',
+        claude_high_context: 'claude-opus-4-8',
         openai: 'gpt-5.5',
         gemini: 'gemini-3.5-flash',
     };
@@ -20803,7 +20803,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.126
+// @version      1.127
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -21505,8 +21505,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
     });
 
-    ackTest('LLM_MODELS.claude_high_context is claude-opus-4-7', () => {
-        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
+    ackTest('LLM_MODELS.claude_high_context is claude-opus-4-8', () => {
+        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-8');
     });
 
     ackTest('LLM_MODELS.gemini is gemini-3.5-flash', () => {
@@ -30370,7 +30370,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(formatted.includes('finalUrl=https://api.anthropic.com/v1/messages'), 'includes target URL');
         const err = makeLLMRequestError('Claude', 'network error', 'status=408', {
             requestLabel: 'reimplementation',
-            model: 'claude-opus-4-7',
+            model: 'claude-opus-4-8',
             approxInputTokens: 2200,
             requestBytes: 12345,
             maxTokens: 4096,
@@ -30381,14 +30381,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             elapsedMs: 30001,
         });
         ackAssert(err.message.includes('label=reimplementation'), 'error includes recipe/request label');
-        ackAssert(err.message.includes('model=claude-opus-4-7'), 'error includes model');
+        ackAssert(err.message.includes('model=claude-opus-4-8'), 'error includes model');
         ackAssert(err.message.includes('input≈2200t'), 'error includes approximate input tokens');
         ackAssert(err.message.includes('body=12345B'), 'error includes body size');
         ackAssert(err.message.includes('stream=true'), 'error includes streaming mode');
         ackAssert(err.message.includes('streamed=4321ch'), 'error includes streamed response size');
         ackAssert(err.message.includes('text=123ch'), 'error includes streamed text size');
         ackAssert(err.message.includes('elapsed=30001ms'), 'error includes elapsed time');
-        ackEq(err.ackLLMMeta.model, 'claude-opus-4-7', 'error keeps structured metadata');
+        ackEq(err.ackLLMMeta.model, 'claude-opus-4-8', 'error keeps structured metadata');
     });
 
     ackTest('LLM streaming parser handles Claude and OpenAI SSE chunks', () => {
@@ -33843,9 +33843,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.126', () => {
+    ackTest('version bumped to 1.127', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.126' || _ackSource.includes('@version      1.126'), 'version is 1.126');
+        ackAssert(versionFromMeta === '1.127' || _ackSource.includes('@version      1.127'), 'version is 1.127');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -34673,7 +34673,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('LLM_MODELS match documented provider models', () => {
         ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
-        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-7');
+        ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-8');
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
         ackEq(LLM_MODELS.gemini, 'gemini-3.5-flash');
     });
