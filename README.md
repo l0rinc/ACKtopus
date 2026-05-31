@@ -181,11 +181,15 @@ Hold **Shift** while clicking **Patch**, **Comments**, or **Full** to reveal hid
 On single-commit pages like `/changes/<sha>`, `/commits/<sha>`, and standalone commit URLs like `/commit/<sha>`, the same button copies **commit-only** context instead: the parent PR metadata/description when available, the current commit patch, and visible comments tied to that commit.
 Each comment’s `...` menu also gets a **Copy comment context** action, which copies just that comment plus its surrounding thread and location metadata (file, line, commit, author, permalink).
 
+### 🪞 Repo mirrors
+
+Settings can define repo mirror mappings such as `bitcoin/bitcoin=https://mirror.b10c.me/bitcoin-bitcoin`. When the current repo has a configured mirror, the toolbar shows a **Mirror** button; PR paths like GitHub `/pull/34897` open as mirror `/34897`, while non-PR paths keep their path. On PR pages, ACKtopus also counts conversation plus review comments through GitHub’s API; once a PR is heavy, currently 300+ comments, Robot result links and exact-comment navigation use the mirror automatically. Shift/Cmd/Ctrl-clicking a Robot result opens that target in a separate tab. ACKtopus also shows a delayed mirror hint if GitHub still appears to be loading hidden, resolved, collapsed, or progressively loaded content.
+
 ### 🤖 Robot recipes / Chat
 
 Opens a robot panel backed by the active Claude, ChatGPT, or Gemini provider. The dropdown supports:
 
-- **Chat**: ask about the page, use `/find ...` to navigate visible comments/code, or use `/quiz` for high-leverage review questions
+- **Chat**: ask about the page, use `/find ...` to navigate comments/code, or use `/quiz` for high-leverage review questions. `/find` asks the active LLM to read structured comment batches, including author, date, direct-vs-reply, file, line, state, and permalink metadata, so requests like “find my comment about ...” or “find a comment by me ...” use the current GitHub login instead of keyword matching. It reads visible comments/code first, then fetches all PR conversation comments, inline review comments, and review summaries through the GitHub API without expanding the whole page; results stream in as each batch is judged, can be stopped, and open exact comment permalinks. Robot discussions are stored per page with a history sidebar, so reopening the robot or refreshing the page continues the existing discussion by default.
 - **Reproducer**: generate the direct outcome-focused local-agent prompt for a no-peek reimplementation only, omitting raw patch and comment context from the LLM request
 - **Suggestions**: generate the follow-up local-agent prompt for splitting the actual PR, rebasing the local reproducer, and adding evidence-backed suggestion commits
 - **Audio guide**: generate a direct audio-agent prompt that tells the audio-enabled assistant to investigate the PR itself before starting the discussion

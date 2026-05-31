@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.127
+// @version      1.132
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2672,6 +2672,7 @@
 
     function scheduleReviewCommentHashNavigation(reason = '') {
         if (_ackTesting || !reviewCommentDiscussionHashId()) return;
+        if (shouldSkipHashRevealOnce(location.hash, { consume: reason !== 'hashchange' })) return;
         if (reviewCommentHashNavigationTimer) ackClearTimeout(reviewCommentHashNavigationTimer);
         reviewCommentHashNavigationTimer = ackSetTimeout(() => {
             reviewCommentHashNavigationTimer = null;
@@ -3401,6 +3402,166 @@
         const m = String(path || '').match(/^\/([^/?#]+)\/([^/?#]+)(?:\/|$)/);
         if (!m) return null;
         return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
+    }
+
+    const DEFAULT_REPO_MIRRORS = 'bitcoin/bitcoin=https://mirror.b10c.me/bitcoin-bitcoin';
+    const HEAVY_PR_COMMENT_THRESHOLD = 300;
+
+    function repoMirrorConfigText() {
+        return GM_getValue('repo_mirrors', DEFAULT_REPO_MIRRORS);
+    }
+
+    function parseRepoMirrorConfig(raw = repoMirrorConfigText()) {
+        const mirrors = new Map();
+        String(raw || '')
+            .split(/\r?\n/)
+            .map((line) => line.replace(/\s+#.*$/, '').trim())
+            .filter(Boolean)
+            .forEach((line) => {
+                const m = line.match(/^([^=\s]+)\s*(?:=|\s+)\s*(\S+)$/);
+                if (!m) return;
+                const repoKey = m[1].toLowerCase();
+                if (!/^[^/]+\/[^/]+$/.test(repoKey)) return;
+                try {
+                    const url = new URL(m[2]);
+                    if (url.protocol !== 'https:' && url.protocol !== 'http:') return;
+                    url.search = '';
+                    url.hash = '';
+                    mirrors.set(repoKey, url.href.replace(/\/+$/, ''));
+                } catch (_) {}
+            });
+        return mirrors;
+    }
+
+    function repoMirrorUrlForPath(path = location.pathname, search = location.search, hash = location.hash) {
+        const repo = parseGitHubRepoPath(path);
+        if (!repo) return '';
+        const mirrorBase = parseRepoMirrorConfig().get(repo.repoKey.toLowerCase());
+        if (!mirrorBase) return '';
+        const repoPrefix = `/${repo.owner}/${repo.repo}`;
+        let suffix = path.startsWith(repoPrefix) ? path.slice(repoPrefix.length) || '/' : '/';
+        const prMatch = suffix.match(/^\/pull\/(\d+)(?:\/?$|\/)/);
+        if (prMatch) suffix = `/${prMatch[1]}`;
+        try {
+            const url = new URL(mirrorBase);
+            const basePath = url.pathname.replace(/\/+$/, '');
+            url.pathname = `${basePath}${suffix.startsWith('/') ? suffix : `/${suffix}`}`;
+            url.search = search || '';
+            url.hash = hash || '';
+            return url.href;
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function mirrorUrlForGitHubUrl(url) {
+        try {
+            const target = new URL(url, location.href);
+            if (target.hostname !== 'github.com') return '';
+            return repoMirrorUrlForPath(target.pathname, target.search, target.hash);
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function prCommentCountCacheKey(pr) {
+        return pr ? `pr_comment_count_${pr.owner}_${pr.repo}_${pr.pr}` : '';
+    }
+
+    function readPRCommentCountInfo(pr = parsePR()) {
+        const key = prCommentCountCacheKey(pr);
+        if (!key) return null;
+        const raw = GM_getValue(key, null);
+        if (!raw) return null;
+        if (typeof raw === 'number') return { count: raw, heavy: raw >= HEAVY_PR_COMMENT_THRESHOLD, source: 'legacy' };
+        const count = Number(raw.count || 0);
+        return {
+            count,
+            heavy: !!raw.heavy || count >= HEAVY_PR_COMMENT_THRESHOLD,
+            source: raw.source || 'cache',
+            ts: Number(raw.ts || 0),
+        };
+    }
+
+    function rememberPRCommentCount(pr, count, source = 'api') {
+        const key = prCommentCountCacheKey(pr);
+        if (!key || !Number.isFinite(count)) return null;
+        const info = {
+            count,
+            heavy: count >= HEAVY_PR_COMMENT_THRESHOLD,
+            source,
+            ts: Date.now(),
+        };
+        GM_setValue(key, info);
+        return info;
+    }
+
+    function isHeavyPRForMirror(pr = parsePR()) {
+        return !!readPRCommentCountInfo(pr)?.heavy;
+    }
+
+    function maybeMirrorUrlForHeavyPR(url, pr = parsePR()) {
+        if (!url || !pr || !isHeavyPRForMirror(pr)) return url || '';
+        return mirrorUrlForGitHubUrl(url) || url;
+    }
+
+    async function updatePRCommentCountState(pr) {
+        if (!pr) return null;
+        const [pullResult, issueResult] = await Promise.allSettled([
+            gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`),
+            gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}`),
+        ]);
+        const pull = pullResult.status === 'fulfilled' ? pullResult.value : {};
+        const issue = issueResult.status === 'fulfilled' ? issueResult.value : {};
+        const issueComments = Number.isFinite(Number(issue.comments))
+            ? Number(issue.comments)
+            : Number(pull.comments || 0);
+        const reviewComments = Number(pull.review_comments || 0);
+        const total = issueComments + reviewComments;
+        if (!Number.isFinite(total) || total <= 0) return readPRCommentCountInfo(pr);
+        return rememberPRCommentCount(pr, total, 'api');
+    }
+
+    function openRepoMirror() {
+        const url = repoMirrorUrlForPath();
+        if (!url) return;
+        window.open(url, '_blank', 'noopener');
+    }
+
+    function shouldOfferRepoMirrorForSlowPage() {
+        if (!isPRPage() || !repoMirrorUrlForPath()) return false;
+        if (isHeavyPRForMirror()) return true;
+        if (document.readyState !== 'complete') return true;
+        if (getHiddenActionCount() > 0 || getCollapsedResolved().length > 0 || getCollapsedSectionCount() > 0) return true;
+        return !!document.querySelector(
+            'include-fragment:not([data-loaded]), [data-testid*="load-more"], .js-diff-load-container, .js-diff-progressive-loader',
+        );
+    }
+
+    function scheduleRepoMirrorSlowPageHint(wrapper) {
+        if (!isPRPage() || !repoMirrorUrlForPath()) return;
+        const key = `ack_repo_mirror_hint:${location.pathname}`;
+        ackSetTimeout(() => {
+            if (!wrapper.isConnected || !shouldOfferRepoMirrorForSlowPage()) return;
+            try {
+                if (sessionStorage.getItem(key)) return;
+                sessionStorage.setItem(key, '1');
+            } catch (_) {}
+            const mirrorUrl = repoMirrorUrlForPath();
+            if (!mirrorUrl) return;
+            const popup = makeStatusPopup('');
+            popup.textContent = '';
+            const msg = document.createElement('div');
+            msg.textContent = 'GitHub still looks heavy. Open the configured mirror?';
+            msg.style.marginBottom = '8px';
+            const actions = document.createElement('div');
+            Object.assign(actions.style, { display: 'flex', gap: '6px', justifyContent: 'flex-end' });
+            const openBtn = createBtn('🪞 Open mirror', () => openRepoMirror(), mirrorUrl);
+            const closeBtn = createBtn('Dismiss', () => popup.remove(), 'Hide this mirror hint');
+            openBtn.style.padding = closeBtn.style.padding = '3px 8px';
+            actions.append(openBtn, closeBtn);
+            popup.append(msg, actions);
+        }, 8000);
     }
 
     function repositoryMetaValue(name, root = document) {
@@ -4751,6 +4912,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             k.startsWith('llm_infographic_') ||
             k.startsWith('llm_cache_') ||
             k.startsWith('llm_prompt_') ||
+            k.startsWith('pr_comment_count_') ||
             k.startsWith('org_members_') ||
             k.startsWith('repo_members_') ||
             k.startsWith('pr_context_') ||
@@ -5026,6 +5188,34 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         maintRow.appendChild(maintInput);
         panel.appendChild(maintRow);
+
+        const mirrorLabel = document.createElement('div');
+        mirrorLabel.textContent = '🪞 Repo mirrors';
+        Object.assign(mirrorLabel.style, { fontSize: '12px', color: '#8b949e', marginTop: '8px', marginBottom: '4px' });
+        panel.appendChild(mirrorLabel);
+        const mirrorInput = document.createElement('textarea');
+        mirrorInput.id = 'ack-repo-mirrors';
+        mirrorInput.value = repoMirrorConfigText();
+        mirrorInput.placeholder = 'owner/repo=https://mirror.example.com/owner-repo';
+        mirrorInput.title = 'One repo mirror per line: owner/repo=https://mirror.example.com/owner-repo';
+        Object.assign(mirrorInput.style, {
+            width: '100%',
+            minHeight: '44px',
+            resize: 'vertical',
+            background: '#0d1117',
+            color: '#c9d1d9',
+            border: '1px solid #30363d',
+            borderRadius: '4px',
+            padding: '5px 8px',
+            fontSize: '12px',
+            fontFamily: 'monospace',
+            boxSizing: 'border-box',
+        });
+        panel.appendChild(mirrorInput);
+        const mirrorHelp = document.createElement('div');
+        mirrorHelp.textContent = 'Used by the toolbar mirror button and the slow-page mirror hint.';
+        Object.assign(mirrorHelp.style, { fontSize: '11px', color: '#8b949e', marginTop: '3px' });
+        panel.appendChild(mirrorHelp);
 
         sep();
 
@@ -5472,6 +5662,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (ghPat) GM_setValue('github_pat', ghPat.value);
             const maintEl = document.getElementById('ack-maintainer-logins');
             if (maintEl) GM_setValue('maintainer_logins', maintEl.value);
+            const mirrorEl = document.getElementById('ack-repo-mirrors');
+            if (mirrorEl) GM_setValue('repo_mirrors', mirrorEl.value);
             closePanel();
         });
 
@@ -6554,9 +6746,39 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const text = body.innerText?.trim();
             if (!text || text.length < 5) return;
             const author = getCommentAuthor(body) || '?';
-            const permalink = container.querySelector('a[id$="-permalink"], a.timestamp, relative-time')?.closest('a');
-            const id = permalink?.getAttribute('href') || container.id || '';
-            items.push({ type: 'comment', author, text: text.slice(0, 500), el: container, id });
+            const threadRoot = getCommentThreadRoot(container);
+            const threadId = getCommentThreadId(container, threadRoot);
+            const flags = getCommentThreadFlags(container, threadRoot);
+            const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
+            const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
+            const permalink = getCommentPermalink(container);
+            const threadComments = threadRoot ? [...threadRoot.querySelectorAll(COMMENT_CONTAINER_SELECTOR)] : [];
+            const isReply = threadComments.length > 1 && threadComments.indexOf(container) > 0;
+            const kind = file
+                ? isReply
+                    ? 'inline review reply'
+                    : 'inline review comment'
+                : 'conversation comment';
+            const id = permalink || container.id || threadId || '';
+            items.push({
+                type: 'comment',
+                source: 'visible',
+                author,
+                text: text.slice(0, 500),
+                fullText: text,
+                el: container,
+                id,
+                htmlUrl: permalink,
+                createdAt: timeEl?.getAttribute('datetime') || timeEl?.textContent?.trim() || '',
+                threadId,
+                file,
+                path: file,
+                line,
+                commitSha,
+                kind,
+                isReply,
+                ...flags,
+            });
         });
         // Code diff hunks
         document.querySelectorAll('.js-file, .diff-table, [data-testid="diff-file"], .file').forEach((file) => {
@@ -6575,8 +6797,313 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return items;
     }
 
+    function cleanAllCommentSearchQuery(text) {
+        return String(text || '')
+            .replace(/^\/find\s*/i, '')
+            .trim();
+    }
+
+    function getCurrentGitHubLogin() {
+        return (
+            document.querySelector('meta[name="user-login"]')?.content ||
+            document.querySelector('meta[name="octolytics-actor-login"]')?.content ||
+            ''
+        ).trim();
+    }
+
+    function findSearchItemKey(item) {
+        return String(item?.htmlUrl || item?.id || [item?.author, item?.createdAt, item?.path, item?.line].join(':'));
+    }
+
+    function findSearchItemLabel(item) {
+        if (!item) return '';
+        if (item.type === 'code') return `code ${item.file || ''}${item.line ? `:${item.line}` : ''}`.trim();
+        const parts = [item.kind || item.source || 'comment', item.author ? `by ${item.author}` : ''];
+        if (item.createdAt) parts.push(`on ${item.createdAt}`);
+        if (item.path || item.file) parts.push(`${item.path || item.file}${item.line ? `:${item.line}` : ''}`);
+        if (item.state) parts.push(item.state);
+        return parts.filter(Boolean).join(' · ');
+    }
+
+    function findSearchItemForLLM(item, ref, viewerLogin = getCurrentGitHubLogin()) {
+        const isMine = !!viewerLogin && item?.author?.toLowerCase?.() === viewerLogin.toLowerCase();
+        const text = String(item?.fullText || item?.text || '').replace(/\r\n/g, '\n').slice(0, 3500);
+        const fields = [
+            `REF: ${ref}`,
+            `Type: ${item?.type === 'code' ? 'visible code line' : item?.kind || item?.source || 'comment'}`,
+            item?.author ? `Author: ${item.author}${isMine ? ' (current viewer)' : ''}` : '',
+            item?.createdAt ? `When: ${item.createdAt}` : '',
+            item?.path || item?.file ? `File: ${item.path || item.file}${item.line ? `:${item.line}` : ''}` : '',
+            item?.commitSha ? `Commit: ${item.commitSha}` : '',
+            item?.isReply ? `Reply: yes${item.replyToId ? `, to ${item.replyToId}` : ''}` : item?.type === 'comment' ? 'Reply: no/unknown' : '',
+            item?.state ? `State: ${item.state}` : '',
+            item?.htmlUrl ? `Permalink: ${item.htmlUrl}` : '',
+            'Text:',
+            text,
+        ].filter(Boolean);
+        return fields.join('\n');
+    }
+
+    function chunkFindSearchItems(items, maxChars = 52000) {
+        const chunks = [];
+        let cur = [];
+        let curLen = 0;
+        for (const item of items || []) {
+            const len = String(item.fullText || item.text || '').length + 500;
+            if (cur.length && curLen + len > maxChars) {
+                chunks.push(cur);
+                cur = [];
+                curLen = 0;
+            }
+            cur.push(item);
+            curLen += len;
+        }
+        if (cur.length) chunks.push(cur);
+        return chunks;
+    }
+
+    function findCommentElementForUrl(url) {
+        let hash = '';
+        try {
+            hash = new URL(url, location.href).hash;
+        } catch (_) {
+            hash = String(url || '').match(/#.+$/)?.[0] || '';
+        }
+        if (!hash) return null;
+        const discussionId = reviewCommentDiscussionHashId(hash);
+        const target = discussionId ? findReviewCommentHashTarget(discussionId) : document.getElementById(hash.slice(1));
+        return target?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) || target || null;
+    }
+
+    function navigateToExactCommentUrl(url) {
+        if (!url) return;
+        let target;
+        try {
+            target = new URL(url, location.href);
+        } catch (_) {
+            location.assign(url);
+            return;
+        }
+        if (target.hash) {
+            try {
+                sessionStorage.setItem('ack_skip_hash_reveal_once', target.hash);
+            } catch (_) {}
+        }
+        const sameDocument =
+            target.origin === location.origin &&
+            target.pathname === location.pathname &&
+            target.search === location.search &&
+            target.hash;
+        if (sameDocument) {
+            location.hash = target.hash;
+            location.reload();
+        } else {
+            location.assign(target.href);
+        }
+    }
+
+    function shouldSkipHashRevealOnce(hash = location.hash, { consume = true } = {}) {
+        try {
+            const stored = sessionStorage.getItem('ack_skip_hash_reveal_once');
+            if (!stored || stored !== hash) return false;
+            if (consume) sessionStorage.removeItem('ack_skip_hash_reveal_once');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function toAllCommentSearchItem(raw, source) {
+        const body = String(raw?.body || '').trim();
+        if (!body) return null;
+        const htmlUrl = raw.html_url || raw._links?.html?.href || '';
+        const path = raw.path || '';
+        const line = raw.line || raw.original_line || raw.position || '';
+        const commitSha = raw.commit_id || raw.original_commit_id || '';
+        const isReply = !!raw.in_reply_to_id;
+        return {
+            type: 'comment',
+            source,
+            api: true,
+            id: `${source}:${raw.id || raw.node_id || htmlUrl}`,
+            author: raw.user?.login || raw.author_association || '?',
+            text: body,
+            fullText: body,
+            htmlUrl,
+            createdAt: raw.created_at || raw.submitted_at || '',
+            path,
+            line,
+            commitSha,
+            state: raw.state || '',
+            kind:
+                source === 'review'
+                    ? isReply
+                        ? 'inline review reply'
+                        : 'inline review comment'
+                    : source === 'review-summary'
+                      ? 'review summary'
+                      : 'conversation comment',
+            isReply,
+            replyToId: raw.in_reply_to_id || '',
+            el: findCommentElementForUrl(htmlUrl),
+        };
+    }
+
+    function toReviewThreadSearchItem(raw, thread) {
+        const body = String(raw?.body || '').trim();
+        if (!body) return null;
+        const htmlUrl = raw.url || '';
+        const isReply = !!raw.replyTo;
+        const state = thread?.isResolved ? 'resolved thread' : '';
+        return {
+            type: 'comment',
+            source: 'review-thread',
+            api: true,
+            id: `review-thread:${raw.databaseId || raw.id || htmlUrl}`,
+            author: raw.author?.login || '?',
+            text: body,
+            fullText: body,
+            htmlUrl,
+            createdAt: raw.createdAt || '',
+            path: thread?.path || '',
+            line: thread?.line || '',
+            commitSha: '',
+            state,
+            kind: isReply ? 'inline review thread reply' : 'inline review thread comment',
+            isReply,
+            replyToId: raw.replyTo?.databaseId || raw.replyTo?.id || '',
+            el: findCommentElementForUrl(htmlUrl),
+        };
+    }
+
+    async function streamPRReviewThreadItems(pr, { onProgress, onItems, shouldStop, seenIds = null } = {}) {
+        if (!patAuthHeaderValue()) return { searched: 0, stopped: false, skipped: true };
+        const seen = seenIds instanceof Set ? seenIds : new Set(seenIds || []);
+        let searched = 0;
+        const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          path
+          line
+          comments(first: 100) {
+            nodes {
+              id
+              databaseId
+              body
+              author { login }
+              createdAt
+              url
+              replyTo { id databaseId }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+        let cursor = null;
+        for (let page = 1; page <= 50; page++) {
+            if (shouldStop?.()) return { searched, stopped: true };
+            onProgress?.(`Fetching review threads, page ${page}...`);
+            let data;
+            try {
+                data = await patGraphQL(query, {
+                    owner: pr.owner,
+                    repo: pr.repo,
+                    number: Number(pr.pr),
+                    cursor,
+                });
+            } catch (e) {
+                onProgress?.(`Could not fetch review threads: ${e.message || e}`);
+                break;
+            }
+            const threads = data?.data?.repository?.pullRequest?.reviewThreads;
+            const nodes = threads?.nodes || [];
+            if (!nodes.length) break;
+            const items = [];
+            for (const thread of nodes) {
+                if (shouldStop?.()) return { searched, stopped: true };
+                for (const comment of thread.comments?.nodes || []) {
+                    const item = toReviewThreadSearchItem(comment, thread);
+                    if (!item) continue;
+                    const key = findSearchItemKey(item);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    searched++;
+                    items.push(item);
+                }
+            }
+            if (items.length) await onItems?.(items, { searched, label: 'review threads', page });
+            if (!threads.pageInfo?.hasNextPage) break;
+            cursor = threads.pageInfo.endCursor || null;
+            if (!cursor) break;
+        }
+        return { searched, stopped: false };
+    }
+
+    async function streamAllPRCommentItems(pr, { onProgress, onItems, shouldStop, seenIds = null } = {}) {
+        const seen = seenIds instanceof Set ? seenIds : new Set(seenIds || []);
+        let searched = 0;
+        const threadResult = await streamPRReviewThreadItems(pr, { onProgress, onItems, shouldStop, seenIds: seen });
+        searched += threadResult.searched || 0;
+        if (threadResult.stopped) return { searched, stopped: true };
+        const endpoints = [
+            {
+                label: 'conversation comments',
+                url: (page) =>
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/comments?per_page=100&page=${page}`,
+                source: 'conversation',
+            },
+            {
+                label: 'inline review comments',
+                url: (page) =>
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/comments?per_page=100&page=${page}`,
+                source: 'review',
+            },
+            {
+                label: 'review summaries',
+                url: (page) =>
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews?per_page=100&page=${page}`,
+                source: 'review-summary',
+            },
+        ];
+        for (const endpoint of endpoints) {
+            for (let page = 1; page <= 50; page++) {
+                if (shouldStop?.()) return { searched, stopped: true };
+                onProgress?.(`Fetching ${endpoint.label}, page ${page}...`);
+                let rows;
+                try {
+                    rows = await gmFetch(endpoint.url(page));
+                } catch (e) {
+                    onProgress?.(`Could not fetch ${endpoint.label}: ${e.message || e}`);
+                    break;
+                }
+                if (!Array.isArray(rows) || rows.length === 0) break;
+                const items = [];
+                for (const row of rows) {
+                    if (shouldStop?.()) return { searched, stopped: true };
+                    const item = toAllCommentSearchItem(row, endpoint.source);
+                    if (!item) continue;
+                    const key = findSearchItemKey(item);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    searched++;
+                    items.push(item);
+                }
+                if (items.length) await onItems?.(items, { searched, label: endpoint.label, page });
+                if (rows.length < 100) break;
+            }
+        }
+        return { searched, stopped: false };
+    }
+
     const NAV_QUERY_RE =
-        /^\/find\b|where (?:did|do|is|are|was|were)\b|find (?:where|the comment|my comment|the code)|which comment|take me to|show me where|navigate to/i;
+        /^\/find\b|^\s*find\b.*\b(?:comment|reply|review|code|where|file|line)\b|where (?:did|do|is|are|was|were)\b|which comment|take me to|show me where|navigate to/i;
 
     function parseNavigationMatches(raw, itemCount = Infinity) {
         const text = String(raw || '').trim();
@@ -6658,6 +7185,56 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (out.length) return out;
 
         throw new Error('could not parse navigation matches');
+    }
+
+    function parseFindSearchMatches(raw, itemCount = Infinity) {
+        const text = String(raw || '').trim();
+        if (!text) throw new Error('empty find response');
+        const stripFences = (value) =>
+            String(value || '')
+                .trim()
+                .replace(/^```(?:json)?\s*/i, '')
+                .replace(/\s*```$/i, '')
+                .trim();
+        const normalizeCollection = (parsed) => {
+            const source = Array.isArray(parsed)
+                ? parsed
+                : parsed && typeof parsed === 'object'
+                  ? parsed.matches || parsed.results || parsed.items
+                  : null;
+            if (!Array.isArray(source)) throw new Error('find response was not an array');
+            const out = [];
+            const seen = new Set();
+            for (const entry of source) {
+                const index = Number.parseInt(entry?.index ?? entry?.ref ?? entry?.item ?? entry?.result, 10);
+                if (!Number.isInteger(index) || index < 0 || index >= itemCount || seen.has(index)) continue;
+                seen.add(index);
+                out.push({
+                    index,
+                    reason: String(entry?.reason || entry?.why || entry?.match || '').trim(),
+                    summary: String(entry?.summary || entry?.text || entry?.excerpt || '').trim(),
+                });
+            }
+            return out;
+        };
+        const parseCandidate = (candidate) => normalizeCollection(JSON.parse(stripFences(candidate)));
+        try {
+            return parseCandidate(text);
+        } catch (_) {}
+        const cleaned = stripFences(text);
+        for (const [startChar, endChar] of [
+            ['[', ']'],
+            ['{', '}'],
+        ]) {
+            const start = cleaned.indexOf(startChar);
+            const end = cleaned.lastIndexOf(endChar);
+            if (start >= 0 && end > start) {
+                try {
+                    return parseCandidate(cleaned.slice(start, end + 1));
+                } catch (_) {}
+            }
+        }
+        throw new Error('could not parse find matches');
     }
 
     function getCommentPermalinkEl(container) {
@@ -8022,10 +8599,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (!item) return match;
                     const label =
                         item.type === 'comment' ? `💬 ${item.author}` : `📄 ${item.file || ''}:${item.line || ''}`;
-                    return `<a href="#" class="ack-ref-link" data-ack-ref="${idx}" title="${escapeHTML(label)}: ${escapeHTML(item.text.slice(0, 80))}" style="color:#58a6ff;text-decoration:none;border-bottom:1px dotted #58a6ff;cursor:pointer;font-size:11px">[${escapeHTML(label)}]</a>`;
+                    const href = robotNavigationUrlForItem(item) || '#';
+                    return `<a href="${escapeHTML(href)}" class="ack-ref-link" data-ack-ref="${idx}" title="${escapeHTML(label)}: ${escapeHTML(item.text.slice(0, 80))}" style="color:#58a6ff;text-decoration:none;border-bottom:1px dotted #58a6ff;cursor:pointer;font-size:11px">[${escapeHTML(label)}]</a>`;
                 });
             })
             .join('');
+    }
+
+    function robotNavigationUrlForItem(item, pr = parsePR()) {
+        const rawUrl = item?.htmlUrl || '';
+        if (!rawUrl) return '';
+        return maybeMirrorUrlForHeavyPR(rawUrl, pr);
     }
 
     function buildChatPanel(opts = {}) {
@@ -8098,6 +8682,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         header.appendChild(closeBtn);
         panel.appendChild(header);
 
+        const contentWrap = document.createElement('div');
+        Object.assign(contentWrap.style, {
+            flex: '1',
+            display: 'flex',
+            minHeight: '0',
+        });
+        panel.appendChild(contentWrap);
+
+        const threadSidebar = document.createElement('div');
+        Object.assign(threadSidebar.style, {
+            width: '150px',
+            borderRight: '1px solid #30363d',
+            background: '#0d1117',
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: '0',
+            flexShrink: '0',
+        });
+        const threadHeader = document.createElement('div');
+        Object.assign(threadHeader.style, {
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '6px',
+            padding: '6px 8px',
+            borderBottom: '1px solid #21262d',
+            color: '#8b949e',
+            fontSize: '11px',
+            fontWeight: '600',
+        });
+        const threadTitle = document.createElement('span');
+        threadTitle.textContent = 'History';
+        const newThreadBtn = document.createElement('button');
+        newThreadBtn.type = 'button';
+        newThreadBtn.textContent = '+';
+        newThreadBtn.title = 'Start a new robot discussion';
+        Object.assign(newThreadBtn.style, {
+            width: '20px',
+            height: '20px',
+            padding: '0',
+            border: '1px solid #30363d',
+            borderRadius: '4px',
+            background: '#161b22',
+            color: '#c9d1d9',
+            cursor: 'pointer',
+            lineHeight: '18px',
+        });
+        threadHeader.appendChild(threadTitle);
+        threadHeader.appendChild(newThreadBtn);
+        const threadList = document.createElement('div');
+        Object.assign(threadList.style, {
+            overflowY: 'auto',
+            padding: '6px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px',
+        });
+        threadSidebar.appendChild(threadHeader);
+        threadSidebar.appendChild(threadList);
+        contentWrap.appendChild(threadSidebar);
+
+        const mainColumn = document.createElement('div');
+        Object.assign(mainColumn.style, {
+            flex: '1',
+            minWidth: '0',
+            minHeight: '0',
+            display: 'flex',
+            flexDirection: 'column',
+        });
+        contentWrap.appendChild(mainColumn);
+
         // Messages area
         const messages = document.createElement('div');
         messages.className = 'ack-chat-messages';
@@ -8110,7 +8765,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             gap: '8px',
             minHeight: '80px',
         });
-        panel.appendChild(messages);
+        mainColumn.appendChild(messages);
 
         // Input row
         const inputRow = document.createElement('div');
@@ -8164,15 +8819,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         inputRow.appendChild(input);
         inputRow.appendChild(sendBtn);
-        panel.appendChild(inputRow);
+        mainColumn.appendChild(inputRow);
 
         // Conversation history for LLM calls
-        const history = [];
+        let history = [];
         // Page index: built once, reused for [ref:N] citations across messages
         let chatPageIndex = null;
         // PR diff context for chat: fetched once per panel (can be large)
         let chatDiffBlock = null;
         let chatDiffPromise = null;
+        const chatThreadStorageKey = (() => {
+            const ctx = parsePageContext() || currentCommitRepoContext?.() || null;
+            const pageKey = ctx?.owner && ctx?.repo ? `${ctx.owner}/${ctx.repo}${ctx.pr ? `#${ctx.pr}` : ''}` : location.pathname;
+            return `ack_robot_chat_threads:${pageKey}`;
+        })();
+        let robotThreads = loadRobotChatThreads();
+        let activeThreadId = '';
 
         async function getChatDiffBlock() {
             if (chatDiffBlock !== null) return chatDiffBlock;
@@ -8215,7 +8877,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             e.preventDefault();
             const idx = parseInt(link.dataset.ackRef, 10);
             const item = chatPageIndex?.[idx];
-            if (item?.el) scrollToAndHighlight(item.el);
+            if (!item) return;
+            const targetUrl = robotNavigationUrlForItem(item);
+            if (targetUrl && (e.shiftKey || e.metaKey || e.ctrlKey)) {
+                window.open(targetUrl, '_blank', 'noopener');
+                return;
+            }
+            const mirrored = !!targetUrl && !!item.htmlUrl && targetUrl !== item.htmlUrl;
+            const visibleEl = item.el && document.body.contains(item.el) ? item.el : findCommentElementForUrl(item.htmlUrl);
+            if (!mirrored && visibleEl) {
+                ensureCommentVisible(visibleEl);
+                scrollToAndHighlight(visibleEl);
+            } else if (targetUrl || item.htmlUrl) {
+                try {
+                    sessionStorage.setItem('ack_reopen_robot_panel', '1');
+                } catch (_) {}
+                navigateToExactCommentUrl(targetUrl || item.htmlUrl);
+            }
         });
 
         function addMessage(role, html) {
@@ -8316,13 +8994,353 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             messages.scrollTop = messages.scrollHeight;
         }
 
+        function loadRobotChatThreads() {
+            const raw = GM_getValue(chatThreadStorageKey, []);
+            if (!Array.isArray(raw)) return [];
+            return raw
+                .filter((thread) => thread && Array.isArray(thread.messages))
+                .map((thread) => ({
+                    id: String(thread.id || `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+                    title: String(thread.title || '').slice(0, 80),
+                    updatedAt: Number(thread.updatedAt || Date.now()),
+                    messages: thread.messages
+                        .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
+                        .map((m) => ({
+                            role: m.role,
+                            content: String(m.content || '').slice(0, 30000),
+                        }))
+                        .slice(-40),
+                }))
+                .filter((thread) => thread.messages.length);
+        }
+
+        function saveRobotChatThreads() {
+            const sorted = [...robotThreads]
+                .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+                .slice(0, 12)
+                .map((thread) => ({
+                    ...thread,
+                    title: String(thread.title || '').slice(0, 80),
+                    messages: thread.messages.slice(-40).map((m) => ({
+                        role: m.role,
+                        content: String(m.content || '').slice(0, 30000),
+                    })),
+                }));
+            robotThreads = sorted;
+            GM_setValue(chatThreadStorageKey, sorted);
+        }
+
+        function createRobotThread() {
+            const thread = {
+                id: `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                title: 'New discussion',
+                updatedAt: Date.now(),
+                messages: [],
+            };
+            robotThreads.unshift(thread);
+            saveRobotChatThreads();
+            return thread;
+        }
+
+        function getActiveRobotThread() {
+            let thread = robotThreads.find((t) => t.id === activeThreadId);
+            if (!thread) {
+                thread = robotThreads[0] || createRobotThread();
+                activeThreadId = thread.id;
+            }
+            return thread;
+        }
+
+        function robotThreadTitle(thread) {
+            if (thread.title && thread.title !== 'New discussion') return thread.title;
+            const firstUser = thread.messages.find((m) => m.role === 'user')?.content || '';
+            return firstUser ? firstUser.replace(/\s+/g, ' ').slice(0, 44) : 'New discussion';
+        }
+
+        function renderRobotThreadList() {
+            threadList.textContent = '';
+            if (!robotThreads.length) robotThreads = [createRobotThread()];
+            for (const thread of robotThreads) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = robotThreadTitle(thread);
+                btn.title = robotThreadTitle(thread);
+                Object.assign(btn.style, {
+                    width: '100%',
+                    textAlign: 'left',
+                    padding: '5px 6px',
+                    border: '1px solid',
+                    borderColor: thread.id === activeThreadId ? '#58a6ff' : '#21262d',
+                    borderRadius: '4px',
+                    background: thread.id === activeThreadId ? '#0d419d33' : '#161b22',
+                    color: '#c9d1d9',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    lineHeight: '1.25',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                });
+                btn.addEventListener('click', () => selectRobotThread(thread.id));
+                threadList.appendChild(btn);
+            }
+        }
+
+        function renderRobotThreadMessages() {
+            messages.textContent = '';
+            history = getActiveRobotThread().messages;
+            for (const item of history) {
+                if (item.role === 'user') {
+                    addMessage('user', item.content);
+                } else {
+                    const msg = addMessage('assistant', '');
+                    setAssistantHtml(msg, linkifyRefs(renderMarkdown(item.content), chatPageIndex || []), item.content);
+                }
+            }
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function selectRobotThread(id) {
+            activeThreadId = id;
+            renderRobotThreadList();
+            renderRobotThreadMessages();
+            input.focus();
+        }
+
+        function rememberMessage(role, content) {
+            const thread = getActiveRobotThread();
+            const text = String(content || '');
+            thread.messages.push({ role, content: text });
+            thread.messages = thread.messages.slice(-40);
+            if (!thread.title || thread.title === 'New discussion') {
+                const firstUser = thread.messages.find((m) => m.role === 'user')?.content || '';
+                if (firstUser) thread.title = firstUser.replace(/\s+/g, ' ').slice(0, 80);
+            }
+            thread.updatedAt = Date.now();
+            history = thread.messages;
+            saveRobotChatThreads();
+            renderRobotThreadList();
+        }
+
+        function appendFindSearchMatch(list, item, match = {}) {
+            if (list.childElementCount >= 120) return;
+            const idx = chatPageIndex.length;
+            chatPageIndex.push(item);
+            const link = document.createElement('a');
+            link.href = robotNavigationUrlForItem(item) || '#';
+            link.className = 'ack-ref-link';
+            link.dataset.ackRef = String(idx);
+            link.title = item.htmlUrl
+                ? 'Open the exact comment permalink. Shift/Cmd/Ctrl-click opens it in a new tab.'
+                : 'Open comment';
+            Object.assign(link.style, {
+                color: '#c9d1d9',
+                textDecoration: 'none',
+                fontSize: '12px',
+                padding: '6px 8px',
+                borderRadius: '4px',
+                background: '#0d1117',
+                border: '1px solid #21262d',
+                display: 'block',
+                cursor: 'pointer',
+            });
+            link.addEventListener('mouseenter', () => {
+                link.style.borderColor = '#58a6ff';
+            });
+            link.addEventListener('mouseleave', () => {
+                link.style.borderColor = '#21262d';
+            });
+            const meta = document.createElement('div');
+            Object.assign(meta.style, { color: '#58a6ff', fontWeight: '600', marginBottom: '3px' });
+            meta.textContent =
+                item.type === 'code'
+                    ? `📄 ${item.file || item.path || 'code'}${item.line ? `:${item.line}` : ''}`
+                    : `💬 ${findSearchItemLabel(item) || item.author || 'comment'}`;
+            const snippet = document.createElement('div');
+            snippet.textContent =
+                match.summary ||
+                String(item.fullText || item.text || '')
+                    .replace(/\s+/g, ' ')
+                    .slice(0, 260);
+            Object.assign(snippet.style, { color: '#c9d1d9' });
+            const reason = document.createElement('div');
+            reason.textContent = `↳ ${match.reason || 'LLM selected this result'}`;
+            Object.assign(reason.style, { color: '#8b949e', fontSize: '11px', marginTop: '3px' });
+            link.appendChild(meta);
+            link.appendChild(snippet);
+            link.appendChild(reason);
+            list.appendChild(link);
+        }
+
+        function findSearchMarkdown(matches) {
+            if (!matches.length) return 'No matching content found.';
+            return matches
+                .map(({ item, match }, i) => {
+                    const label = findSearchItemLabel(item) || `result ${i + 1}`;
+                    const href = robotNavigationUrlForItem(item) || item.htmlUrl || location.href;
+                    const summary =
+                        match.summary ||
+                        String(item.fullText || item.text || '')
+                            .replace(/\s+/g, ' ')
+                            .slice(0, 220);
+                    const reason = match.reason ? `\n  Reason: ${match.reason}` : '';
+                    return `${i + 1}. [${label}](${href})\n  ${summary}${reason}`;
+                })
+                .join('\n');
+        }
+
+        function refreshRobotRefLinks() {
+            messages.querySelectorAll('.ack-ref-link[data-ack-ref]').forEach((link) => {
+                const item = chatPageIndex?.[parseInt(link.dataset.ackRef, 10)];
+                const href = robotNavigationUrlForItem(item);
+                if (href) link.href = href;
+            });
+        }
+
+        async function runFindSearch(query, assistantMsg, stopSpin, provider) {
+            const body = assistantMsg._ackBody || assistantMsg;
+            body.innerHTML = '';
+            assistantMsg.dataset.ackRawContent = '';
+            const status = document.createElement('div');
+            Object.assign(status.style, { color: '#8b949e', fontSize: '11px', marginBottom: '6px' });
+            const stopBtn = document.createElement('button');
+            stopBtn.type = 'button';
+            stopBtn.textContent = 'Stop';
+            stopBtn.title = 'Stop after the current GitHub API page or LLM read finishes';
+            Object.assign(stopBtn.style, {
+                marginBottom: '8px',
+                padding: '3px 8px',
+                background: '#21262d',
+                color: '#c9d1d9',
+                border: '1px solid #30363d',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+            });
+            const list = document.createElement('div');
+            Object.assign(list.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
+            let cancelled = false;
+            stopBtn.addEventListener('click', () => {
+                cancelled = true;
+                stopBtn.disabled = true;
+                stopBtn.textContent = 'Stopping...';
+            });
+            body.appendChild(status);
+            body.appendChild(stopBtn);
+            body.appendChild(list);
+            stopSpin();
+
+            const pr = parsePR();
+            const viewerLogin = getCurrentGitHubLogin();
+            const seen = new Set(chatPageIndex.map(findSearchItemKey).filter(Boolean));
+            const found = [];
+            let persistedAssistantIndex = -1;
+            if (pr && repoMirrorUrlForPath()) {
+                status.textContent = 'Checking PR size for mirror routing...';
+                try {
+                    await updatePRCommentCountState(pr);
+                    refreshRobotRefLinks();
+                } catch (_) {}
+            }
+            const persistFindProgress = () => {
+                const thread = getActiveRobotThread();
+                const content = findSearchMarkdown(found);
+                if (persistedAssistantIndex < 0) {
+                    thread.messages.push({ role: 'assistant', content });
+                    persistedAssistantIndex = thread.messages.length - 1;
+                } else {
+                    thread.messages[persistedAssistantIndex] = { role: 'assistant', content };
+                }
+                if (thread.messages.length > 40) {
+                    const removed = thread.messages.length - 40;
+                    thread.messages = thread.messages.slice(-40);
+                    persistedAssistantIndex = Math.max(0, persistedAssistantIndex - removed);
+                }
+                thread.updatedAt = Date.now();
+                history = thread.messages;
+                saveRobotChatThreads();
+                renderRobotThreadList();
+            };
+            const readBatch = async (items, label) => {
+                if (cancelled || !items.length) return;
+                const chunks = chunkFindSearchItems(items, 52000);
+                for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+                    if (cancelled) return;
+                    const chunk = chunks[chunkIndex];
+                    const providerLabel = PROVIDER_META[provider]?.label || provider;
+                    status.textContent = `Reading ${label}${chunks.length > 1 ? ` chunk ${chunkIndex + 1}/${chunks.length}` : ''} with ${providerLabel}...`;
+                    const source = chunk
+                        .map((item, i) => findSearchItemForLLM(item, i, viewerLogin))
+                        .join('\n\n---\n\n');
+                    const system = `${SYSTEM_BASE}\n\nYou are a GitHub PR navigation assistant. Read the supplied comments and code excerpts, then decide which items answer the user's find request.\n\nRules:\n- Read the text and metadata for each item; do not use keyword matching as a substitute for understanding.\n- Respect author and ownership constraints. The current viewer login is ${viewerLogin ? `\`${viewerLogin}\`` : 'unknown'}.\n- If the user says "my", "mine", "by me", "from me", "I said", "I wrote", "I asked", "I suggested", or similar first-person wording, that refers to the current viewer login when it is known.\n- Use metadata such as author, date, direct comment vs reply, review summary vs inline comment, file path, line, commit, state, and permalink when relevant.\n- Return ONLY JSON: [{"index": number, "summary": "short factual summary", "reason": "why this answers the request"}].\n- Use each item's REF as the index. Return at most 12 results for this batch, ordered by relevance. Return [] if no item in the batch is relevant.\n- If the request asks where something was said, include the closest actual comment or reply, not just surrounding discussion.`;
+                    const user = `Find request: ${cleanAllCommentSearchQuery(query)}\n\nItems (${label}):\n${source}`;
+                    let matches = [];
+                    try {
+                        matches = parseFindSearchMatches(
+                            await callLLM(provider, system, user, {
+                                requestLabel: 'robot-find',
+                                maxTokens: 2048,
+                                skipCache: true,
+                            }),
+                            chunk.length,
+                        );
+                    } catch (e) {
+                        status.textContent = `Could not read ${label}: ${e.message || e}`;
+                        continue;
+                    }
+                    for (const match of matches) {
+                        const item = chunk[match.index];
+                        if (!item) continue;
+                        appendFindSearchMatch(list, item, match);
+                        found.push({ item, match });
+                    }
+                    assistantMsg.dataset.ackRawContent = findSearchMarkdown(found);
+                    persistFindProgress();
+                    status.textContent = `Found ${found.length} result${found.length === 1 ? '' : 's'} so far.`;
+                }
+            };
+
+            const visibleItems = chatPageIndex.filter((item) => item?.type === 'comment' || item?.type === 'code');
+            await readBatch(visibleItems, 'visible page content');
+
+            let hiddenResult = { searched: 0, stopped: false };
+            if (!cancelled && pr) {
+                status.textContent = 'Fetching all PR comments through GitHub API...';
+                hiddenResult = await streamAllPRCommentItems(pr, {
+                    seenIds: seen,
+                    shouldStop: () => cancelled,
+                    onProgress: (msg) => {
+                        status.textContent = msg;
+                    },
+                    onItems: async (items, progress) => {
+                        await readBatch(items, `${progress.label} page ${progress.page}`);
+                    },
+                });
+            }
+            if (pr) {
+                const seenCommentCount = chatPageIndex.filter((item) => item?.type === 'comment').length;
+                const inferredCount = seenCommentCount + (hiddenResult.searched || 0);
+                if (inferredCount >= HEAVY_PR_COMMENT_THRESHOLD) {
+                    rememberPRCommentCount(pr, inferredCount, 'find-stream');
+                    refreshRobotRefLinks();
+                }
+            }
+            stopBtn.remove();
+            status.textContent = cancelled || hiddenResult.stopped
+                ? `Stopped with ${found.length} result${found.length === 1 ? '' : 's'}.`
+                : `Done: found ${found.length} result${found.length === 1 ? '' : 's'}.`;
+            if (found.length === 0) {
+                const empty = document.createElement('div');
+                empty.textContent = 'No matching comments found.';
+                empty.style.color = '#8b949e';
+                list.appendChild(empty);
+            }
+            persistFindProgress();
+        }
+
         async function send(recipe = null, opts = {}) {
             const copyPromptOnly = !!opts.promptOnly;
             const provider = getActiveProvider();
-            if (!copyPromptOnly && !isProviderAvailable(provider)) {
-                document.body.appendChild(buildConfigPanel());
-                return;
-            }
 
             const recipeMap = {
                 chat: {
@@ -8393,13 +9411,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const text = recipeCfg ? recipeCfg.userText : input.value.trim();
             if (recipeCfg?.sendAsConversation === false && recipeCfg.userText === '') return;
             if (!recipeCfg && !text) return;
+            if (!copyPromptOnly && !isProviderAvailable(provider)) {
+                document.body.appendChild(buildConfigPanel());
+                return;
+            }
             if (!recipeCfg) {
                 input.value = '';
                 input.style.height = 'auto';
             }
 
             addMessage('user', recipeCfg ? recipeCfg.label : text);
-            history.push({ role: 'user', content: recipeCfg ? recipeCfg.label : text });
+            rememberMessage('user', recipeCfg ? recipeCfg.label : text);
 
             // Spinner message
             const assistantMsg = addMessage('assistant', '');
@@ -8409,6 +9431,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             // Build/refresh page index (shared across regular chat and /find)
             chatPageIndex = gatherPageIndex();
+            const prForChat = parsePR();
+            if (prForChat && repoMirrorUrlForPath()) {
+                updatePRCommentCountState(prForChat)
+                    .then(refreshRobotRefLinks)
+                    .catch(() => {});
+            }
 
             try {
                 const isQuiz = !recipeCfg && /^\/quiz\b/i.test(text);
@@ -8428,87 +9456,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     stopSpin();
                     const trimmed = result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    history.push({ role: 'assistant', content: trimmed });
+                    rememberMessage('assistant', trimmed);
                     messages.scrollTop = messages.scrollHeight;
                 } else if (isNavQuery) {
-                    // Navigation mode: index page content, ask LLM for matches
-                    const indexText = chatPageIndex
-                        .map((item, i) => {
-                            if (item.type === 'comment') return `[${i}] COMMENT by ${item.author}: ${item.text}`;
-                            return `[${i}] CODE ${item.file}:${item.line}: ${item.text}`;
-                        })
-                        .join('\n');
-
-                    const query = text.replace(/^\/find\s*/i, '').trim();
-                    const navSystem = `You are a navigation assistant for a GitHub PR page. The user wants to find specific content. You will receive an indexed list of all visible comments and code lines. Return ONLY a JSON array of matching indices with a brief reason, like: [{"index": 5, "reason": "mentions fuzzer concern"}, ...]. Return at most 10 matches, ordered by relevance. If nothing matches, return [].`;
-                    const navUser = `Query: ${query}\n\nPage content:\n${indexText.slice(0, 60000)}`;
-
-                    const result = await callLLM(provider, navSystem, navUser);
-                    stopSpin();
-
-                    let matches = [];
-                    try {
-                        matches = parseNavigationMatches(result, chatPageIndex.length);
-                    } catch (e) {
-                        console.warn('ACKtopus: could not parse navigation results:', e?.message || e, result);
-                        setAssistantText(assistantMsg, 'Could not parse navigation results.', '#f85149');
-                        return;
-                    }
-
-                    if (!matches.length) {
-                        setAssistantText(assistantMsg, 'No matching content found on this page.');
-                        history.push({ role: 'assistant', content: 'No matches found.' });
-                        return;
-                    }
-
-                    // Render clickable results
-                    setAssistantHtml(assistantMsg, '');
-                    const resultList = document.createElement('div');
-                    Object.assign(resultList.style, { display: 'flex', flexDirection: 'column', gap: '6px' });
-
-                    for (const match of matches) {
-                        const item = chatPageIndex[match.index];
-                        if (!item) continue;
-                        const link = document.createElement('a');
-                        link.href = '#';
-                        link.className = 'ack-ref-link';
-                        link.dataset.ackRef = String(match.index);
-                        Object.assign(link.style, {
-                            color: '#58a6ff',
-                            textDecoration: 'none',
-                            fontSize: '12px',
-                            padding: '4px 8px',
-                            borderRadius: '4px',
-                            background: '#0d1117',
-                            border: '1px solid #21262d',
-                            display: 'block',
-                            cursor: 'pointer',
-                        });
-                        link.addEventListener('mouseenter', () => {
-                            link.style.borderColor = '#58a6ff';
-                        });
-                        link.addEventListener('mouseleave', () => {
-                            link.style.borderColor = '#21262d';
-                        });
-
-                        const label =
-                            item.type === 'comment'
-                                ? `💬 ${item.author}: ${item.text.slice(0, 80)}...`
-                                : `📄 ${item.file}:${item.line}: ${item.text.slice(0, 60)}...`;
-                        link.textContent = label;
-                        if (match.reason) {
-                            const small = document.createElement('div');
-                            Object.assign(small.style, { fontSize: '11px', color: '#8b949e', marginTop: '2px' });
-                            small.textContent = `↳ ${match.reason}`;
-                            link.appendChild(small);
-                        }
-
-                        resultList.appendChild(link);
-                    }
-                    (assistantMsg._ackBody || assistantMsg).appendChild(resultList);
-                    const summary = `Found ${matches.length} match${matches.length > 1 ? 'es' : ''}.`;
-                    history.push({ role: 'assistant', content: summary });
-                    messages.scrollTop = messages.scrollHeight;
+                    await runFindSearch(text, assistantMsg, stopSpin, provider);
                 } else if (recipeCfg?.fullPRContext) {
                     const prForRecipe = parsePR();
                     if (!prForRecipe) throw new Error('this recipe is only available on pull request pages');
@@ -8532,7 +9483,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 open: true,
                             },
                         );
-                        history.push({ role: 'assistant', content: prompt });
+                        rememberMessage('assistant', prompt);
                         messages.scrollTop = messages.scrollHeight;
                         return;
                     }
@@ -8584,7 +9535,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt, {
                             open: true,
                         });
-                        history.push({ role: 'assistant', content: generatedPrompt });
+                        rememberMessage('assistant', generatedPrompt);
                         messages.scrollTop = messages.scrollHeight;
                         return;
                     }
@@ -8607,7 +9558,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             : result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     if (generatedPrompt) setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt);
-                    history.push({ role: 'assistant', content: trimmed });
+                    rememberMessage('assistant', trimmed);
                     messages.scrollTop = messages.scrollHeight;
                 } else {
                     // Regular chat mode - with [ref:N] citation support
@@ -8628,7 +9579,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const trimmed = result.trim();
                     // Render markdown then replace [ref:N] with clickable navigation links
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    history.push({ role: 'assistant', content: trimmed });
+                    rememberMessage('assistant', trimmed);
                     messages.scrollTop = messages.scrollHeight;
                 }
             } catch (e) {
@@ -8652,6 +9603,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 send();
             }
         });
+        newThreadBtn.addEventListener('click', () => {
+            const thread = createRobotThread();
+            selectRobotThread(thread.id);
+        });
+        chatPageIndex = gatherPageIndex();
+        activeThreadId = robotThreads[0]?.id || createRobotThread().id;
+        renderRobotThreadList();
+        renderRobotThreadMessages();
 
         // Auto-focus input
         setTimeout(() => input.focus(), 100);
@@ -19467,6 +20426,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             toolbar.appendChild(buildContextCopyGroup());
         }
 
+        const mirrorUrl = repoMirrorUrlForPath();
+        if (mirrorUrl) {
+            const mirrorBtn = createBtn(
+                compact ? '🪞' : '🪞 Mirror',
+                openRepoMirror,
+                `Open configured repo mirror\n${mirrorUrl}`,
+            );
+            if (compact) mirrorBtn.style.padding = '4px 8px';
+            toolbar.appendChild(mirrorBtn);
+        }
+
         function disableBtn(btn, emoji) {
             btn.textContent = emoji;
             btn.disabled = true;
@@ -19781,9 +20751,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         wrapper.appendChild(toolbar);
         document.body.appendChild(wrapper);
+        scheduleRepoMirrorSlowPageHint(wrapper);
+        try {
+            if (sessionStorage.getItem('ack_reopen_robot_panel') === '1') {
+                sessionStorage.removeItem('ack_reopen_robot_panel');
+                ackSetTimeout(() => {
+                    if (!document.getElementById('acktopus-analysis')) runAnalysis(wrapper, 'chat');
+                }, 250);
+            }
+        } catch (_) {}
 
         // Load ACK panel + force-push data async (PR only)
         if (onPR) {
+            const pr = parsePR();
+            if (pr && repoMirrorUrlForPath()) updatePRCommentCountState(pr).catch(() => {});
             // Always create the ACK panel container synchronously so DOM tests
             // can validate injection even before async ACK discovery finishes.
             const existingAckPanel = document.getElementById(ACK_PANEL_ID);
@@ -20803,7 +21784,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.127
+// @version      1.132
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26902,6 +27883,50 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(currentGitHubRepoBaseBranch(host), 'trunk');
     });
 
+    ackTest('repo mirror config maps current GitHub paths and heavy PR links', () => {
+        const old = GM_getValue('repo_mirrors', null);
+        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '31132' };
+        try {
+            GM_setValue('repo_mirrors', 'bitcoin/bitcoin=https://mirror.b10c.me/bitcoin-bitcoin');
+            ackEq(
+                repoMirrorUrlForPath('/bitcoin/bitcoin/pull/31132', '?foo=1', '#discussion_r1'),
+                'https://mirror.b10c.me/bitcoin-bitcoin/31132?foo=1#discussion_r1',
+                'mirror maps GitHub PR path to mirror PR id while preserving query and hash',
+            );
+            ackEq(
+                repoMirrorUrlForPath('/bitcoin/bitcoin/commit/abc123', '', ''),
+                'https://mirror.b10c.me/bitcoin-bitcoin/commit/abc123',
+                'mirror preserves non-PR paths',
+            );
+            rememberPRCommentCount(pr, 301, 'test');
+            ackEq(
+                maybeMirrorUrlForHeavyPR('https://github.com/bitcoin/bitcoin/pull/31132#discussion_r1', pr),
+                'https://mirror.b10c.me/bitcoin-bitcoin/31132#discussion_r1',
+                'heavy PR comment links use the mirror',
+            );
+            rememberPRCommentCount(pr, 10, 'test');
+            ackEq(
+                maybeMirrorUrlForHeavyPR('https://github.com/bitcoin/bitcoin/pull/31132#discussion_r1', pr),
+                'https://github.com/bitcoin/bitcoin/pull/31132#discussion_r1',
+                'non-heavy PR links stay on GitHub',
+            );
+        } finally {
+            GM_deleteValue(prCommentCountCacheKey(pr));
+            if (old === null || old === undefined) GM_deleteValue('repo_mirrors');
+            else GM_setValue('repo_mirrors', old);
+        }
+    });
+
+    ackTest('heavy PR mirror routing is wired into toolbar and Robot refs', () => {
+        const source = _ackSource;
+        ackAssert(source.includes('const HEAVY_PR_COMMENT_THRESHOLD = 300'), 'heavy threshold is 300 comments');
+        ackAssert(source.includes('updatePRCommentCountState(pr)'), 'toolbar updates heavy PR comment count');
+        ackAssert(source.includes('robotNavigationUrlForItem'), 'Robot refs use shared navigation URL policy');
+        ackAssert(source.includes('e.shiftKey || e.metaKey || e.ctrlKey'), 'Robot refs can open in a separate tab');
+        ackAssert(source.includes('repoMirrorUrlForPath()'), 'toolbar exposes configured mirror button');
+        ackAssert(source.includes('ack-repo-mirrors'), 'settings expose repo mirror config');
+    });
+
     ackTest('local repo compare rewrite marks modified compare buttons', () => {
         const host = document.createElement('div');
         host.innerHTML =
@@ -28961,6 +29986,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('NAV_QUERY_RE detects navigation patterns', () => {
         const re = NAV_QUERY_RE;
         ackAssert(re.test('/find my concern about fuzzers'), '/find triggers');
+        ackAssert(
+            re.test('find a comment by me talking about the vector resize and the movability'),
+            'find a comment by me triggers',
+        );
         ackAssert(re.test('where did I express my concern'), '"where did" triggers');
         ackAssert(re.test('which comment mentions the variable'), '"which comment" triggers');
         ackAssert(re.test('take me to the fuzzer discussion'), '"take me to" triggers');
@@ -28998,6 +30027,61 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '1',
             'drops out-of-range indices',
         );
+    });
+
+    ackTest('find search parser validates LLM JSON result shape', () => {
+        const result = parseFindSearchMatches(
+            '```json\n{"matches":[{"index":2,"summary":"Andrew wants to keep HaveCoin","reason":"author and content match"}]}\n```',
+            5,
+        );
+        ackEq(result[0].index, 2, 'parses index');
+        ackEq(result[0].summary, 'Andrew wants to keep HaveCoin', 'parses summary');
+        ackEq(parseFindSearchMatches('[{"index":9}]', 2).length, 0, 'drops out-of-range indices');
+    });
+
+    ackTest('all-comment item streaming uses paginated GitHub comment APIs without keyword scoring', () => {
+        const fn = sourceSection(_ackSource, 'function toReviewThreadSearchItem', 'const NAV_QUERY_RE');
+        ackAssert(fn.includes('/issues/${pr.pr}/comments'), 'searches issue conversation comments');
+        ackAssert(fn.includes('/pulls/${pr.pr}/comments'), 'searches inline review comments');
+        ackAssert(fn.includes('/pulls/${pr.pr}/reviews'), 'searches review summaries');
+        ackAssert(fn.includes('reviewThreads(first: 50'), 'searches closed review threads through GraphQL');
+        ackAssert(fn.includes('patAuthHeaderValue()'), 'uses PAT-backed GraphQL when available');
+        ackAssert(fn.includes('state = thread?.isResolved'), 'labels resolved review threads');
+        ackAssert(fn.includes('await onItems?.'), 'streams items as pages are fetched');
+        ackAssert(fn.includes('shouldStop?.()'), 'supports stopping the search');
+        ackAssert(!fn.includes('scoreAllCommentSearchItem'), 'does not keyword-score matches locally');
+    });
+
+    ackTest('Robot find search reads visible then hidden batches with the LLM', () => {
+        const fn = sourceSection(_ackSource, 'function buildChatPanel', 'function addPromptDetails');
+        ackAssert(!fn.includes('Search all comments, including hidden'), 'no opt-in checkbox');
+        ackAssert(!fn.includes("GM_getValue('chat_search_all_comments'"), 'no checkbox state');
+        ackAssert(fn.includes("readBatch(visibleItems, 'visible page content')"), 'reads visible content first');
+        ackAssert(fn.includes('if (!cancelled && pr)'), 'fetches API comments on PR pages without DOM hidden gating');
+        ackAssert(fn.includes('Fetching all PR comments through GitHub API'), 'shows API search status');
+        ackAssert(fn.includes('streamAllPRCommentItems(pr'), 'fetches hidden comment items');
+        ackAssert(fn.includes('callLLM(provider, system, user'), 'LLM judges each batch');
+        ackAssert(!fn.includes('getProviderMeta'), 'uses existing provider metadata directly');
+        ackAssert(fn.includes('do not use keyword matching as a substitute for understanding'), 'prompt forbids keyword-only matching');
+        ackAssert(fn.includes('current viewer login'), 'prompt explains my comment semantics');
+        ackAssert(fn.includes('"by me"'), 'prompt maps by-me wording to current viewer login');
+        ackAssert(fn.includes('"I suggested"'), 'prompt maps first-person suggestion wording');
+        ackAssert(fn.includes('Stop after the current GitHub API page or LLM read finishes'), 'search can be stopped');
+        ackAssert(fn.includes('navigateToExactCommentUrl(item.htmlUrl)'), 'falls back to exact GitHub permalink navigation');
+        ackAssert(_ackSource.includes('ack_skip_hash_reveal_once'), 'permalink navigation suppresses broad hash reveal');
+    });
+
+    ackTest('Robot find search is passive and robot discussions persist', () => {
+        const fn = sourceSection(_ackSource, 'function buildChatPanel', 'function addPromptDetails');
+        const findFn = sourceSection(fn, 'async function runFindSearch', 'async function send');
+        ackAssert(!findFn.includes('scrollToAndHighlight'), 'find streaming does not auto-jump to results');
+        ackAssert(!findFn.includes('navigateToExactCommentUrl'), 'find streaming does not auto-navigate to results');
+        ackAssert(!findFn.includes('messages.scrollTop = messages.scrollHeight'), 'find streaming does not steal panel scroll');
+        ackAssert(fn.includes('ack_robot_chat_threads:'), 'stores robot discussions per page');
+        ackAssert(fn.includes("threadTitle.textContent = 'History'"), 'shows history sidebar');
+        ackAssert(fn.includes('rememberMessage('), 'persists messages as the discussion continues');
+        ackAssert(fn.includes('newThreadBtn'), 'new discussion control exists');
+        ackAssert(_ackSource.includes('ack_reopen_robot_panel'), 'reopens robot panel after exact permalink navigation');
     });
 
     ackTest('gatherChatContext accepts pageIndex and annotates comments with [ref:N]', () => {
@@ -33843,9 +34927,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.127', () => {
+    ackTest('version bumped to 1.132', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.127' || _ackSource.includes('@version      1.127'), 'version is 1.127');
+        ackAssert(versionFromMeta === '1.132' || _ackSource.includes('@version      1.132'), 'version is 1.132');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -35566,6 +36650,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         commitExplainCacheKey,
         gatherChatContext,
         gatherPageIndex,
+        getCurrentGitHubLogin,
+        streamAllPRCommentItems,
+        parseFindSearchMatches,
         NAV_QUERY_RE,
         scrollToAndHighlight,
         linkifyRefs,
@@ -35610,6 +36697,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         extractCsrfFromHtml,
         shouldExposeTestExports,
         parseGitHubRepoPath,
+        parseRepoMirrorConfig,
+        repoMirrorUrlForPath,
+        maybeMirrorUrlForHeavyPR,
+        prCommentCountCacheKey,
         repositoryMetaValue,
         currentGitHubRepo,
         currentGitHubRepoBaseBranch,
