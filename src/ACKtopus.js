@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.132
+// @version      1.136
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -435,6 +435,7 @@
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
     const SHIFT_COPY_HINT = '📋';
     const SHIFT_REVEAL_HINT = '📂';
+    const SHIFT_VISIBLE_ONLY_HINT = '👁';
     const SHIFT_REVERSE_HINT = '⬆';
     const EDIT_POST_SHORTCUT_KEY = 'e';
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
@@ -1878,6 +1879,55 @@
             .map((el) => el.closest('button'))
             .filter(Boolean);
         return { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs };
+    }
+
+    function getPendingReviewRevealTargets(root = document) {
+        const targets = [];
+        const seen = new Set();
+        const push = (el) => {
+            if (!el || seen.has(el)) return;
+            seen.add(el);
+            targets.push(el);
+        };
+        const isSafePendingDetails = (details) => {
+            if (!details || details.open) return false;
+            if (details.closest(COMMENT_MENU_ROOT_SELECTOR)) return false;
+            if (
+                details.matches(
+                    '.details-overlay, [data-target="action-menu.overlay"], ' +
+                        '.js-reaction-popover-container, .new-reactions-dropdown, .js-comment-header-reaction-button',
+                )
+            )
+                return false;
+            if (
+                details.querySelector?.(
+                    ':scope > summary.timeline-comment-action, :scope > summary[aria-haspopup="menu"], ' +
+                        ':scope > summary[aria-label*="reaction" i], :scope > summary[aria-label*="react" i]',
+                )
+            )
+                return false;
+            return !!details.closest?.(
+                '.outdated-comment, .js-resolvable-timeline-thread-container, .js-line-comments, ' +
+                    '.inline-comments, .review-thread-component, [data-testid="review-thread"]',
+            );
+        };
+        const pendingMarkers = [...(root.querySelectorAll?.('.js-pending-review-comment, .Label--warning, [title="Label: Pending"], [data-testid="pending-badge"]') || [])]
+            .filter((el) => {
+                if (el.classList?.contains('js-pending-review-comment')) return true;
+                const label = `${el.textContent || ''} ${el.getAttribute?.('title') || ''}`.trim();
+                return /pending/i.test(label);
+            });
+        for (const marker of pendingMarkers) {
+            const scope =
+                marker.closest?.(`${COMMENT_CONTAINER_SELECTOR}, ${COMMENT_THREAD_SELECTOR}`) || marker;
+            const details = marker.closest?.('details:not([open])');
+            if (isSafePendingDetails(details)) push(details.querySelector(':scope > summary') || details);
+            const minimized =
+                scope.closest?.('.minimized-comment, .Details-content--hidden-not-important') ||
+                scope.querySelector?.('.minimized-comment, .Details-content--hidden-not-important');
+            if (minimized) push(minimized.querySelector('.timeline-comment-header') || minimized);
+        }
+        return targets;
     }
 
     async function showCollapsedSections(btn) {
@@ -7371,6 +7421,81 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return { file, line, commitSha, threadRoot: threadEl };
     }
 
+    function collectEmbeddedDiffContents(root = readPRSSRData()) {
+        const out = [];
+        const seen = new Set();
+        const visit = (node) => {
+            if (!node || typeof node !== 'object' || seen.has(node)) return;
+            seen.add(node);
+            if (Array.isArray(node)) {
+                node.forEach(visit);
+                return;
+            }
+            if (node.path && Array.isArray(node.diffLines)) out.push(node);
+            for (const value of Object.values(node)) visit(value);
+        };
+        visit(root);
+        return out;
+    }
+
+    function formatEmbeddedDiffLineContext(diffContents, file, line, commitSha = '') {
+        if (!file || !line) return '';
+        const wantedLine = String(line);
+        const wantedCommit = String(commitSha || '').toLowerCase();
+        const fileDiffs = (diffContents || []).filter((diff) => diff?.path === file && Array.isArray(diff.diffLines));
+        const commitMatches = wantedCommit
+            ? fileDiffs.filter((diff) =>
+                  [diff.newCommitOid, diff.oldCommitOid].some((oid) =>
+                      String(oid || '').toLowerCase().startsWith(wantedCommit),
+                  ),
+              )
+            : [];
+        const candidates = commitMatches.length ? commitMatches : fileDiffs;
+        const lineMatches = (diffLine) =>
+            [diffLine?.right, diffLine?.left, diffLine?.blobLineNumber]
+                .filter((value) => value !== undefined && value !== null)
+                .some((value) => String(value) === wantedLine);
+        const lineSign = (diffLine, raw) => {
+            if (/^[ +\-]/.test(raw)) return raw;
+            const type = String(diffLine?.type || '').toUpperCase();
+            if (type.includes('ADDITION')) return `+${raw}`;
+            if (type.includes('DELETION')) return `-${raw}`;
+            return ` ${raw}`;
+        };
+        for (const diff of candidates) {
+            const lines = diff.diffLines || [];
+            const targetIdx = lines.findIndex(lineMatches);
+            if (targetIdx < 0) continue;
+            let hunkIdx = targetIdx;
+            while (hunkIdx > 0 && String(lines[hunkIdx]?.type || '').toUpperCase() !== 'HUNK') hunkIdx--;
+            if (String(lines[hunkIdx]?.type || '').toUpperCase() !== 'HUNK') hunkIdx = Math.max(0, targetIdx - 3);
+            const start = hunkIdx;
+            const end = Math.min(lines.length, targetIdx + 3);
+            return lines
+                .slice(start, end)
+                .map((diffLine) => {
+                    const raw = String(diffLine?.text || '').replace(/\r\n/g, '\n');
+                    if (String(diffLine?.type || '').toUpperCase() === 'HUNK') return raw;
+                    return lineSign(diffLine, raw);
+                })
+                .filter((text) => text.trim() || /^ /.test(text))
+                .join('\n');
+        }
+        return '';
+    }
+
+    function getEmbeddedDiffLineContext(file, line, commitSha = '') {
+        return formatEmbeddedDiffLineContext(collectEmbeddedDiffContents(), file, line, commitSha);
+    }
+
+    function getPendingReviewTargetContext(comment) {
+        return (
+            comment?.codeContext ||
+            comment?.diffHunk ||
+            getEmbeddedDiffLineContext(comment?.file, comment?.line, comment?.commitSha)
+        );
+    }
+
     function getCommentCodeContext(container, threadRoot = null) {
         const commentRow = container.closest('tr.inline-comments, tr.js-inline-comments-container');
         const threadEl = threadRoot || getCommentThreadRoot(container) || container;
@@ -7681,6 +7806,262 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return ['fallback', comment?.threadId || loc || '', comment?.author || '', comment?.date || '', markdown].join(
             ':',
         );
+    }
+
+    function normalizePendingReviewComment(raw, source = 'unknown', thread = null) {
+        if (!raw || typeof raw !== 'object') return null;
+        const body = String(raw.body || raw.bodyText || raw.markdown || raw.text || '').trim();
+        if (!body) return null;
+        const path = raw.path || raw.file || thread?.path || '';
+        const line = raw.line || raw.originalLine || raw.original_line || raw.position || thread?.line || '';
+        const commitSha = String(raw.commit?.oid || raw.commit_id || raw.commitId || raw.originalCommit?.oid || '')
+            .trim()
+            .slice(0, 12);
+        const permalink = raw.url || raw.htmlUrl || raw.html_url || raw.permalink || '';
+        const replyTo = raw.replyTo || raw.reply_to || null;
+        const replyToId = replyTo?.databaseId || replyTo?.id || raw.replyToId || raw.in_reply_to_id || '';
+        const id = raw.id || raw.node_id || raw.databaseId || permalink || '';
+        return {
+            id: id ? `${source}:${id}` : '',
+            source,
+            author: raw.author?.login || raw.user?.login || raw.authorLogin || getCurrentGitHubLogin() || '?',
+            date: raw.createdAt || raw.created_at || raw.submitted_at || '',
+            markdown: body,
+            permalink,
+            threadId: raw.threadId || raw.thread_id || thread?.id || thread?.databaseId || '',
+            replyToId,
+            file: path,
+            line,
+            commitSha,
+            diffHunk: raw.diffHunk || raw.diff_hunk || raw.diff || '',
+            codeContext: raw.codeContext || '',
+            threadContext: raw.threadContext || '',
+            isPending: true,
+            isResolved: !!(raw.isResolved || thread?.isResolved),
+            isOutdated: !!raw.isOutdated,
+        };
+    }
+
+    function pendingReviewCommentKeys(comment) {
+        const keys = [];
+        if (comment?.id) keys.push(`id:${comment.id}`);
+        if (comment?.permalink) keys.push(`url:${comment.permalink}`);
+        const body = String(comment?.markdown || '').replace(/\s+/g, ' ').trim();
+        const loc = formatCommentLocation(comment?.file, comment?.line, comment?.commitSha);
+        if (body) keys.push(`body:${loc}:${comment?.threadId || ''}:${body.slice(0, 220)}`);
+        return keys;
+    }
+
+    function mergePendingReviewComments(...groups) {
+        const merged = [];
+        const keyToIndex = new Map();
+        const remember = (comment, idx) => pendingReviewCommentKeys(comment).forEach((key) => keyToIndex.set(key, idx));
+        const add = (comment) => {
+            if (!comment?.markdown) return;
+            const keys = pendingReviewCommentKeys(comment);
+            let idx = keys.map((key) => keyToIndex.get(key)).find((value) => value !== undefined);
+            if (idx === undefined) {
+                idx = merged.length;
+                merged.push(comment);
+                remember(comment, idx);
+                return;
+            }
+            const existing = merged[idx];
+            merged[idx] = {
+                ...comment,
+                ...existing,
+                source: [...new Set([existing.source, comment.source].filter(Boolean))].join(', '),
+                author: existing.author && existing.author !== '?' ? existing.author : comment.author,
+                date: existing.date || comment.date,
+                permalink: existing.permalink || comment.permalink,
+                threadId: existing.threadId || comment.threadId,
+                replyToId: existing.replyToId || comment.replyToId,
+                file: existing.file || comment.file,
+                line: existing.line || comment.line,
+                commitSha: existing.commitSha || comment.commitSha,
+                diffHunk: existing.diffHunk || comment.diffHunk,
+                codeContext: existing.codeContext || comment.codeContext,
+                threadContext: existing.threadContext || comment.threadContext,
+            };
+            remember(comment, idx);
+            remember(merged[idx], idx);
+        };
+        groups.flat().forEach(add);
+        return merged;
+    }
+
+    function extractPendingReviewCommentsFromObject(root, source = 'page data') {
+        const out = [];
+        const seen = new Set();
+        const visit = (node, thread = null) => {
+            if (!node || typeof node !== 'object' || seen.has(node)) return;
+            seen.add(node);
+            const candidate = normalizePendingReviewComment(node, source, thread);
+            if (candidate && (candidate.file || candidate.line || candidate.diffHunk || candidate.permalink)) {
+                out.push(candidate);
+            }
+            const nextThread =
+                node.path || node.line || node.isResolved !== undefined
+                    ? {
+                          id: node.id || node.databaseId || thread?.id || '',
+                          databaseId: node.databaseId || thread?.databaseId || '',
+                          path: node.path || thread?.path || '',
+                          line: node.line || thread?.line || '',
+                          isResolved: !!(node.isResolved || thread?.isResolved),
+                      }
+                    : thread;
+            const collections = [
+                node.comments,
+                node.comments?.nodes,
+                node.comments?.edges?.map((edge) => edge?.node),
+                node.nodes,
+                node.edges?.map((edge) => edge?.node),
+                node.reviewThreads,
+                node.reviewThreads?.nodes,
+                node.threads,
+                node.threads?.nodes,
+            ];
+            for (const collection of collections) {
+                if (Array.isArray(collection)) collection.forEach((item) => visit(item, nextThread));
+                else if (collection && typeof collection === 'object') visit(collection, nextThread);
+            }
+        };
+        visit(root);
+        return mergePendingReviewComments(out);
+    }
+
+    function gatherPendingReviewDomComments(root = document) {
+        const comments = [];
+        const seenBodies = new Set();
+        for (const container of root.querySelectorAll?.(COMMENT_CONTAINER_SELECTOR) || []) {
+            const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
+            if (!body || seenBodies.has(body)) continue;
+            seenBodies.add(body);
+            const threadRoot = getCommentThreadRoot(container);
+            const flags = getCommentThreadFlags(container, threadRoot);
+            if (!flags.isPending && !container.closest?.('.js-pending-review-comment')) continue;
+            const markdown = renderBodyMarkdown(body);
+            if (!markdown) continue;
+            const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
+            const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
+            const threadContext = gatherCommentContext(container);
+            const comment = {
+                source: 'visible DOM',
+                author: getCommentAuthor(body) || getCurrentGitHubLogin() || '?',
+                date: timeEl?.getAttribute('datetime') || timeEl?.getAttribute?.('title') || timeEl?.textContent?.trim() || '',
+                markdown,
+                permalink: getCommentPermalink(container),
+                threadId: getCommentThreadId(container, threadRoot),
+                file,
+                line,
+                commitSha,
+                codeContext: getCommentCodeContext(container, threadRoot) || getEmbeddedDiffLineContext(file, line, commitSha),
+                threadContext: threadContext.includes('## Prior thread context') ? threadContext : '',
+                ...flags,
+                isPending: true,
+            };
+            comments.push(comment);
+        }
+        return mergePendingReviewComments(comments);
+    }
+
+    async function fetchViewerPendingReviewComments(pr, onProgress = () => {}) {
+        if (!patAuthHeaderValue()) return [];
+        const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      viewerLatestReview {
+        id
+        state
+        comments(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            databaseId
+            body
+            author { login }
+            createdAt
+            url
+            path
+            line
+            originalLine
+            diffHunk
+            commit { oid }
+            replyTo { id databaseId url }
+          }
+        }
+      }
+    }
+  }
+}`;
+        const comments = [];
+        let cursor = null;
+        for (let page = 1; page <= 20; page++) {
+            onProgress(`Fetching pending review comments, page ${page}...`);
+            const data = await patGraphQL(query, {
+                owner: pr.owner,
+                repo: pr.repo,
+                number: Number(pr.pr),
+                cursor,
+            });
+            const review = data?.data?.repository?.pullRequest?.viewerLatestReview;
+            if (review?.state && review.state !== 'PENDING') break;
+            const connection = review?.comments;
+            const nodes = connection?.nodes || [];
+            nodes.forEach((node) => {
+                const normalized = normalizePendingReviewComment(node, 'GraphQL viewerLatestReview');
+                if (normalized) comments.push(normalized);
+            });
+            if (!connection?.pageInfo?.hasNextPage) break;
+            cursor = connection.pageInfo.endCursor || null;
+            if (!cursor) break;
+        }
+        return mergePendingReviewComments(comments);
+    }
+
+    function formatPendingReviewCommentContext(comment, index) {
+        const loc = formatCommentLocation(comment.file, comment.line, comment.commitSha);
+        const title = `## Pending comment ${index + 1}${loc ? ` - ${loc}` : ''}`;
+        const meta = [];
+        if (comment.author) meta.push(`* Author: ${comment.author}`);
+        if (comment.date) meta.push(`* Date: ${comment.date}`);
+        if (comment.source) meta.push(`* Source: ${comment.source}`);
+        if (loc) meta.push(`* Location: ${loc}`);
+        if (comment.threadId) meta.push(`* Thread: ${comment.threadId}`);
+        if (comment.replyToId) meta.push(`* Reply to: ${comment.replyToId}`);
+        if (comment.permalink) meta.push(`* Permalink: ${comment.permalink}`);
+        const flags = formatCommentFlags(comment).trim();
+        if (flags) meta.push(`* State: ${flags}`);
+        const parts = [title, meta.join('\n')].filter(Boolean);
+        const targetContext = getPendingReviewTargetContext(comment);
+        if (targetContext) parts.push(`### Target line context\n\`\`\`diff\n${targetContext}\n\`\`\``);
+        parts.push(`### Pending comment\n${comment.markdown}`);
+        if (comment.threadContext && comment.threadContext.includes('## Prior thread context')) {
+            parts.push(`### Visible thread context\n${comment.threadContext}`);
+        }
+        return parts.join('\n\n');
+    }
+
+    async function gatherPendingReviewCommentsContext(onProgress = () => {}) {
+        const pr = parsePR();
+        if (!pr) return '';
+        const pageUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
+        const comments = mergePendingReviewComments(
+            await fetchViewerPendingReviewComments(pr, onProgress).catch((e) => {
+                onProgress(`Could not fetch pending comments through GraphQL: ${e.message || e}`);
+                return [];
+            }),
+            extractPendingReviewCommentsFromObject(readViewerPendingReviewFromSSR(), 'embedded page data'),
+            gatherPendingReviewDomComments(document),
+        );
+        if (!comments.length) return '';
+        const parts = [
+            `# Pending review comments for ${pageUrl}`,
+            `Pending comments: ${comments.length}`,
+            ...comments.map(formatPendingReviewCommentContext),
+        ];
+        onProgress('Done');
+        return parts.join('\n\n---\n\n');
     }
 
     // --- Visible Comments Scraper ---
@@ -19815,6 +20196,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    async function copyPendingReviewCommentsContext(btn) {
+        return copyContextWith(btn, {
+            gather: gatherPendingReviewCommentsContext,
+            initialStatus: 'Gathering pending review comments...',
+            successLabel: 'Copied pending comments',
+            errorLabel: 'copy pending review comments context',
+        });
+    }
+
     async function revealAllContext(btn, { restoreMs = 2000 } = {}) {
         if (btn._running) return;
         btn._running = true;
@@ -19901,6 +20291,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    async function revealPendingReviewComments(btn, { restoreMs = 0 } = {}) {
+        if (btn._running) return false;
+        btn._running = true;
+        const origText = btn.textContent;
+        const stopAnim = startBrailleAnimation((frame) => {
+            const remaining = getPendingReviewRevealTargets().length;
+            btn.textContent = `${frame} ${remaining > 0 ? remaining + ' pending...' : 'finishing...'}`;
+        });
+        const popup = makeStatusPopup('Opening pending review comments only...');
+        const finish = (msg, shortMsg, ok = false) => {
+            stopAnim();
+            btn.textContent = shortMsg || msg;
+            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            const restore = () => {
+                btn.textContent = origText;
+                popup.remove();
+                btn._running = false;
+            };
+            if (restoreMs <= 0) restore();
+            else setTimeout(restore, restoreMs);
+            return ok;
+        };
+
+        try {
+            for (let round = 0; round < 10; round++) {
+                const targets = getPendingReviewRevealTargets();
+                if (targets.length === 0) return finish('Pending comments are open or loaded', '✅', true);
+                popup.textContent = `Opening pending review comments only... ${targets.length} remaining`;
+                targets[0]?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+                targets.forEach((target) => target.click?.());
+                await ackSleep(500);
+            }
+            const remaining = getPendingReviewRevealTargets().length;
+            if (remaining === 0) return finish('Pending comments are open or loaded', '✅', true);
+            return finish(`${remaining} pending comments still appear collapsed`, '❌', false);
+        } catch (e) {
+            console.error('ACKtopus: reveal pending review comments failed:', e);
+            return finish(`Error: ${e.message}`, '❌', false);
+        }
+    }
+
     function buildContextCopyGroup() {
         const compact = GM_getValue('compactToolbar', false);
         const group = document.createElement('div');
@@ -19916,6 +20347,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     getAnalysisMode() === ANALYSIS_MODES.commit
                         ? 'Copy only the patch of the currently viewed commit to clipboard'
                         : 'Copy PR description, commits, and full patch to clipboard',
+                revealBeforeCopy: 'all',
                 enabled: () => !isIssue,
                 run: (btn) => copyPatchContext(btn),
             },
@@ -19927,25 +20359,56 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     getAnalysisMode() === ANALYSIS_MODES.commit
                         ? 'Copy PR description and visible comments for the currently viewed commit, without any patch'
                         : `Copy ${isIssue ? 'issue' : 'PR'} description and comments, without any patch`,
+                revealBeforeCopy: 'all',
                 enabled: () => true,
                 run: (btn) => copyCommentsContext(btn),
+            },
+            {
+                key: 'pending',
+                emoji: '⏳',
+                label: 'Pending',
+                tip: 'Copy pending review comments only, with file, line, thread, permalink, and target context',
+                revealBeforeCopy: 'pending',
+                enabled: () => !isIssue && getAnalysisMode() !== ANALYSIS_MODES.commit,
+                run: (btn) => copyPendingReviewCommentsContext(btn),
             },
             {
                 key: 'full',
                 emoji: '📎',
                 label: 'Full',
                 tip: 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)',
+                revealBeforeCopy: 'all',
                 enabled: () => true,
                 run: (btn) => copyPRContext(btn),
             },
         ];
         let selectedAction = GM_getValue('contextCopyAction', 'patch');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
-        const contextShiftSuffix = () => (ackShiftPressed ? ` ${SHIFT_REVEAL_HINT}` : '');
+        const contextModeSuffix = (action) => {
+            if (!action.revealBeforeCopy) return '';
+            if (ackShiftPressed) return ` ${SHIFT_VISIBLE_ONLY_HINT}`;
+            if (action.revealBeforeCopy === 'all') return ` ${SHIFT_REVEAL_HINT}`;
+            return '';
+        };
+        const contextActionTitle = (action) => {
+            if (action.revealBeforeCopy === 'all') {
+                return `${action.tip}\nDefault: reveal hidden/resolved/collapsed content first, then copy.\nShift+click: copy currently open/loaded content only.`;
+            }
+            if (action.revealBeforeCopy === 'pending') {
+                return `${action.tip}\nDefault: open only pending review comments already present on the page, then copy all pending drafts available from GitHub data.\nShift+click: copy pending drafts without opening page UI.`;
+            }
+            return action.tip;
+        };
         const runContextCopyAction = async (action, btn, e) => {
             if (!action.enabled()) return;
-            if (eventUsesShiftAlternate(e) && getRevealAllState().total > 0) {
+            if (action.revealBeforeCopy === 'all' && !eventUsesShiftAlternate(e) && getRevealAllState().total > 0) {
                 await revealAllContext(btn, { restoreMs: 0 });
+            } else if (
+                action.revealBeforeCopy === 'pending' &&
+                !eventUsesShiftAlternate(e) &&
+                getPendingReviewRevealTargets().length > 0
+            ) {
+                await revealPendingReviewComments(btn, { restoreMs: 0 });
             }
             await action.run(btn);
         };
@@ -19954,9 +20417,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const updateMainLabel = () => {
             const action = getAction();
             mainBtn.innerHTML = compact
-                ? `${action.emoji}${contextShiftSuffix()}`
-                : `${action.emoji} ${action.label}${contextShiftSuffix()}`;
-            mainBtn.title = `${action.tip}\nShift+click: reveal hidden/resolved/collapsed content first, then copy.`;
+                ? `${action.emoji}${contextModeSuffix(action)}`
+                : `${action.emoji} ${action.label}${contextModeSuffix(action)}`;
+            mainBtn.title = contextActionTitle(action);
             const enabled = action.enabled();
             mainBtn.disabled = !enabled;
             mainBtn.style.opacity = enabled ? '' : '0.35';
@@ -20029,7 +20492,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
             const renderItem = () => {
-                item.textContent = `${action.emoji} ${action.label}${contextShiftSuffix()}`;
+                item.textContent = `${action.emoji} ${action.label}${contextModeSuffix(action)}`;
             };
             renderItem();
             registerShiftAlternateRenderer(item, renderItem);
@@ -21784,7 +22247,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.132
+// @version      1.136
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26996,6 +27459,57 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('pending review reveal ignores visible comment menus and reactions', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="js-line-comments">
+                <div class="timeline-comment js-pending-review-comment">
+                    <div class="timeline-comment-header">
+                        <span class="Label--warning">Pending</span>
+                        <details class="details-overlay">
+                            <summary class="timeline-comment-action" aria-haspopup="menu">Actions</summary>
+                            <details-menu><button>Edit</button></details-menu>
+                        </details>
+                        <details class="js-reaction-popover-container">
+                            <summary aria-label="Add your reaction">React</summary>
+                            <button data-reaction-content="+1">Like</button>
+                        </details>
+                    </div>
+                    <div class="markdown-body">Pending draft</div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            ackEq(getPendingReviewRevealTargets(host).length, 0, 'does not target visible menus or reaction popovers');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('pending review reveal opens only ancestor collapsed review wrappers', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="js-line-comments">
+                <details class="js-resolvable-timeline-thread-container">
+                    <summary id="safe-pending-summary">Collapsed pending thread</summary>
+                    <div class="timeline-comment">
+                        <span class="Label--warning">Pending</span>
+                        <div class="markdown-body">Pending draft</div>
+                    </div>
+                </details>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const targets = getPendingReviewRevealTargets(host);
+            ackEq(targets.length, 1, 'finds one collapsed thread target');
+            ackEq(targets[0].id, 'safe-pending-summary', 'targets the thread summary, not nested controls');
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('context copy dropdown includes unified reveal-all action', () => {
         const source = _ackSource;
         const group = source.slice(
@@ -30752,6 +31266,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('embedded diff context recovers commented code for pending copies', () => {
+        const out = formatEmbeddedDiffLineContext(
+            [
+                {
+                    path: 'src/index/base.cpp',
+                    newCommitOid: '7933e270eea628f0f58d864fdb3ef32cddc40f2f',
+                    diffLines: [
+                        { type: 'HUNK', text: '@@ -272,7 +272,15 @@ bool BaseIndex::Commit()' },
+                        {
+                            type: 'CONTEXT',
+                            left: 272,
+                            right: 272,
+                            text: "    // Don't commit anything if we haven't indexed any block yet",
+                        },
+                        {
+                            type: 'CONTEXT',
+                            left: 273,
+                            right: 273,
+                            text: '    // (this could happen if init is interrupted).',
+                        },
+                        { type: 'CONTEXT', left: 274, right: 274, text: '    bool ok = m_best_block_index != nullptr;' },
+                        { type: 'ADDITION', right: 275, text: '    if (!ok) return true;' },
+                    ],
+                },
+            ],
+            'src/index/base.cpp',
+            '274',
+            '7933e270',
+        );
+        ackAssert(out.includes('@@ -272,7 +272,15 @@ bool BaseIndex::Commit()'), 'includes the hunk header');
+        ackAssert(
+            out.includes('bool ok = m_best_block_index != nullptr;'),
+            'includes the line the pending comment targets',
+        );
+        ackAssert(out.includes("Don't commit anything"), 'includes nearby context before the target line');
+    });
+
     ackTest('renderBodyMarkdown preserves blockquotes without adding inline backticks', () => {
         const host = document.createElement('div');
         host.innerHTML = `
@@ -31151,10 +31702,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(group.includes('runContextCopyAction'), 'context split group routes clicks through one runner');
         ackAssert(group.includes('eventUsesShiftAlternate(e)'), 'context copy checks Shift-click');
         ackAssert(
-            group.includes('revealAllContext(btn, { restoreMs: 0 })'),
-            'Shift-click reveals all before copying',
+            group.includes("revealBeforeCopy: 'all'"),
+            'broad context actions reveal all by default',
         );
-        ackAssert(group.includes('SHIFT_REVEAL_HINT'), 'Shift context-copy mode shows reveal hint');
+        ackAssert(
+            group.includes("!eventUsesShiftAlternate(e) && getRevealAllState().total > 0"),
+            'default context copy reveals all before copying',
+        );
+        ackAssert(group.includes('SHIFT_VISIBLE_ONLY_HINT'), 'Shift context-copy mode shows visible-only hint');
         ackAssert(
             group.includes("revealItem.dataset.ackRevealAll = 'true'"),
             'reveal-all item is rendered as a menu-only action',
@@ -31215,6 +31770,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             commentsFn.includes('Gathering commit comments context'),
             'shows commit-specific comments status text',
         );
+        ackAssert(commentsFn.includes('copyPendingReviewCommentsContext'), 'has pending-review comments copy helper');
+        ackAssert(commentsFn.includes('gatherPendingReviewCommentsContext'), 'pending helper gathers pending only');
+        ackAssert(group.includes("key: 'pending'"), 'context menu has a pending comments action');
+        ackAssert(group.includes("emoji: '⏳'"), 'pending comments action is visually marked');
+        ackAssert(group.includes('copyPendingReviewCommentsContext'), 'pending action copies pending comments');
+        ackAssert(group.includes("revealBeforeCopy: 'pending'"), 'pending action opens only pending comments by default');
+        ackAssert(group.includes('revealPendingReviewComments'), 'pending action uses targeted pending reveal');
+        ackAssert(group.includes('copy pending drafts without opening page UI'), 'Shift skips page opening for pending copy');
     });
 
     ackTest('gatherPatchContext omits comments but keeps patch content', () => {
@@ -31238,6 +31801,71 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('includePatch: false'), 'omits patch content');
         ackAssert(fn.includes('includeComments: true'), 'keeps comments');
         ackAssert(fn.includes('includeCommits: false'), 'omits commit list for comments-only context');
+    });
+
+    ackTest('pending review comments context keeps line and thread metadata', () => {
+        const text = formatPendingReviewCommentContext(
+            {
+                source: 'GraphQL viewerLatestReview',
+                author: 'l0rinc',
+                date: '2026-05-31T10:00:00Z',
+                markdown: 'Could this use the pointer form here?',
+                permalink: 'https://github.com/bitcoin/bitcoin/pull/1#discussion_r123',
+                threadId: 'PRRT_kwDO',
+                replyToId: '123',
+                file: 'src/foo.cpp',
+                line: '42',
+                commitSha: 'abcdef123456',
+                diffHunk: '@@\n- HaveCoin();\n+ PeekCoin();',
+                isPending: true,
+            },
+            0,
+        );
+        ackAssert(text.includes('## Pending comment 1 - src/foo.cpp:42@abcdef123456'), 'title has file line commit');
+        ackAssert(text.includes('* Thread: PRRT_kwDO'), 'metadata includes thread');
+        ackAssert(text.includes('* Reply to: 123'), 'metadata includes reply target');
+        ackAssert(text.includes('* Permalink: https://github.com/bitcoin/bitcoin/pull/1#discussion_r123'), 'metadata includes permalink');
+        ackAssert(text.includes('```diff\n@@\n- HaveCoin();\n+ PeekCoin();\n```'), 'includes diff hunk context');
+        ackAssert(text.includes('### Pending comment\nCould this use the pointer form here?'), 'includes exact pending body');
+    });
+
+    ackTest('pending review comments prefer code context over duplicated selected comment context', () => {
+        const text = formatPendingReviewCommentContext(
+            {
+                source: 'visible DOM',
+                author: 'l0rinc',
+                markdown: 'Could this use the pointer form here?',
+                file: 'src/foo.cpp',
+                line: '42',
+                commitSha: 'abcdef123456',
+                codeContext: '@@\n bool ok = m_best_block_index != nullptr;',
+                threadContext: '## Selected comment\nCould this use the pointer form here?',
+                isPending: true,
+            },
+            0,
+        );
+        ackAssert(text.includes('bool ok = m_best_block_index != nullptr;'), 'keeps target code context');
+        ackAssert(!text.includes('### Visible thread context'), 'does not duplicate a selected-only thread context');
+    });
+
+    ackTest('pending review comments gather from GraphQL, page data, and DOM without reveal-all', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function gatherPendingReviewCommentsContext'),
+            source.indexOf('// --- Visible Comments Scraper'),
+        );
+        ackAssert(fn.includes('fetchViewerPendingReviewComments'), 'uses GraphQL pending review comments');
+        ackAssert(fn.includes('readViewerPendingReviewFromSSR'), 'uses embedded page pending review data');
+        ackAssert(fn.includes('gatherPendingReviewDomComments'), 'uses DOM pending comments as fallback/enrichment');
+        ackAssert(fn.includes('mergePendingReviewComments'), 'deduplicates across sources');
+        ackAssert(!fn.includes('revealAllContext'), 'does not visually open hidden GitHub content');
+        const graphQL = source.slice(
+            source.indexOf('async function fetchViewerPendingReviewComments'),
+            source.indexOf('function formatPendingReviewCommentContext'),
+        );
+        ackAssert(graphQL.includes('viewerLatestReview'), 'queries viewer latest review');
+        ackAssert(graphQL.includes("review.state !== 'PENDING'"), 'keeps only pending review comments');
+        ackAssert(graphQL.includes('diffHunk'), 'requests target diff hunk context');
     });
 
     ackTest('gatherSingleCommitPatchContext copies only the viewed commit patch', () => {
@@ -34927,9 +35555,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.132', () => {
+    ackTest('version bumped to 1.136', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.132' || _ackSource.includes('@version      1.132'), 'version is 1.132');
+        ackAssert(versionFromMeta === '1.136' || _ackSource.includes('@version      1.136'), 'version is 1.136');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -36674,6 +37302,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         buildContextBlock,
         gatherVisibleComments,
         gatherFullPRContext,
+        gatherPendingReviewCommentsContext,
+        formatPendingReviewCommentContext,
+        mergePendingReviewComments,
+        formatEmbeddedDiffLineContext,
         hashPrompt,
         buildPromptCacheKey,
         parseCoAuthoredBy,
