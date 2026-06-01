@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.136
+// @version      1.138
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1889,22 +1889,22 @@
             seen.add(el);
             targets.push(el);
         };
+        const hasAttrContaining = (el, name, needle) =>
+            String(el?.getAttribute?.(name) || '')
+                .toLowerCase()
+                .includes(needle);
         const isSafePendingDetails = (details) => {
             if (!details || details.open) return false;
-            if (details.closest(COMMENT_MENU_ROOT_SELECTOR)) return false;
-            if (
-                details.matches(
-                    '.details-overlay, [data-target="action-menu.overlay"], ' +
-                        '.js-reaction-popover-container, .new-reactions-dropdown, .js-comment-header-reaction-button',
-                )
-            )
-                return false;
-            if (
-                details.querySelector?.(
-                    ':scope > summary.timeline-comment-action, :scope > summary[aria-haspopup="menu"], ' +
-                        ':scope > summary[aria-label*="reaction" i], :scope > summary[aria-label*="react" i]',
-                )
-            )
+            if (details.classList?.contains('details-overlay')) return false;
+            if (details.classList?.contains('js-reaction-popover-container')) return false;
+            if (details.classList?.contains('new-reactions-dropdown')) return false;
+            if (details.classList?.contains('js-comment-header-reaction-button')) return false;
+            if (details.getAttribute?.('data-target') === 'action-menu.overlay') return false;
+            const summary = [...(details.children || [])].find((child) => child.tagName === 'SUMMARY');
+            if (!summary) return false;
+            if (summary.classList?.contains('timeline-comment-action')) return false;
+            if (hasAttrContaining(summary, 'aria-haspopup', 'menu')) return false;
+            if (hasAttrContaining(summary, 'aria-label', 'reaction') || hasAttrContaining(summary, 'aria-label', 'react'))
                 return false;
             return !!details.closest?.(
                 '.outdated-comment, .js-resolvable-timeline-thread-container, .js-line-comments, ' +
@@ -1921,7 +1921,7 @@
             const scope =
                 marker.closest?.(`${COMMENT_CONTAINER_SELECTOR}, ${COMMENT_THREAD_SELECTOR}`) || marker;
             const details = marker.closest?.('details:not([open])');
-            if (isSafePendingDetails(details)) push(details.querySelector(':scope > summary') || details);
+            if (isSafePendingDetails(details)) push([...details.children].find((child) => child.tagName === 'SUMMARY') || details);
             const minimized =
                 scope.closest?.('.minimized-comment, .Details-content--hidden-not-important') ||
                 scope.querySelector?.('.minimized-comment, .Details-content--hidden-not-important');
@@ -20864,6 +20864,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             alignItems: 'center',
             width: 'max-content',
         });
+        wrapper.appendChild(toolbar);
+        document.body.appendChild(wrapper);
 
         // --- ACK toggle button (PR only) ---
         if (onPR) {
@@ -21212,8 +21214,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         toolbar.style.cursor = 'pointer';
         toolbar.title = 'Click background to toggle compact mode';
 
-        wrapper.appendChild(toolbar);
-        document.body.appendChild(wrapper);
         scheduleRepoMirrorSlowPageHint(wrapper);
         try {
             if (sessionStorage.getItem('ack_reopen_robot_panel') === '1') {
@@ -22247,7 +22247,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.136
+// @version      1.138
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -30581,7 +30581,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('"by me"'), 'prompt maps by-me wording to current viewer login');
         ackAssert(fn.includes('"I suggested"'), 'prompt maps first-person suggestion wording');
         ackAssert(fn.includes('Stop after the current GitHub API page or LLM read finishes'), 'search can be stopped');
-        ackAssert(fn.includes('navigateToExactCommentUrl(item.htmlUrl)'), 'falls back to exact GitHub permalink navigation');
+        ackAssert(
+            fn.includes('navigateToExactCommentUrl(targetUrl || item.htmlUrl)'),
+            'falls back to exact permalink or configured mirror navigation',
+        );
         ackAssert(_ackSource.includes('ack_skip_hash_reveal_once'), 'permalink navigation suppresses broad hash reveal');
     });
 
@@ -31674,6 +31677,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
         ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
+    });
+
+    ackTest('toolbar shell is attached before optional groups are built', () => {
+        const inject = _ackSource.slice(_ackSource.indexOf('function inject()'), _ackSource.indexOf('// --- Hide GitHub'));
+        const attachIdx = inject.indexOf('document.body.appendChild(wrapper)');
+        const contextIdx = inject.indexOf('toolbar.appendChild(buildContextCopyGroup())');
+        const robotIdx = inject.indexOf('toolbar.appendChild(buildRobotRecipeGroup(wrapper))');
+        ackAssert(attachIdx > -1, 'toolbar wrapper is attached');
+        ackAssert(contextIdx > -1, 'context group exists');
+        ackAssert(robotIdx > -1, 'robot group exists');
+        ackAssert(attachIdx < contextIdx, 'context copy group cannot prevent toolbar shell insertion');
+        ackAssert(attachIdx < robotIdx, 'robot group cannot prevent toolbar shell insertion');
     });
 
     ackTest('context copy helpers delegate to shared clipboard helper', () => {
@@ -35555,9 +35570,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.136', () => {
+    ackTest('version bumped to 1.138', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.136' || _ackSource.includes('@version      1.136'), 'version is 1.136');
+        ackAssert(versionFromMeta === '1.138' || _ackSource.includes('@version      1.138'), 'version is 1.138');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
