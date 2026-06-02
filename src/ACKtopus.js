@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.142
+// @version      1.143
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -7692,49 +7692,74 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         const commentRow = container.closest('tr.inline-comments, tr.js-inline-comments-container');
         const threadEl = threadRoot || getCommentThreadRoot(container) || container;
         const diffTable = threadEl.querySelector?.('table.diff-table, .js-diff-table');
+        const loc = getCommentLocationInfo(container, threadEl);
         let codeRows = [];
         let targetRow = null;
+
+        const rowCodeSelector =
+            'td.blob-code, td.diff-text, .blob-code-inner, .diff-text-cell, code.diff-text, ' +
+            '[data-testid="diff-line-content"], [class*="blobCode"]';
+
+        const getRowLineNumber = (row) => {
+            const codeCell = row.querySelector(rowCodeSelector);
+            if (codeCell) {
+                let sibling = codeCell.previousElementSibling;
+                while (sibling) {
+                    if (sibling.hasAttribute?.('data-line-number')) {
+                        const val = sibling.getAttribute('data-line-number') || '';
+                        if (val) return val;
+                    }
+                    sibling = sibling.previousElementSibling;
+                }
+            }
+            const nums = [...row.querySelectorAll('[data-line-number]')]
+                .map((el) => el.getAttribute('data-line-number') || '')
+                .filter(Boolean);
+            return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || '';
+        };
+
+        const rowHasCode = (row) => !!row.querySelector?.(rowCodeSelector);
+        const findRowForLine = (line) => {
+            if (!line) return null;
+            const wanted = String(line);
+            return codeRows.find((row) => String(getRowLineNumber(row)) === wanted) || null;
+        };
 
         if (commentRow) {
             const tbody = commentRow.closest('tbody') || diffTable?.querySelector?.('tbody');
             codeRows = [
                 ...(tbody?.querySelectorAll?.('tr:not(.inline-comments):not(.js-inline-comments-container)') || []),
-            ];
+            ].filter(rowHasCode);
             targetRow = commentRow.previousElementSibling;
         } else if (diffTable) {
             codeRows = [...diffTable.querySelectorAll('tr')].filter(
                 (row) => row.querySelector('[data-line-number]') && row.querySelector('td.blob-code, td.diff-text'),
             );
-            targetRow = codeRows[codeRows.length - 1] || null;
         }
 
-        if (!codeRows.length || !targetRow) return '';
+        if (!codeRows.length) {
+            codeRows = [
+                ...(threadEl.querySelectorAll?.('[data-testid="diff-line"], [class*="DiffLine"], tr') || []),
+            ].filter(rowHasCode);
+        }
+
+        if (!codeRows.length) return getEmbeddedDiffLineContext(loc.file, loc.line, loc.commitSha);
+
+        const lineRow = findRowForLine(loc.line);
+        if (lineRow) targetRow = lineRow;
+        if (!targetRow || !codeRows.includes(targetRow)) targetRow = codeRows[codeRows.length - 1] || null;
 
         const targetIdx = codeRows.indexOf(targetRow);
-        if (targetIdx < 0) return '';
-
-        const getRowLineNumber = (row) => {
-            const codeCell = row.querySelector('td.blob-code, td.diff-text');
-            if (!codeCell) return '';
-            let sibling = codeCell.previousElementSibling;
-            while (sibling) {
-                if (sibling.hasAttribute?.('data-line-number')) {
-                    const val = sibling.getAttribute('data-line-number') || '';
-                    if (val) return val;
-                }
-                sibling = sibling.previousElementSibling;
-            }
-            const nums = [...row.querySelectorAll('[data-line-number]')]
-                .map((el) => el.getAttribute('data-line-number') || '')
-                .filter(Boolean);
-            return nums[nums.length - 1] || '';
-        };
+        if (targetIdx < 0) return getEmbeddedDiffLineContext(loc.file, loc.line, loc.commitSha);
 
         // Classify each row as +/-/space so the copied block is readable as a
         // real diff. Prefer data-code-marker (modern GitHub), fall back to the
         // classic blob-code-{addition,deletion,context} class modifiers.
         const getRowDiffSign = (row) => {
-            const marker = row.querySelector('[data-code-marker]')?.getAttribute('data-code-marker') || '';
+            const marker =
+                row.getAttribute?.('data-code-marker') ||
+                row.querySelector('[data-code-marker]')?.getAttribute('data-code-marker') ||
+                '';
             if (marker === '+' || marker === '-') return marker;
             if (marker) return ' ';
             const codeCell = row.querySelector('td.blob-code, td.diff-text');
@@ -7752,7 +7777,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             const lineNum = getRowLineNumber(row);
             const sign = getRowDiffSign(row);
             const codeEl =
-                row.querySelector('.blob-code-inner, .diff-text-cell, code.diff-text') ||
+                row.querySelector('.blob-code-inner, .diff-text-cell, code.diff-text, [data-testid="diff-line-content"], [class*="blobCode"]') ||
                 row.querySelector('td.blob-code, td.diff-text');
             const rawCode = String(codeEl?.innerText || codeEl?.textContent || '').replace(/\r\n/g, '\n');
             const parts = rawCode.split('\n');
@@ -13751,6 +13776,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (threadId) meta.push(`* Thread: ${threadId}`);
         if (isResolved) meta.push(`* Resolved: yes`);
         if (meta.length > 0) parts.push(`## Metadata\n${meta.join('\n')}`);
+        const codeContext = getCommentCodeContext(root, threadRoot) || getEmbeddedDiffLineContext(file, line, commitSha);
+        if (codeContext) parts.push(`## Target line context\n\`\`\`diff\n${codeContext}\n\`\`\``);
 
         const selectedMeta = [`* Author: ${author}`, date ? `* Date: ${date}` : '', `* Permalink: ${permalink}`].filter(
             Boolean,
@@ -14266,6 +14293,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (n.nodeType !== 1) continue;
                 changed = true;
                 pendingMutationRoots.add(n);
+                scheduleFastCommitPrefill(n);
                 if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
                     pendingMutationHiddenLoadersChanged = true;
                 }
@@ -14474,7 +14502,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function isInlineThreadReplyTextarea(ta, form) {
         if (!ta) return false;
-        if (form?.querySelector?.('input[name="in_reply_to"], input[name="inReplyTo"]')) return true;
+        const replyInputSelector = [
+            'input[name="in_reply_to"]',
+            'input[name="inReplyTo"]',
+            'input[name="reply_to"]',
+            'input[name="replyTo"]',
+            'input[name$="[in_reply_to]"]',
+            'input[name$="[reply_to]"]',
+        ].join(', ');
+        if (form?.querySelector?.(replyInputSelector)) return true;
+        const action = form?.getAttribute?.('action') || '';
+        if (/\/review_comment\/\d+\/(?:repl(?:y|ies))(?=\?|\/|$)|\/repl(?:y|ies)(?=\?|\/|$)/.test(action)) return true;
         if (ta.closest('.review-thread-reply, [data-testid="review-thread-reply"]')) return true;
 
         const thread = ta.closest(
@@ -14484,10 +14522,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const postedComment = [
             ...thread.querySelectorAll(
-                '.timeline-comment-group.review-comment, [id^="discussion_r"], a.js-timestamp[href*="#discussion_r"]',
+                `${MARKDOWN_BODY_SELECTOR}, .timeline-comment-group.review-comment, [id^="discussion_r"], ` +
+                    'a.js-timestamp[href*="#discussion_r"], .js-comment-body, .comment-body, ' +
+                    '[data-testid="comment-body"], [data-testid*="comment-body" i]',
             ),
-        ].find((el) => !form?.contains(el));
+        ].find((el) => !form?.contains(el) && !el.closest?.('form'));
         return !!postedComment;
+    }
+
+    let _fastCommitPrefillTimer = null;
+    const _fastCommitPrefillRoots = new Set();
+
+    function scheduleFastCommitPrefill(root = document, delayMs = 0) {
+        if (_ackTesting) return;
+        if (!isCommitScopedPRView(location.pathname)) return;
+        const target =
+            root === document
+                ? document
+                : root?.nodeType === 1
+                  ? root
+                  : root?.parentElement || document;
+        if (target !== document && target.tagName !== 'TEXTAREA' && !target.querySelector?.('textarea')) return;
+        _fastCommitPrefillRoots.add(target);
+        if (_fastCommitPrefillTimer) return;
+        _fastCommitPrefillTimer = ackSetTimeout(() => {
+            _fastCommitPrefillTimer = null;
+            const roots = [..._fastCommitPrefillRoots];
+            _fastCommitPrefillRoots.clear();
+            for (const r of roots) {
+                try {
+                    if (r !== document && r.isConnected === false) continue;
+                    prefillCommitHash(r);
+                } catch (e) {
+                    if (!_ackTesting) console.warn('ACKtopus: fast commit prefill failed:', e);
+                }
+            }
+        }, delayMs);
     }
 
     // Auto-prefills new inline comment textareas with a markdown link to the
@@ -14601,7 +14671,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     document.addEventListener('focusin', (e) => {
         if (_ackTesting || !isPRPage()) return;
         const t = e.target;
-        if (t?.tagName === 'TEXTAREA') prefillCommitHash(t);
+        if (t?.tagName === 'TEXTAREA') {
+            prefillCommitHash(t);
+            scheduleFastCommitPrefill(t.closest?.('form') || t, 80);
+        }
     });
 
     // Some GitHub diff UIs reveal (unhide) an existing inline-comment textarea
@@ -14620,16 +14693,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_commitPrefillSweepPending) return;
         _commitPrefillSweepPending = true;
         ackRaf(() => {
-            _commitPrefillSweepPending = false;
             try {
                 prefillCommitHash(document);
             } catch {}
             // Some inline forms appear after an async include-fragment render.
+            for (const delay of [60, 180, 450]) {
+                ackSetTimeout(() => {
+                    try {
+                        prefillCommitHash(document);
+                    } catch {}
+                }, delay);
+            }
             ackSetTimeout(() => {
                 try {
                     prefillCommitHash(document);
                 } catch {}
-            }, 250);
+                _commitPrefillSweepPending = false;
+            }, 800);
         });
     };
     document.addEventListener(
@@ -22621,7 +22701,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.142
+// @version      1.143
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -31640,7 +31720,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('let sibling = codeCell.previousElementSibling'), 'walks left from the code cell');
         ackAssert(fn.includes('if (val) return val'), 'prefers the nearest non-empty adjacent line number');
         ackAssert(
-            fn.includes("return nums[nums.length - 1] || ''"),
+            fn.includes("return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || ''"),
             'falls back to the last populated line number in the row',
         );
         ackAssert(
@@ -31657,6 +31737,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(!fn.includes('<<<'), 'copied comment code context does not add target markers');
         ackAssert(fn.includes('data-code-marker'), 'classifies rows by data-code-marker attribute');
+        ackAssert(fn.includes('findRowForLine(loc.line)'), 'chooses the row matching the comment line');
+        ackAssert(fn.includes('getEmbeddedDiffLineContext(loc.file, loc.line, loc.commitSha)'), 'falls back to embedded diff context');
         ackAssert(
             fn.includes('blob-code|diff-text)-addition') || fn.includes('blob-code-addition'),
             'falls back to classic addition classes',
@@ -31876,8 +31958,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         host.style.left = '-99999px';
         host.innerHTML = `
             <div class="js-line-comments">
-                <a href="/bitcoin/bitcoin/pull/34124/files/8bd49123#diff-deadbeef" class="text-mono Link--primary">src/txmempool.cpp</a>
-                <table class="diff-table"><tbody><tr><td data-line-number="760"></td></tr></tbody></table>
+                <a href="/bitcoin/bitcoin/pull/34124/files/8bd49123#diff-deadbeefR760" class="text-mono Link--primary">src/txmempool.cpp</a>
+                <table class="diff-table">
+                    <tbody>
+                        <tr>
+                            <td data-line-number="760">760</td>
+                            <td class="blob-code blob-code-context"><span class="blob-code-inner">    exact commented line</span></td>
+                        </tr>
+                        <tr>
+                            <td data-line-number="761">761</td>
+                            <td class="blob-code blob-code-context"><span class="blob-code-inner">    unrelated following line</span></td>
+                        </tr>
+                    </tbody>
+                </table>
                 <div id="discussion_r1" class="timeline-comment-group review-comment">
                     <h3><a class="author" href="/alice">alice</a><a id="discussion_r1-permalink" href="#discussion_r1"><relative-time datetime="2026-03-05T10:00:00Z"></relative-time></a></h3>
                     <div class="markdown-body">Original thread comment</div>
@@ -31892,6 +31985,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             const ctx = gatherCommentContext(host.querySelector('#discussion_r2'));
             ackAssert(ctx.includes('src/txmempool.cpp:760@8bd49123'), 'includes file, line, and commit');
+            ackAssert(ctx.includes('## Target line context'), 'includes target line context section');
+            ackAssert(ctx.includes(' 760|     exact commented line'), 'quotes exact commented line');
             ackAssert(ctx.includes('## Selected comment'), 'includes selected comment section');
             ackAssert(ctx.includes('Follow-up concern'), 'includes selected comment text');
             ackAssert(ctx.includes('## Prior thread context (1 comment)'), 'includes only prior thread section');
@@ -36015,9 +36110,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.142', () => {
+    ackTest('version bumped to 1.143', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.142' || _ackSource.includes('@version      1.142'), 'version is 1.142');
+        ackAssert(versionFromMeta === '1.143' || _ackSource.includes('@version      1.143'), 'version is 1.143');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -36779,6 +36874,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('// --- Quick Comment Actions'),
         );
         ackAssert(fn.includes('isInlineThreadReplyTextarea(ta, form)'), 'uses shared thread-reply guard');
+    });
+
+    ackTest('isInlineThreadReplyTextarea detects existing thread bodies', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="review-thread-component">
+                <div class="markdown-body">Existing review comment</div>
+                <form><textarea></textarea><button>Reply</button></form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const form = host.querySelector('form');
+            const ta = host.querySelector('textarea');
+            ackEq(isInlineThreadReplyTextarea(ta, form), true, 'existing thread body means reply form');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('commit prefix prefill has a fast targeted path for new inline comment boxes', () => {
+        ensureSelfSource();
+        const collectFn = _ackSource.slice(
+            _ackSource.indexOf('function collectDomMutationBatch'),
+            _ackSource.indexOf('function drainDomMutationBatch'),
+        );
+        const helperFn = _ackSource.slice(
+            _ackSource.indexOf('function scheduleFastCommitPrefill'),
+            _ackSource.indexOf('// Auto-prefills new inline comment textareas'),
+        );
+        const sweepFn = _ackSource.slice(
+            _ackSource.indexOf('const scheduleCommitPrefillSweep'),
+            _ackSource.indexOf("document.addEventListener(\n        'click'", _ackSource.indexOf('const scheduleCommitPrefillSweep')),
+        );
+        ackAssert(collectFn.includes('scheduleFastCommitPrefill(n)'), 'added roots trigger fast prefill');
+        ackAssert(helperFn.includes('prefillCommitHash(r)'), 'fast path calls targeted prefill');
+        ackAssert(sweepFn.includes('[60, 180, 450]'), 'click sweep retries quickly for async form mount');
     });
 
     ackTest('buildCommitPrefix returns prefix for /changes/<sha> URLs', () => {
