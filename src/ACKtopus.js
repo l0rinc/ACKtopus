@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.138
+// @version      1.141
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -807,6 +807,198 @@
             });
         });
     }
+
+    // --- Interaction-aware background work ---
+    // GitHub's React/Turbo pages can emit mutation bursts while the user types
+    // or scrolls. ACKtopus background rescans must yield to direct interaction.
+    const ACK_INTERACTION_KEYBOARD_IDLE_MS = 1500;
+    const ACK_INTERACTION_SCROLL_IDLE_MS = 1500;
+    const ACK_INTERACTION_POINTER_IDLE_MS = 1000;
+    const ACK_INTERACTION_POINTER_MOVE_IDLE_MS = 700;
+    const ACK_INTERACTION_SELECTION_IDLE_MS = 1200;
+    const ACK_BACKGROUND_MIN_DELAY_MS = 80;
+    const ACK_BACKGROUND_IDLE_TIMEOUT_MS = 1800;
+    const ACK_LAZY_COMMENT_BATCH_SIZE = 2;
+    let _ackInteractionQuietUntil = 0;
+    let _ackInteractionGeneration = 0;
+    let _ackLastActivityReason = '';
+    const _ackBackgroundJobs = new Map();
+    const _ackBackgroundLogTimes = new Map();
+
+    function ackNow() {
+        return (typeof performance !== 'undefined' && performance.now && performance.now()) || Date.now();
+    }
+
+    function ackDebugLoggingEnabled() {
+        try {
+            return !GM_getValue('compactToolbar', false);
+        } catch (_) {
+            return true;
+        }
+    }
+
+    function ackBackgroundLog(message, details = {}, throttleMs = 1000) {
+        if (_ackTesting || !ackDebugLoggingEnabled()) return;
+        const now = ackNow();
+        const key = message + JSON.stringify(Object.keys(details).sort());
+        const last = _ackBackgroundLogTimes.get(key) || 0;
+        if (throttleMs && now - last < throttleMs) return;
+        _ackBackgroundLogTimes.set(key, now);
+        try {
+            console.log(`ACKtopus: ${message}`, details);
+        } catch (_) {
+            console.log(`ACKtopus: ${message}`);
+        }
+    }
+
+    function isAckUserInteracting() {
+        return ackNow() < _ackInteractionQuietUntil;
+    }
+
+    function ackInteractionDelay(extraDelay = ACK_BACKGROUND_MIN_DELAY_MS) {
+        return Math.max(extraDelay, Math.ceil(_ackInteractionQuietUntil - ackNow()));
+    }
+
+    function clearAckBackgroundJobTimer(job) {
+        if (job.timer) {
+            ackClearTimeout(job.timer);
+            job.timer = null;
+        }
+        if (job.idleId && typeof cancelIdleCallback === 'function') {
+            try {
+                cancelIdleCallback(job.idleId);
+            } catch (_) {}
+        }
+        job.idleId = null;
+    }
+
+    function runAckBackgroundJob(job) {
+        job.timer = null;
+        if (isAckUserInteracting()) {
+            scheduleAckBackgroundTimer(job, 'still-active');
+            return;
+        }
+        const interactionGen = _ackInteractionGeneration;
+        const run = (deadline = null) => {
+            job.idleId = null;
+            if (isAckUserInteracting() || interactionGen !== _ackInteractionGeneration) {
+                scheduleAckBackgroundTimer(job, 'activity-before-run');
+                return;
+            }
+            _ackBackgroundJobs.delete(job.label);
+            const started = ackNow();
+            ackBackgroundLog('background work start', {
+                label: job.label,
+                age_ms: Math.round(started - job.queuedAt),
+                last_activity: _ackLastActivityReason,
+            });
+            try {
+                job.fn({
+                    deadline,
+                    isCanceled: () => isAckUserInteracting() || interactionGen !== _ackInteractionGeneration,
+                });
+            } finally {
+                const elapsed = Math.round(ackNow() - started);
+                ackBackgroundLog('background work done', { label: job.label, elapsed_ms: elapsed }, 500);
+            }
+        };
+        if (typeof requestIdleCallback === 'function') {
+            job.idleId = requestIdleCallback(run, { timeout: job.timeoutMs });
+        } else {
+            job.timer = ackSetTimeout(() => run(null), 0);
+        }
+    }
+
+    function scheduleAckBackgroundTimer(job, reason = 'schedule') {
+        clearAckBackgroundJobTimer(job);
+        const delay = ackInteractionDelay(job.delayMs);
+        ackBackgroundLog(
+            delay > job.delayMs ? 'background work deferred for interaction' : 'background work queued',
+            { label: job.label, reason, delay_ms: delay, pending_jobs: _ackBackgroundJobs.size },
+            1000,
+        );
+        job.timer = ackSetTimeout(() => runAckBackgroundJob(job), delay);
+    }
+
+    function scheduleAckBackgroundWork(label, fn, opts = {}) {
+        const job =
+            _ackBackgroundJobs.get(label) ||
+            {
+                label,
+                timer: null,
+                idleId: null,
+                queuedAt: ackNow(),
+                delayMs: ACK_BACKGROUND_MIN_DELAY_MS,
+                timeoutMs: ACK_BACKGROUND_IDLE_TIMEOUT_MS,
+                fn,
+            };
+        job.fn = fn;
+        job.delayMs = opts.delayMs ?? job.delayMs ?? ACK_BACKGROUND_MIN_DELAY_MS;
+        job.timeoutMs = opts.timeoutMs ?? job.timeoutMs ?? ACK_BACKGROUND_IDLE_TIMEOUT_MS;
+        job.queuedAt = job.queuedAt || ackNow();
+        _ackBackgroundJobs.set(label, job);
+        scheduleAckBackgroundTimer(job, opts.reason || 'schedule');
+    }
+
+    function markAckUserActivity(reason, quietMs) {
+        if (_ackTesting) return;
+        const now = ackNow();
+        const prevQuietUntil = _ackInteractionQuietUntil;
+        const nextQuietUntil = Math.max(_ackInteractionQuietUntil, now + quietMs);
+        _ackInteractionQuietUntil = nextQuietUntil;
+        const extensionMs = nextQuietUntil - prevQuietUntil;
+        const sameReason = reason === _ackLastActivityReason;
+        _ackLastActivityReason = reason;
+        if (sameReason && extensionMs < 120) return;
+        _ackInteractionGeneration++;
+        ackBackgroundLog(
+            'user activity paused background work',
+            {
+                reason,
+                quiet_ms: Math.round(_ackInteractionQuietUntil - now),
+                pending_jobs: _ackBackgroundJobs.size,
+            },
+            1000,
+        );
+        for (const job of _ackBackgroundJobs.values()) scheduleAckBackgroundTimer(job, `activity:${reason}`);
+    }
+
+    function installAckInteractionGuards() {
+        const passiveCapture = { capture: true, passive: true };
+        const keyboard = (e) => {
+            if (!e?.isTrusted) return;
+            markAckUserActivity(e.type, ACK_INTERACTION_KEYBOARD_IDLE_MS);
+        };
+        const scroll = (e) => {
+            if (e && e.isTrusted === false) return;
+            markAckUserActivity(e?.type || 'scroll', ACK_INTERACTION_SCROLL_IDLE_MS);
+        };
+        const pointer = (e) => {
+            if (!e?.isTrusted) return;
+            markAckUserActivity(e.type, ACK_INTERACTION_POINTER_IDLE_MS);
+        };
+        const pointerMove = (e) => {
+            if (!e?.isTrusted) return;
+            markAckUserActivity(e.type, ACK_INTERACTION_POINTER_MOVE_IDLE_MS);
+        };
+        const selection = () => {
+            const sel = document.getSelection?.();
+            if (!sel || sel.isCollapsed) return;
+            markAckUserActivity('selectionchange', ACK_INTERACTION_SELECTION_IDLE_MS);
+        };
+        document.addEventListener('keydown', keyboard, passiveCapture);
+        document.addEventListener('beforeinput', keyboard, passiveCapture);
+        document.addEventListener('input', keyboard, passiveCapture);
+        document.addEventListener('wheel', scroll, passiveCapture);
+        document.addEventListener('touchmove', scroll, passiveCapture);
+        document.addEventListener('scroll', scroll, passiveCapture);
+        window.addEventListener('scroll', scroll, { passive: true });
+        document.addEventListener('pointerdown', pointer, passiveCapture);
+        document.addEventListener('pointermove', pointerMove, passiveCapture);
+        document.addEventListener('selectionchange', selection, { passive: true });
+    }
+
+    installAckInteractionGuards();
 
     function isVisible(el) {
         if (!el || el.nodeType !== 1) return false;
@@ -13897,19 +14089,60 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function processVisibleComment(container) {
         if (_ackTesting) return;
+        const started = ackNow();
         // Deferred to visibility: API-heavy work + per-comment decoration.
         expandReactionAvatars(container);
         verifyPGPSignatures(container);
         addCommitBadges(container);
+        const elapsed = Math.round(ackNow() - started);
+        if (elapsed > 25) ackBackgroundLog('visible comment decoration was slow', { elapsed_ms: elapsed }, 1000);
+    }
+
+    const lazyCommentQueue = [];
+    const lazyCommentQueued = new WeakSet();
+
+    function scheduleLazyCommentProcessing() {
+        scheduleAckBackgroundWork(
+            'lazy-comments',
+            ({ isCanceled }) => {
+                let processed = 0;
+                while (lazyCommentQueue.length && processed < ACK_LAZY_COMMENT_BATCH_SIZE) {
+                    if (isCanceled()) break;
+                    const target = lazyCommentQueue.shift();
+                    if (target?.isConnected) {
+                        processVisibleComment(target);
+                        processed++;
+                    }
+                }
+                ackBackgroundLog(
+                    'lazy comment batch',
+                    { processed, remaining: lazyCommentQueue.length },
+                    lazyCommentQueue.length ? 1000 : 0,
+                );
+                if (lazyCommentQueue.length) {
+                    scheduleLazyCommentProcessing();
+                }
+            },
+            { delayMs: 120, reason: 'visible-comment' },
+        );
     }
 
     const lazyCommentObserver = new IntersectionObserver(
         (entries) => {
             if (_ackTesting) return;
+            let queued = 0;
             for (const entry of entries) {
                 if (!entry.isIntersecting) continue;
                 lazyCommentObserver.unobserve(entry.target);
-                processVisibleComment(entry.target);
+                if (!lazyCommentQueued.has(entry.target)) {
+                    lazyCommentQueued.add(entry.target);
+                    lazyCommentQueue.push(entry.target);
+                    queued++;
+                }
+            }
+            if (queued) {
+                ackBackgroundLog('lazy comments queued after visibility', { queued, total: lazyCommentQueue.length });
+                scheduleLazyCommentProcessing();
             }
         },
         { rootMargin: '200px' },
@@ -13990,6 +14223,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    function runRootInjectorsForNames(root, names, ctx = currentInjectContext()) {
+        const wanted = new Set(names);
+        for (const inj of ROOT_INJECTORS) {
+            if (!wanted.has(inj.name)) continue;
+            if (inj.when && !inj.when(ctx)) continue;
+            try {
+                inj.fn(root);
+            } catch (e) {
+                if (!_ackTesting) console.warn(`ACKtopus: injector failed (${inj.name})`, e);
+            }
+        }
+    }
+
     function runDocInjectors(ctx = currentInjectContext()) {
         for (const inj of DOC_INJECTORS) {
             if (inj.when && !inj.when(ctx)) continue;
@@ -14001,64 +14247,107 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    // Watch for dynamically added elements (incremental: only scan added subtrees)
+    // Watch for dynamically added elements. Batches are coalesced and run in
+    // idle time so GitHub typing/scrolling stays responsive on huge PRs.
+    const HIDDEN_LOADER_SELECTOR =
+        '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn, ' +
+        ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR;
     let mutationPending = false;
+    const pendingMutationRoots = new Set();
+    let pendingMutationHadRemovals = false;
+    let pendingMutationPrTitleBtnRemoved = false;
+    let pendingMutationHiddenLoadersChanged = false;
     let _domObserverAbortGen = 0;
+
+    function collectDomMutationBatch(mutations) {
+        let changed = false;
+        for (const m of mutations) {
+            for (const n of m.addedNodes) {
+                if (n.nodeType !== 1) continue;
+                changed = true;
+                pendingMutationRoots.add(n);
+                if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
+                    pendingMutationHiddenLoadersChanged = true;
+                }
+            }
+            for (const n of m.removedNodes) {
+                if (n.nodeType !== 1) continue;
+                changed = true;
+                pendingMutationHadRemovals = true;
+                if (n.matches?.('.ack-pr-title-proofread') || n.querySelector?.('.ack-pr-title-proofread')) {
+                    pendingMutationPrTitleBtnRemoved = true;
+                }
+                if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
+                    pendingMutationHiddenLoadersChanged = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    function drainDomMutationBatch(isCanceled) {
+        mutationPending = false;
+        const roots = [...pendingMutationRoots];
+        const hadRemovals = pendingMutationHadRemovals;
+        const prTitleBtnRemoved = pendingMutationPrTitleBtnRemoved;
+        const hiddenLoadersChanged = pendingMutationHiddenLoadersChanged;
+        pendingMutationRoots.clear();
+        pendingMutationHadRemovals = false;
+        pendingMutationPrTitleBtnRemoved = false;
+        pendingMutationHiddenLoadersChanged = false;
+        if (roots.length === 0 && !prTitleBtnRemoved && !hadRemovals) return;
+        const ctx = currentInjectContext();
+        ackBackgroundLog('mutation injector batch', {
+            roots: roots.length,
+            removals: hadRemovals,
+            hidden_loaders: hiddenLoadersChanged,
+            last_activity: _ackLastActivityReason,
+        });
+        for (const root of roots) {
+            if (isCanceled()) {
+                pendingMutationRoots.add(root);
+                mutationPending = true;
+                scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
+                    delayMs: 160,
+                    reason: 'canceled-mid-batch',
+                });
+                return;
+            }
+            if (root !== document && !root.isConnected) continue;
+            runRootInjectors(root, ctx);
+        }
+        // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
+        focusVisibleDeleteCommentConfirmButton();
+        if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
+        runDocInjectors(ctx);
+        if (hiddenLoadersChanged) {
+            if (!shouldSuppressHiddenConversationRefresh()) {
+                refreshToolbarForLiveUpdate('hidden-conversations');
+            }
+            return;
+        }
+        if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
+    }
+
     new MutationObserver((mutations) => {
-        if (_ackTesting || mutationPending || !shouldRunEditorInjectors()) return;
+        if (_ackTesting || !shouldRunEditorInjectors()) return;
+        if (!collectDomMutationBatch(mutations)) return;
         const lt = ensureAckLifetime('dom-observer');
         if (lt.gen !== _domObserverAbortGen) {
             _domObserverAbortGen = lt.gen;
             lt.onAbort(() => {
                 mutationPending = false;
+                pendingMutationRoots.clear();
+                pendingMutationHadRemovals = false;
+                pendingMutationPrTitleBtnRemoved = false;
+                pendingMutationHiddenLoadersChanged = false;
             });
         }
+        if (mutationPending) return;
         mutationPending = true;
-        ackRaf(() => {
-            mutationPending = false;
-            // Collect all added element roots from this batch
-            const roots = [];
-            let prTitleBtnRemoved = false;
-            for (const m of mutations) {
-                for (const n of m.addedNodes) {
-                    if (n.nodeType === 1) roots.push(n);
-                }
-                for (const n of m.removedNodes) {
-                    if (n.nodeType !== 1) continue;
-                    if (n.matches?.('.ack-pr-title-proofread') || n.querySelector?.('.ack-pr-title-proofread')) {
-                        prTitleBtnRemoved = true;
-                    }
-                }
-            }
-            const hadRemovals = mutations.some((m) => [...m.removedNodes].some((n) => n.nodeType === 1));
-            if (roots.length === 0 && !prTitleBtnRemoved && !hadRemovals) return;
-            const ctx = currentInjectContext();
-            for (const root of roots) {
-                runRootInjectors(root, ctx);
-            }
-            // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
-            focusVisibleDeleteCommentConfirmButton();
-            if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
-            runDocInjectors(ctx);
-            const hiddenLoaderSelector =
-                '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn, ' +
-                ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR;
-            const hiddenLoadersChanged =
-                ctx.onToolbar &&
-                [...mutations].some((m) =>
-                    [...m.addedNodes, ...m.removedNodes].some(
-                        (n) =>
-                            n.nodeType === 1 &&
-                            (n.matches?.(hiddenLoaderSelector) || n.querySelector?.(hiddenLoaderSelector)),
-                    ),
-                );
-            if (hiddenLoadersChanged) {
-                if (!shouldSuppressHiddenConversationRefresh()) {
-                    refreshToolbarForLiveUpdate('hidden-conversations');
-                }
-                return;
-            }
-            if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
+        scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
+            delayMs: 120,
+            reason: 'mutation',
         });
     }).observe(document.body, { childList: true, subtree: true });
 
@@ -14066,27 +14355,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // data-resolved, open) that the childList observer misses. Debounced to
     // avoid thrashing on rapid attribute changes during React reconciliation.
     let attrRefreshPending = false;
+    const pendingAttrRoots = new Set();
     let _attrObserverAbortGen = 0;
-    new MutationObserver((mutations) => {
-        if (_ackTesting || attrRefreshPending || !shouldRunEditorInjectors()) return;
+
+    function attrRefreshRoot(target) {
+        return (
+            target?.closest?.(
+                `${COMMENT_CONTAINER_SELECTOR}, ${EDIT_FORM_SELECTOR}, [data-testid="markdown-editor"], ` +
+                    '[class*="MarkdownEditor-module__container"], .js-previewable-comment-form, .js-write-bucket, form',
+            ) ||
+            target?.parentElement ||
+            null
+        );
+    }
+
+    function collectAttrMutationBatch(mutations) {
+        let changed = false;
         for (const m of mutations) {
-            if (!m.target?.closest?.(COMMENT_CONTAINER_SELECTOR)) continue;
-            const lt = ensureAckLifetime('attr-observer');
-            if (lt.gen !== _attrObserverAbortGen) {
-                _attrObserverAbortGen = lt.gen;
-                lt.onAbort(() => {
-                    attrRefreshPending = false;
-                });
-            }
-            attrRefreshPending = true;
-            ackSetTimeout(() => {
-                attrRefreshPending = false;
-                const ctx = currentInjectContext();
-                runRootInjectors(document, ctx);
-                runDocInjectors(ctx);
-            }, 300);
-            return;
+            const root = attrRefreshRoot(m.target);
+            if (!root) continue;
+            changed = true;
+            pendingAttrRoots.add(root);
         }
+        return changed;
+    }
+
+    function drainAttrMutationBatch(isCanceled) {
+        attrRefreshPending = false;
+        const roots = [...pendingAttrRoots];
+        pendingAttrRoots.clear();
+        if (!roots.length) return;
+        const ctx = currentInjectContext();
+        ackBackgroundLog('attribute injector refresh', {
+            roots: roots.length,
+            last_activity: _ackLastActivityReason,
+        });
+        for (const root of roots) {
+            if (isCanceled()) {
+                pendingAttrRoots.add(root);
+                attrRefreshPending = true;
+                scheduleAckBackgroundWork('attr-observer', ({ isCanceled }) => drainAttrMutationBatch(isCanceled), {
+                    delayMs: 600,
+                    reason: 'attr-canceled-mid-batch',
+                });
+                return;
+            }
+            if (!root.isConnected) continue;
+            runRootInjectorsForNames(
+                root,
+                ['detailsButtons', 'trackEditForms', 'stickyEditToolbar', 'quickActions', 'reactionHover'],
+                ctx,
+            );
+        }
+    }
+
+    new MutationObserver((mutations) => {
+        if (_ackTesting || !shouldRunEditorInjectors()) return;
+        if (!collectAttrMutationBatch(mutations)) return;
+        const lt = ensureAckLifetime('attr-observer');
+        if (lt.gen !== _attrObserverAbortGen) {
+            _attrObserverAbortGen = lt.gen;
+            lt.onAbort(() => {
+                attrRefreshPending = false;
+                pendingAttrRoots.clear();
+            });
+        }
+        if (attrRefreshPending) return;
+        attrRefreshPending = true;
+        scheduleAckBackgroundWork('attr-observer', ({ isCanceled }) => drainAttrMutationBatch(isCanceled), {
+            delayMs: 600,
+            reason: 'attribute',
+        });
     }).observe(document.body, {
         attributes: true,
         subtree: true,
@@ -14868,7 +15207,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // After save/cancel, React may replace the entire comment container,
         // making `container` a stale detached reference. Always rescan from
         // document to ensure we find the freshly rendered header.
-        console.log('ACKtopus: schedulePostEditRefresh: scheduling quick-action rebuild');
+        ackBackgroundLog('post-edit quick-action refresh scheduled', { reason: 'edit-state-change' }, 1000);
         // Coalesce rapid edit-mode events (save + submit + React rerender) into
         // one refresh schedule to avoid stacking expensive full-document scans.
         _postEditRefreshGeneration++;
@@ -14877,9 +15216,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const gen = _postEditRefreshGeneration;
         const refresh = () => {
             if (gen !== _postEditRefreshGeneration) return;
-            document.querySelectorAll('[data-ack-quick-processed]').forEach((h) => delete h.dataset.ackQuickProcessed);
-            document.querySelectorAll('.ack-quick-actions').forEach((el) => el.remove());
-            addQuickCommentActions(document);
+            scheduleAckBackgroundWork(
+                `post-edit-refresh-${gen}`,
+                ({ isCanceled }) => {
+                    if (gen !== _postEditRefreshGeneration || isCanceled()) return;
+                    document
+                        .querySelectorAll('[data-ack-quick-processed]')
+                        .forEach((h) => delete h.dataset.ackQuickProcessed);
+                    document.querySelectorAll('.ack-quick-actions').forEach((el) => el.remove());
+                    addQuickCommentActions(document);
+                },
+                { delayMs: 80, reason: 'post-edit-refresh' },
+            );
         };
         // Multiple sweeps to catch async state changes
         _postEditRefreshTimers.push(ackSetTimeout(refresh, 800));
@@ -20826,7 +21174,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (pr) {
             await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
-            addCommitBadges(document);
+            scheduleAckBackgroundWork('commit-badges-after-api', () => addCommitBadges(document), {
+                delayMs: 120,
+                reason: 'review-comment-commit-map',
+            });
         }
     }
 
@@ -21940,6 +22291,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
+    function mutationBatchMightContainForcePush(mutations) {
+        for (const m of mutations) {
+            for (const n of [...m.addedNodes, ...m.removedNodes]) {
+                if (n.nodeType !== 1) continue;
+                const text = String(n.textContent || '');
+                if (/force[- ]?pushed/i.test(text)) return true;
+                if (n.querySelector?.('a[href*="/compare/"], a[href*="/commit/"]') && /force/i.test(text)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     function tryInject() {
         if (_ackTesting) return;
         ensureAckLifetime('tryInject');
@@ -22247,7 +22612,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.138
+// @version      1.141
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -25537,6 +25902,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(val, false, 'defaults to non-compact');
     });
 
+    ackTest('background scheduler debug logging only runs in expanded toolbar mode', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function ackBackgroundLog'), source.indexOf('function isAckUserInteracting'));
+        ackAssert(source.includes('function ackDebugLoggingEnabled'), 'has debug logging gate');
+        ackAssert(fn.includes('!ackDebugLoggingEnabled()'), 'background logs check expanded-mode gate');
+        ackAssert(source.includes("GM_getValue('compactToolbar', false)"), 'debug gate reads compact toolbar mode');
+    });
+
     ackTest('compact mode affects button text (emoji only vs emoji + label)', () => {
         const compact = true;
         const label = compact ? '📦' : '📦 Show hidden';
@@ -25666,14 +26039,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("? 'e' : 'v'"), 'edit state encoded as e/v');
     });
 
-    ackTest('attribute observer re-runs editor injectors on class/open flips', () => {
+    ackTest('attribute observer re-runs editor injectors on changed roots only', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('new MutationObserver((mutations) => {'),
             source.indexOf('}).observe(document.body, {\n        attributes: true'),
         );
-        ackAssert(fn.includes('runRootInjectors(document, ctx)'), 'attribute observer re-runs root injectors');
-        ackAssert(fn.includes('runDocInjectors(ctx)'), 'attribute observer re-runs doc injectors');
+        ackAssert(fn.includes('collectAttrMutationBatch(mutations)'), 'attribute observer collects changed roots');
+        ackAssert(fn.includes('drainAttrMutationBatch(isCanceled)'), 'attribute observer drains targeted roots');
+        ackAssert(!fn.includes('runRootInjectors(document, ctx)'), 'attribute observer does not rescan document');
+        ackAssert(!fn.includes('runDocInjectors(ctx)'), 'attribute observer does not run doc injectors');
+        const drainFn = source.slice(source.indexOf('function drainAttrMutationBatch'), source.indexOf('new MutationObserver((mutations) => {', source.indexOf('function drainAttrMutationBatch')));
+        ackAssert(drainFn.includes('runRootInjectorsForNames'), 'attribute refresh uses named root injectors');
+        ackAssert(drainFn.includes('roots: roots.length'), 'logs targeted root count');
     });
 
     ackTest('proofread edit mode uses React-compatible textarea updates', () => {
@@ -26013,11 +26391,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
 
         // MutationObserver uses the shared injector runner (root-scoped + doc injectors)
+        const drainFn = source.slice(
+            source.indexOf('function drainDomMutationBatch'),
+            source.indexOf('new MutationObserver((mutations)'),
+        );
         ackAssert(
-            source.includes('runRootInjectors(root, ctx)'),
+            drainFn.includes('runRootInjectors(root, ctx)'),
             'MutationObserver runs root injectors for added subtrees',
         );
-        ackAssert(source.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors after mutations');
+        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors after mutations');
 
         // Pipeline includes key injectors (structural)
         ackAssert(source.includes('fn: addQuickCommentActions'), 'root pipeline includes quick actions');
@@ -26651,11 +27033,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('MutationObserver is incremental: walks addedNodes instead of full document', () => {
         const source = _ackSource;
         ackAssert(source.includes('m.addedNodes'), 'iterates over addedNodes');
-        ackAssert(source.includes('n.nodeType === 1'), 'filters to element nodes');
+        ackAssert(source.includes('n.nodeType !== 1'), 'filters to element nodes');
         ackAssert(source.includes('for (const root of roots)'), 'calls helpers per root');
     });
 
-    ackTest('MutationObserver scheduling is lifetime-aware (ackRaf + abort cleanup)', () => {
+    ackTest('MutationObserver scheduling is lifetime-aware and interaction-aware', () => {
         const source = _ackSource;
         const obsSection = source.slice(
             source.indexOf('new MutationObserver((mutations)'),
@@ -26664,7 +27046,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(obsSection.includes("ensureAckLifetime('dom-observer')"), 'ties observer to page lifetime');
         ackAssert(obsSection.includes('lt.onAbort'), 'registers abort cleanup');
         ackAssert(obsSection.includes('mutationPending = false'), 'resets pending flag on abort');
-        ackAssert(obsSection.includes('ackRaf(() => {'), 'uses ackRaf (cancellable) instead of requestAnimationFrame');
+        ackAssert(obsSection.includes("scheduleAckBackgroundWork('dom-observer'"), 'schedules observer work in background');
+        ackAssert(source.includes('function markAckUserActivity'), 'tracks typing/scrolling as foreground activity');
+        ackAssert(source.includes('requestIdleCallback(run'), 'uses idle callback when available');
+        ackAssert(source.includes('background work deferred for interaction'), 'logs interaction deferrals');
+    });
+
+    ackTest('visible comment work is chunked and cancellable', () => {
+        const source = _ackSource;
+        const lazy = source.slice(
+            source.indexOf('function processVisibleComment'),
+            source.indexOf('// --- DOM Injection Pipeline ---'),
+        );
+        ackAssert(source.includes('const ACK_LAZY_COMMENT_BATCH_SIZE = 2'), 'uses small lazy-comment batches');
+        ackAssert(lazy.includes('lazyCommentQueue'), 'queues visible comments');
+        ackAssert(lazy.includes("scheduleAckBackgroundWork(\n            'lazy-comments'"), 'processes queue in background');
+        ackAssert(lazy.includes('isCanceled()'), 'checks cancellation before processing a batch');
+        ackAssert(lazy.includes('visible comment decoration was slow'), 'logs slow per-comment decoration');
     });
 
     ackTest('DOM observer editor gate includes compare-page compose mode', () => {
@@ -26754,15 +27152,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('MutationObserver runs lazy queueing and essential eager functions', () => {
         const source = _ackSource;
-        const obsSection = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
+        const drainFn = source.slice(
+            source.indexOf('function drainDomMutationBatch'),
             source.indexOf('Auto-prefill commit hash'),
         );
         // Shared injector runner keeps root-scoped mutations consistent
-        ackAssert(obsSection.includes('runRootInjectors(root, ctx)'), 'runs root injectors from observer');
-        ackAssert(obsSection.includes('runDocInjectors(ctx)'), 'runs doc injectors from observer');
+        ackAssert(drainFn.includes('runRootInjectors(root, ctx)'), 'runs root injectors from observer');
+        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'runs doc injectors from observer');
         // addCommitBadges is deferred (IntersectionObserver) and should not be forced eagerly.
-        ackAssert(!obsSection.includes('addCommitBadges(root)'), 'addCommitBadges is lazy now');
+        ackAssert(!drainFn.includes('addCommitBadges(root)'), 'addCommitBadges is lazy now');
     });
 
     ackTest('getCommentReactionMeta handles PR body via js-discussion fallback', () => {
@@ -27190,6 +27588,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('ackSetTimeout(refresh, 800)'), 'first sweep at 800ms');
         ackAssert(fn.includes('ackSetTimeout(refresh, 2500)'), 'second sweep at 2500ms');
+        ackAssert(fn.includes("scheduleAckBackgroundWork(\n                `post-edit-refresh-${gen}`"), 'refresh scan runs in background');
         ackAssert(fn.includes('delete h.dataset.ackQuickProcessed'), 'clears processed marker');
     });
 
@@ -27523,18 +27922,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('childList observer refreshes toolbar when hidden loaders appear later', () => {
         const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('const hiddenLoaderSelector'),
-            source.indexOf('if (ctx.onPR && hadRemovals)'),
+        const collectFn = source.slice(
+            source.indexOf('const HIDDEN_LOADER_SELECTOR'),
+            source.indexOf('function drainDomMutationBatch'),
         );
-        ackAssert(fn.includes('hiddenLoadersChanged'), 'detects hidden loader mutations');
-        ackAssert(fn.includes('ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR'), 'detects React issue timeline loader mutations');
+        const drainFn = source.slice(
+            source.indexOf('function drainDomMutationBatch'),
+            source.indexOf('// Attribute observer'),
+        );
+        ackAssert(collectFn.includes('pendingMutationHiddenLoadersChanged = true'), 'detects hidden loader mutations');
         ackAssert(
-            fn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
+            collectFn.includes('ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR'),
+            'detects React issue timeline loader mutations',
+        );
+        ackAssert(
+            drainFn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
             'refreshes toolbar when hidden conversation loaders appear',
         );
         ackAssert(
-            fn.includes('!shouldSuppressHiddenConversationRefresh()'),
+            drainFn.includes('!shouldSuppressHiddenConversationRefresh()'),
             'skips toolbar refresh while a review-comment hash reveal is active',
         );
     });
@@ -28673,7 +29079,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(injectFn.includes('runDocInjectors(ctx)'), 'inject runs doc injectors');
 
         const domObserver = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
+            source.indexOf('function drainDomMutationBatch'),
             source.indexOf('// Attribute observer'),
         );
         ackAssert(domObserver.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors');
@@ -28746,6 +29152,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const observerEnd = source.indexOf('})();', observerStart);
         const observer = source.slice(observerStart, observerEnd);
         ackAssert(observer.includes('location.href !== lastUrl'), 'same-URL observer ignores actual navigations');
+        ackAssert(
+            observer.includes('mutationBatchMightContainForcePush(mutations)'),
+            'same-URL observer skips unrelated DOM mutations before timeline scan',
+        );
         ackAssert(
             observer.includes('maybeRefreshToolbarForForcePushLiveUpdate()'),
             'same-URL observer checks for force-push live updates',
@@ -29177,7 +29587,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('doc injectors run once per mutation batch, not per root', () => {
         const source = _ackSource;
         const obsBlock = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
+            source.indexOf('function drainDomMutationBatch'),
             source.indexOf('Auto-prefill commit hash'),
         );
         // Doc injectors should be OUTSIDE the for-of-roots loop so expensive
@@ -35570,9 +35980,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.138', () => {
+    ackTest('version bumped to 1.141', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.138' || _ackSource.includes('@version      1.138'), 'version is 1.138');
+        ackAssert(versionFromMeta === '1.141' || _ackSource.includes('@version      1.141'), 'version is 1.141');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -37410,21 +37820,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
         pending = true;
-        ackSetTimeout(() => {
-            pending = false;
-            checkUrlChange();
-            if (isToolbarPage() || isGitHubRepoPage()) tryInject();
-        }, 500);
+        scheduleAckBackgroundWork(
+            'url-observer',
+            () => {
+                pending = false;
+                checkUrlChange();
+                if (isToolbarPage() || isGitHubRepoPage()) tryInject();
+            },
+            { delayMs: 500, reason: 'url-mutation' },
+        );
     }).observe(document.body, { childList: true, subtree: true });
 
     let liveRefreshPending = false;
-    new MutationObserver(() => {
+    new MutationObserver((mutations) => {
         if (_ackTesting) return;
         if (liveRefreshPending || location.href !== lastUrl) return;
+        if (!mutationBatchMightContainForcePush(mutations)) return;
         liveRefreshPending = true;
-        ackSetTimeout(() => {
-            liveRefreshPending = false;
-            maybeRefreshToolbarForForcePushLiveUpdate();
-        }, 500);
+        scheduleAckBackgroundWork(
+            'live-toolbar-refresh',
+            () => {
+                liveRefreshPending = false;
+                maybeRefreshToolbarForForcePushLiveUpdate();
+            },
+            { delayMs: 500, reason: 'live-mutation' },
+        );
     }).observe(document.body, { childList: true, subtree: true });
 })();
