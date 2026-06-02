@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.141
+// @version      1.142
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18808,8 +18808,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // - Show only on the final `mouseup` (avoids flicker while dragging or held double-clicks).
     // - Works for multi-line selections and side-by-side diff panes.
     // - Deterministic prompts (temperature 0) so caching is effective.
-    // - Minimal prompt for the one-line summary (fast/cheap); heavier context only
-    //   when needed (e.g. Fact check uses full PR context).
+    // - Provider/context work only happens after an explicit toolbar action.
     // - Async race-safe: request IDs prevent stale results after the selection changes.
 
     const DIFF_SELECTION_TOOLBAR_ID = 'ack-diff-selection-toolbar';
@@ -19791,7 +19790,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (_diffSelectionOneLinerEl) {
                 _diffSelectionOneLinerEl.textContent = '';
                 _diffSelectionOneLinerEl.innerHTML = '';
-                _diffSelectionOneLinerEl.style.display = 'block';
+                _diffSelectionOneLinerEl.style.display = 'none';
             }
             setDiffSelectionOutputPresentation('one-liner');
         }
@@ -19843,7 +19842,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         bar.style.left = `${left}px`;
         bar.style.top = `${top}px`;
         bar.style.visibility = 'visible';
-        if (_diffSelectionOutputMode === 'one-liner') updateDiffSelectionOneLiner(ctx);
     }
 
     async function updateDiffSelectionOneLiner(ctx) {
@@ -21632,9 +21630,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
         hideNativeCommitNav(false);
 
-        // Debounce the API call
-        if (commitNavTimer) clearTimeout(commitNavTimer);
-        commitNavTimer = setTimeout(_addFloatingCommitNavInner, 300);
+        // Debounce the API call and keep it out of the active interaction path.
+        if (commitNavTimer) ackClearTimeout(commitNavTimer);
+        commitNavTimer = ackSetTimeout(() => {
+            commitNavTimer = null;
+            scheduleAckBackgroundWork(
+                'floating-commit-nav',
+                () => {
+                    _addFloatingCommitNavInner().catch((e) => {
+                        if (!_ackTesting) console.warn('ACKtopus: floating commit nav failed:', e);
+                    });
+                },
+                { delayMs: 0, reason: 'commit-nav' },
+            );
+        }, 300);
     }
 
     async function fetchCommitList(owner, repo, prNum) {
@@ -22612,7 +22621,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.141
+// @version      1.142
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -30026,6 +30035,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('bar.style.width = `${targetW}px`'), 'sets width from clamped row width');
     });
 
+    ackTest('diff selection toolbar does not auto-run LLM work on selection', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function updateDiffSelectionToolbar'),
+            source.indexOf('async function updateDiffSelectionOneLiner'),
+        );
+        ackAssert(!fn.includes('updateDiffSelectionOneLiner(ctx)'), 'selection update does not start one-liner LLM');
+        ackAssert(fn.includes("_diffSelectionOneLinerEl.style.display = 'none'"), 'new selections keep output hidden');
+        const oneLinerFn = source.slice(
+            source.indexOf('async function updateDiffSelectionOneLiner'),
+            source.indexOf('async function fetchBatchCommitExplanations'),
+        );
+        ackAssert(oneLinerFn.includes('fetchPRContext(pr)'), 'explicit one-liner helper remains contextual when used');
+    });
+
     ackTest('diff selection one-liner does not truncate output with hard 200-char ellipsis', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -35762,6 +35786,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('(currentIdx + 1) % commits.length'), 'next wraps to first');
     });
 
+    ackTest('floating commit nav rebuild is interaction-aware', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function addFloatingCommitNav'),
+            source.indexOf('async function fetchCommitList'),
+        );
+        ackAssert(fn.includes('ackSetTimeout'), 'uses lifetime-aware debounce timer');
+        ackAssert(fn.includes("scheduleAckBackgroundWork(\n                'floating-commit-nav'"), 'schedules API work in background');
+        ackAssert(!fn.includes('commitNavTimer = setTimeout'), 'does not use raw setTimeout for nav fetch');
+    });
+
     ackTest('floating commit nav has no disabled/null button state', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
@@ -35980,9 +36015,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.141', () => {
+    ackTest('version bumped to 1.142', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.141' || _ackSource.includes('@version      1.141'), 'version is 1.141');
+        ackAssert(versionFromMeta === '1.142' || _ackSource.includes('@version      1.142'), 'version is 1.142');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
