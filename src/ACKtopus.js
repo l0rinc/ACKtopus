@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.146
+// @version      1.147
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22728,7 +22728,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.146
+// @version      1.147
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -31135,7 +31135,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!findFn.includes('scrollToAndHighlight'), 'find streaming does not auto-jump to results');
         ackAssert(!findFn.includes('navigateToExactCommentUrl'), 'find streaming does not auto-navigate to results');
         ackAssert(!findFn.includes('messages.scrollTop = messages.scrollHeight'), 'find streaming does not steal panel scroll');
-        ackAssert(fn.includes('ack_robot_chat_threads:'), 'stores robot discussions per page');
+        ackAssert(_ackSource.includes('ack_robot_chat_threads:'), 'stores robot discussions per page');
         ackAssert(fn.includes('robotChatHistoryKeyForPage()'), 'uses shared robot history key helper');
         ackAssert(fn.includes('ROBOT_CHAT_HISTORY_CLEARED_EVENT'), 'listens for robot history clear events');
         ackAssert(fn.includes("threadTitle.textContent = 'History'"), 'shows history sidebar');
@@ -31227,7 +31227,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(panelFn.includes("resize: 'vertical'"), 'chat panel is vertically resizable');
         ackAssert(panelFn.includes("closeBtn.textContent = '✕'"), 'chat panel has a close button');
         ackAssert(
-            panelFn.includes("closeBtn.addEventListener('click', () => panel.remove())"),
+            panelFn.includes("closeBtn.addEventListener('click', () => {") && panelFn.includes('panel.remove()'),
             'close button removes the panel',
         );
     });
@@ -36155,9 +36155,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.146', () => {
+    ackTest('version bumped to 1.147', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.146' || _ackSource.includes('@version      1.146'), 'version is 1.146');
+        ackAssert(versionFromMeta === '1.147' || _ackSource.includes('@version      1.147'), 'version is 1.147');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
