@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.144
+// @version      1.146
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3648,6 +3648,7 @@
 
     const DEFAULT_REPO_MIRRORS = 'bitcoin/bitcoin=https://mirror.b10c.me/bitcoin-bitcoin';
     const HEAVY_PR_COMMENT_THRESHOLD = 300;
+    const ROBOT_CHAT_HISTORY_CLEARED_EVENT = 'ack-robot-chat-history-cleared';
 
     function repoMirrorConfigText() {
         return GM_getValue('repo_mirrors', DEFAULT_REPO_MIRRORS);
@@ -4699,7 +4700,7 @@ No-peek rules, approval gate, grounding requirements, commit hygiene, and stop r
 A high-level description of the change to reproduce from the base tree: desired behavior, invariants, failure modes, constraints, and validation signals.
 
 ## Commit-By-Commit Target Jobs
-Start by stating the exact or inferred number of local commits to create from the supplied commit metadata. Then use one concise subsection per logical author commit, in original order, labeled "Commit N of M". Each subsection should describe what that commit is supposed to accomplish, why that outcome matters for review, and what evidence would validate it. Keep this abstract enough that the local agent must rediscover the implementation.
+Start by stating the exact or inferred number of local commits to create from the supplied commit metadata. Then use one concise subsection per logical author commit, in original order, labeled "Commit N of M". Each subsection should describe what that commit is supposed to accomplish as the outcome to reproduce, why that outcome matters for review, and what evidence would validate it. Keep this abstract enough that the local agent must rediscover the implementation.
 
 ## Local Commit Expectations
 How to keep the local branch reviewable: create exactly the stated number of local commits when the commit metadata is complete, tests that document existing behavior before a refactor should come first, real reproducers should live with fixes, each commit should compile or clearly explain why it cannot, and commit messages should explain the problem and result.
@@ -5038,6 +5039,21 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return `${prInfographicCachePrefix(pr)}${scopeKey}_${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${OPENAI_IMAGE_BACKGROUND}_${OPENAI_IMAGE_MODERATION}_${version}_${sha}`;
     }
 
+    function robotChatHistoryKeyForPage(ctx = parsePageContext() || currentCommitRepoContext?.() || null) {
+        const pageKey =
+            ctx?.owner && ctx?.repo ? `${ctx.owner}/${ctx.repo}${ctx.pr ? `#${ctx.pr}` : ''}` : location.pathname;
+        return `ack_robot_chat_threads:${pageKey}`;
+    }
+
+    function clearRobotChatHistoryForPage() {
+        const key = robotChatHistoryKeyForPage();
+        const existing = GM_getValue(key, null);
+        if (existing == null) return 0;
+        GM_deleteValue(key);
+        window.dispatchEvent(new CustomEvent(ROBOT_CHAT_HISTORY_CLEARED_EVENT, { detail: { key } }));
+        return 1;
+    }
+
     function normalizeInfographicCacheValue(value) {
         if (!value) return null;
         if (typeof value === 'string') return { b64: value, mimeType: `image/${OPENAI_IMAGE_FORMAT}` };
@@ -5140,6 +5156,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 count++;
             }
         });
+        count += clearRobotChatHistoryForPage();
         return count;
     }
 
@@ -7571,9 +7588,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         }
 
         const fileLink = threadEl.querySelector?.('a[href*="/files/"][href*="#diff-"]');
+        const fileLinkHref = fileLink?.getAttribute('href') || '';
         if (fileLink) {
             if (!file) file = fileLink.textContent?.trim() || '';
-            const shaMatch = fileLink.getAttribute('href')?.match(/\/files\/([0-9a-f]{7,40})/);
+            const shaMatch = fileLinkHref.match(/\/files\/([0-9a-f]{7,40})/);
             if (shaMatch) commitSha = shaMatch[1].slice(0, 8);
         }
 
@@ -7581,6 +7599,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (commentRow) {
             const lineRow = commentRow.previousElementSibling;
             line = lineRow?.querySelector('[data-line-number]')?.getAttribute('data-line-number') || '';
+        }
+
+        if (!line && fileLinkHref) {
+            const lineMatch = fileLinkHref.match(/#diff-\w+[RL](\d+)/);
+            if (lineMatch) line = lineMatch[1];
         }
 
         if (!line) {
@@ -7591,11 +7614,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     line = allLineNums[allLineNums.length - 1].getAttribute('data-line-number') || '';
                 }
             }
-        }
-
-        if (!line && fileLink) {
-            const lineMatch = fileLink.getAttribute('href')?.match(/#diff-\w+[RL](\d+)/);
-            if (lineMatch) line = lineMatch[1];
         }
 
         if (!commitSha) {
@@ -9275,7 +9293,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             closeBtn.style.borderColor = 'transparent';
             closeBtn.style.background = 'transparent';
         });
-        closeBtn.addEventListener('click', () => panel.remove());
+        let onRobotHistoryCleared = null;
+        closeBtn.addEventListener('click', () => {
+            if (onRobotHistoryCleared) window.removeEventListener(ROBOT_CHAT_HISTORY_CLEARED_EVENT, onRobotHistoryCleared);
+            panel.remove();
+        });
 
         header.appendChild(title);
         header.appendChild(closeBtn);
@@ -9427,11 +9449,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // PR diff context for chat: fetched once per panel (can be large)
         let chatDiffBlock = null;
         let chatDiffPromise = null;
-        const chatThreadStorageKey = (() => {
-            const ctx = parsePageContext() || currentCommitRepoContext?.() || null;
-            const pageKey = ctx?.owner && ctx?.repo ? `${ctx.owner}/${ctx.repo}${ctx.pr ? `#${ctx.pr}` : ''}` : location.pathname;
-            return `ack_robot_chat_threads:${pageKey}`;
-        })();
+        const chatThreadStorageKey = robotChatHistoryKeyForPage();
         let robotThreads = loadRobotChatThreads();
         let activeThreadId = '';
 
@@ -10206,6 +10224,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const thread = createRobotThread();
             selectRobotThread(thread.id);
         });
+        onRobotHistoryCleared = (e) => {
+            if (e?.detail?.key !== chatThreadStorageKey) return;
+            robotThreads = [createRobotThread()];
+            activeThreadId = robotThreads[0].id;
+            renderRobotThreadList();
+            renderRobotThreadMessages();
+        };
+        window.addEventListener(ROBOT_CHAT_HISTORY_CLEARED_EVENT, onRobotHistoryCleared);
         chatPageIndex = gatherPageIndex();
         activeThreadId = robotThreads[0]?.id || createRobotThread().id;
         renderRobotThreadList();
@@ -22702,7 +22728,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.144
+// @version      1.146
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -31110,6 +31136,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!findFn.includes('navigateToExactCommentUrl'), 'find streaming does not auto-navigate to results');
         ackAssert(!findFn.includes('messages.scrollTop = messages.scrollHeight'), 'find streaming does not steal panel scroll');
         ackAssert(fn.includes('ack_robot_chat_threads:'), 'stores robot discussions per page');
+        ackAssert(fn.includes('robotChatHistoryKeyForPage()'), 'uses shared robot history key helper');
+        ackAssert(fn.includes('ROBOT_CHAT_HISTORY_CLEARED_EVENT'), 'listens for robot history clear events');
         ackAssert(fn.includes("threadTitle.textContent = 'History'"), 'shows history sidebar');
         ackAssert(fn.includes('rememberMessage('), 'persists messages as the discussion continues');
         ackAssert(fn.includes('newThreadBtn'), 'new discussion control exists');
@@ -32155,6 +32183,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('llm_lightbulb_autoopen_'), 'clears auto-open cache flags');
         ackAssert(fn.includes('infographicPrefix'), 'has infographic prefix');
         ackAssert(fn.includes('prInfographicCachePrefix(pr)'), 'clears infographic cache through helper prefix');
+        ackAssert(fn.includes('clearRobotChatHistoryForPage()'), 'clears PR robot chat history with PR caches');
+        ackAssert(_ackSource.includes('function robotChatHistoryKeyForPage'), 'has shared robot history key helper');
+        ackAssert(_ackSource.includes('ack_robot_chat_threads:'), 'robot history uses dedicated storage prefix');
     });
 
     ackTest('minisign signature detection in verifyPGPSignatures', () => {
@@ -36124,9 +36155,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.144', () => {
+    ackTest('version bumped to 1.146', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.144' || _ackSource.includes('@version      1.144'), 'version is 1.144');
+        ackAssert(versionFromMeta === '1.146' || _ackSource.includes('@version      1.146'), 'version is 1.146');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
