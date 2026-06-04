@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.148
+// @version      1.149
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3646,6 +3646,15 @@
         return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
     }
 
+    function getCurrentGitHubLogin(root = document) {
+        const doc = root?.ownerDocument || document;
+        return (
+            doc.querySelector('meta[name="user-login"]')?.content ||
+            doc.querySelector('meta[name="octolytics-actor-login"]')?.content ||
+            ''
+        ).trim();
+    }
+
     const DEFAULT_REPO_MIRRORS = 'bitcoin/bitcoin=https://mirror.b10c.me/bitcoin-bitcoin';
     const HEAVY_PR_COMMENT_THRESHOLD = 300;
     const ROBOT_CHAT_HISTORY_CLEARED_EVENT = 'ack-robot-chat-history-cleared';
@@ -3884,6 +3893,95 @@
 
     function isGitHubRepoPage(path = location.pathname, root = document) {
         return !!currentGitHubRepo(root, path);
+    }
+
+    function isPullRequestListPage(path = location.pathname) {
+        return /^\/[^/?#]+\/[^/?#]+\/pulls\/?$/.test(String(path || ''));
+    }
+
+    function normalizePullsListQuery(query, opts = {}) {
+        const tokens = String(query || '')
+            .trim()
+            .split(/\s+/)
+            .map((token) => token.trim())
+            .filter(Boolean)
+            .filter((token) => !/^sort:/i.test(token))
+            .filter((token) => !/^is:issue$/i.test(token));
+        if (opts.author !== undefined) {
+            for (let i = tokens.length - 1; i >= 0; i--) {
+                if (/^author:/i.test(tokens[i])) tokens.splice(i, 1);
+            }
+        }
+        if (!tokens.some((token) => /^is:pr$/i.test(token))) tokens.unshift('is:pr');
+        if (!tokens.some((token) => /^is:(?:open|closed|merged)$/i.test(token))) tokens.push('is:open');
+        if (opts.author) tokens.push(`author:${opts.author}`);
+        tokens.push('sort:updated-desc');
+        return tokens.join(' ');
+    }
+
+    function pullsListUrlWithQuery(opts = {}) {
+        if (!isPullRequestListPage(opts.path || location.pathname)) return null;
+        const url = new URL(opts.href || location.href, location.origin);
+        const nextQuery = normalizePullsListQuery(url.searchParams.get('q') || '', {
+            author: opts.author,
+        });
+        url.searchParams.set('q', nextQuery);
+        url.searchParams.delete('sort');
+        return sameOriginPath(url);
+    }
+
+    function ensurePullsRecentlyUpdatedSort(opts = {}) {
+        const path = opts.path || location.pathname;
+        const href = opts.href || location.href;
+        if (_ackTesting || !isPullRequestListPage(path)) return false;
+        const next = pullsListUrlWithQuery({ path, href });
+        const current = sameOriginPath(new URL(href, location.origin));
+        if (!next || next === current) return false;
+        location.replace(next);
+        return true;
+    }
+
+    function findPullsAuthorFilterControl(root = document) {
+        const controls = qsa(root, 'summary, button, a, [role="button"]').filter(isVisible);
+        const labelOf = (el) =>
+            String(el?.textContent || el?.getAttribute?.('aria-label') || el?.title || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+        return controls.find((el) => /^Author$/i.test(labelOf(el))) || null;
+    }
+
+    function enhancePullRequestListPage(root = document, opts = {}) {
+        const path = opts.path || location.pathname;
+        const href = opts.href || location.href;
+        if (!isPullRequestListPage(path)) return;
+        ensurePullsRecentlyUpdatedSort({ path, href });
+        const login = getCurrentGitHubLogin(root);
+        if (!login) return;
+        const doc = root?.ownerDocument || document;
+        if (doc.querySelector('.ack-my-prs-filter')) return;
+        const authorControl = findPullsAuthorFilterControl(root) || findPullsAuthorFilterControl(document);
+        if (!authorControl) return;
+        const insertionTarget = authorControl.closest('details') || authorControl;
+        if (!insertionTarget?.parentElement) return;
+        const myPullsHref = pullsListUrlWithQuery({ author: login, path, href });
+        if (!myPullsHref) return;
+
+        const btn = document.createElement('a');
+        btn.className = 'ack-my-prs-filter btn btn-sm';
+        btn.href = myPullsHref;
+        btn.textContent = 'Mine 👤';
+        btn.title = `Show PRs authored by ${login}, sorted by recently updated`;
+        Object.assign(btn.style, {
+            marginLeft: '6px',
+            verticalAlign: 'middle',
+            whiteSpace: 'nowrap',
+        });
+        const currentQ = new URL(href, location.origin).searchParams.get('q') || '';
+        if (new RegExp(`(?:^|\\s)author:${login.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`, 'i').test(currentQ)) {
+            btn.setAttribute('aria-current', 'true');
+            btn.style.fontWeight = '600';
+        }
+        insertionTarget.insertAdjacentElement('afterend', btn);
     }
 
     function isComparePullRequestButton(link) {
@@ -14217,6 +14315,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const ROOT_INJECTORS = [
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
         { name: 'localRepoCompareLinks', when: (ctx) => ctx.onRepositoryPage, fn: rewriteLocalRepoCompareLinks },
+        { name: 'pullRequestListPage', when: (ctx) => ctx.onRepositoryPage, fn: enhancePullRequestListPage },
         { name: 'queueLazyComments', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: queueLazyComments },
         { name: 'startReviewButtons', when: (ctx) => ctx.onPR, fn: addStartReviewButtons },
         {
@@ -14290,6 +14389,62 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    const FAST_EDITOR_AFFORDANCE_SELECTOR =
+        COMMENT_CONTAINER_SELECTOR +
+        ', ' +
+        EDIT_SCOPE_SELECTOR +
+        ', [data-testid="comment-header"], .timeline-comment-header, .review-comment-header, ' +
+        'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, ' +
+        '[class*="Toolbar-module__toolbar"], textarea';
+    const FAST_EDITOR_INJECTORS = ['detailsButtons', 'trackEditForms', 'quickActions'];
+    let fastEditorAffordanceTimer = null;
+    const pendingFastEditorRoots = new Set();
+
+    function rootMayNeedFastEditorAffordances(root) {
+        if (!root || root.nodeType !== 1) return false;
+        try {
+            return (
+                root.matches?.(FAST_EDITOR_AFFORDANCE_SELECTOR) ||
+                !!root.querySelector?.(FAST_EDITOR_AFFORDANCE_SELECTOR)
+            );
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function runFastEditorAffordances(root, ctx = currentInjectContext()) {
+        if (!root || root.nodeType !== 1 || !root.isConnected) return;
+        if (!((ctx.onToolbar && !ctx.onCompare) || ctx.onCompose)) return;
+        if (!rootMayNeedFastEditorAffordances(root)) return;
+        runRootInjectorsForNames(root, FAST_EDITOR_INJECTORS, ctx);
+    }
+
+    function attrTargetMayNeedFastEditorAffordances(target) {
+        if (!target || target.nodeType !== 1) return false;
+        try {
+            if (target.matches?.(FAST_EDITOR_AFFORDANCE_SELECTOR)) return true;
+        } catch (_) {}
+        const classText =
+            typeof target.className === 'string' ? target.className : target.getAttribute?.('class') || '';
+        const markerText = `${classText} ${target.getAttribute?.('data-testid') || ''}`;
+        return /comment-header|markdown-editor|edit-comment|Toolbar|CommentBox|ActivityThread|ReviewThread|is-comment-editing|js-comment-update|js-previewable-comment-form|write-bucket/i.test(
+            markerText,
+        );
+    }
+
+    function scheduleFastEditorAffordances(root) {
+        if (_ackTesting || !rootMayNeedFastEditorAffordances(root)) return;
+        pendingFastEditorRoots.add(root);
+        if (fastEditorAffordanceTimer) return;
+        fastEditorAffordanceTimer = ackSetTimeout(() => {
+            fastEditorAffordanceTimer = null;
+            const roots = [...pendingFastEditorRoots];
+            pendingFastEditorRoots.clear();
+            const ctx = currentInjectContext();
+            for (const queuedRoot of roots) runFastEditorAffordances(queuedRoot, ctx);
+        }, 40);
+    }
+
     function runDocInjectors(ctx = currentInjectContext()) {
         for (const inj of DOC_INJECTORS) {
             if (inj.when && !inj.when(ctx)) continue;
@@ -14320,6 +14475,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (n.nodeType !== 1) continue;
                 changed = true;
                 pendingMutationRoots.add(n);
+                scheduleFastEditorAffordances(n);
                 scheduleFastCommitPrefill(n);
                 if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
                     pendingMutationHiddenLoadersChanged = true;
@@ -14431,6 +14587,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!root) continue;
             changed = true;
             pendingAttrRoots.add(root);
+            if (attrTargetMayNeedFastEditorAffordances(m.target)) scheduleFastEditorAffordances(root);
         }
         return changed;
     }
@@ -15315,6 +15472,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // making `container` a stale detached reference. Always rescan from
         // document to ensure we find the freshly rendered header.
         ackBackgroundLog('post-edit quick-action refresh scheduled', { reason: 'edit-state-change' }, 1000);
+        if (container?.isConnected) {
+            runFastEditorAffordances(container);
+            scheduleFastEditorAffordances(container);
+        }
+        scheduleQuickActionsSoftRescan(120);
         // Coalesce rapid edit-mode events (save + submit + React rerender) into
         // one refresh schedule to avoid stacking expensive full-document scans.
         _postEditRefreshGeneration++;
@@ -15916,11 +16078,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function addQuickCommentActions(root = document) {
-        const currentUser = (
-            document.querySelector('meta[name="user-login"]')?.content ||
-            document.querySelector('meta[name="octolytics-actor-login"]')?.content ||
-            ''
-        ).trim();
+        const currentUser = getCurrentGitHubLogin();
 
         // Find all comment headers across classic and React UI.
         // GitHub has multiple markup variants:
@@ -22728,7 +22886,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.148
+// @version      1.149
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -27168,6 +27326,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('background work deferred for interaction'), 'logs interaction deferrals');
     });
 
+    ackTest('editor affordance buttons refresh quickly without full document rescans', () => {
+        const source = _ackSource;
+        const fastSection = sourceSection(source, 'const FAST_EDITOR_AFFORDANCE_SELECTOR', 'function runDocInjectors');
+        ackAssert(fastSection.includes('FAST_EDITOR_INJECTORS'), 'has named fast editor injector list');
+        ackAssert(
+            fastSection.includes('runRootInjectorsForNames(root, FAST_EDITOR_INJECTORS, ctx)'),
+            'fast refresh runs only selected root injectors',
+        );
+        ackAssert(!fastSection.includes('runRootInjectors(document'), 'fast refresh does not run document injectors');
+
+        const childBatch = sourceSection(source, 'function collectDomMutationBatch', 'function drainDomMutationBatch');
+        ackAssert(childBatch.includes('scheduleFastEditorAffordances(n)'), 'added editor/comment roots get fast refresh');
+
+        const attrBatch = sourceSection(source, 'function collectAttrMutationBatch', 'function drainAttrMutationBatch');
+        ackAssert(
+            attrBatch.includes('attrTargetMayNeedFastEditorAffordances(m.target)'),
+            'attribute fast refresh is gated to editor/comment targets',
+        );
+    });
+
     ackTest('visible comment work is chunked and cancellable', () => {
         const source = _ackSource;
         const lazy = source.slice(
@@ -27702,6 +27880,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'function schedulePostEditRefresh',
             "document.addEventListener(\n        'submit'",
         );
+        ackAssert(fn.includes('runFastEditorAffordances(container)'), 'runs immediate scoped affordance refresh');
+        ackAssert(fn.includes('scheduleQuickActionsSoftRescan(120)'), 'schedules quick soft rescan');
         ackAssert(fn.includes('ackSetTimeout(refresh, 800)'), 'first sweep at 800ms');
         ackAssert(fn.includes('ackSetTimeout(refresh, 2500)'), 'second sweep at 2500ms');
         ackAssert(fn.includes("scheduleAckBackgroundWork(\n                `post-edit-refresh-${gen}`"), 'refresh scan runs in background');
@@ -28917,6 +29097,72 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ].join('');
         ackDeepEq(currentGitHubRepo(host, '/fallback/repo'), { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' });
         ackEq(currentGitHubRepoBaseBranch(host), 'trunk');
+    });
+
+    ackTest('pull request list URLs use recently-updated sort and current-user author filter', () => {
+        ackEq(isPullRequestListPage('/octo/demo/pulls'), true);
+        ackEq(isPullRequestListPage('/octo/demo/pull/123'), false);
+
+        const sorted = new URL(
+            pullsListUrlWithQuery({
+                href: 'https://github.com/octo/demo/pulls',
+                path: '/octo/demo/pulls',
+            }),
+            location.origin,
+        );
+        ackEq(sorted.pathname, '/octo/demo/pulls');
+        ackEq(sorted.searchParams.get('q'), 'is:pr is:open sort:updated-desc');
+
+        const mine = new URL(
+            pullsListUrlWithQuery({
+                href: 'https://github.com/octo/demo/pulls?q=is%3Apr+is%3Aopen+author%3Aalice+sort%3Acreated-desc',
+                path: '/octo/demo/pulls',
+                author: 'l0rinc',
+            }),
+            location.origin,
+        );
+        ackEq(mine.searchParams.get('q'), 'is:pr is:open author:l0rinc sort:updated-desc');
+    });
+
+    ackTest('pull request list injects Mine button beside Author filter', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="table-list-header"><details><summary>Author</summary></details></div>';
+        document.body.appendChild(host);
+        const metaUserExisting = document.querySelector('meta[name="user-login"]');
+        const metaActorExisting = document.querySelector('meta[name="octolytics-actor-login"]');
+        const oldUser = metaUserExisting?.getAttribute('content');
+        const oldActor = metaActorExisting?.getAttribute('content');
+        const created = [];
+        const ensureMeta = (name) => {
+            let m = document.querySelector(`meta[name="${name}"]`);
+            if (!m) {
+                m = document.createElement('meta');
+                m.setAttribute('name', name);
+                document.head.appendChild(m);
+                created.push(m);
+            }
+            return m;
+        };
+        try {
+            ensureMeta('user-login').setAttribute('content', '');
+            ensureMeta('octolytics-actor-login').setAttribute('content', 'acktest_user');
+            enhancePullRequestListPage(host, {
+                path: '/octo/demo/pulls',
+                href: 'https://github.com/octo/demo/pulls?q=is%3Apr+is%3Aopen+sort%3Acreated-desc',
+            });
+            const btn = host.querySelector('.ack-my-prs-filter');
+            ackAssert(btn, 'injects Mine PR filter');
+            ackAssert(host.querySelector('details').nextElementSibling === btn, 'places button next to Author filter');
+            const href = new URL(btn.href, location.origin);
+            ackEq(href.pathname, '/octo/demo/pulls');
+            ackEq(href.searchParams.get('q'), 'is:pr is:open author:acktest_user sort:updated-desc');
+            ackAssert(btn.title.includes('acktest_user'), 'button title names current user');
+        } finally {
+            if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
+            if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
+            created.forEach((m) => m.remove());
+            host.remove();
+        }
     });
 
     ackTest('repo mirror config maps current GitHub paths and heavy PR links', () => {
@@ -36161,9 +36407,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.148', () => {
+    ackTest('version bumped to 1.149', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.148' || _ackSource.includes('@version      1.148'), 'version is 1.148');
+        ackAssert(versionFromMeta === '1.149' || _ackSource.includes('@version      1.149'), 'version is 1.149');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
