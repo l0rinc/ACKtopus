@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.149
+// @version      1.150
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16749,6 +16749,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (nativeTa) return nativeTa;
             }
             if (opts.allowGM === false) return null;
+            if (!frag?.isConnected) return null;
             console.log(`ACKtopus: triggerMenuEdit: ${reason}, trying GM fragment load:`, url);
             const html = await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
@@ -16766,20 +16767,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             tmp.innerHTML = html;
             const nodes = Array.from(tmp.childNodes);
             if (nodes.length) {
-                if (frag?.isConnected) {
-                    frag.replaceWith(...nodes);
-                } else {
-                    let anchor = null;
-                    for (const root of roots) {
-                        anchor = root?.querySelector?.(
-                            '.edit-comment-hide, .js-comment-body, [data-testid="comment-body-content"], ' +
-                                '[data-testid="comment-body"], .comment-body, [data-testid="comment-header"]',
-                        );
-                        if (anchor) break;
-                    }
-                    if (anchor?.parentNode) anchor.after(...nodes);
-                    else container.append(...nodes);
-                }
+                frag.replaceWith(...nodes);
             }
             return await waitForEditTextarea(container, lt, 1500, roots);
         } catch (e) {
@@ -16795,124 +16783,122 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function triggerMenuEdit(container, header) {
         const lt = ensureAckLifetime('triggerMenuEdit');
-        const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', {
-            allowGM: false,
-        });
-        if (taDirect) {
-            schedulePostEditRefresh(container);
-            return true;
-        }
-        const kebabSelector = COMMENT_MENU_TRIGGER_SELECTOR;
-        const kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
-        if (!kebab) {
-            console.warn('ACKtopus: triggerMenuEdit: kebab not found');
-            const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', { nativeWaitMs: 1200 });
-            if (ta) {
+        if (container?.dataset?.ackEditOpening === '1') return false;
+        if (container?.dataset) container.dataset.ackEditOpening = '1';
+        try {
+            const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', {
+                allowGM: false,
+            });
+            if (taDirect) {
                 schedulePostEditRefresh(container);
                 return true;
             }
-            return false;
-        }
-        const menuHost =
-            kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
-        const origOpacity = menuHost.style.opacity;
-        // Keep the menu practically invisible to avoid UI flash, but not fully
-        // transparent — our `isVisible()` helper treats opacity:0 as invisible,
-        // which would prevent finding/clicking the Edit item.
-        menuHost.style.opacity = '0.01';
-        console.log('ACKtopus: triggerMenuEdit: opening kebab menu');
-        openMenuTrigger(kebab);
+            const kebabSelector = COMMENT_MENU_TRIGGER_SELECTOR;
+            const kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
+            if (!kebab) {
+                console.warn('ACKtopus: triggerMenuEdit: kebab not found');
+                const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', { nativeWaitMs: 1200 });
+                if (ta) {
+                    schedulePostEditRefresh(container);
+                    return true;
+                }
+                return false;
+            }
+            const menuHost =
+                kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
+            const origOpacity = menuHost.style.opacity;
+            // Keep the menu practically invisible to avoid UI flash, but not fully
+            // transparent — our `isVisible()` helper treats opacity:0 as invisible,
+            // which would prevent finding/clicking the Edit item.
+            menuHost.style.opacity = '0.01';
+            console.log('ACKtopus: triggerMenuEdit: opening kebab menu');
+            openMenuTrigger(kebab);
 
-        const actionRe = /^edit(\s|$)/i;
-        const ok = await clickWithRetry(
-            container,
-            () => {
-                for (const root of getCommentMenuRoots(kebab, container)) {
-                    const direct = root.querySelector?.('button.js-comment-edit-button');
-                    if (direct && isVisible(direct)) return direct;
-                    for (const item of root.querySelectorAll?.('button, a, [role="menuitem"]') || []) {
-                        if (!isVisible(item)) continue;
-                        if (actionRe.test(item.textContent.trim())) return item;
+            const actionRe = /^edit(\s|$)/i;
+            const ok = await clickWithRetry(
+                container,
+                () => {
+                    for (const root of getCommentMenuRoots(kebab, container)) {
+                        const direct = root.querySelector?.('button.js-comment-edit-button');
+                        if (direct && isVisible(direct)) return direct;
+                        for (const item of root.querySelectorAll?.('button, a, [role="menuitem"]') || []) {
+                            if (!isVisible(item)) continue;
+                            if (actionRe.test(item.textContent.trim())) return item;
+                        }
                     }
-                }
 
-                // Last-resort: find visible Edit-like items nearest to the kebab.
-                // Some ActionMenu variants portal menuitems without stable menu wrappers.
-                const kr = kebab.getBoundingClientRect?.();
-                const kx = (kr?.left || 0) + (kr?.width || 0) / 2;
-                const ky = (kr?.top || 0) + (kr?.height || 0) / 2;
-                const maxDist2 = 650 * 650;
-                const candidates = [];
-                for (const el of document.querySelectorAll('button, a, [role="menuitem"]')) {
-                    if (!isVisible(el)) continue;
-                    const txt = (el.textContent || '').trim();
-                    if (!actionRe.test(txt)) continue;
-                    if (
-                        !el.closest(
-                            '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]',
+                    // Last-resort: find visible Edit-like items nearest to the kebab.
+                    // Some ActionMenu variants portal menuitems without stable menu wrappers.
+                    const kr = kebab.getBoundingClientRect?.();
+                    const kx = (kr?.left || 0) + (kr?.width || 0) / 2;
+                    const ky = (kr?.top || 0) + (kr?.height || 0) / 2;
+                    const maxDist2 = 650 * 650;
+                    const candidates = [];
+                    for (const el of document.querySelectorAll('button, a, [role="menuitem"]')) {
+                        if (!isVisible(el)) continue;
+                        const txt = (el.textContent || '').trim();
+                        if (!actionRe.test(txt)) continue;
+                        if (
+                            !el.closest(
+                                '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]',
+                            )
                         )
-                    )
-                        continue;
-                    const r = el.getBoundingClientRect?.();
-                    if (!r) continue;
-                    const cx = r.left + r.width / 2;
-                    const cy = r.top + r.height / 2;
-                    const dx = cx - kx;
-                    const dy = cy - ky;
-                    const d2 = dx * dx + dy * dy;
-                    if (d2 <= maxDist2) candidates.push({ el, d2 });
-                }
-                candidates.sort((a, b) => a.d2 - b.d2);
-                return candidates[0]?.el || null;
-            },
-            'edit comment button',
-            6,
-        );
+                            continue;
+                        const r = el.getBoundingClientRect?.();
+                        if (!r) continue;
+                        const cx = r.left + r.width / 2;
+                        const cy = r.top + r.height / 2;
+                        const dx = cx - kx;
+                        const dy = cy - ky;
+                        const d2 = dx * dx + dy * dy;
+                        if (d2 <= maxDist2) candidates.push({ el, d2 });
+                    }
+                    candidates.sort((a, b) => a.d2 - b.d2);
+                    return candidates[0]?.el || null;
+                },
+                'edit comment button',
+                6,
+            );
 
-        menuHost.style.opacity = origOpacity;
-        if (!ok) {
-            try {
-                const visibleMenus = [...qsa(document, '[role="menu"], .Overlay, .ActionListWrap, details-menu')]
-                    .filter(isVisible)
-                    .slice(0, 3);
-                const items = visibleMenus.flatMap((m) =>
-                    [...m.querySelectorAll('button, a, [role="menuitem"]')]
+            menuHost.style.opacity = origOpacity;
+            if (!ok) {
+                try {
+                    const visibleMenus = [...qsa(document, '[role="menu"], .Overlay, .ActionListWrap, details-menu')]
                         .filter(isVisible)
-                        .map((el) => (el.textContent || el.getAttribute?.('aria-label') || '').trim())
-                        .filter(Boolean),
-                );
-                console.warn('ACKtopus: triggerMenuEdit: could not find Edit item. Visible menu items:', items);
-            } catch (_) {}
-            const ta = await tryOpenEditFormFromFragment(container, lt, 'edit item missing', { nativeWaitMs: 1200 });
-            if (ta) {
+                        .slice(0, 3);
+                    const items = visibleMenus.flatMap((m) =>
+                        [...m.querySelectorAll('button, a, [role="menuitem"]')]
+                            .filter(isVisible)
+                            .map((el) => (el.textContent || el.getAttribute?.('aria-label') || '').trim())
+                            .filter(Boolean),
+                    );
+                    console.warn('ACKtopus: triggerMenuEdit: could not find Edit item. Visible menu items:', items);
+                } catch (_) {}
+                const ta = await tryOpenEditFormFromFragment(container, lt, 'edit item missing', { nativeWaitMs: 1200 });
+                if (ta) {
+                    schedulePostEditRefresh(container);
+                    return true;
+                }
+            } else {
+                console.log('ACKtopus: triggerMenuEdit: clicked Edit');
                 schedulePostEditRefresh(container);
-                return true;
-            }
-        } else {
-            console.log('ACKtopus: triggerMenuEdit: clicked Edit');
-            schedulePostEditRefresh(container);
-            // GitHub sometimes loads edit forms via <include-fragment>. On some
-            // pages their internal fetch can fail (e.g. 403) while the userscript
-            // layer can still retrieve the fragment with cookies. If the edit
-            // textarea doesn't appear shortly after clicking Edit, try to load
-            // and inject the fragment ourselves so editing still works.
-            const { frag, roots } = getEditFormRequest(container);
-            const ta = await waitForEditTextarea(container, lt, frag?.isConnected ? 2800 : 1200, roots);
-            if (!ta) {
-                if (lt.signal.aborted) return ok;
-                const ta2 = await tryOpenEditFormFromFragment(container, lt, 'edit textarea missing', {
-                    allowGM: !frag?.isConnected,
-                    nativeWaitMs: frag?.isConnected ? 1200 : 0,
-                });
-                if (ta2) {
-                    if (!frag?.isConnected)
-                        console.log('ACKtopus: triggerMenuEdit: edit fragment injected successfully');
-                } else if (!frag?.isConnected) {
-                    console.warn('ACKtopus: triggerMenuEdit: edit fallback did not produce textarea');
+                // GitHub sometimes loads edit forms via <include-fragment>. If a
+                // real fragment placeholder exists and does not resolve, replace
+                // that placeholder. Never synthesize a second editor beside React.
+                const { frag, roots } = getEditFormRequest(container);
+                const ta = await waitForEditTextarea(container, lt, frag?.isConnected ? 2800 : 1200, roots);
+                if (!ta) {
+                    if (lt.signal.aborted) return ok;
+                    await tryOpenEditFormFromFragment(container, lt, 'edit textarea missing', {
+                        allowGM: !!frag?.isConnected,
+                        nativeWaitMs: frag?.isConnected ? 1200 : 0,
+                    });
                 }
             }
+            return ok;
+        } finally {
+            if (container?.dataset) delete container.dataset.ackEditOpening;
         }
-        return ok;
     }
 
     function triggerMenuAction(container, header, actionName) {
@@ -22886,7 +22872,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.149
+// @version      1.150
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -32195,6 +32181,40 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('tryOpenEditFormFromFragment does not synthesize duplicate editors without a fragment', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = '<div class="timeline-comment"><div class="markdown-body">hello</div></div>';
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const lt = ensureAckLifetime('test no synthetic edit form');
+        const origGM = GM_xmlhttpRequest;
+        const origGetEditFormRequest = getEditFormRequest;
+        let gmCalls = 0;
+        getEditFormRequest = () => ({
+            frag: null,
+            url: `${location.origin}/bitcoin/bitcoin/pull/1/review_comment/333/edit_form?textarea_id=discussion_r333-body&comment_context=discussion`,
+            roots: [container],
+        });
+        GM_xmlhttpRequest = () => {
+            gmCalls++;
+        };
+        try {
+            const ta = await tryOpenEditFormFromFragment(container, lt, 'unit test no fragment', {
+                allowGM: true,
+                nativeWaitMs: 0,
+            });
+            ackEq(ta, null, 'no textarea without native UI or fragment');
+            ackEq(gmCalls, 0, 'does not fetch and append a synthetic edit form');
+        } finally {
+            GM_xmlhttpRequest = origGM;
+            getEditFormRequest = origGetEditFormRequest;
+            abortAckLifetime('test cleanup');
+            host.remove();
+        }
+    });
+
     ackTest('waitForEditTextarea detects visible React edit textarea before legacy fallback', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -36407,9 +36427,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.149', () => {
+    ackTest('version bumped to 1.150', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.149' || _ackSource.includes('@version      1.149'), 'version is 1.149');
+        ackAssert(versionFromMeta === '1.150' || _ackSource.includes('@version      1.150'), 'version is 1.150');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
