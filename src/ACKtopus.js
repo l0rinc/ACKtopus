@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.152
+// @version      1.153
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -15494,6 +15494,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    // GitHub re-renders (and our own fast affordance refreshes) can tear down
+    // and rebuild a quick-action icon row between pointerdown and the trailing
+    // native click. If the pressed button is detached in that window, the
+    // browser retargets the click to whatever now sits under the pointer -
+    // typically the neighboring "edited" badge, which opens the edit-history
+    // dropdown instead of the intended action. Track the pressed row so
+    // rebuilds skip it, and swallow the retargeted trusted click.
+    let _ackPressedQuickActions = null;
+
+    function beginQuickActionPress(btn) {
+        _ackPressedQuickActions = btn.closest('.ack-quick-actions');
+        const clearPress = () => {
+            _ackPressedQuickActions = null;
+        };
+        document.addEventListener('pointerup', clearPress, { capture: true, once: true });
+        document.addEventListener('pointercancel', clearPress, { capture: true, once: true });
+        const swallowRetargetedClick = (ev) => {
+            if (!ev.isTrusted) return; // programmatic menu automation must pass through
+            ev.preventDefault();
+            ev.stopPropagation();
+            unarm();
+        };
+        const unarm = () => document.removeEventListener('click', swallowRetargetedClick, true);
+        document.addEventListener('click', swallowRetargetedClick, true);
+        ackSetTimeout(unarm, 400);
+    }
+
     function schedulePostEditRefresh(container) {
         // After save/cancel, React may replace the entire comment container,
         // making `container` a stale detached reference. Always rescan from
@@ -15519,7 +15546,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     document
                         .querySelectorAll('[data-ack-quick-processed]')
                         .forEach((h) => delete h.dataset.ackQuickProcessed);
-                    document.querySelectorAll('.ack-quick-actions').forEach((el) => el.remove());
+                    document.querySelectorAll('.ack-quick-actions').forEach((el) => {
+                        if (el !== _ackPressedQuickActions) el.remove();
+                    });
                     addQuickCommentActions(document);
                 },
                 { delayMs: 80, reason: 'post-edit-refresh' },
@@ -16246,6 +16275,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.addEventListener('pointerdown', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                beginQuickActionPress(btn);
                 handler(btn);
             });
             // Also suppress the subsequent synthetic click (prevents form submits
@@ -16305,6 +16335,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     delete header.dataset.ackQuickProcessed;
                 }
             }
+            // Never tear down an icon row mid-press (see beginQuickActionPress):
+            // the trailing native click would land on the "edited" badge.
+            if (_ackPressedQuickActions && [...staleActions].includes(_ackPressedQuickActions)) continue;
             staleActions.forEach((el) => el.remove());
             header.dataset.ackQuickProcessed = editState;
 
@@ -16777,6 +16810,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             if (opts.allowGM === false) return null;
             if (!frag?.isConnected) return null;
+            // Only replace a fragment whose host form is actually visible
+            // (GitHub entered edit mode). Replacing it inside a hidden form
+            // consumes the only native edit_form fragment without ever showing
+            // an editor, permanently breaking edit for this comment.
+            const fragHost = frag.closest('form') || frag.parentElement || frag;
+            if (!isVisible(fragHost)) return null;
             console.log(`ACKtopus: triggerMenuEdit: ${reason}, trying GM fragment load:`, url);
             const html = await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
@@ -16810,8 +16849,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function triggerMenuEdit(container, header) {
         const lt = ensureAckLifetime('triggerMenuEdit');
-        if (container?.dataset?.ackEditOpening === '1') return false;
-        if (container?.dataset) container.dataset.ackEditOpening = '1';
+        // Re-entry guard with a short takeover window: a stuck attempt (e.g.
+        // waiting on slow menu fragments for several seconds) must not swallow
+        // fresh user clicks for its whole lifetime.
+        const prevAttempt = Number(container?.dataset?.ackEditOpening || 0);
+        if (prevAttempt && Date.now() - prevAttempt < 1500) return false;
+        const attemptStamp = String(Date.now());
+        if (container?.dataset) container.dataset.ackEditOpening = attemptStamp;
+        let kebab = null;
+        let menuHost = null;
+        let origOpacity = '';
+        let clickedEdit = false;
         try {
             const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', {
                 allowGM: false,
@@ -16821,7 +16869,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return true;
             }
             const kebabSelector = COMMENT_MENU_TRIGGER_SELECTOR;
-            const kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
+            kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
             if (!kebab) {
                 console.warn('ACKtopus: triggerMenuEdit: kebab not found');
                 const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', { nativeWaitMs: 1200 });
@@ -16831,9 +16879,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
                 return false;
             }
-            const menuHost =
+            menuHost =
                 kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
-            const origOpacity = menuHost.style.opacity;
+            origOpacity = menuHost.style.opacity;
             // Keep the menu practically invisible to avoid UI flash, but not fully
             // transparent — our `isVisible()` helper treats opacity:0 as invisible,
             // which would prevent finding/clicking the Edit item.
@@ -16845,6 +16893,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const ok = await clickWithRetry(
                 container,
                 () => {
+                    // A swallowed user click (or GitHub itself) may have closed
+                    // the kebab mid-attempt; re-open so Edit can render.
+                    const kebabDetails = kebab.closest('details');
+                    if (kebabDetails && !kebabDetails.hasAttribute('open')) openMenuTrigger(kebab);
                     for (const root of getCommentMenuRoots(kebab, container)) {
                         const direct = root.querySelector?.('button.js-comment-edit-button');
                         if (direct && isVisible(direct)) return direct;
@@ -16887,7 +16939,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 6,
             );
 
-            menuHost.style.opacity = origOpacity;
+            clickedEdit = ok;
             if (!ok) {
                 try {
                     const visibleMenus = [...qsa(document, '[role="menu"], .Overlay, .ActionListWrap, details-menu')]
@@ -16924,7 +16976,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             return ok;
         } finally {
-            if (container?.dataset) delete container.dataset.ackEditOpening;
+            if (menuHost) menuHost.style.opacity = origOpacity;
+            // Never leave an invisibly-open kebab behind: Primer's open
+            // details-overlay paints a full-viewport click-catcher that would
+            // swallow every later click on the page.
+            if (!clickedEdit) kebab?.closest?.('details')?.removeAttribute('open');
+            if (container?.dataset?.ackEditOpening === attemptStamp) delete container.dataset.ackEditOpening;
         }
     }
 
@@ -22914,7 +22971,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.152
+// @version      1.153
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26298,6 +26355,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             !/addEventListener\('click'[\s\S]*handler\(/.test(makeIconSection),
             'does not invoke handler on click (would race with React re-renders)',
+        );
+    });
+
+    ackTest('quick action press guards against mid-press icon teardown and retargeted clicks', () => {
+        const source = _ackSource;
+        const press = sourceSection(source, 'function beginQuickActionPress', 'function schedulePostEditRefresh');
+        ackAssert(
+            press.includes("document.addEventListener('click', swallowRetargetedClick, true)"),
+            'arms a capture-phase click swallower while a quick action is pressed',
+        );
+        ackAssert(press.includes('ev.isTrusted'), 'programmatic menu-automation clicks pass through');
+        const quick = sourceSection(source, 'function addQuickCommentActions', 'function getCommentMenuRoots');
+        ackAssert(quick.includes('beginQuickActionPress(btn)'), 'pointerdown registers the press');
+        ackAssert(
+            quick.includes('[...staleActions].includes(_ackPressedQuickActions)'),
+            'icon teardown skips the row that is currently pressed',
+        );
+        const editFn = sourceSection(source, 'async function triggerMenuEdit', 'function triggerMenuAction');
+        ackAssert(editFn.includes('attemptStamp'), 'edit re-entry guard is timestamped, not attempt-lifetime');
+        ackAssert(editFn.includes("removeAttribute('open')"), 'failed edit attempts close the kebab overlay');
+        ackAssert(
+            editFn.includes("!kebabDetails.hasAttribute('open')) openMenuTrigger(kebab)"),
+            'retry finder re-opens a kebab that was closed mid-attempt',
+        );
+        const fragFn = sourceSection(source, 'async function tryOpenEditFormFromFragment', 'async function triggerMenuEdit');
+        ackAssert(
+            fragFn.includes('if (!isVisible(fragHost)) return null'),
+            'GM fragment replacement requires a visible (edit-mode) host form',
         );
     });
 
@@ -36516,9 +36601,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.152', () => {
+    ackTest('version bumped to 1.153', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.152' || _ackSource.includes('@version      1.152'), 'version is 1.152');
+        ackAssert(versionFromMeta === '1.153' || _ackSource.includes('@version      1.153'), 'version is 1.153');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
