@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.151
+// @version      1.152
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -15241,6 +15241,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return !!form && isPRCreationPage(path, form);
     }
 
+    function isNewPostComposeForm(scope, path = location.pathname) {
+        if (!scope || scope === document || !scope.querySelector) return false;
+        const ownerForm = scope.matches?.('form') ? scope : scope.closest?.('form');
+        if (ownerForm && isPRCreationForm(ownerForm, path)) return true;
+        const action = ownerForm?.getAttribute?.('action') || scope.getAttribute?.('action') || '';
+        if (
+            /\/(?:issues|pull)\/\d+\/comments(?:[/?#]|$)/.test(action) ||
+            /\/review_comment\/create(?:[/?#]|$)/.test(action) ||
+            /\/page_data\/create_review_comment(?:[/?#]|$)/.test(action)
+        )
+            return true;
+
+        const hasCommentTextarea =
+            scope.matches?.(COMMENT_TA_SELECTOR) ||
+            !!scope.querySelector?.(`${COMMENT_TA_SELECTOR}, textarea[name="comment[body]"]`);
+        if (!hasCommentTextarea) return false;
+        const hasNewPostSubmit = [...(scope.querySelectorAll?.('button[type="submit"], button') || [])].some((btn) =>
+            /^(comment|reply|add\s+(?:single\s+)?comment|start a review|submit review|review changes|create pull request)$/i.test(
+                editButtonLabel(btn),
+            ),
+        );
+        return hasNewPostSubmit && !findEditSaveButton(scope);
+    }
+
     function isEditCancelButton(btn) {
         const label = editButtonLabel(btn).toLowerCase();
         return (
@@ -15272,6 +15296,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!form || form === document || form === document.body || !form.querySelector) return false;
         const ownerForm = form.matches?.('form') ? form : form.closest?.('form');
         if (ownerForm && isPRCreationForm(ownerForm, path)) return false;
+        if (ownerForm && ownerForm !== form && isNewPostComposeForm(ownerForm, path)) return false;
+        if (isNewPostComposeForm(form, path)) return false;
         if (form.matches?.(EDIT_FORM_SELECTOR)) return true;
 
         const ta = findEditTextarea(form);
@@ -15418,6 +15444,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function shouldConfirmEditSave(form) {
         if (!form?._ackEditTracked) return false;
+        if (!isExistingPostEditForm(form)) return false;
         const ta = findEditTextarea(form);
         if (!ta) return false;
         if (typeof form._ackEditInitialValue !== 'string') return false;
@@ -22887,7 +22914,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.151
+// @version      1.152
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -36489,9 +36516,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.151', () => {
+    ackTest('version bumped to 1.152', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.151' || _ackSource.includes('@version      1.151'), 'version is 1.151');
+        ackAssert(versionFromMeta === '1.152' || _ackSource.includes('@version      1.152'), 'version is 1.152');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -36691,6 +36718,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             trackEditForms(host);
             ackEq(form._ackEditTracked, undefined, 'does not track create-PR form for edit diff confirmation');
             ackEq(form.querySelector('.ack-edit-diff-marker'), null, 'does not mark create-PR submit button');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('trackEditForms ignores new comment compose forms', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <form class="js-comment-update" action="/owner/repo/issues/123/comments">
+                <textarea class="js-comment-field" name="comment[body]"></textarea>
+                <button type="button">Cancel</button>
+                <button type="submit">Update comment</button>
+            </form>
+        `;
+        document.body.appendChild(host);
+        const form = host.querySelector('form');
+        const ta = host.querySelector('textarea');
+        const saveBtn = host.querySelector('button[type="submit"]');
+        let clickEvents = 0;
+        saveBtn.addEventListener('click', () => clickEvents++);
+        try {
+            ackEq(isNewPostComposeForm(form), true, 'detects issue/PR comment create form');
+            ackEq(isExistingPostEditForm(form), false, 'new comment form is not an existing post edit form');
+            trackEditForms(host);
+            ackEq(form._ackEditTracked, undefined, 'does not track new comment form for edit diff confirmation');
+            ackEq(findEditForm(saveBtn), null, 'new comment submit button does not resolve an edit form');
+            ta.value = 'New draft comment';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ackEq(shouldConfirmEditSave(form), false, 'new comment never requires edit diff confirmation');
+            const ok = saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            ackEq(ok, true, 'new comment click is not intercepted by edit diff confirmation');
+            ackEq(clickEvents, 1, 'new comment button click reaches the native handler');
+            ackEq(document.querySelector('.ack-diff-dialog-overlay'), null, 'new comment click does not open diff dialog');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            host.remove();
+        }
+    });
+
+    ackTest('trackEditForms ignores inline review comment create forms inside thread scopes', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.style.top = '0';
+        host.innerHTML = `
+            <div class="ActivityThread">
+                <form action="/owner/repo/pull/123/review_comment/create">
+                    <div data-testid="markdown-editor">
+                        <textarea class="js-comment-field" name="comment[body]">Draft review reply</textarea>
+                    </div>
+                    <button type="button">Cancel</button>
+                    <button type="submit">Update comment</button>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const form = host.querySelector('form');
+        const scope = host.querySelector('.ActivityThread');
+        const saveBtn = host.querySelector('button[type="submit"]');
+        try {
+            ackEq(isNewPostComposeForm(form), true, 'detects inline review-comment create form');
+            ackEq(isExistingPostEditForm(form), false, 'inline create form is not an edit form');
+            ackEq(isExistingPostEditForm(scope), false, 'ancestor thread scope is not promoted to edit form');
+            trackEditForms(host);
+            ackEq(form._ackEditTracked, undefined, 'does not track inline create form');
+            ackEq(scope._ackEditTracked, undefined, 'does not track ancestor thread scope');
+            ackEq(findEditForm(saveBtn), null, 'inline create submit button does not resolve an edit form');
+            ackEq(saveBtn.querySelector('.ack-edit-diff-marker'), null, 'does not mark inline create submit button');
         } finally {
             host.remove();
         }
