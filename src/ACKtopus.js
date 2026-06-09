@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.150
+// @version      1.151
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17051,6 +17051,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
     }
 
+    function isOwnReactionTrigger(trigger) {
+        const login = getCurrentGitHubLogin();
+        if (!login || !trigger) return false;
+        const container =
+            trigger.closest?.(COMMENT_CONTAINER_SELECTOR) ||
+            trigger.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) ||
+            null;
+        if (container?.classList?.contains('current-user')) return true;
+        const author = getCommentAuthor(trigger);
+        return !!author && author.toLowerCase() === login.toLowerCase();
+    }
+
     // auto-open the native reaction popup on mouseenter. One less click to
     // react. Clicking the trigger itself applies 👍 directly.
     // Pure DOM — no API calls, no PAT needed, uses GitHub's own session.
@@ -17113,6 +17125,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Re-check in case a details/summary entry somehow resolved to an
             // existing reaction button.
             if (isExistingReactionButton(trigger)) continue;
+            if (isOwnReactionTrigger(trigger)) continue;
             if (trigger.dataset.ackReactionHover) continue;
             trigger.dataset.ackReactionHover = 'true';
 
@@ -17141,6 +17154,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'click',
                 (e) => {
                     if (_reactionPassthrough) return; // allow native popup open
+                    if (e.isTrusted === false) return; // never turn synthetic hover/open clicks into 👍
                     if (hoverTimer) {
                         clearTimeout(hoverTimer);
                         hoverTimer = null;
@@ -17215,6 +17229,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const lt = ensureAckLifetime('applyReactionChoice');
         // Design principle: DOM-first for writes — clicking native UI buttons
         // avoids PAT requirements and uses GitHub's own session/CSRF handling.
+        if (isOwnReactionTrigger(trigger)) return;
         const container = getReactionContainer(trigger);
         if (!container) return;
 
@@ -22872,7 +22887,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.150
+// @version      1.151
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26701,6 +26716,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('mouseleave'), 'adds mouseleave to cancel timer');
         ackAssert(fn.includes('clearTimeout'), 'cancels timer on mouseleave');
         ackAssert(fn.includes('ackReactionHover'), 'guards against double-processing');
+        const hoverBlock = fn.slice(fn.indexOf("openTarget.addEventListener('mouseenter'"), fn.indexOf('// Click:'));
+        ackAssert(!hoverBlock.includes('applyReactionChoice'), 'hover path does not apply thumbs up');
         // Excludes existing reaction emoji buttons (classic + React UI)
         ackAssert(fn.includes('data-reaction-content'), 'skips buttons with data-reaction-content');
         ackAssert(fn.includes('js-reaction-group-button'), 'skips reaction group buttons');
@@ -26735,6 +26752,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'hovering/clicking the existing reaction follows native behavior, no extra click is synthesized',
             );
         } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('autoOpenReactionPopup does not attach handlers to current-user posts', () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment current-user">
+                <div class="timeline-comment-header"><a class="author" href="/acktest_user">acktest_user</a></div>
+                <button id="trigger" aria-label="Add your reaction" style="width:10px;height:10px">
+                    <svg class="octicon-smiley"></svg>
+                </button>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const metaUserExisting = document.querySelector('meta[name="user-login"]');
+        const metaActorExisting = document.querySelector('meta[name="octolytics-actor-login"]');
+        const oldUser = metaUserExisting?.getAttribute('content');
+        const oldActor = metaActorExisting?.getAttribute('content');
+        const created = [];
+        const ensureMeta = (name) => {
+            let m = document.querySelector(`meta[name="${name}"]`);
+            if (!m) {
+                m = document.createElement('meta');
+                m.setAttribute('name', name);
+                document.head.appendChild(m);
+                created.push(m);
+            }
+            return m;
+        };
+        try {
+            ensureMeta('user-login').setAttribute('content', 'acktest_user');
+            ensureMeta('octolytics-actor-login').setAttribute('content', 'acktest_user');
+            autoOpenReactionPopup(host);
+            const trigger = host.querySelector('#trigger');
+            ackAssert(!trigger.dataset.ackReactionHover, 'own comment trigger is not marked as a hover/click target');
+        } finally {
+            if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
+            if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
+            created.forEach((m) => m.remove());
             host.remove();
         }
     });
@@ -34350,6 +34409,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('e.preventDefault()'), 'prevents default popup open');
         ackAssert(fn.includes('e.stopPropagation()'), 'stops propagation');
         ackAssert(fn.includes('capture'), 'uses capture phase');
+        ackAssert(fn.includes('e.isTrusted === false'), 'synthetic clicks cannot add thumbs up');
+        ackAssert(fn.includes('isOwnReactionTrigger(trigger)'), 'skips current-user posts');
         ackAssert(fn.includes('mouseenter'), 'hover still opens popup');
         ackAssert(fn.includes('withReactionPassthrough'), 'hover uses passthrough for React buttons');
         ackAssert(fn.includes('_reactionPassthrough'), 'click handler checks passthrough flag');
@@ -34370,6 +34431,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('opt.click()'), 'clicks popup button to add reaction');
         ackAssert(fn.includes("desired = '+1'"), 'defaults to thumbs up');
         ackAssert(fn.includes('withReactionPassthrough'), 'uses passthrough to open popup');
+        ackAssert(fn.includes('isOwnReactionTrigger(trigger)'), 'does not react to current-user posts');
     });
 
     ackTest('findUserReactedButtons detects user reactions via multiple indicators', () => {
@@ -36427,9 +36489,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.150', () => {
+    ackTest('version bumped to 1.151', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.150' || _ackSource.includes('@version      1.150'), 'version is 1.150');
+        ackAssert(versionFromMeta === '1.151' || _ackSource.includes('@version      1.151'), 'version is 1.151');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
