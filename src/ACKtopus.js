@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.153
+// @version      1.154
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -445,7 +445,7 @@
     function isMacKeyboardPlatform() {
         const platform =
             (typeof navigator !== 'undefined' && (navigator.userAgentData?.platform || navigator.platform)) || '';
-        return /\b(Mac|iPhone|iPad|iPod)\b/i.test(platform);
+        return /Mac|iPhone|iPad|iPod/i.test(platform);
     }
 
     function shortcutLetter(key) {
@@ -2014,6 +2014,7 @@
             if (m) total += parseInt(m[1], 10);
         });
         document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR).forEach((b) => {
+            if (b.closest(HIDDEN_CONVERSATION_SELECTOR)) return; // form pass above already counted wrapped buttons
             const m = b.textContent.match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
             if (m) total += parseInt(m[1], 10);
         });
@@ -3107,6 +3108,7 @@
             } else {
                 orgMembers = new Set();
                 console.log(`ACKtopus: fetchRepoMembers(${owner}) - org cache miss, fetching`);
+                let fetchFailed = false;
                 try {
                     let page = 1;
                     while (page <= 5) {
@@ -3122,10 +3124,15 @@
                         `ACKtopus: fetchRepoMembers - org public_members: ${orgMembers.size} found${orgMembers.size > 0 ? ` (${[...orgMembers].slice(0, 10).join(', ')}${orgMembers.size > 10 ? '...' : ''})` : ''}`,
                     );
                 } catch (e) {
+                    fetchFailed = true;
                     console.warn('ACKtopus: fetchRepoMembers - org public_members failed:', e.message || e);
                 }
-                _orgMemberCache[owner] = { members: orgMembers, ts: now };
-                GM_setValue(gmKey, { logins: [...orgMembers], ts: now });
+                // Don't cache failed/partial fetches: a transient error would otherwise pin an
+                // empty/incomplete member set for the whole 24h ORG_TTL.
+                if (!fetchFailed) {
+                    _orgMemberCache[owner] = { members: orgMembers, ts: now };
+                    GM_setValue(gmKey, { logins: [...orgMembers], ts: now });
+                }
             }
         }
 
@@ -3436,6 +3443,9 @@
     function parseForcePushesFromPage() {
         const pushes = [];
         document.querySelectorAll('.TimelineItem, .js-timeline-item').forEach((item) => {
+            // Keep only innermost rows: outer .js-timeline-item wrappers duplicate the nested .TimelineItem
+            // with polluted actor/timestamp metadata (first grouped event wins inside the wrapper).
+            if (item.querySelector('.TimelineItem, .js-timeline-item')) return;
             const text = item.textContent;
             if (!/force[- ]?pushed/i.test(text)) return;
             const actor = item.querySelector('.author')?.textContent?.trim() || '';
@@ -5275,6 +5285,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             k.startsWith('repo_members_') ||
             k.startsWith('pr_context_') ||
             k.startsWith('commitlist_') ||
+            k.startsWith('forcepush_sig_') ||
             k === 'llm_cache_timestamps';
         keys.forEach((k) => {
             if (isCacheKey(k)) {
@@ -5342,7 +5353,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             if (provider !== 'claude' && r.status === 429 && responseText.includes('quota')) {
                 return { ok: true, warn: true, state: 'nofunds', msg: 'Quota exceeded, add funds' };
             }
-            if (provider !== 'claude' && r.status === 429) {
+            if (r.status === 429) {
                 return { ok: true, warn: true, state: 'valid', msg: 'Rate limited, try again shortly' };
             }
             if (provider === 'claude' && r.status === 529) {
@@ -5731,12 +5742,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             panel.appendChild(row);
         }
 
+        // Keys must match the llm_* GM keys getLLMConfig() reads, so saves actually persist.
         addCheckbox(
             'Include full patch as context for single-commit analysis',
             config.includeFullPatch,
-            'includeFullPatch',
+            'include_patch',
         );
-        addCheckbox('Cache LLM results (avoid repeated requests)', config.cacheEnabled, 'cacheEnabled');
+        addCheckbox('Cache LLM results (avoid repeated requests)', config.cacheEnabled, 'cache_enabled');
 
         const clearRow = document.createElement('div');
         Object.assign(clearRow.style, { marginTop: '6px' });
@@ -6696,6 +6708,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 skippingDeletedBody = true;
                 continue;
             }
+            // A new commit's mbox From-line ends the deleted-file body (hunk lines all start with
+            // '-' or '\', binary base85 has no spaces), so the next commit's headers are kept.
+            if (skippingDeletedBody && /^From [0-9a-f]{40} /.test(line)) {
+                skippingDeletedBody = false;
+                inFile = false;
+                deletedFile = false;
+                out.push(line);
+                continue;
+            }
             if (skippingDeletedBody) continue;
             out.push(line);
         }
@@ -6834,16 +6855,23 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
 
     async function fetchPRFileCategories(pr) {
         try {
-            const resp = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=100`,
-                    headers: ghApiHeaders(),
-                    onload: (r) => resolve(r),
-                    onerror: reject,
+            const files = [];
+            let page = 1;
+            let batch;
+            do {
+                const resp = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=100&page=${page}`,
+                        headers: ghApiHeaders(),
+                        onload: (r) => resolve(r),
+                        onerror: reject,
+                    });
                 });
-            });
-            const files = JSON.parse(resp.responseText);
+                batch = JSON.parse(resp.responseText);
+                files.push(...batch);
+                page++;
+            } while (batch.length === 100 && page <= 30); // up to 3000 files (GitHub API listing cap)
             const cats = categorizePRFiles(files.map((f) => f.filename));
 
             // For bench files, fetch raw content to extract BENCHMARK() names
@@ -7039,7 +7067,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                   ?.textContent?.trim() || '';
         if (prTitle) parts.push(`PR Title: ${prTitle}`);
 
-        const prBodyEl = document.querySelector('#issue-body, [data-testid="issue-body"]');
+        const prBodyEl =
+            document.querySelector('#issue-body, [data-testid="issue-body"]') ||
+            document.querySelector('.js-discussion [id^="issue-"] .comment-body'); // classic PR conversation pages
         const prBody = prBodyEl?.innerText?.trim();
         if (prBody) parts.push(`PR Description:\n${prBody.slice(0, 5000)}`);
 
@@ -7159,14 +7189,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return String(text || '')
             .replace(/^\/find\s*/i, '')
             .trim();
-    }
-
-    function getCurrentGitHubLogin() {
-        return (
-            document.querySelector('meta[name="user-login"]')?.content ||
-            document.querySelector('meta[name="octolytics-actor-login"]')?.content ||
-            ''
-        ).trim();
     }
 
     function findSearchItemKey(item) {
@@ -8703,7 +8725,9 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                         .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
                         ?.textContent?.trim() ||
                     '';
-                const bodyEl = document.querySelector('#issue-body, [data-testid="issue-body"]');
+                const bodyEl =
+                    document.querySelector('#issue-body, [data-testid="issue-body"]') ||
+                    document.querySelector('.js-discussion [id^="issue-"] .comment-body'); // classic PR pages
                 description = bodyEl?.innerText?.trim() || '';
             }
         }
@@ -9555,13 +9579,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (chatDiffBlock !== null) return chatDiffBlock;
             if (chatDiffPromise) return chatDiffPromise;
             chatDiffPromise = (async () => {
-                chatDiffBlock = '';
-                if (!isPRPage()) return chatDiffBlock;
-                const pr = parsePageContext();
-                if (!pr) return chatDiffBlock;
+                // Compute into a local and only cache on completion, so concurrent callers
+                // await the shared promise instead of short-circuiting on a premature ''.
+                let result = '';
                 try {
+                    if (!isPRPage()) return result;
+                    const pr = parsePageContext();
+                    if (!pr) return result;
                     const ctx = await fetchPRContext(pr);
-                    if (!ctx?.diff) return chatDiffBlock;
+                    if (!ctx?.diff) return result;
                     const max = 200000;
                     let diffText = ctx.diff;
                     let truncated = false;
@@ -9574,13 +9600,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         diffText =
                             head + `\n\n...[TRUNCATED ${ctx.diff.length - headLen - tailLen} chars]...\n\n` + tail;
                     }
-                    chatDiffBlock =
+                    result =
                         `\n\n---\n\nPR diff (${ctx.diff.length} chars${truncated ? `, truncated to ~${max}` : ''}):\n` +
                         '```diff\n' +
                         diffText +
                         '\n```';
-                } catch (_) {}
-                return chatDiffBlock;
+                } catch (_) {
+                } finally {
+                    chatDiffBlock = result;
+                }
+                return result;
             })();
             return chatDiffPromise;
         }
@@ -9589,10 +9618,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         messages.addEventListener('click', (e) => {
             const link = e.target.closest('.ack-ref-link');
             if (!link) return;
-            e.preventDefault();
             const idx = parseInt(link.dataset.ackRef, 10);
-            const item = chatPageIndex?.[idx];
-            if (!item) return;
+            const item = link._ackItem || chatPageIndex?.[idx];
+            if (!item) {
+                // Stale index (chatPageIndex was rebuilt): let the browser follow the
+                // still-valid permalink href instead of leaving the link inert.
+                const href = link.getAttribute('href');
+                if (!href || href === '#') e.preventDefault();
+                return;
+            }
+            e.preventDefault();
             const targetUrl = robotNavigationUrlForItem(item);
             if (targetUrl && (e.shiftKey || e.metaKey || e.ctrlKey)) {
                 window.open(targetUrl, '_blank', 'noopener');
@@ -9845,6 +9880,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             link.href = robotNavigationUrlForItem(item) || '#';
             link.className = 'ack-ref-link';
             link.dataset.ackRef = String(idx);
+            link._ackItem = item; // survives chatPageIndex rebuilds on later messages
             link.title = item.htmlUrl
                 ? 'Open the exact comment permalink. Shift/Cmd/Ctrl-click opens it in a new tab.'
                 : 'Open comment';
@@ -9906,7 +9942,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         function refreshRobotRefLinks() {
             messages.querySelectorAll('.ack-ref-link[data-ack-ref]').forEach((link) => {
-                const item = chatPageIndex?.[parseInt(link.dataset.ackRef, 10)];
+                const item = link._ackItem || chatPageIndex?.[parseInt(link.dataset.ackRef, 10)];
                 const href = robotNavigationUrlForItem(item);
                 if (href) link.href = href;
             });
@@ -10828,8 +10864,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     currentCommitIdx = commits.findIndex((c) => c.sha.startsWith(urlSha) || urlSha.startsWith(c.sha));
                 }
             }
-            // Circular wrap: next after last goes to first, prev before first goes to last
-            currentCommitIdx = (currentCommitIdx + dir + commits.length) % commits.length;
+            // Circular wrap: next after last goes to first, prev before first goes to last;
+            // from an unselected state, next starts at the first commit and prev at the last.
+            currentCommitIdx =
+                currentCommitIdx < 0
+                    ? (dir > 0 ? 0 : commits.length - 1)
+                    : (currentCommitIdx + dir + commits.length) % commits.length;
             const target = commits[currentCommitIdx];
             if (focusCommitEntry(target, currentCommitIdx)) {
                 return;
@@ -11669,7 +11709,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             ...tbody.querySelectorAll('tr:not(.inline-comments):not(.js-inline-comments-container)'),
                         ];
                         const targetRow = commentRow?.previousElementSibling;
-                        let targetIdx = targetRow ? codeRows.indexOf(targetRow) : codeRows.length - 1;
+                        let targetIdx = targetRow ? codeRows.indexOf(targetRow) : -1;
+                        // If not found, take last N rows before the comment
+                        if (targetIdx === -1) targetIdx = codeRows.length - 1;
                         const start = Math.max(0, targetIdx - 8);
                         const end = Math.min(codeRows.length, targetIdx + 5);
                         const lines = [];
@@ -13372,7 +13414,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             .replace(/&gt;/g, '>')
                             .replace(/&#39;/g, "'")
                             .replace(/&quot;/g, '"');
-                        const titleMatch = raw.match(/^(.+?)\s+by\s+\S+\s+/);
+                        // Greedy + anchored to the author separator so PR titles containing ' by ' survive.
+                        const titleMatch = raw.match(/^(.+)\s+by\s+\S+\s+\u00b7\s+Pull Request/);
                         updateTitle(titleMatch ? titleMatch[1].trim() : raw.split(' \u00b7 ')[0].trim());
                     }
                 })
@@ -14011,6 +14054,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         });
         pgpKeyCache.set(upper, promise);
+        // Evict failed lookups once settled (keeps in-flight dedup) so transient
+        // keyserver errors don't poison the cache for the whole session.
+        promise.then((key) => {
+            if (!key) pgpKeyCache.delete(upper);
+        });
         return promise;
     }
 
@@ -14125,7 +14173,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Verify async
             const author = getCommentAuthor(details);
             verifyPGPSignature(cleartext).then((result) => {
-                if (commentId) pgpResultCache.set(commentId, result);
+                // Don't cache transient errors so a failed key fetch can recover on the next scan.
+                if (commentId && result.status !== 'error') pgpResultCache.set(commentId, result);
                 applyPGPBadge(summary, result);
                 if (author) {
                     pgpUserResults.set(author, result);
@@ -14172,9 +14221,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function updateAckPanelPGPOverlays() {
         const panel = document.getElementById(ACK_PANEL_ID);
         if (!panel) return;
-        // Each chip is an <a> with an <img> avatar + <span> username
+        // Each chip is an <a> with an <img> avatar (possibly already wrapped) + <span> username
         for (const chip of panel.querySelectorAll('a')) {
-            const nameSpan = chip.querySelector('span');
+            const nameSpan = chip.querySelector('span:not(.ack-pgp-avatar-wrap):not(.ack-pgp-overlay)');
             if (!nameSpan) continue;
             const username = nameSpan.textContent.trim();
             const result = pgpUserResults.get(username);
@@ -14182,52 +14231,51 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const avatar = chip.querySelector('img');
             if (!avatar) continue;
-            // Ensure parent is positioned for absolute overlay
-            if (avatar.parentElement === chip) {
-                // Wrap avatar in a positioned container
-                let wrap = avatar.closest('.ack-pgp-avatar-wrap');
-                if (!wrap) {
-                    wrap = document.createElement('span');
-                    wrap.className = 'ack-pgp-avatar-wrap';
-                    Object.assign(wrap.style, {
-                        position: 'relative',
-                        display: 'inline-block',
-                        width: '14px',
-                        height: '14px',
-                        flexShrink: '0',
-                    });
-                    avatar.before(wrap);
-                    wrap.appendChild(avatar);
-                }
-                // Add or update overlay badge
-                let overlay = wrap.querySelector('.ack-pgp-overlay');
-                if (!overlay) {
-                    overlay = document.createElement('span');
-                    overlay.className = 'ack-pgp-overlay';
-                    Object.assign(overlay.style, {
-                        position: 'absolute',
-                        bottom: '-2px',
-                        right: '-3px',
-                        fontSize: '8px',
-                        lineHeight: '1',
-                        pointerEvents: 'none',
-                        textShadow: '0 0 2px #161b22, 0 0 2px #161b22',
-                    });
-                    wrap.appendChild(overlay);
-                }
-                if (result.status === 'valid') {
-                    overlay.textContent = '✅';
-                    const fp = result.fingerprint || '';
-                    const fpFmt = fp.replace(/(.{4})/g, '$1 ').trim();
-                    chip.title = `${username}: PGP verified\n${fpFmt}`;
-                } else if (result.status === 'minisign') {
-                    overlay.textContent = '🔑';
-                    chip.title = `${username}: minisign signature${result.reason ? '\n' + result.reason : ''}`;
-                } else {
-                    overlay.textContent = '❌';
-                    Object.assign(overlay.style, { fontSize: '10px' });
-                    chip.title = `${username}: PGP ${result.status === 'invalid' ? 'INVALID' : 'failed'} -- ${result.reason || 'unknown'}`;
-                }
+            // Wrap avatar in a positioned container once; the overlay/title updates below
+            // always re-run so a later result for the same user refreshes the badge.
+            let wrap = avatar.closest('.ack-pgp-avatar-wrap');
+            if (!wrap) {
+                wrap = document.createElement('span');
+                wrap.className = 'ack-pgp-avatar-wrap';
+                Object.assign(wrap.style, {
+                    position: 'relative',
+                    display: 'inline-block',
+                    width: '14px',
+                    height: '14px',
+                    flexShrink: '0',
+                });
+                avatar.before(wrap);
+                wrap.appendChild(avatar);
+            }
+            // Add or update overlay badge
+            let overlay = wrap.querySelector('.ack-pgp-overlay');
+            if (!overlay) {
+                overlay = document.createElement('span');
+                overlay.className = 'ack-pgp-overlay';
+                Object.assign(overlay.style, {
+                    position: 'absolute',
+                    bottom: '-2px',
+                    right: '-3px',
+                    fontSize: '8px',
+                    lineHeight: '1',
+                    pointerEvents: 'none',
+                    textShadow: '0 0 2px #161b22, 0 0 2px #161b22',
+                });
+                wrap.appendChild(overlay);
+            }
+            overlay.style.fontSize = '8px'; // reset the invalid-branch bump on status upgrades
+            if (result.status === 'valid') {
+                overlay.textContent = '✅';
+                const fp = result.fingerprint || '';
+                const fpFmt = fp.replace(/(.{4})/g, '$1 ').trim();
+                chip.title = `${username}: PGP verified\n${fpFmt}`;
+            } else if (result.status === 'minisign') {
+                overlay.textContent = '🔑';
+                chip.title = `${username}: minisign signature${result.reason ? '\n' + result.reason : ''}`;
+            } else {
+                overlay.textContent = '❌';
+                Object.assign(overlay.style, { fontSize: '10px' });
+                chip.title = `${username}: PGP ${result.status === 'invalid' ? 'INVALID' : 'failed'} -- ${result.reason || 'unknown'}`;
             }
         }
     }
@@ -14514,9 +14562,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             hidden_loaders: hiddenLoadersChanged,
             last_activity: _ackLastActivityReason,
         });
+        let processed = 0;
         for (const root of roots) {
             if (isCanceled()) {
-                pendingMutationRoots.add(root);
+                // Re-queue the current root plus all unprocessed ones and restore the
+                // consumed flags, so the rescheduled drain does not lose work.
+                for (let j = processed; j < roots.length; j++) pendingMutationRoots.add(roots[j]);
+                pendingMutationHadRemovals ||= hadRemovals;
+                pendingMutationPrTitleBtnRemoved ||= prTitleBtnRemoved;
+                pendingMutationHiddenLoadersChanged ||= hiddenLoadersChanged;
                 mutationPending = true;
                 scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
                     delayMs: 160,
@@ -14524,6 +14578,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
                 return;
             }
+            processed++;
             if (root !== document && !root.isConnected) continue;
             runRootInjectors(root, ctx);
         }
@@ -14602,9 +14657,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             roots: roots.length,
             last_activity: _ackLastActivityReason,
         });
+        let processed = 0;
         for (const root of roots) {
             if (isCanceled()) {
-                pendingAttrRoots.add(root);
+                // Re-queue the current root plus all unprocessed ones (see drainDomMutationBatch).
+                for (let j = processed; j < roots.length; j++) pendingAttrRoots.add(roots[j]);
                 attrRefreshPending = true;
                 scheduleAckBackgroundWork('attr-observer', ({ isCanceled }) => drainAttrMutationBatch(isCanceled), {
                     delayMs: 600,
@@ -14612,6 +14669,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
                 return;
             }
+            processed++;
             if (!root.isConnected) continue;
             runRootInjectorsForNames(
                 root,
@@ -16074,7 +16132,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     String(s || '')
                         .toLowerCase()
                         .replace(/[^a-z0-9]+/g, ' ')
-                        .split(/\\s+/)
+                        .split(/\s+/)
                         .map((t) => t.trim())
                         .filter(Boolean),
                 );
@@ -17198,7 +17256,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         qsa(root, '.octicon-smiley').forEach((icon) => {
             const btn = icon.closest('button, summary');
-            if (btn && !triggers.some((t) => (t.el === btn && t.el === btn.closest('details')) || t.el === btn))
+            if (btn && !triggers.some((t) => t.el === btn || t.el === btn.closest('details')))
                 triggers.push({
                     el: btn.closest('details') || btn,
                     type: btn.closest('details') ? 'details' : 'button',
@@ -17491,11 +17549,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .split(/,\s*/)
                 .map((s) => s.trim())
                 .filter(Boolean);
-            const avatarSrc =
-                li.querySelector('img[src], [data-testid="avatar-link"] img[src]')?.getAttribute('src') || '';
+            // DOM gives logins only; fetchCommentReactors enrichment fills per-login avatars.
+            // (Popover <li>s contain no avatar imgs, and a shared per-li img would
+            // mis-attribute one avatar to every reactor in the group.)
             result[alias] = names.map((login) => ({
                 login,
-                avatar: avatarSrc,
+                avatar: '',
             }));
         }
         return Object.keys(result).length > 0 ? result : null;
@@ -18146,7 +18205,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!hasSelection) {
             // Insert empty template at cursor with fenced code block
             const template = `\n<details><summary>${summaryLabel}</summary>\n\n\`\`\`bash\n\n\`\`\`\n\n</details>\n`;
-            const cursorPos = start + template.indexOf('```\n\n```') + 4; // after opening fence + newline
+            const fence = '```bash\n';
+            const cursorPos = start + template.indexOf(fence) + fence.length; // start of the empty line inside the code block
             setTextareaValue(ta, text.slice(0, start) + template + text.slice(end));
             ta.focus();
             ta.selectionStart = ta.selectionEnd = cursorPos;
@@ -19512,15 +19572,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         const lineNum = lineEl?.getAttribute?.('data-line-number') || '';
         const anchorId = lineEl?.id || '';
-        const side = anchorId.match(/#?diff-\w+([RL])\d+$/)?.[1] || anchorId.match(/([RL])\d+$/)?.[1] || '';
+        // React diff cells carry no id; their R/L side lives in data-line-anchor (preferred:
+        // GitHub anchors context lines as R<n>, matching permalink semantics) or data-diff-side.
+        const lineAnchor = codeCell.closest('[data-line-anchor]')?.getAttribute('data-line-anchor') || '';
+        const side =
+            anchorId.match(/#?diff-\w+([RL])\d+$/)?.[1] ||
+            anchorId.match(/([RL])\d+$/)?.[1] ||
+            lineAnchor.match(/diff-\w+([RL])\d+$/)?.[1] ||
+            ({ left: 'L', right: 'R' })[(lineEl || codeCell).getAttribute?.('data-diff-side')] ||
+            '';
 
-        // File path
+        // File path: classic containers first, then the React diff table's own aria-label.
         const diffFile = codeCell.closest('[data-path], .js-file, .diff-table, [data-testid="diff-file"], .file');
         const fileName =
             diffFile
                 ?.querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
                 ?.textContent?.trim() ||
             diffFile?.getAttribute?.('data-path') ||
+            codeCell
+                .closest('table[data-diff-anchor]')
+                ?.getAttribute('aria-label')
+                ?.match(/^Diff for: (.+)$/)?.[1] ||
             '';
 
         return { codeCell, row, fileName, lineNum, side, anchorId };
@@ -20754,58 +20826,55 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ].filter((el) => /co-authored-by/i.test(el.textContent || ''));
         if (descs.length === 0) return;
 
-        const coAuthors = [];
-        for (const desc of descs) {
-            coAuthors.push(...parseCoAuthoredBy(desc.textContent));
-        }
-        if (coAuthors.length === 0) return;
-
-        // Scrape resolved avatars from the page's commit attribution stack.
-        // GitHub renders: [committer, co-author1, co-author2, ...] in trailer order.
-        const stackAvatars = document.querySelectorAll('[data-testid="commit-stack-avatar"]');
-        const resolvedMap = new Map(); // name|email -> { login, avatarUrl }
-
-        if (stackAvatars.length > 1) {
-            // Skip first avatar (main committer), rest are co-authors in order
-            const coAvatars = [...stackAvatars].slice(1);
-            for (let i = 0; i < Math.min(coAuthors.length, coAvatars.length); i++) {
-                const img = coAvatars[i];
-                const login = img.alt || '';
-                const avatarUrl = img.src || '';
-                if (login && avatarUrl) {
-                    // Map by position (most reliable) and also by name/email for fallback
-                    const key = `${coAuthors[i].name}|${coAuthors[i].email}`;
-                    resolvedMap.set(key, { login, avatarUrl });
-                }
-            }
-        }
-
-        // Fallback: resolve from noreply emails
-        for (const ca of coAuthors) {
-            const key = `${ca.name}|${ca.email}`;
-            if (resolvedMap.has(key)) continue;
-            const login = resolveGitHubLogin(ca.email);
-            if (login) {
-                resolvedMap.set(key, {
-                    login,
-                    avatarUrl: `https://github.com/${login}.png?size=32`,
-                });
-            }
-        }
-
         for (const desc of descs) {
             if (desc.dataset.ackCoauthorProcessed) continue;
+            const coAuthors = parseCoAuthoredBy(desc.textContent);
+            if (coAuthors.length === 0) continue;
             desc.dataset.ackCoauthorProcessed = 'true';
 
+            // Scrape resolved avatars from this commit row's attribution stack -- the trailer
+            // order invariant ([committer, co-author1, ...]) only holds per row, so page-global
+            // mapping would misattribute avatars on commits-list pages. Fall back to the
+            // page-wide stack on single-commit pages (one stack on the page).
+            const row = desc.closest('[data-testid="commit-row-item"]');
+            const stackAvatars = (row || document).querySelectorAll('[data-testid="commit-stack-avatar"]');
+            const resolvedMap = new Map(); // name|email -> { login, avatarUrl }
+
+            if (stackAvatars.length > 1) {
+                // Skip first avatar (main committer), rest are co-authors in order
+                const coAvatars = [...stackAvatars].slice(1);
+                for (let i = 0; i < Math.min(coAuthors.length, coAvatars.length); i++) {
+                    const img = coAvatars[i];
+                    const login = img.alt || '';
+                    const avatarUrl = img.src || '';
+                    if (login && avatarUrl) {
+                        // Map by position (most reliable) and also by name/email for fallback
+                        const key = `${coAuthors[i].name}|${coAuthors[i].email}`;
+                        resolvedMap.set(key, { login, avatarUrl });
+                    }
+                }
+            }
+
+            // Fallback: resolve from noreply emails
+            for (const ca of coAuthors) {
+                const key = `${ca.name}|${ca.email}`;
+                if (resolvedMap.has(key)) continue;
+                const login = resolveGitHubLogin(ca.email);
+                if (login) {
+                    resolvedMap.set(key, {
+                        login,
+                        avatarUrl: `https://github.com/${login}.png?size=32`,
+                    });
+                }
+            }
+
             const text = desc.innerHTML;
-            let caIdx = 0;
             const replaced = text.replace(
                 /Co-authored-by:\s*([^\n<&]+?)\s*(?:&lt;|<)\s*([^\n]*?)\s*(?:&gt;|>)/gi,
                 (match, rawName, email) => {
                     const name = rawName.trim();
                     const key = `${name}|${email.trim()}`;
                     const resolved = resolvedMap.get(key);
-                    caIdx++;
                     if (!resolved) return match;
                     const avatarImg = `<img src="${escapeHTML(resolved.avatarUrl)}" alt="${escapeHTML(resolved.login)}" style="width:16px;height:16px;border-radius:50%;vertical-align:middle;margin-right:3px;display:inline">`;
                     const profileLink = `<a href="https://github.com/${escapeHTML(resolved.login)}" style="color:#58a6ff;text-decoration:none" title="${escapeHTML(name)}">${escapeHTML(resolved.login)}</a>`;
@@ -21493,22 +21562,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (pushes.length > 0) {
             lastForcePush = pushes[pushes.length - 1];
             lastForcePushRange = getForcePushRange(pushes);
-            invalidatePRContext();
-            commitListCache.clear();
-            if (pr) {
-                for (const prov of Object.keys(PROVIDER_META)) {
-                    const ck = commitExplainCacheKey(pr, prov);
-                    GM_deleteValue(ck);
-                    GM_deleteValue(`llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
-                    GM_deleteValue(`llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
-                    GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commits'));
-                    GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commit'));
+            // The parsers return ALL historical pushes, so only wipe the persistent LLM caches
+            // when the signature differs from the last handled one for this PR -- otherwise
+            // every navigation would delete caches generated after the latest push. Compare on
+            // 7-char SHA prefixes so DOM-parsed (sometimes short) and API (full) sigs match.
+            const normalizedSig = pushes
+                .map((p) => `${(p.fromFull || p.from || '').slice(0, 7)}->${(p.toFull || p.to || '').slice(0, 7)}`)
+                .join('|');
+            const sigKey = pr ? `forcepush_sig_${pr.owner}_${pr.repo}_${pr.pr}` : null;
+            const handledSig = sigKey ? GM_getValue(sigKey, '') : '';
+            if (!sigKey || normalizedSig !== handledSig) {
+                invalidatePRContext();
+                commitListCache.clear();
+                if (pr) {
+                    for (const prov of Object.keys(PROVIDER_META)) {
+                        const ck = commitExplainCacheKey(pr, prov);
+                        GM_deleteValue(ck);
+                        GM_deleteValue(`llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
+                        GM_deleteValue(`llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
+                        GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commits'));
+                        GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commit'));
+                    }
+                    const infographicPrefix = prInfographicCachePrefix(pr);
+                    const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
+                    keys.forEach((k) => {
+                        if (k.startsWith(infographicPrefix)) GM_deleteValue(k);
+                    });
+                    GM_setValue(sigKey, normalizedSig);
                 }
-                const infographicPrefix = prInfographicCachePrefix(pr);
-                const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
-                keys.forEach((k) => {
-                    if (k.startsWith(infographicPrefix)) GM_deleteValue(k);
-                });
             }
         }
 
@@ -22971,7 +23052,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.153
+// @version      1.154
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -26605,6 +26686,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("const PROOFREAD_POST_SHORTCUT_KEY = 'p'"), 'proofread uses P shortcut');
         ackAssert(source.includes('`⌘⌥${letter}`'), 'macOS shortcut label uses Command+Option');
         ackAssert(source.includes('`Alt+Shift+${letter}`'), 'non-mac shortcut label uses Alt+Shift');
+        ackAssert(
+            source.includes('/Mac|iPhone|iPad|iPod/i.test(platform)'),
+            'platform regex matches MacIntel/macOS without word boundaries',
+        );
         const matcher = sourceSection(source, 'function matchesPostActionShortcut', 'function notifyShiftAlternateRenderers');
         ackAssert(matcher.includes('isMacKeyboardPlatform()'), 'has platform-specific shortcut matcher');
         ackAssert(matcher.includes('eventCode === `key${letter}`'), 'matches physical key code for Option-modified mac keys');
@@ -30657,6 +30742,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('td.diff-text-cell'), 'supports React diff table cells');
         ackAssert(fn.includes('code.diff-text'), 'supports nested code.diff-text nodes');
+        ackAssert(fn.includes('data-line-anchor'), 'derives R/L side from React line anchors');
+        ackAssert(fn.includes('Diff for:'), 'derives file name from React diff table aria-label');
     });
 
     ackTest('diff selection context works outside diff (commit messages/comments/etc)', () => {
@@ -31189,6 +31276,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(!out.includes('-line one'), 'omits deleted file content lines');
         ackAssert(out.includes('+new'), 'keeps non-deleted file hunks intact');
+    });
+
+    ackTest('stripDeletedFileBodiesFromPatch keeps the next commit when one ends with a deleted file', () => {
+        const sha = 'a'.repeat(40);
+        const patch = [
+            'From 1234567890123456789012345678901234567890 Mon Sep 17 00:00:00 2001',
+            'Subject: [PATCH 1/2] remove obsolete file',
+            '',
+            'diff --git a/src/delete.cpp b/src/delete.cpp',
+            'deleted file mode 100644',
+            'index abcdef..000000',
+            '--- a/src/delete.cpp',
+            '+++ /dev/null',
+            '@@ -1,2 +0,0 @@',
+            '-line one',
+            '-line two',
+            '-- ',
+            '2.39.5',
+            '',
+            `From ${sha} Mon Sep 17 00:00:00 2001`,
+            'Subject: [PATCH 2/2] add replacement',
+            '',
+            'second commit message body',
+            '',
+            'diff --git a/src/keep.cpp b/src/keep.cpp',
+            'index 111..222 100644',
+            '--- a/src/keep.cpp',
+            '+++ b/src/keep.cpp',
+            '@@ -1 +1 @@',
+            '-old',
+            '+new',
+            '',
+        ].join('\n');
+        const out = stripDeletedFileBodiesFromPatch(patch);
+        ackAssert(out.includes(`From ${sha} `), 'keeps the second commit mbox From line');
+        ackAssert(out.includes('Subject: [PATCH 2/2] add replacement'), 'keeps the second commit subject');
+        ackAssert(out.includes('second commit message body'), 'keeps the second commit message body');
+        ackAssert(!out.includes('-line one'), 'omits deleted file content lines');
+        ackAssert(
+            out.split('@@ deleted file contents omitted @@').length === 2,
+            'contains exactly one placeholder',
+        );
     });
 
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchRawFile, fetchCommitPatch', () => {
@@ -31819,7 +31948,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('!hasSelection'), 'checks for no selection');
         ackAssert(fn.includes("const summaryLabel = 'Details';"), 'defines default details summary label');
         ackAssert(fn.includes('<details><summary>${summaryLabel}</summary>'), 'inserts details template');
-        ackAssert(fn.includes("'```\\n\\n```'") || fn.includes('```\\n\\n```'), 'template includes empty code block');
+        ackAssert(fn.includes("const fence = '```bash\\n'"), 'template includes empty bash code block');
         ackAssert(fn.includes('ta.selectionStart = ta.selectionEnd = cursorPos'), 'positions cursor inside code block');
     });
 
@@ -36505,6 +36634,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('(currentCommitIdx + dir + commits.length) % commits.length'),
             'wraps with modular arithmetic',
         );
+        ackAssert(fn.includes('dir > 0 ? 0 : commits.length - 1'), 'unselected state starts at first/last commit');
         ackAssert(!fn.includes('Math.max(0, Math.min('), 'no clamping');
     });
 
@@ -36601,9 +36731,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.153', () => {
+    ackTest('version bumped to 1.154', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.153' || _ackSource.includes('@version      1.153'), 'version is 1.153');
+        ackAssert(versionFromMeta === '1.154' || _ackSource.includes('@version      1.154'), 'version is 1.154');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -38561,10 +38691,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }).observe(document.body, { childList: true, subtree: true });
 
     let liveRefreshPending = false;
+    let _liveRefreshAbortGen = 0;
     new MutationObserver((mutations) => {
         if (_ackTesting) return;
         if (liveRefreshPending || location.href !== lastUrl) return;
         if (!mutationBatchMightContainForcePush(mutations)) return;
+        // A lifetime abort drops the scheduled job (and its flag reset) -- clear the
+        // flag on abort like the url-observer above, or live refresh stays disabled.
+        const lt = ensureAckLifetime('live-toolbar-refresh');
+        if (lt.gen !== _liveRefreshAbortGen) {
+            _liveRefreshAbortGen = lt.gen;
+            lt.onAbort(() => {
+                liveRefreshPending = false;
+            });
+        }
         liveRefreshPending = true;
         scheduleAckBackgroundWork(
             'live-toolbar-refresh',
