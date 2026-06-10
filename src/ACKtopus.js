@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.156
+// @version      1.157
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2612,6 +2612,11 @@
         }
     }
 
+    // PR sub-pages (/files, /commits, /changes) from which the ACK chip redirects
+    // to the conversation tab. Shared by the chip click handler and the self-tests.
+    const PR_SUBPAGE_RE = /\/pull\/\d+\/(files|commits|changes)/;
+    const PR_SUBPAGE_TO_CONVERSATION_RE = /\/pull\/(\d+)\/(files|commits|changes).*/;
+
     function findUserAcks(username) {
         // Find all comments by this user that look like ACKs
         const results = [];
@@ -3073,9 +3078,9 @@
                     e.preventDefault();
 
                     const path = location.pathname;
-                    const isOnFiles = /\/pull\/\d+\/(files|commits|changes)/.test(path);
+                    const isOnFiles = PR_SUBPAGE_RE.test(path);
                     if (isOnFiles) {
-                        const convUrl = path.replace(/\/pull\/(\d+)\/(files|commits|changes).*/, '/pull/$1');
+                        const convUrl = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
                         const fullUrl = convUrl + (u.url.includes('#') ? '#' + u.url.split('#')[1] : '');
                         location.href = fullUrl;
                         return;
@@ -22999,14 +23004,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackDeepEq(extractBenchmarkNames('#include <bench.h>\nint main() {}'), []);
     });
 
-    ackTest('does not match BENCHMARK in comments or strings', () => {
-        // This is a best-effort check -- the regex is simple
+    ackTest('extracts BENCHMARK names best-effort (commented-out macros also match)', () => {
+        // The regex is simple and does not exclude comments or strings.
         const src = `
     // BENCHMARK(Commented);
     BENCHMARK(Real);
     `;
         const names = extractBenchmarkNames(src);
-        ackAssert(names.includes('Real'), 'finds real benchmark');
+        ackDeepEq(names, ['Commented', 'Real'], 'matches commented-out and real macros');
     });
 
     // --- SHA_FORMATS ACK labels ---
@@ -23227,41 +23232,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!PROOFREAD_ICON.includes('📝'), 'should not use colorful emoji icon');
     });
 
-    ackTest('BadgesGroupContainer selector matches only badge container, not other children', () => {
-        // React UI CSS module classes all start with "ActivityHeader-module__"
-        // but only the badges group contains "BadgesGroupContainer"
-        const badgesGroup = 'ActivityHeader-module__BadgesGroupContainer__W2UYE';
-        const actionsBtn = 'ActivityHeader-module__ActionsButtonsContainer__YAGtp';
-        const badgesContainer = 'ActivityHeader-module__BadgesContainer__iimDP';
-        ackAssert(badgesGroup.includes('BadgesGroupContainer'), 'badges group should match');
-        ackAssert(!actionsBtn.includes('BadgesGroupContainer'), 'actions buttons should NOT match');
-        ackAssert(!badgesContainer.includes('BadgesGroupContainer'), 'parent container should NOT match');
-    });
-
     // ============================================================================
     // React UI header/author detection tests
     // ============================================================================
 
-    ackTest('__activityHeader selector matches top-level header only', () => {
-        // The ActivityHeader CSS module applies "ActivityHeader-module__" prefix to
-        // ALL child classes (ActionsButtonsContainer, BadgesContainer, etc).
-        // Using [class*="ActivityHeader"] would match children too.
-        // [class*="__activityHeader"] only matches the top-level header div.
-        const topLevel = 'ActivityHeader-module__activityHeader__ZGlyB';
-        const child = 'ActivityHeader-module__ActionsButtonsContainer__YAGtp';
-        ackAssert(topLevel.includes('__activityHeader'), 'top-level class should match');
-        ackAssert(!child.includes('__activityHeader'), 'child class should NOT match');
-    });
-
     ackTest('avatar-link testid finds author name, not avatar image link', () => {
         // React UI has two links with data-hovercard-type="user":
-        // 1. Avatar IMAGE link: class*="avatarLink", empty text, appears first in DOM
+        // 1. Avatar IMAGE link: class*="avatarLink" (eg Avatar-module__avatarLink__LpV3I),
+        //    empty text, appears first in DOM
         // 2. Author NAME link: data-testid="avatar-link", has username text
         // Our selector must find #2 not #1.
-        const avatarLinkClass = 'Avatar-module__avatarLink__LpV3I';
-        const selector = ':not([class*="avatar" i])';
-        // The :not filter excludes the image link
-        ackAssert(avatarLinkClass.toLowerCase().includes('avatar'), 'avatar class should be filtered');
+        const source = _ackSource;
+        ackAssert(
+            source.includes(':not([class*="avatar" i])'),
+            'author-name lookup filters avatar-classed links',
+        );
     });
 
     // ============================================================================
@@ -23276,16 +23261,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('direct mode with non-JSON body logs warning but passes through', () => {
-        let caught = false;
-        try {
-            JSON.parse('not-json-body');
-        } catch {
-            caught = true;
-        }
-        ackAssert(caught, 'non-JSON body triggers catch in interceptor');
-    });
-
     // ============================================================================
     // ACK chip: navigate to conversation tab from /files or /commits
     // ============================================================================
@@ -23297,59 +23272,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ['/bitcoin/bitcoin/pull/31400/changes/abc123', '/bitcoin/bitcoin/pull/31400'],
         ];
         for (const [path, expected] of cases) {
-            const conv = path.replace(/\/pull\/(\d+)\/(files|commits|changes).*/, '/pull/$1');
+            const conv = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
             ackEq(conv, expected, `${path} → ${expected}`);
         }
         const convPath = '/bitcoin/bitcoin/pull/31400';
-        ackAssert(!/\/pull\/\d+\/(files|commits|changes)/.test(convPath), 'conversation tab not redirected');
-    });
-
-    // ============================================================================
-    // PR body detection -- no delete on main description
-    // ============================================================================
-    ackTest('data-morpheus-enabled matches both PR body and review comment headers', () => {
-        // Both classic UI header types have data-morpheus-enabled attribute
-        const prHeader = 'timeline-comment-header clearfix d-flex flex-items-start';
-        const reviewHeader = 'ml-n1 flex-items-center flex-row-reverse clearfix d-flex flex-items-start';
-        // Neither has a shared recognizable class, but both have data-morpheus-enabled
-        ackAssert(!reviewHeader.includes('timeline-comment-header'), 'review header lacks timeline class');
-        ackAssert(!reviewHeader.includes('review-comment-header'), 'review header lacks review-comment class');
-        // data-morpheus-enabled is the universal classic UI header marker
-    });
-
-    ackTest('classic UI icons insert between badges and kebab (flex-row-reverse)', () => {
-        // Parent div has flex-row-reverse, so visual order is REVERSE of DOM order.
-        // DOM: [kebab, badges] → Visual: badges(left), kebab(right)
-        // To place icons visually AFTER badges: insert BEFORE badges in DOM.
-        // DOM: [kebab, icons, badges] → Visual: badges, icons, kebab ✓
-        //
-        // Verify the logic: .before() inserts earlier in DOM = later visually
-        const domOrder = ['kebab', 'badges']; // original
-        // .before('badges') → insert at index of badges
-        const idx = domOrder.indexOf('badges');
-        domOrder.splice(idx, 0, 'icons');
-        ackDeepEq(domOrder, ['kebab', 'icons', 'badges'], 'DOM order after .before');
-        // Visual (reversed): badges, icons, kebab -- icons appear right after Author badge
-        const visual = [...domOrder].reverse();
-        ackDeepEq(visual, ['badges', 'icons', 'kebab'], 'visual order (flex-row-reverse)');
-    });
-
-    ackTest('PR body detected by permalink href starting with #issue-', () => {
-        // PR body permalink: href="#issue-3779522505"
-        ackAssert('#issue-3779522505'.startsWith('#issue-'), 'issue permalink = PR body');
-        // Review comment permalink: href="#discussion_r2817527463"
-        ackAssert(!'#discussion_r2817527463'.startsWith('#issue-'), 'discussion permalink = not PR body');
-        // No permalink (React UI) -- isPRBody defaults to false
-        ackAssert(!(null?.startsWith?.('#issue-') || false), 'null permalink = not PR body');
-    });
-
-    // ============================================================================
-    // Stale icon cleanup
-    // ============================================================================
-    ackTest('processed container without icons triggers marker reset', () => {
-        const processed = true,
-            hasIcons = false;
-        ackAssert(processed && !hasIcons, 'stale marker reset allows icon re-insertion');
+        ackAssert(!PR_SUBPAGE_RE.test(convPath), 'conversation tab not redirected');
     });
 
     ackTest('proofread prompt instructs LLM to preserve markdown formatting', () => {
@@ -23364,64 +23291,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // insertIntoTextarea
     // ============================================================================
 
+    // The fixtures below stay DETACHED so focus() is a no-op and the bubbling
+    // input/change events from setTextareaValue cannot leak into the live page.
     ackTest('insertIntoTextarea inserts at cursor position', () => {
-        const el = {
-            tagName: 'TEXTAREA',
-            value: 'hello world',
-            selectionStart: 5,
-            selectionEnd: 5,
-            focus: () => {},
-        };
-        // Simulate: cursor between "hello" and " world"
-        const start = el.selectionStart;
-        const end = el.selectionEnd;
-        const before = el.value.slice(0, start);
-        const after = el.value.slice(end);
-        el.value = before + ' inserted' + after;
-        ackEq(el.value, 'hello inserted world');
+        const ta = document.createElement('textarea');
+        ta.value = 'hello world';
+        // Cursor between "hello" and " world"
+        ta.selectionStart = ta.selectionEnd = 5;
+        insertIntoTextarea(ta, ' inserted');
+        ackEq(ta.value, 'hello inserted world');
     });
 
     ackTest('insertIntoTextarea replaces selection', () => {
-        const el = {
-            tagName: 'TEXTAREA',
-            value: 'hello cruel world',
-            selectionStart: 6,
-            selectionEnd: 11,
-            focus: () => {},
-        };
-        const before = el.value.slice(0, el.selectionStart);
-        const after = el.value.slice(el.selectionEnd);
-        el.value = before + 'beautiful' + after;
-        ackEq(el.value, 'hello beautiful world');
+        const ta = document.createElement('textarea');
+        ta.value = 'hello cruel world';
+        ta.selectionStart = 6;
+        ta.selectionEnd = 11;
+        insertIntoTextarea(ta, 'beautiful');
+        ackEq(ta.value, 'hello beautiful world');
     });
 
     ackTest('insertIntoTextarea appends at end when no selection info', () => {
-        const el = {
-            tagName: 'TEXTAREA',
-            value: 'existing',
-            selectionStart: undefined,
-            selectionEnd: undefined,
-            focus: () => {},
-        };
-        const start = el.selectionStart ?? el.value.length;
-        const end = el.selectionEnd ?? el.value.length;
-        const before = el.value.slice(0, start);
-        const after = el.value.slice(end);
-        el.value = before + ' new' + after;
-        ackEq(el.value, 'existing new');
+        const ta = document.createElement('textarea');
+        // Setting .value places the cursor at the end (spec: value setter moves
+        // the text entry cursor to the end of the control)
+        ta.value = 'existing';
+        insertIntoTextarea(ta, ' new');
+        ackEq(ta.value, 'existing new');
     });
 
     ackTest('insertIntoTextarea sets cursor after inserted text', () => {
-        const el = {
-            tagName: 'TEXTAREA',
-            value: 'abcdef',
-            selectionStart: 3,
-            selectionEnd: 3,
-            focus: () => {},
-        };
-        const text = 'XY';
-        const newPos = el.selectionStart + text.length;
-        ackEq(newPos, 5, 'cursor should be at position 5 after inserting 2 chars at position 3');
+        const ta = document.createElement('textarea');
+        ta.value = 'abcdef';
+        ta.selectionStart = ta.selectionEnd = 3;
+        insertIntoTextarea(ta, 'XY');
+        ackEq(ta.value, 'abcXYdef');
+        ackEq(ta.selectionStart, 5, 'cursor should be at position 5 after inserting 2 chars at position 3');
+        ackEq(ta.selectionEnd, 5, 'selection collapsed after insert');
     });
 
     // ============================================================================
@@ -23449,11 +23355,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('wordDiff preserves whitespace tokens', () => {
-        const d = wordDiff('a  b', 'a  b');
-        // All tokens should be 'same'
-        ackAssert(
-            d.every((x) => x.type === 'same'),
-            'identical text has no changes',
+        const d = wordDiff('a  b', 'a  b c');
+        ackEq(
+            d.filter((x) => x.type !== 'del').map((x) => x.text).join(''),
+            'a  b c',
+            'non-del tokens reconstruct new text including double space',
         );
     });
 
@@ -23962,8 +23868,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('showDiffDialog returns unchanged for whitespace-only difference in same words', async () => {
-        // wordDiff splits on whitespace -- if all words match, no dialog
-        const result = await showDiffDialog('hello world', 'hello world');
+        // jsdiff diffWords ignores whitespace when computing the diff --
+        // whitespace-only changes = no dialog (double space is load-bearing below)
+        const result = await showDiffDialog('hello  world', 'hello world');
         ackDeepEq(result, { action: 'unchanged', text: 'hello world' }, 'same words = no changes');
     });
 
@@ -24215,69 +24122,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const proofFn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
         ackAssert(proofFn.includes('showDiffDialog'), 'edit mode shows diff dialog');
         ackAssert(proofFn.includes('scheduleQuickActionsSoftRescan'), 'edit mode refreshes icons');
-    });
-
-    // ============================================================================
-    // Selection-only proofread logic
-    // ============================================================================
-
-    ackTest('selection range captures exact substring', () => {
-        const value = 'The quick brown fox jumps over the lazy dog';
-        const selStart = 10,
-            selEnd = 19; // "brown fox"
-        const selected = value.slice(selStart, selEnd);
-        ackEq(selected, 'brown fox');
-    });
-
-    ackTest('setSelectionRange + insertText replaces only selection', () => {
-        // Simulate the logic: before = value[0..selStart), after = value[selEnd..)
-        const value = 'The quick brown fox jumps over the lazy dog';
-        const selStart = 10,
-            selEnd = 19;
-        const replacement = 'red cat';
-        const result = value.slice(0, selStart) + replacement + value.slice(selEnd);
-        ackEq(result, 'The quick red cat jumps over the lazy dog');
-        // Verify surrounding text is untouched
-        ackAssert(result.startsWith('The quick '), 'text before selection unchanged');
-        ackAssert(result.endsWith(' jumps over the lazy dog'), 'text after selection unchanged');
-    });
-
-    ackTest('full text replacement when no selection (selStart === selEnd === 0)', () => {
-        const selStart = 0,
-            selEnd = 0;
-        const hasSelection = selStart !== selEnd;
-        ackAssert(!hasSelection, 'cursor at position 0 with no selection');
-        // In this case, select-all + insert replaces everything
-    });
-
-    ackTest('selection at end of text', () => {
-        const value = 'hello world';
-        const selStart = 6,
-            selEnd = 11; // "world"
-        const selected = value.slice(selStart, selEnd);
-        ackEq(selected, 'world');
-        const result = value.slice(0, selStart) + 'earth' + value.slice(selEnd);
-        ackEq(result, 'hello earth');
-    });
-
-    ackTest('selection at start of text', () => {
-        const value = 'hello world';
-        const selStart = 0,
-            selEnd = 5; // "hello"
-        const result = value.slice(0, selStart) + 'greetings' + value.slice(selEnd);
-        ackEq(result, 'greetings world');
-    });
-
-    ackTest('selection preserves markdown context around it', () => {
-        const value = 'See [this link](https://example.com) for details about the **important** topic';
-        // Select only "important"
-        const selStart = value.indexOf('important'),
-            selEnd = selStart + 'important'.length;
-        const selected = value.slice(selStart, selEnd);
-        ackEq(selected, 'important');
-        const result = value.slice(0, selStart) + 'critical' + value.slice(selEnd);
-        ackAssert(result.includes('[this link](https://example.com)'), 'markdown link untouched');
-        ackAssert(result.includes('**critical**'), 'only the word inside bold changed');
     });
 
     // ============================================================================
@@ -24738,11 +24582,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // ============================================================================
 
     ackTest('isProviderAvailable returns false for empty string key', () => {
-        // MOCK: const origGV = GM_getValue;
-        // MOCK: GM_getValue = (k, def) => k === 'claudeKey' ? '' : def;
-        // Re-evaluate: empty string is falsy
-        // NEEDS-MOCK: ackAssert(!(''), 'empty string is falsy');
-        // MOCK: GM_getValue = origGV;
+        GM_setValue('llm_claude_key', 'test-key');
+        ackEq(isProviderAvailable('claude'), true, 'non-empty key is available');
+        GM_setValue('llm_claude_key', '');
+        ackEq(isProviderAvailable('claude'), false, 'empty string key is not available');
     });
 
     // ============================================================================
@@ -24806,23 +24649,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('ACK chip: conversation path not redirected', () => {
         const path = '/bitcoin/bitcoin/pull/42';
-        const isOnFiles = /\/pull\/\d+\/(files|commits|changes)/.test(path);
-        ackAssert(!isOnFiles, 'base PR path not redirected');
+        ackAssert(!PR_SUBPAGE_RE.test(path), 'base PR path not redirected');
     });
 
     ackTest('ACK chip: /files with sub-path redirected', () => {
         const path = '/bitcoin/bitcoin/pull/42/files/some-anchor';
-        const isOnFiles = /\/pull\/\d+\/(files|commits|changes)/.test(path);
-        ackAssert(isOnFiles, '/files with sub-path detected');
-        const conv = path.replace(/\/pull\/(\d+)\/(files|commits|changes).*/, '/pull/$1');
+        ackAssert(PR_SUBPAGE_RE.test(path), '/files with sub-path detected');
+        const conv = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
         ackEq(conv, '/bitcoin/bitcoin/pull/42');
     });
 
     ackTest('ACK chip: /changes/ path redirected to conversation', () => {
         const path = '/bitcoin/bitcoin/pull/42/changes/abc123';
-        const isOnFiles = /\/pull\/\d+\/(files|commits|changes)/.test(path);
-        ackAssert(isOnFiles, '/changes path detected');
-        const conv = path.replace(/\/pull\/(\d+)\/(files|commits|changes).*/, '/pull/$1');
+        ackAssert(PR_SUBPAGE_RE.test(path), '/changes path detected');
+        const conv = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
         ackEq(conv, '/bitcoin/bitcoin/pull/42');
     });
 
@@ -24849,90 +24689,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
         ackAssert(source.includes('shouldSuppressHiddenConversationRefresh()'), 'suppresses toolbar refresh churn during hash reveal');
         ackAssert(!source.includes('schedulePostHashRevealToolbarRefresh'), 'does not schedule delayed toolbar rebuild after hash reveal');
-    });
-
-    // ============================================================================
-    // PR body detection -- extended
-    // ============================================================================
-
-    ackTest('PR body: #issue- permalink is PR description', () => {
-        ackAssert('#issue-3779522505'.startsWith('#issue-'));
-    });
-
-    ackTest('PR body: #discussion_r permalink is review comment', () => {
-        ackAssert(!'#discussion_r2817527463'.startsWith('#issue-'));
-    });
-
-    ackTest('PR body: #pullrequestreview- permalink is review', () => {
-        ackAssert(!'#pullrequestreview-12345'.startsWith('#issue-'));
-    });
-
-    ackTest('PR body: null permalink defaults to not-PR-body', () => {
-        const href = null;
-        const isPRBody = href?.startsWith('#issue-') || false;
-        ackEq(isPRBody, false);
-    });
-
-    // ============================================================================
-    // data-morpheus-enabled header selector -- extended
-    // ============================================================================
-
-    ackTest('data-morpheus-enabled is present on both classic header types', () => {
-        // PR body header: class="timeline-comment-header ..."
-        // Review comment header: class="ml-n1 flex-items-center ..."
-        // Both have data-morpheus-enabled="false"
-        const prBodyClasses = 'timeline-comment-header clearfix d-flex flex-items-start';
-        const reviewClasses = 'ml-n1 flex-items-center flex-row-reverse clearfix d-flex flex-items-start';
-        // Neither class is the other
-        ackAssert(!reviewClasses.includes('timeline-comment-header'));
-        ackAssert(!prBodyClasses.includes('ml-n1'));
-        // But data-morpheus-enabled on both -- this is what our selector uses
-    });
-
-    ackTest('flex-row-reverse means DOM-before = visually-after', () => {
-        // Insertion logic for classic UI icons
-        const domOrder = ['kebab', 'badges'];
-        const idx = domOrder.indexOf('badges');
-        domOrder.splice(idx, 0, 'icons');
-        const visual = [...domOrder].reverse();
-        ackDeepEq(visual, ['badges', 'icons', 'kebab']);
-    });
-
-    // ============================================================================
-    // Stale icon cleanup -- extended
-    // ============================================================================
-
-    ackTest('header with marker but no .ack-quick-actions gets marker reset', () => {
-        const hasMarker = true,
-            hasIcons = false;
-        const shouldReset = hasMarker && !hasIcons;
-        ackAssert(shouldReset, 'stale marker triggers reset');
-    });
-
-    ackTest('header with marker AND .ack-quick-actions is skipped (no reset)', () => {
-        const hasMarker = true,
-            hasIcons = true;
-        const shouldSkip = hasMarker && hasIcons;
-        ackAssert(shouldSkip, 'fresh icons = skip');
-    });
-
-    ackTest('header without marker always gets processed', () => {
-        const hasMarker = false;
-        ackAssert(!hasMarker, 'no marker = needs processing');
-    });
-
-    ackTest('permalink regex extracts comment ID from discussion_r format', () => {
-        const href = '#discussion_r2817527463';
-        const m = href.match(/discussion_r(\d+)|pullrequestreviewcomment-(\d+)/);
-        ackAssert(m, 'matches discussion_r format');
-        ackEq(Number(m[1]), 2817527463, 'extracts numeric ID');
-    });
-
-    ackTest('permalink regex extracts comment ID from pullrequestreviewcomment format', () => {
-        const href = '#pullrequestreviewcomment-12345';
-        const m = href.match(/discussion_r(\d+)|pullrequestreviewcomment-(\d+)/);
-        ackAssert(m, 'matches pullrequestreviewcomment format');
-        ackEq(Number(m[2]), 12345, 'extracts numeric ID from group 2');
     });
 
     // ============================================================================
@@ -25126,26 +24882,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("GM_getValue('compactToolbar', false)"), 'debug gate reads compact toolbar mode');
     });
 
-    ackTest('compact mode affects button text (emoji only vs emoji + label)', () => {
-        const compact = true;
-        const label = compact ? '📦' : '📦 Show hidden';
-        ackEq(label, '📦', 'compact shows emoji only');
-        const expanded = false;
-        const label2 = expanded ? '📦' : '📦 Show hidden';
-        ackEq(label2, '📦 Show hidden', 'expanded shows emoji + text');
-    });
-
-    ackTest('compact mode affects SHA button (no label text)', () => {
-        // Simulates updateMainLabel logic
-        const emoji = '📋';
-        const label = 'Fetch';
-        const icon = '<svg>...</svg>';
-        const compactResult = `${emoji}${icon}`;
-        const expandedResult = `${emoji} ${label}${icon}`;
-        ackAssert(!compactResult.includes(label), 'compact omits label');
-        ackAssert(expandedResult.includes(label), 'expanded includes label');
-    });
-
     ackTest('toolbar toggle uses click-on-background (no dedicated button)', () => {
         // The compact toggle is triggered by clicking toolbar background
         // (e.target === toolbar), not a dedicated button
@@ -25162,9 +24898,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('ackPanelVisible true means panel is shown', () => {
+        const orig = GM_getValue('ackPanelVisible', undefined);
         GM_setValue('ackPanelVisible', true);
         ackEq(GM_getValue('ackPanelVisible', undefined), true);
-        delete GM_getValue('ackPanelVisible', undefined); // restore
+        // restore
+        if (orig === undefined) GM_deleteValue('ackPanelVisible');
+        else GM_setValue('ackPanelVisible', orig);
     });
 
     // ============================================================================
@@ -25955,7 +25694,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('// Build overlapping avatar row'),
             source.indexOf('countEl.replaceWith'),
         );
-        ackAssert(fn.includes("marginLeft: i === 0 ? '0' : '-4px'"), 'overlaps avatars by 4px');
+        ackAssert(/marginLeft: i === 0 \? '0' : '-\d+px'/.test(fn), 'first avatar unshifted, rest overlap');
         ackAssert(fn.includes('zIndex:'), 'sets z-index for stacking order');
         ackAssert(fn.includes("borderRadius: '50%'"), 'circular avatars');
     });
@@ -26285,7 +26024,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Note: addQuickCommentActions uses a different guard pattern (dataset + length),
         // so it correctly has 3 querySelector-based guards.
         const source = _ackSource;
-        const testSuiteIdx = source.indexOf('const _ackTests = []');
+        // _ackSource has the test suite replaced by a strip marker; stop the scan there
+        // so only the production code before the test region is covered.
+        const testSuiteIdx = source.indexOf('[ACKtopus self-tests stripped');
         const mainSource = testSuiteIdx > 0 ? source.slice(0, testSuiteIdx) : source;
         // Match simple guards like:
         //   if (toolbar.querySelector('.ack-foo')) return;
@@ -29305,7 +29046,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('const btnRow'), 'uses a button row container');
         ackAssert(fn.includes('bar.appendChild(btnRow)'), 'buttons appended as a row');
         ackAssert(fn.includes("alignItems: 'stretch'"), 'output row stretches Chat button to full height');
-        ackAssert(fn.includes("marginTop: '2px'"), 'one-liner has top margin (below buttons)');
+        ackAssert(
+            fn.indexOf('bar.appendChild(btnRow)') < fn.indexOf('bar.appendChild(outRow)'),
+            'output row appended after button row',
+        );
+        ackAssert(/marginTop: '\d+px'/.test(fn), 'one-liner has top margin (below buttons)');
         ackAssert(!fn.includes("marginLeft: '4px'"), 'no inline one-liner placement');
     });
 
@@ -29345,7 +29090,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("bar.style.width = 'auto'"), 'resets width before measuring');
         ackAssert(fn.includes('btnRow.scrollWidth'), 'measures full button-row width, not clipped width');
         ackAssert(fn.includes('const targetW = Math.min'), 'clamps measured row width to viewport');
-        ackAssert(fn.includes('Math.ceil(rowW) + 18'), 'adds explicit width budget so all action buttons fit');
+        ackAssert(/Math\.ceil\(rowW\) \+ \d+/.test(fn), 'adds a positive width budget so all action buttons fit');
         ackAssert(fn.includes('bar.style.width = `${targetW}px`'), 'sets width from clamped row width');
     });
 
@@ -29894,13 +29639,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const stripComments = (s) => s.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
         const stripped = stripComments(afterHelper);
         // contentEditable still uses execCommand (only valid path)
-        const contentEditableLine = "document.execCommand('insertText', false, text)";
         const execCmdCount = (stripped.match(/execCommand\('insertText'/g) || []).length;
         ackAssert(execCmdCount <= 1, 'at most 1 execCommand for contentEditable path, found ' + execCmdCount);
         // No raw HTMLTextAreaElement.prototype.value.set outside setTextareaValue
-        const outsideHelper = stripped.slice(stripped.indexOf('function insertIntoTextarea'));
         ackAssert(
-            !outsideHelper.includes('Object.getOwnPropertyDescriptor(\n                    HTMLTextAreaElement'),
+            !stripped.includes('Object.getOwnPropertyDescriptor(\n                    HTMLTextAreaElement'),
             'no raw native setter outside helper',
         );
     });
@@ -32164,9 +31907,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(saveFn.includes('instrDefault'), 'save compares against default');
         ackAssert(saveFn.includes('.trim()'), 'comparison is trimmed');
 
-        const addInstr = source.slice(
-            source.indexOf('function addInstruction'),
-            source.indexOf("addInstruction('chat'"),
+        const addInstr = sourceSection(
+            source,
+            'function addInstruction',
+            'for (const { key, label } of CONFIG_INSTRUCTION_DEFS)',
         );
         ackAssert(addInstr.includes('instrDefault'), 'textarea stores default in data attribute');
         ackAssert(addInstr.includes('↺ Reset'), 'has reset button');
@@ -36630,18 +36374,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             tas.length >= commentTas.length,
             `COMMENT_TA_SELECTOR found ${tas.length} but manual check found ${commentTas.length} — selector may be incomplete`,
-        );
-    });
-
-    ackDomTest('DOM: no addQuickCommentActions(container) calls in source', () => {
-        // Verify the stale-container pattern isn't present (caught by our Node tests too,
-        // but this validates it at runtime from the actual running code)
-        const scriptText = document.querySelector('script[src*="ACKtopus"]')?.textContent || '';
-        // Can't easily get own source in Tampermonkey, so skip if not available
-        if (!scriptText) return;
-        ackAssert(
-            !scriptText.includes('addQuickCommentActions(container)'),
-            'found stale addQuickCommentActions(container) call in source',
         );
     });
 
