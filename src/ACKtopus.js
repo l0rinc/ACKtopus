@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.157
+// @version      1.158
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3235,10 +3235,6 @@
 
     // --- Force-Push Compare Enhancement ---
 
-    // On PR pages, rewrite force-push Compare links:
-    // Enhance force-push compare links: store the PR number so the compare page
-    // can identify which files belong to the PR and collapse upstream noise.
-    // Targets links directly by href pattern -- works in both Classic and React UI.
     // Find the SHA the current user last ACKed by scanning page comments.
     // Returns a full or abbreviated SHA string, or null.
     function findUserAckSha(acks) {
@@ -3304,6 +3300,10 @@
         return null;
     }
 
+    // On PR pages, enhance force-push Compare links: store the PR number so the
+    // compare page can identify which files belong to the PR and collapse
+    // upstream noise. Targets links directly by href pattern -- works in both
+    // Classic and React UI.
     function enhanceForcePushLinks() {
         const pr = parsePR();
         document.querySelectorAll('a[href*="/compare/"]').forEach((link) => {
@@ -11502,7 +11502,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (hasSelection) {
                         // Verify the captured text still matches -- abort if user typed during async LLM call
                         if (freshTa.value.slice(selStart, selEnd) !== textToProofread) {
-                            console.warn('ACKtopus: selection drifted during proofread, aborting partial replace');
+                            console.warn(
+                                'ACKtopus: selection drifted during proofread, falling back to whole-text replace',
+                            );
                             await setTextareaValueRobust(
                                 liveTextArea.container,
                                 freshTa,
@@ -16228,7 +16230,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         ...(menu.querySelectorAll?.('[role="menu"], .Overlay, .ActionListWrap, details-menu') || []),
                     ];
                     // Fallback: if nothing found in container, try document-level
-                    // menus but verify they are near the kebab (visible + positioned).
+                    // menus, restricted to visible (positioned) ones.
                     if (searchRoots.length === 0) {
                         for (const root of document.querySelectorAll(
                             '[role="menu"], .Overlay, .ActionListWrap, details-menu',
@@ -16314,7 +16316,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- Auto-open Reaction Popup on Hover ---
 
-    // Instead of replacing the smiley button with a custom emoji row, just
     // Known native reaction keys we manage from the smiley trigger
     const REACTION_CYCLE = ['+1', 'heart', 'hooray', 'rocket', 'eyes'];
 

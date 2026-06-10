@@ -90,7 +90,7 @@ _Compare-page cleanup that collapses unrelated files and keeps focus on the PR-r
 
 <img src="screenshots/expand%20closed%20sections.png" alt="Expand closed sections">
 
-_Bulk expansion of hidden, minimized, outdated, or otherwise collapsed review content._
+_Bulk expansion of hidden, minimized, outdated, or otherwise collapsed review content via **Reveal all**._
 
 ----
 
@@ -119,7 +119,7 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Navigating long PRs by comment, file, and commit
 - Reviewing with LLM chat, local reproducer prompts, maintainer summaries, commit lightbulbs, selection helpers, and cached PR/commit infographics
 - Proofreading comments, PR descriptions, and selected prose with a diff preview before applying changes
-- Starting/submitting pending GitHub reviews from the Conversation tab
+- Starting pending GitHub reviews and opening the review dialog from the Conversation tab
 - Keeping a personal PR review queue
 
 ## Toolbar (top-right)
@@ -153,16 +153,6 @@ If the PR changes C/C++ files, additional per-PR helpers appear:
 
 These three commands are generated with the PR’s exact changed C/C++ file paths already filled in, so they are ready to run as-is.
 
-### 📦 / 📂 / 🪟 Expand dropdown
-
-The expand control can run three related actions:
-
-- **Show hidden**: loads hidden conversation/comment pagination and issue timeline “Load more” items
-- **Show resolved**: expands resolved review threads
-- **Open collapsed**: opens minimized comments, outdated sections, and “Load diff” buttons for large diffs
-
-The context-copy dropdown also has **Reveal all**, which walks through hidden conversations, issue timeline items, resolved threads, collapsed sections, and deferred diffs before copying.
-
 ### 💬 Comment navigation
 
 Jumps between comments by date on PR pages, and between visible files on compare pages. Hold **Shift** to reverse direction. The delayed Ctrl hotkey chooser exposes this as **Ctrl+N** after the chooser is armed.
@@ -174,7 +164,7 @@ Copies page context to your clipboard for sharing or pasting into an LLM. The dr
 - **Patch**: PR description, commits, and patch
 - **Comments**: description plus visible comments, without the patch
 - **Full**: URL, title, description, commits, patch, and visible comments
-- **Reveal all**: expands hidden/resolved/collapsed content before copying
+- **Reveal all**: walks through hidden conversations, issue timeline items, resolved threads, collapsed sections, and deferred diffs before copying
 
 Hold **Shift** while clicking **Patch**, **Comments**, or **Full** to reveal hidden/resolved/collapsed content first, then run the chosen copy action. ACKtopus shows a 📂 hint next to the active context-copy button while Shift is held.
 
@@ -245,9 +235,7 @@ The quick 1-2 line summary is fetched automatically after a short stable-selecti
 
 On the PR Conversation tab, reply boxes normally only show **Comment**. ACKtopus adds a **Start a review** button next to it (only on replies), so you can start a review without navigating to the Files/Changes views.
 
-When a pending review already exists, ACKtopus marks reply and inline comment buttons with `⏳`, and adds a **Submit review** button to the main Conversation comment box.
-If the main comment box is empty, it submits the pending comments only.
-If it has text, that text is used as the review summary while submitting the pending comments.
+When a pending review already exists, ACKtopus marks reply and inline comment buttons with `⏳`, and adds a **Review** button to the main Conversation comment box. Clicking it opens GitHub's native review dialog; any text in the main comment box is moved into the review body so you can submit from there.
 
 ### Quick actions on comments
 
@@ -277,11 +265,15 @@ Keeps the comment formatting toolbar accessible while editing longer comments.
 
 ### Faster reactions
 
-Makes reacting faster by reducing clicks (for example: hover to open the picker and quick cycling on click).
+Makes reacting faster by reducing clicks: hovering a comment's smiley button opens the reaction picker, and clicking applies a 👍 directly (guarded so it never fires on your own comments or on accidental targets).
 
 ### PGP signature badges
 
 ACKtopus scans visible comment details blocks for cleartext PGP signatures, fetches keys from `keys.openpgp.org`, verifies signatures with `openpgp.js`, caches results, and marks valid, invalid, or failed checks inline.
+
+### Pull request lists
+
+On a repository's `/pulls` page, ACKtopus normalizes the list to recently-updated order (`sort:updated-desc`) and adds a **Mine 👤** button next to GitHub's Author filter that shows your own PRs with the same sorting.
 
 ### Focused compare/diff views
 
