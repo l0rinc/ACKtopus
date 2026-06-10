@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.154
+// @version      1.155
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -541,7 +541,6 @@
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
     const EDIT_FORM_SELECTOR =
         'form.js-comment-update, [data-testid="edit-comment-form"], form.js-issue-update, ' +
-        'form[action*="/issue_comments/"][action*="/update"], form[action*="/review_comment/"][action*="/update"], ' +
         'form[action*="/reviews/"][action*="/update"]';
     const EDIT_BODY_TEXTAREA_SELECTOR =
         'textarea[name="issue[body]"], textarea[name="pull_request[body]"], textarea#issue_body, textarea#pull_request_body';
@@ -595,27 +594,6 @@
         return '#';
     }
 
-    // Heuristic: did an error represent a given HTTP status?
-    // Useful when callers normalize failures into Error(message) strings.
-    function isHttpStatus(err, code) {
-        if (!err) return false;
-        const want = String(code ?? '').trim();
-        if (!/^\d{3}$/.test(want)) return false;
-        let msg = '';
-        try {
-            msg = String(err?.message ?? err?.statusText ?? err ?? '');
-        } catch (_) {
-            msg = '';
-        }
-        if (!msg) return false;
-        // Match:
-        // - "HTTP 422"
-        // - "422:" (or "server 422: ...")
-        // - space-delimited " 404 " in messages like "error 404 not found"
-        const re = new RegExp(`(?:\\bHTTP\\s*${want}\\b|\\b${want}\\b\\s*:|\\b${want}\\b)`);
-        return re.test(msg);
-    }
-
     function isTransientNetworkError(err) {
         if (!err) return false;
         let msg = '';
@@ -665,17 +643,6 @@
             }
         }
         throw lastErr || new Error(`${label} failed`);
-    }
-
-    // Extract CSRF token from a GitHub HTML document (string).
-    // Used by some session-auth endpoints where we must bootstrap a CSRF token from HTML.
-    function extractCsrfFromHtml(html) {
-        const text = String(html || '');
-        const meta = text.match(/<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i);
-        if (meta?.[1]) return meta[1];
-        const json = text.match(/"csrfToken"\s*:\s*"([^"]{10,})"/i);
-        if (json?.[1]) return json[1];
-        return '';
     }
 
     // Scoped querySelectorAll: returns matching descendants + root itself if it matches.
@@ -1304,12 +1271,6 @@
                 : '';
         if (/^[0-9a-f]{40}$/i.test(cached)) return cached;
         return readHeadShaFromSSR();
-    }
-
-    function flash(btn, msg) {
-        const orig = btn.textContent;
-        btn.textContent = msg;
-        setTimeout(() => (btn.textContent = orig), 1500);
     }
 
     function createBtn(text, onClick, tooltip) {
@@ -2123,197 +2084,6 @@
         return targets;
     }
 
-    async function showCollapsedSections(btn) {
-        if (btn._running) {
-            btn._cancel = true;
-            return;
-        }
-        btn._running = true;
-        btn._cancel = false;
-        const origText = btn.textContent;
-        const origTitle = btn.title;
-        btn.title = 'Click to cancel';
-        const compact = GM_getValue('compactToolbar', false);
-
-        const firstTarget =
-            document.querySelector(
-                '.minimized-comment,' + '.outdated-comment details:not([open]):not([data-resolved])',
-            ) ||
-            [...document.querySelectorAll('button span, [class*="Button-Label"]')].find((el) =>
-                /^load\s*diff$/i.test(el.textContent.trim()),
-            );
-        if (firstTarget) firstTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-        let spinHandle = null;
-        if (compact) spinHandle = startSpin(btn);
-        const stopAnim = compact
-            ? null
-            : startBrailleAnimation((frame) => {
-                  btn.textContent = `${frame} ${getCollapsedSectionCount()} remaining...`;
-              }, 100);
-
-        const finish = (msg, shortMsg) => {
-            if (stopAnim) stopAnim();
-            const display = compact ? shortMsg || msg : msg;
-            if (spinHandle) spinHandle(display);
-            else btn.textContent = display;
-            ackSetTimeout(() => {
-                btn.textContent = origText;
-                btn.title = origTitle;
-                btn._running = false;
-                btn._cancel = false;
-            }, 1200);
-        };
-
-        try {
-            for (let round = 0; round < 50; round++) {
-                if (btn._cancel) {
-                    finish('Cancelled', '✖');
-                    return;
-                }
-                const { minimized, outdated, loadDiffs } = getLoadableElements();
-                if (minimized.length === 0 && outdated.length === 0 && loadDiffs.length === 0) break;
-                const scrollTarget = minimized[0] || outdated[0] || loadDiffs[0];
-                if (scrollTarget) scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                minimized.forEach((h) => h.click());
-                outdated.forEach((d) => d.setAttribute('open', ''));
-                loadDiffs.forEach((b) => b.click());
-                await ackSleep(250);
-            }
-            finish('Done', '✓');
-        } catch (e) {
-            console.error('ACKtopus showCollapsedSections failed:', e);
-            finish('Error', '!');
-        }
-    }
-
-    async function showHidden(btn) {
-        if (btn._running) {
-            btn._cancel = true;
-            return;
-        }
-        btn._running = true;
-        btn._cancel = false;
-        const origText = btn.textContent;
-        const origTitle = btn.title;
-        btn.title = 'Click to cancel';
-        const compact = GM_getValue('compactToolbar', false);
-
-        const firstTarget =
-            document.querySelector(
-                '.js-review-hidden-comment-ids,' +
-                    '.ajax-pagination-btn,' +
-                    '[data-testid^="issue-timeline-load-more-container-"],' +
-                    'button[data-testid^="issue-timeline-load-more-"],' +
-                    '.ajax-pagination-form,' +
-                    '.minimized-comment,' +
-                    '.outdated-comment details:not([open]):not([data-resolved])',
-            ) ||
-            [...document.querySelectorAll('button span, [class*="Button-Label"]')].find((el) =>
-                /^load\s*diff$/i.test(el.textContent.trim()),
-            );
-        if (firstTarget) firstTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-        // Compact mode: overlay spinner on button; normal: show text progress
-        let spinHandle = null;
-        if (compact) {
-            spinHandle = startSpin(btn);
-        }
-        const stopAnim = compact
-            ? null
-            : startBrailleAnimation((frame) => {
-                  const count = getHiddenCount();
-                  const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
-                  const remaining =
-                      count ||
-                      paginationBtns.length +
-                          timelineLoadMore.length +
-                          minimized.length +
-                          outdated.length +
-                          loadDiffs.length;
-                  btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
-              }, 100);
-
-        const finish = (msg, shortMsg) => {
-            if (stopAnim) stopAnim();
-            const display = compact ? shortMsg || msg : msg;
-            if (spinHandle) spinHandle(display);
-            else {
-                btn.textContent = display;
-                setTimeout(() => {
-                    btn.textContent = origText;
-                }, 1500);
-            }
-            btn.title = origTitle;
-            btn._running = false;
-            if (spinHandle) setTimeout(() => spinHandle(), 1500);
-        };
-
-        try {
-            let iterations = 0;
-            while (iterations++ < 50) {
-                if (btn._cancel) {
-                    finish('⏹ cancelled', '⏹');
-                    return;
-                }
-
-                const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
-                if (
-                    paginationBtns.length === 0 &&
-                    timelineLoadMore.length === 0 &&
-                    minimized.length === 0 &&
-                    outdated.length === 0 &&
-                    loadDiffs.length === 0
-                )
-                    break;
-
-                const scrollTarget =
-                    paginationBtns[0] || timelineLoadMore[0] || minimized[0] || outdated[0] || loadDiffs[0];
-                if (scrollTarget) scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-                paginationBtns.forEach((b) => b.click());
-                timelineLoadMore.forEach((b) => b.click());
-                minimized.forEach((h) => h.click());
-                outdated.forEach((d) => d.setAttribute('open', ''));
-                loadDiffs.forEach((b) => b.click());
-
-                await ackSleep(2000);
-            }
-            finish('✓ all loaded', '✓');
-            // After the success message fades, recheck -- disable if nothing left
-            setTimeout(() => {
-                const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
-                const hiddenRemaining =
-                    getHiddenCount() +
-                    paginationBtns.length +
-                    timelineLoadMore.length +
-                    minimized.length +
-                    outdated.length +
-                    loadDiffs.length;
-                const resolvedRemaining = getCollapsedResolved().length;
-                if (hiddenRemaining === 0 && resolvedRemaining > 0) {
-                    GM_setValue('expandToolbarAction', 'resolved');
-                    btn.textContent = compact ? '📂' : '📂 Show resolved';
-                    btn.title = 'Expand all resolved review threads';
-                    btn.disabled = false;
-                    Object.assign(btn.style, { opacity: '', cursor: '' });
-                } else if (hiddenRemaining === 0 && getCollapsedSectionCount() > 0) {
-                    GM_setValue('expandToolbarAction', 'collapsed');
-                    btn.textContent = compact ? '🪟' : '🪟 Open collapsed';
-                    btn.title = 'Expand minimized comments, outdated collapsed threads, and load-diff sections';
-                    btn.disabled = false;
-                    Object.assign(btn.style, { opacity: '', cursor: '' });
-                } else if (hiddenRemaining === 0) {
-                    btn.textContent = compact ? '📦' : '📦 Show hidden';
-                    btn.disabled = true;
-                    Object.assign(btn.style, { opacity: '0.35', cursor: 'default' });
-                }
-            }, 1600);
-        } catch (e) {
-            finish('✗ error', '✗');
-        }
-    }
-
     // --- Show Resolved ---
 
     function getCollapsedResolved() {
@@ -2367,94 +2137,6 @@
             });
         });
         return items;
-    }
-
-    async function showResolved(btn) {
-        if (btn._running) {
-            btn._cancel = true;
-            return;
-        }
-        btn._running = true;
-        btn._cancel = false;
-        const origText = btn.textContent;
-        const origTitle = btn.title;
-        btn.title = 'Click to cancel';
-        const compact = GM_getValue('compactToolbar', false);
-        let remaining = 0;
-
-        // Compact mode: overlay spinner on button; normal: show text progress
-        let spinHandle = null;
-        if (compact) {
-            spinHandle = startSpin(btn);
-        }
-        const stopAnim = compact
-            ? null
-            : startBrailleAnimation((frame) => {
-                  btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
-              }, 100);
-
-        const finish = (msg, shortMsg) => {
-            if (stopAnim) stopAnim();
-            const display = compact ? shortMsg || msg : msg;
-            if (spinHandle) spinHandle(display);
-            else {
-                btn.textContent = display;
-                setTimeout(() => {
-                    btn.textContent = origText;
-                }, 1500);
-            }
-            btn.title = origTitle;
-            btn._running = false;
-            if (spinHandle) setTimeout(() => spinHandle(), 1500);
-        };
-
-        try {
-            const items = getCollapsedResolved();
-            remaining = items.length;
-
-            if (remaining === 0) {
-                finish('✓ all visible', '✓');
-                setTimeout(() => {
-                    btn.textContent = compact ? '📂' : '📂 Show resolved';
-                    btn.disabled = true;
-                    Object.assign(btn.style, { opacity: '0.35', cursor: 'default' });
-                }, 1600);
-                return;
-            }
-
-            for (const item of items) {
-                if (btn._cancel) {
-                    finish('⏹ cancelled', '⏹');
-                    return;
-                }
-
-                item.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                item.click();
-
-                await new Promise((resolve) => {
-                    let waited = 0;
-                    const check = setInterval(() => {
-                        if (item.isDone() || waited >= 3000) {
-                            clearInterval(check);
-                            resolve();
-                        }
-                        waited += 100;
-                    }, 100);
-                });
-
-                remaining--;
-            }
-            finish('✓ all shown', '✓');
-            setTimeout(() => {
-                if (getCollapsedResolved().length === 0) {
-                    btn.textContent = compact ? '📂' : '📂 Show resolved';
-                    btn.disabled = true;
-                    Object.assign(btn.style, { opacity: '0.35', cursor: 'default' });
-                }
-            }, 1600);
-        } catch (e) {
-            finish('✗ error', '✗');
-        }
     }
 
     // --- ACK Panel ---
@@ -3003,8 +2685,6 @@
     const BRAILLE_PHASES = [BRAILLE_ROWS, BRAILLE_COLS, BRAILLE_ROWS, BRAILLE_COLS];
     const BRAILLE_START_FRAME = BRAILLE_PHASES[0]?.[0] || '⠀';
     const BRAILLE_STATES = [...new Set([...BRAILLE_ROWS, ...BRAILLE_COLS])];
-    // Back-compat alias: historically a single BRAILLE array existed.
-    const BRAILLE = BRAILLE_ROWS;
 
     function createBrailleStepper() {
         const sequence = BRAILLE_PHASES.flat();
@@ -5187,13 +4867,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     function getCache(provider, pr, id) {
         if (!getLLMConfig().cacheEnabled) return null;
         return GM_getValue(cacheKey(provider, pr, id), null);
-    }
-
-    function setCache(provider, pr, id, value) {
-        if (!getLLMConfig().cacheEnabled) return;
-        const key = cacheKey(provider, pr, id);
-        GM_setValue(key, value);
-        recordCacheTimestamp(key);
     }
 
     function recordCacheTimestamp(key) {
@@ -8606,44 +8279,13 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 } else {
                     // Group by thread
                     const threads = new Map(); // anchor/thread key -> [comment, ...]
-                    const general = []; // non-threaded comments
                     for (const c of comments) {
                         const groupKey = getCommentAnchorGroupKey(c);
-                        if (groupKey) {
-                            if (!threads.has(groupKey)) threads.set(groupKey, []);
-                            threads.get(groupKey).push(c);
-                        } else {
-                            general.push(c);
-                        }
+                        if (!threads.has(groupKey)) threads.set(groupKey, []);
+                        threads.get(groupKey).push(c);
                     }
                     const commentParts = [];
-                    // Format file:line@commit location string
-                    const fmtLoc = (c) => {
-                        if (!c.file) return '';
-                        let loc = c.file;
-                        if (c.line) loc += ':' + c.line;
-                        if (c.commitSha) loc += '@' + c.commitSha;
-                        return ` [${loc}]`;
-                    };
-                    // General comments first
-                    for (const c of general) {
-                        const datePart = c.date ? ` (${c.date})` : '';
-                        const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
-                        const metaLines = [];
-                        if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
-                        if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
-                        if (c.reactions) metaLines.push(`* Reactions: ${c.reactions}`);
-                        if (includeCommentCodeContext && c.codeContext)
-                            metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
-                        commentParts.push(
-                            [
-                                `**${c.author}**${datePart}${pendingPart}${fmtLoc(c)}${formatCommentFlags(c)}:`,
-                                ...metaLines,
-                                c.markdown,
-                            ].join('\n'),
-                        );
-                    }
-                    // Then threaded comments
+                    // Threaded comments
                     for (const [tid, rawThread] of threads) {
                         const thread = sortCommentsChronologically(rawThread);
                         const first = thread[0];
@@ -8774,40 +8416,12 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             );
             if (comments.length > 0) {
                 const threads = new Map();
-                const general = [];
                 for (const c of comments) {
                     const groupKey = getCommentAnchorGroupKey(c);
-                    if (groupKey) {
-                        if (!threads.has(groupKey)) threads.set(groupKey, []);
-                        threads.get(groupKey).push(c);
-                    } else {
-                        general.push(c);
-                    }
+                    if (!threads.has(groupKey)) threads.set(groupKey, []);
+                    threads.get(groupKey).push(c);
                 }
-                const fmtLoc = (c) => {
-                    if (!c.file) return '';
-                    let loc = c.file;
-                    if (c.line) loc += ':' + c.line;
-                    if (c.commitSha) loc += '@' + c.commitSha;
-                    return ` [${loc}]`;
-                };
                 const commentParts = [];
-                for (const c of general) {
-                    const datePart = c.date ? ` (${c.date})` : '';
-                    const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
-                    const metaLines = [];
-                    if (c.threadId) metaLines.push(`* Thread: ${c.threadId}`);
-                    if (c.permalink) metaLines.push(`* Permalink: ${c.permalink}`);
-                    if (c.reactions) metaLines.push(`* Reactions: ${c.reactions}`);
-                    if (c.codeContext) metaLines.push(`* Code context:\n\`\`\`\n${c.codeContext}\n\`\`\``);
-                    commentParts.push(
-                        [
-                            `${c.author}${datePart}${pendingPart}${fmtLoc(c)}${formatCommentFlags(c)}:`,
-                            ...metaLines,
-                            c.markdown,
-                        ].join('\n'),
-                    );
-                }
                 for (const [tid, rawThread] of threads) {
                     const thread = sortCommentsChronologically(rawThread);
                     const first = thread[0];
@@ -10477,69 +10091,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (parts.length > 1) body.appendChild(document.createTextNode(parts.slice(1).join(verifyUrl)));
     }
 
-    function addResultCard(panel, label, color) {
-        const card = document.createElement('div');
-        Object.assign(card.style, { padding: '10px 14px', borderBottom: '1px solid #21262d', position: 'relative' });
-        const header = document.createElement('div');
-        const renderHeaderFrame = (frame) => {
-            header.innerHTML = `${label} ${frame}`;
-        };
-        renderHeaderFrame(BRAILLE_START_FRAME);
-        Object.assign(header.style, { fontWeight: '600', fontSize: '12px', color, marginBottom: '6px' });
-        card.appendChild(header);
-        const copyBtn = document.createElement('button');
-        copyBtn.type = 'button';
-        copyBtn.textContent = '⧉';
-        copyBtn.title = 'Copy markdown to clipboard';
-        Object.assign(copyBtn.style, {
-            position: 'absolute',
-            top: '8px',
-            right: '8px',
-            padding: '0 4px',
-            fontSize: '11px',
-            lineHeight: '1.4',
-            background: 'transparent',
-            color: '#8b949e',
-            border: '1px solid transparent',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            display: 'none',
-        });
-        copyBtn.addEventListener('mouseenter', () => {
-            copyBtn.style.color = '#c9d1d9';
-            copyBtn.style.borderColor = '#30363d';
-        });
-        copyBtn.addEventListener('mouseleave', () => {
-            copyBtn.style.color = '#8b949e';
-            copyBtn.style.borderColor = 'transparent';
-        });
-        card.appendChild(copyBtn);
-        const body = document.createElement('div');
-        Object.assign(body.style, { fontSize: '12px', color: '#c9d1d9', lineHeight: '1.5' });
-        body.textContent = 'Analyzing...';
-        card.appendChild(body);
-        panel.appendChild(card);
-        const stopSpin = startBrailleAnimation(renderHeaderFrame);
-        let rawMarkdown = '';
-        return {
-            resolve: (text) => {
-                stopSpin();
-                rawMarkdown = text;
-                header.innerHTML = label;
-                body.innerHTML = renderMarkdown(text);
-                copyBtn.style.display = '';
-                copyBtn.onclick = async () => {
-                    await copyTextWithSpinner(copyBtn, rawMarkdown);
-                };
-            },
-            reject: (err) => {
-                stopSpin();
-                header.innerHTML = `${label} ✗`;
-                renderProviderError(body, err);
-            },
-        };
-    }
-
     function base64ToBlobUrl(b64, mimeType) {
         const binary = atob(b64);
         const chunks = [];
@@ -10714,75 +10265,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
     }
 
-    function addErrorDiv(panel, msg) {
-        const div = document.createElement('div');
-        div.textContent = msg;
-        Object.assign(div.style, { padding: '10px', color: '#f85149', fontSize: '12px' });
-        panel.appendChild(div);
-    }
-
-    function addTruncNotice(panel, len) {
-        if (len < 200000) return;
-        const n = document.createElement('div');
-        n.textContent = '⚠️ Patch truncated to ~200k chars';
-        Object.assign(n.style, { padding: '6px 14px', color: '#d29922', fontSize: '11px' });
-        panel.appendChild(n);
-    }
-
-    // --- Dispatch per provider with cache ---
-
-    async function dispatchToProviders(panel, pr, cacheId, system, userContent) {
-        const active = getActiveProvider();
-        if (!isProviderAvailable(active)) {
-            document.body.appendChild(buildConfigPanel());
-            return;
-        }
-        const meta = PROVIDER_META[active];
-        const config = getLLMConfig();
-        const model = config[active].model;
-        const cached = getCache(active, pr, cacheId);
-        if (cached !== null) {
-            const card = addResultCard(panel, `${meta.icon} ${meta.label} (${model}), cached`, meta.color);
-            card.resolve(cached);
-            return;
-        }
-        const card = addResultCard(panel, `${meta.icon} ${meta.label} (${model})`, meta.color);
-        try {
-            const text = await callLLM(active, system, userContent);
-            setCache(active, pr, cacheId, text);
-            card.resolve(text);
-        } catch (e) {
-            card.reject(e);
-        }
-    }
-
-    // --- Mode: Full PR ---
-
-    async function analyzePR(wrapper) {
-        const pr = parsePR();
-        if (!pr) return;
-        const config = getLLMConfig();
-        const old = document.getElementById('acktopus-analysis');
-        if (old) old.remove();
-        const panel = buildAnalysisPanel();
-        wrapper.appendChild(panel);
-
-        let patch;
-        try {
-            patch = await fetchPatch(pr);
-        } catch (e) {
-            addErrorDiv(panel, `Patch fetch failed: ${e.message}`);
-            return;
-        }
-        const truncated = patch.slice(0, 200000);
-        addTruncNotice(panel, patch.length);
-
-        const extra = config.instructions.pr || DEFAULT_INSTRUCTIONS.pr;
-        const system = `${SYSTEM_BASE}\n\n${extra}`;
-        const user = `Analyze this PR patch:\n\n${truncated}`;
-        await dispatchToProviders(panel, pr, 'full', system, user);
-    }
-
     // --- Mode: Commits List ---
 
     function parseCommitsFromPage() {
@@ -10884,78 +10366,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (navBtn) navBtn.click();
     }
 
-    async function analyzeCommitsList(wrapper) {
-        const pr = parsePR();
-        if (!pr) return;
-        const config = getLLMConfig();
-        const commits = parseCommitsFromPage();
-        if (commits.length === 0) {
-            alert('No commits found on page');
-            return;
-        }
-
-        let fullPatch = '';
-        if (config.includeFullPatch) {
-            try {
-                fullPatch = (await fetchPatch(pr)).slice(0, 40000);
-            } catch (e) {
-                /* ignore */
-            }
-        }
-
-        const old = document.getElementById('acktopus-analysis');
-        if (old) old.remove();
-        const panel = buildAnalysisPanel();
-        wrapper.appendChild(panel);
-
-        const extra = config.instructions.commits || DEFAULT_INSTRUCTIONS.commits;
-        const system = `${SYSTEM_BASE}\n\n${extra}`;
-        const commitList = commits.map((c) => `- ${c.sha.slice(0, 8)}: ${c.msg}`).join('\n');
-        const user = `Here are the commits in this PR:\n${commitList}\n\n${fullPatch ? `Full PR patch for context:\n${fullPatch}` : '(no full patch provided)'}\n\nExplain what each commit does and its role in the PR.`;
-        await dispatchToProviders(panel, pr, 'commits_list', system, user);
-    }
-
-    // --- Mode: Single Commit ---
-
-    async function analyzeSingleCommit(wrapper) {
-        const pr = parsePR();
-        if (!pr) return;
-        const config = getLLMConfig();
-        const sha = pathCommitSha();
-        if (!sha) return;
-
-        const old = document.getElementById('acktopus-analysis');
-        if (old) old.remove();
-        const panel = buildAnalysisPanel();
-        wrapper.appendChild(panel);
-
-        let commitPatch;
-        try {
-            commitPatch = await fetchCommitPatch(pr, sha);
-        } catch (e) {
-            addErrorDiv(panel, `Commit patch failed: ${e.message}`);
-            return;
-        }
-
-        let fullPatch = '';
-        if (config.includeFullPatch) {
-            try {
-                fullPatch = (await fetchPatch(pr)).slice(0, 30000);
-            } catch (e) {
-                /* ignore */
-            }
-        }
-
-        const truncated = commitPatch.slice(0, 200000);
-        addTruncNotice(panel, commitPatch.length);
-
-        const extra = config.instructions.commit || DEFAULT_INSTRUCTIONS.commit;
-        const system = `${SYSTEM_BASE}\n\n${extra}`;
-        const contextBlock = fullPatch ? `\n\nFull PR patch for context (may be truncated):\n${fullPatch}` : '';
-        const user = `Annotate this commit (${sha.slice(0, 8)}):\n\n${truncated}${contextBlock}`;
-        await dispatchToProviders(panel, pr, `commit_${sha.slice(0, 12)}`, system, user);
-    }
-
     async function runPRInfographic(wrapper, opts = {}) {
         const pr = parsePR();
         if (!pr) return;
@@ -11014,8 +10424,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     // --- Chat Dispatcher (replaces old Analyze button) ---
-    // Old analyzePR/analyzeCommitsList/analyzeSingleCommit are retained above
-    // because they seed the cache that gatherChatContext reads from.
 
     async function runAnalysis(wrapper, recipe = 'chat', opts = {}) {
         if (recipe === 'infographic') {
@@ -11613,7 +11021,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const extra = config.instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
 
         // Start spinner IMMEDIATELY so user sees feedback before API calls
-        const origText = commentEl.textContent;
         const origHTML = commentEl.innerHTML;
         const origTitle = commentEl.title || '';
         const restoreButton = () => {
@@ -11885,73 +11292,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (outputMatch) s = outputMatch[1].trim();
                 // Final safety: strip any GitHub metadata the LLM might have added
                 return stripGitHubMeta(s);
-            };
-
-            const findSubmitBtn = (container, ta) => {
-                // Safety: verify a submit button is safe before clicking — must not navigate
-                // to a different page (e.g. issue creation, settings).
-                const safeSubmitClick = (btn) => {
-                    if (!btn) return false;
-                    // Check the button's form action — reject if it navigates to issue/new/settings
-                    const form = btn.closest('form');
-                    const action = form?.getAttribute('action') || '';
-                    if (/\/issues\/new|\/settings|\/compare/.test(action)) {
-                        console.warn('ACKtopus: blocked submit on unsafe form:', action);
-                        return false;
-                    }
-                    // Check if button has formaction that navigates
-                    const formAction = btn.getAttribute('formaction') || '';
-                    if (formAction && !/comment|review/.test(formAction)) {
-                        console.warn('ACKtopus: blocked submit with unsafe formaction:', formAction);
-                        return false;
-                    }
-                    btn.disabled = false;
-                    btn.click();
-                    return true;
-                };
-
-                // Priority 1: textarea's own form — but ONLY if it's a comment-update form,
-                // not an unrelated form (e.g. issue creation) that happens to contain the textarea.
-                if (ta) {
-                    const taForm = ta.closest('form');
-                    if (taForm) {
-                        const action = taForm.getAttribute('action') || '';
-                        const isCommentForm =
-                            /comment|review/.test(action) || taForm.classList.contains('js-comment-update');
-                        if (isCommentForm) {
-                            const formBtn = taForm.querySelector(
-                                'button.js-comment-update, button[data-testid="save-edit-button"], ' +
-                                    'button[data-testid="update-comment-button"]',
-                            );
-                            if (formBtn) return formBtn;
-                        }
-                    }
-                }
-                // Priority 2: data-testid buttons (stable across GitHub rebuilds)
-                const testIdBtn = container.querySelector(
-                    'button[data-testid="save-edit-button"], button[data-testid="update-comment-button"]',
-                );
-                if (testIdBtn) return testIdBtn;
-                // Priority 3: known edit form containers
-                const editForm = container.querySelector(
-                    'form.js-comment-update, [data-testid="edit-comment-form"], .js-previewable-comment-form',
-                );
-                if (editForm) {
-                    const formBtn = editForm.querySelector(
-                        'button.js-comment-update, button[data-testid="save-edit-button"], ' +
-                            'button[data-testid="update-comment-button"], button[type="submit"]',
-                    );
-                    if (formBtn) return formBtn;
-                }
-                // Priority 4: class-based fallback within container only
-                const classBtn = container.querySelector('button.js-comment-update');
-                if (classBtn) return classBtn;
-                // Priority 5: text-match fallback — within container only (never widen to parent)
-                const textBtn = [...container.querySelectorAll('button')].find((b) =>
-                    /^(update comment|save edit|update)$/i.test(b.textContent.trim()),
-                );
-                if (textBtn) return textBtn;
-                return null;
             };
 
             // Find the comment container -- anchor from the header if inside quick-actions
@@ -12255,9 +11595,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }, 2000);
                     console.error('ACKtopus: EDIT MODE proofread failed:', e?.message, e?.stack);
                 }
-            } else {
-                // Could not enter edit mode.
-                stopSpin();
             }
         } catch (e) {
             try {
@@ -12280,24 +11617,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     // --- Start a review ---
-    // GitHub's native "Start a review" button isn't shown on every PR surface
-    // (notably the Conversations tab). We keep a small helper so other features
-    // can start a review without relying on GitHub's internal /_graphql endpoints.
-
-    async function fetchPullRequestNodeId(pr) {
-        const key = `ack_pr_node_id_${pr.owner}_${pr.repo}_${pr.pr}`;
-        const cached = GM_getValue(key, '');
-        if (cached) return cached;
-        try {
-            const data = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
-            const nodeId = data?.node_id || '';
-            if (nodeId) GM_setValue(key, nodeId);
-            return nodeId || null;
-        } catch (e) {
-            console.warn('ACKtopus: fetchPullRequestNodeId failed:', e?.message);
-            return null;
-        }
-    }
+    // PAT-based GraphQL helpers used by review-thread search and chat context.
 
     function patAuthHeaderValue() {
         const pat = GM_getValue('github_pat', '').trim();
@@ -12332,27 +11652,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 },
             });
         });
-    }
-
-    function getCsrfToken() {
-        return (
-            document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
-            document.querySelector('input[name="authenticity_token"]')?.value ||
-            extractCsrfFromHtml(document.documentElement?.innerHTML || '') ||
-            ''
-        );
-    }
-
-    // Create a pending review using the official GitHub GraphQL API with PAT.
-    // This avoids the CSRF dance entirely — no cookies, no interceptor needed.
-    async function createPendingReviewViaPatGraphQL(prNodeId) {
-        const query = `mutation($input: AddPullRequestReviewInput!) {
-  addPullRequestReview(input: $input) { pullRequestReview { id state } }
-}`;
-        const json = await patGraphQL(query, { input: { pullRequestId: prNodeId, body: '' } });
-        const review = json.data?.addPullRequestReview?.pullRequestReview;
-        if (!review?.id) throw new Error('addPullRequestReview returned no id');
-        return review;
     }
 
     function isAckOwnedReviewControl(el) {
@@ -12435,29 +11734,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    function findNativeReviewSubmitButton(dialog, eventValue) {
-        const textMatchers = {
-            COMMENT: /^(submit\s*review|comment)$/i,
-            APPROVE: /^(submit\s*review|approve)$/i,
-            REQUEST_CHANGES: /^(submit\s*review|request changes)$/i,
-        };
-        const matcher = textMatchers[eventValue] || textMatchers.COMMENT;
-        const buttons = [...dialog.querySelectorAll('button, [role="button"]')].filter((btn) => {
-            if (btn.disabled || btn.offsetParent === null) return false;
-            if (isAckOwnedReviewControl(btn)) return false;
-            const text = (btn.textContent || '').trim();
-            if (!text) return false;
-            if (/^(cancel|close)$/i.test(text)) return false;
-            return true;
-        });
-        return (
-            buttons.find((btn) => matcher.test((btn.textContent || '').trim())) ||
-            buttons.find((btn) => /submit\s*review/i.test((btn.textContent || '').trim())) ||
-            buttons.find((btn) => btn.matches?.('button[type="submit"], .Button--primary, [data-variant="primary"]')) ||
-            null
-        );
-    }
-
     function findNativeReviewTrigger() {
         const candidates = [
             ...document.querySelectorAll('button[data-testid="submit-review-button"]'),
@@ -12527,22 +11803,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (items[0]) return items[0];
         }
         return null;
-    }
-
-    // Submit a pending review by driving GitHub's own native dialog: we click the
-    // Submit review trigger, wait for the dialog, fill in the body + event radio,
-    // then click the dialog's submit button. Going through GitHub's UI avoids the
-    // fragile dance of CSRF tokens, fetch nonces, and PAT permissions that the
-    // older API-based paths required.
-    async function submitPendingReview(pr, { event, body } = {}) {
-        if (!pr) throw new Error('not on a PR page');
-        const eventValue = String(event || 'COMMENT').toUpperCase();
-        const { dialog } = await prepareNativeReviewDialog({ event: eventValue, body });
-
-        const submitBtn = findNativeReviewSubmitButton(dialog, eventValue);
-        if (!submitBtn) throw new Error('native submit review button not found');
-        submitBtn.click();
-        return { state: eventValue };
     }
 
     async function prepareNativeReviewDialog({ event = 'COMMENT', body = '' } = {}) {
@@ -12811,53 +12071,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             comparisonEndOid,
             comparisonBaseOid,
         });
-    }
-
-    // Try clicking "Start a review" button directly in the DOM.
-    // Design principle: DOM-first for writes — uses GitHub's own tokens, no API or CSRF needed.
-    function tryClickStartReview() {
-        const allBtns = [...document.querySelectorAll('button,[role="button"]')];
-        const btn = allBtns.find(
-            (b) => /^(start a review|start review)$/i.test((b.textContent || '').trim()) && b.offsetParent !== null,
-        );
-        if (btn) {
-            btn.click();
-            if (!_ackTesting) console.log('ACKtopus: created pending review by clicking "Start a review" button');
-            return true;
-        }
-        return false;
-    }
-
-    async function startPendingReview() {
-        // DOM-first for writes: if the native button exists (files/commits view),
-        // prefer clicking it to avoid needing a PAT.
-        if (tryClickStartReview()) return { ok: true, method: 'dom_click' };
-
-        const pr = parsePR();
-        if (!pr) throw new Error('not on a PR page');
-
-        const pat = GM_getValue('github_pat', '').trim();
-        if (!pat) {
-            throw new Error(
-                'GitHub PAT required to start review from Conversation tab — configure in ACKtopus settings',
-            );
-        }
-
-        const nodeId = await fetchPullRequestNodeId(pr);
-        if (!nodeId) throw new Error('could not fetch PR node id');
-
-        try {
-            await createPendingReviewViaPatGraphQL(nodeId);
-            if (!_ackTesting) console.log('ACKtopus: started review via PAT GraphQL');
-            return { ok: true, method: 'pat_graphql' };
-        } catch (e) {
-            // GraphQL returns errors when a pending review already exists.
-            if (/already exists|pending review/i.test(e?.message || '')) {
-                if (!_ackTesting) console.log('ACKtopus: review already started');
-                return { ok: true, method: 'already' };
-            }
-            throw e;
-        }
     }
 
     // Tracks whether a pending review is active for this PR.
@@ -13157,17 +12370,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // stands out as the primary action — matches the Changes view.
             submitBtn.classList.remove('Button--primary');
             submitBtn.classList.add('Button--secondary');
-
-            // If a pending review is active, just mark the Reply button with ⏳
-            if (_ackPendingReviewActive) {
-                if (!submitBtn.dataset.ackOrigLabel) {
-                    submitBtn.dataset.ackOrigLabel = submitBtn.textContent.trim();
-                    submitBtn.textContent = submitBtn.dataset.ackOrigLabel + ' ⏳';
-                    submitBtn.title = 'Reply will be added to your pending review';
-                }
-                form.dataset.ackStartReviewInjected = 'true';
-                continue;
-            }
 
             // Match Changes view: Reply (default), then Start a review (primary/green).
             const startBtn = document.createElement('button');
@@ -15277,7 +14479,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // (eg, markdown stripped) if the edit form loads in a degraded state.
     // If the user didn't edit anything, treat Save/Update as Cancel to keep
     // the original comment unchanged.
-    const _trackedEditTextareas = new WeakSet();
 
     function editButtonLabel(btn) {
         return (btn?.textContent || '').replace(EDIT_SAVE_DIFF_EMOJI, '').trim();
@@ -15440,14 +14641,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (typeof form._ackEditInitialValue !== 'string') {
                 form._ackEditInitialValue = ta.value || '';
             }
-            form._ackEditDirty = ta.value !== form._ackEditInitialValue;
-            if (_trackedEditTextareas.has(ta)) continue;
-            _trackedEditTextareas.add(ta);
-            const syncDirty = () => {
-                form._ackEditDirty = ta.value !== (form._ackEditInitialValue || '');
-            };
-            ta.addEventListener('input', syncDirty);
-            ta.addEventListener('change', syncDirty);
         }
     }
 
@@ -15496,7 +14689,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         form._ackEditDiffAcceptedUntil = Date.now() + 3000;
         if (typeof submittedText === 'string') {
             form._ackEditInitialValue = submittedText;
-            form._ackEditDirty = false;
         }
     }
 
@@ -19222,12 +18414,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // - Async race-safe: request IDs prevent stale results after the selection changes.
 
     const DIFF_SELECTION_TOOLBAR_ID = 'ack-diff-selection-toolbar';
-    const DIFF_SELECTION_TOOLTIP_ID = 'ack-diff-selection-tooltip';
     let _diffSelectionInstalled = false;
     let _diffSelectionToolbar = null;
-    let _diffSelectionTooltip = null;
     let _diffSelectionOneLinerEl = null;
-    let _diffSelectionOutputMode = 'one-liner'; // 'one-liner' | 'action'
     let _diffSelectionCtxKey = '';
     let _diffSelectionOneLinerReqId = 0;
     let _diffSelectionOneLinerKey = '';
@@ -19322,7 +18511,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const sel = window.getSelection?.();
                 if (!sel || sel.isCollapsed || !sel.toString?.().trim()) {
                     hideDiffSelectionToolbar();
-                    hideDiffSelectionTooltip();
                     return;
                 }
                 try {
@@ -19357,9 +18545,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (_ackTesting) return;
                 const t = e.target;
                 if (_diffSelectionToolbar && _diffSelectionToolbar.contains(t)) return;
-                if (_diffSelectionTooltip && _diffSelectionTooltip.contains(t)) return;
                 hideDiffSelectionToolbar();
-                hideDiffSelectionTooltip();
             },
             true,
         );
@@ -19374,16 +18560,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     _diffSelectionUiMouseDown = true;
                     return;
                 }
-                if (_diffSelectionTooltip && _diffSelectionTooltip.contains(t)) {
-                    _diffSelectionUiMouseDown = true;
-                    return;
-                }
                 _diffSelectionUiMouseDown = false;
                 _diffSelectionMouseIsDown = true;
                 _diffSelectionMouseDownSeq++;
                 // Keep selection; just hide the helper UI.
                 hideDiffSelectionToolbar();
-                hideDiffSelectionTooltip();
             },
             true,
         );
@@ -19403,13 +18584,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ) {
                         _diffSelectionCopySuppressUntil = Date.now() + 1200;
                         hideDiffSelectionToolbar();
-                        hideDiffSelectionTooltip();
                         return;
                     }
                 }
                 if (e.key === 'Escape') {
                     hideDiffSelectionToolbar();
-                    hideDiffSelectionTooltip();
                 }
             },
             true,
@@ -19419,7 +18598,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function hideDiffSelectionToolbar() {
         if (_diffSelectionToolbar) _diffSelectionToolbar.style.display = 'none';
         _diffSelectionCtx = null;
-        _diffSelectionOutputMode = 'one-liner';
         _diffSelectionCtxKey = '';
         // Cancel any in-flight selection action so stale results can't appear later.
         _diffSelectionActionReqId++;
@@ -19431,18 +18609,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function hideDiffSelectionTooltip(cancel = true) {
-        // Cancel any in-flight selection action so stale results can't re-appear.
-        // When called as part of showing a NEW tooltip, pass cancel=false and
-        // let the caller own request-id changes (avoids double-increment races).
-        if (cancel) _diffSelectionActionReqId++;
-        if (_diffSelectionTooltip) _diffSelectionTooltip.remove();
-        _diffSelectionTooltip = null;
-    }
-
     function teardownDiffSelectionUI() {
         hideDiffSelectionToolbar();
-        hideDiffSelectionTooltip();
         // Also remove the toolbar node entirely so turbo snapshots don't keep it.
         document.getElementById(DIFF_SELECTION_TOOLBAR_ID)?.remove();
         _diffSelectionToolbar = null;
@@ -19455,7 +18623,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return !!el.closest(
             'textarea, input, [contenteditable="true"], ' +
                 '#acktopus-analysis, #acktopus-queue, ' +
-                `#${DIFF_SELECTION_TOOLBAR_ID}, #${DIFF_SELECTION_TOOLTIP_ID}, .ack-config-overlay`,
+                `#${DIFF_SELECTION_TOOLBAR_ID}, .ack-config-overlay`,
         );
     }
 
@@ -19839,69 +19007,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return bar;
     }
 
-    function showDiffSelectionTooltipAt(rect, title, initialText = '') {
-        // This hides any previous tooltip without bumping the request-id;
-        // the caller should manage cancellation (runDiffSelectionLLM increments).
-        hideDiffSelectionTooltip(false);
-        const tip = document.createElement('div');
-        tip.id = DIFF_SELECTION_TOOLTIP_ID;
-        Object.assign(tip.style, {
-            position: 'fixed',
-            zIndex: '999999',
-            maxWidth: '520px',
-            overflow: 'hidden',
-            background: '#0d1117',
-            border: '1px solid #30363d',
-            borderRadius: '10px',
-            boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
-            padding: '10px 12px',
-            color: '#c9d1d9',
-            fontSize: '12px',
-            lineHeight: '1.5',
-        });
-
-        const h = document.createElement('div');
-        h.textContent = title;
-        Object.assign(h.style, { fontWeight: '600', color: '#e6edf3' });
-        tip.appendChild(h);
-
-        const body = document.createElement('div');
-        Object.assign(body.style, {
-            marginTop: '8px',
-            whiteSpace: 'pre-wrap',
-            overflow: 'hidden',
-            minHeight: '4.05em',
-            maxHeight: '4.05em',
-        });
-        body.textContent = initialText;
-        tip.appendChild(body);
-
-        document.body.appendChild(tip);
-        // Position with full-size measurement, clamped to viewport.
-        // Prefer opening below the selection when possible, but always keep the popup on-screen.
-        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-        const pad = 8;
-        const tr = tip.getBoundingClientRect();
-        const tipW = tr.width || 520;
-        const tipH = tr.height || 120;
-        const left = clamp(rect.left, pad, Math.max(pad, window.innerWidth - tipW - pad));
-        const aboveTop = rect.top - tipH - pad;
-        const belowTop = rect.bottom + pad;
-        let top;
-        if (belowTop + tipH <= window.innerHeight - pad) {
-            top = belowTop;
-        } else if (aboveTop >= pad) {
-            top = aboveTop;
-        } else {
-            top = clamp(belowTop, pad, Math.max(pad, window.innerHeight - tipH - pad));
-        }
-        tip.style.left = `${left}px`;
-        tip.style.top = `${top}px`;
-        tip.style.transform = '';
-        _diffSelectionTooltip = tip;
-        return { tip, body };
-    }
-
     function getCachedCommitReviewAid(pr, sha) {
         if (!pr || !sha) return null;
         const sha8 = sha.slice(0, 8);
@@ -19956,7 +19061,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function runDiffSelectionLLM(mode) {
         const ctx = _diffSelectionCtx;
         if (!ctx) return;
-        const { provider, model } = getTooltipLLMTarget();
+        const { provider } = getTooltipLLMTarget();
         if (!isProviderAvailable(provider)) {
             document.body.appendChild(buildConfigPanel());
             return;
@@ -19973,8 +19078,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const reqId = ++_diffSelectionActionReqId;
         // Render into the selection popup's bottom text area (not a separate tooltip).
         cancelDiffSelectionOneLiner();
-        hideDiffSelectionTooltip(false);
-        _diffSelectionOutputMode = 'action';
         const bar = ensureDiffSelectionToolbar();
         const outEl = _diffSelectionOneLinerEl;
         if (!outEl) return;
@@ -20192,20 +19295,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackTesting) return;
         if (!isPRPage()) {
             hideDiffSelectionToolbar();
-            hideDiffSelectionTooltip();
             return;
         }
         const sel = window.getSelection?.();
         const ctx = getDiffSelectionContext(sel);
         if (!ctx) {
             hideDiffSelectionToolbar();
-            hideDiffSelectionTooltip();
             return;
         }
         const nextKey = diffSelectionCtxKey(ctx);
         if (nextKey && nextKey !== _diffSelectionCtxKey) {
             _diffSelectionCtxKey = nextKey;
-            _diffSelectionOutputMode = 'one-liner';
             // Cancel any in-flight action from the previous selection.
             _diffSelectionActionReqId++;
             cancelDiffSelectionOneLiner();
@@ -20264,127 +19364,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         bar.style.left = `${left}px`;
         bar.style.top = `${top}px`;
         bar.style.visibility = 'visible';
-    }
-
-    async function updateDiffSelectionOneLiner(ctx) {
-        const el = _diffSelectionOneLinerEl;
-        if (!el) return;
-        const { provider, model } = getTooltipLLMTarget();
-        if (!isProviderAvailable(provider)) {
-            if (_diffSelectionOneLinerTimer) {
-                ackClearTimeout(_diffSelectionOneLinerTimer);
-                _diffSelectionOneLinerTimer = null;
-            }
-            if (_diffSelectionOneLinerStopAnim) {
-                _diffSelectionOneLinerStopAnim();
-                _diffSelectionOneLinerStopAnim = null;
-            }
-            _diffSelectionOneLinerReqId++;
-            _diffSelectionOneLinerKey = '';
-            el.textContent = '';
-            el.style.display = 'none';
-            return;
-        }
-        const pr = ctx?.pr;
-        if (!pr) return;
-
-        const sha8 = (ctx.commitSha || '').slice(0, 8);
-        const loc = [
-            sha8 ? `Commit ${sha8}` : '',
-            ctx.file ? ctx.file : '',
-            ctx.startLabel
-                ? `L${ctx.startLabel}${ctx.endLabel && ctx.endLabel !== ctx.startLabel ? `-${ctx.endLabel}` : ''}`
-                : '',
-            ctx.source ? ctx.source : '',
-        ]
-            .filter(Boolean)
-            .join(' | ');
-
-        const selectedText = (ctx.text || '').trim().replace(/\r\n/g, '\n');
-        const parentText = (ctx.parentText || '').trim().replace(/\r\n/g, '\n');
-        const prOverview = getCachedPRLightbulbOverview(pr, provider);
-        const prCtx = await fetchPRContext(pr);
-        const overviewText = prOverview?.text ? prOverview.text.slice(0, 1200) : '';
-        const maxChars = 4000; // keep high; output scrolls in UI if needed
-        const snippet = selectedText.length > maxChars ? selectedText.slice(0, maxChars) + '\n…' : selectedText;
-        const parentSnippet =
-            parentText && parentText !== selectedText
-                ? parentText.length > maxChars
-                    ? parentText.slice(0, maxChars) + '\n…'
-                    : parentText
-                : '';
-        const prDescription = !ctx.isPRDescription && prCtx?.description ? prCtx.description.slice(0, 3000) : '';
-        // Keep this cheap/fast: minimal input, deterministic output, short response.
-        // Important: the user can already read the selection; we need context ("what role does this play?"),
-        // not a paraphrase of the selected text.
-        const system =
-            'In 1-2 very short lines (max 180 chars total), describe the role/purpose of the selection in the change. Do NOT rephrase/paraphrase the selection. Add missing context, implications, or intent. No markdown, no quotes, no preamble.';
-        const user = [
-            loc || location.href,
-            overviewText ? `PR overview:\n${overviewText}` : '',
-            prDescription ? `PR description:\n${prDescription}` : '',
-            parentSnippet ? `Containing text block:\n${parentSnippet}` : '',
-            `Selection:\n${snippet}`,
-        ]
-            .filter(Boolean)
-            .join('\n\n');
-        const key = hashPrompt(provider + '\0' + model + '\0' + system + '\0' + user);
-        if (key === _diffSelectionOneLinerKey && el.textContent && el.textContent !== '…') return;
-        _diffSelectionOneLinerKey = key;
-
-        el.style.display = 'block';
-        if (_diffSelectionOneLinerStopAnim) {
-            _diffSelectionOneLinerStopAnim();
-            _diffSelectionOneLinerStopAnim = null;
-        }
-        _diffSelectionOneLinerStopAnim = startBrailleAnimation((frame) => {
-            el.textContent = frame;
-        });
-
-        // Debounce: even on mouseup, selection can change rapidly while the user drags/adjusts.
-        // This avoids firing extra LLM calls for transient selections.
-        const throttleMs = 250;
-        if (_diffSelectionOneLinerTimer) ackClearTimeout(_diffSelectionOneLinerTimer);
-        _diffSelectionOneLinerTimer = ackSetTimeout(() => {
-            _diffSelectionOneLinerTimer = null;
-            const reqId = ++_diffSelectionOneLinerReqId;
-            callLLM(provider, system, user)
-                .then((raw) => {
-                    if (reqId !== _diffSelectionOneLinerReqId) return;
-                    if (_diffSelectionOneLinerStopAnim) {
-                        _diffSelectionOneLinerStopAnim();
-                        _diffSelectionOneLinerStopAnim = null;
-                    }
-                    const cleaned = (raw || '').trim().replace(/\r\n/g, '\n');
-                    const lines = cleaned
-                        .split('\n')
-                        .map((l) => l.trim().replace(/\s+/g, ' '))
-                        .filter(Boolean);
-                    if (lines.length === 0) {
-                        el.textContent = '';
-                        el.style.display = 'none';
-                        return;
-                    }
-                    el.textContent = lines.join('\n');
-                    // Re-position now that the bar height may have changed.
-                    ackRaf(() => {
-                        if (reqId !== _diffSelectionOneLinerReqId) return;
-                        if (!_diffSelectionToolbar || !_diffSelectionToolbar.isConnected) return;
-                        try {
-                            updateDiffSelectionToolbar();
-                        } catch (_) {}
-                    });
-                })
-                .catch(() => {
-                    if (reqId !== _diffSelectionOneLinerReqId) return;
-                    if (_diffSelectionOneLinerStopAnim) {
-                        _diffSelectionOneLinerStopAnim();
-                        _diffSelectionOneLinerStopAnim = null;
-                    }
-                    el.textContent = '';
-                    el.style.display = 'none';
-                });
-        }, throttleMs);
     }
 
     async function fetchBatchCommitExplanations(pr, commits, opts = {}) {
@@ -21682,154 +20661,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             toolbar.appendChild(mirrorBtn);
         }
 
-        function disableBtn(btn, emoji) {
-            btn.textContent = emoji;
-            btn.disabled = true;
-            Object.assign(btn.style, { opacity: '0.35', cursor: 'default', padding: '4px 6px' });
-        }
-
-        function enableBtn(btn) {
-            btn.disabled = false;
-            btn.style.display = '';
-            btn.style.opacity = '';
-            btn.style.cursor = '';
-        }
-
-        const EXPAND_ACTIONS = [
-            {
-                key: 'hidden',
-                emoji: '📦',
-                label: 'Show hidden',
-                tip: 'Load hidden conversations/comments and issue timeline items',
-                count: () => getHiddenActionCount(),
-                run: (btn) => showHidden(btn),
-            },
-            {
-                key: 'resolved',
-                emoji: '📂',
-                label: 'Show resolved',
-                tip: 'Expand all resolved review threads',
-                count: () => getCollapsedResolved().length,
-                run: (btn) => showResolved(btn),
-            },
-            {
-                key: 'collapsed',
-                emoji: '🪟',
-                label: 'Open collapsed',
-                tip: 'Expand minimized comments, outdated collapsed threads, and load-diff sections',
-                count: () => getCollapsedSectionCount(),
-                run: (btn) => showCollapsedSections(btn),
-            },
-        ];
-        let selectedExpandAction = GM_getValue('expandToolbarAction', 'hidden');
-        const syncSelectedExpandAction = () => {
-            const stored = GM_getValue('expandToolbarAction', selectedExpandAction);
-            if (EXPAND_ACTIONS.some((a) => a.key === stored)) selectedExpandAction = stored;
-            return selectedExpandAction;
-        };
-        const getExpandAction = () =>
-            EXPAND_ACTIONS.find((a) => a.key === syncSelectedExpandAction()) || EXPAND_ACTIONS[0];
-        const expandGroup = document.createElement('div');
-        Object.assign(expandGroup.style, { display: 'flex', position: 'relative' });
-        const expandMainBtn = createBtn(
-            '',
-            function () {
-                const act = getExpandAction();
-                if (expandMainBtn.disabled) return;
-                act.run(this);
-            },
-            '',
-        );
-        expandMainBtn.style.borderRadius = '6px 0 0 6px';
-        expandMainBtn.style.borderRight = 'none';
-        if (compact) expandMainBtn.style.padding = '4px 8px';
-        const expandDropBtn = document.createElement('button');
-        expandDropBtn.textContent = '▾';
-        expandDropBtn.title = 'Choose expand action';
-        Object.assign(expandDropBtn.style, {
-            padding: '4px 6px',
-            fontSize: '12px',
-            cursor: 'pointer',
-            border: '1px solid #444c56',
-            borderRadius: '0 6px 6px 0',
-            color: '#c9d1d9',
-            background: '#21262d',
-            lineHeight: '1.5',
-        });
-        const expandMenu = document.createElement('div');
-        Object.assign(expandMenu.style, {
-            display: 'none',
-            position: 'absolute',
-            top: '100%',
-            left: '0',
-            marginTop: '4px',
-            background: '#161b22',
-            border: '1px solid #30363d',
-            borderRadius: '8px',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
-            zIndex: '100000',
-            minWidth: 'max-content',
-            padding: '4px 0',
-        });
-        const updateExpandMainBtn = () => {
-            const act = getExpandAction();
-            const count = act.count();
-            expandMainBtn.innerHTML = compact ? `${act.emoji}` : `${act.emoji} ${act.label}`;
-            expandMainBtn.title = act.tip;
-            if (count === 0) disableBtn(expandMainBtn, act.emoji);
-            else enableBtn(expandMainBtn);
-        };
-        for (const act of EXPAND_ACTIONS) {
-            const item = document.createElement('div');
-            item.dataset.ackExpandKey = act.key;
-            Object.assign(item.style, {
-                padding: '6px 12px',
-                fontSize: '12px',
-                color: '#c9d1d9',
-                cursor: 'pointer',
-                whiteSpace: 'nowrap',
-                background: act.key === selectedExpandAction ? '#30363d' : 'transparent',
-            });
-            const render = () => {
-                const count = act.count();
-                item.textContent = `${act.emoji} ${act.label}${count > 0 ? ` (${count})` : ''}`;
-                item.style.opacity = count > 0 ? '1' : '0.45';
-            };
-            render();
-            item.title = act.tip;
-            item.addEventListener('mouseenter', () => (item.style.background = '#30363d'));
-            item.addEventListener('mouseleave', () => {
-                item.style.background = act.key === selectedExpandAction ? '#30363d' : 'transparent';
-            });
-            item.addEventListener('click', () => {
-                selectedExpandAction = act.key;
-                GM_setValue('expandToolbarAction', act.key);
-                [...expandMenu.children].forEach((c) => (c.style.background = 'transparent'));
-                item.style.background = '#30363d';
-                updateExpandMainBtn();
-                expandMenu.style.display = 'none';
-                if (act.count() > 0) act.run(expandMainBtn);
-            });
-            expandMenu.appendChild(item);
-        }
-        updateExpandMainBtn();
-        expandDropBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const activeKey = syncSelectedExpandAction();
-            [...expandMenu.children].forEach((item) => {
-                const act = EXPAND_ACTIONS.find((a) => a.key === item.dataset.ackExpandKey);
-                if (!act) return;
-                item.textContent = `${act.emoji} ${act.label}${act.count() > 0 ? ` (${act.count()})` : ''}`;
-                item.style.opacity = act.count() > 0 ? '1' : '0.45';
-                item.style.background = act.key === activeKey ? '#30363d' : 'transparent';
-            });
-            expandMenu.style.display = expandMenu.style.display === 'none' ? 'block' : 'none';
-        });
-        document.addEventListener('click', () => (expandMenu.style.display = 'none'));
-        expandGroup.appendChild(expandMainBtn);
-        expandGroup.appendChild(expandDropBtn);
-        expandGroup.appendChild(expandMenu);
-
         // --- 💬 Comment navigator ---
         const commentNavLabel = compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments';
         const commentNavTitle = onCompare
@@ -22212,7 +21043,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const commitLine = (commit) => (commit?.commit?.message || commit?.msg || '').split('\n')[0];
         const commitHref = (commit) => `${basePath}/${commit.sha}`;
 
-        const makeNavBtn = (commit, chevron, isNext) => {
+        const makeNavBtn = (commit, isNext) => {
             const hintKey = isNext ? 'K' : 'J';
             const href = commitHref(commit);
             const msg = escapeHTML(truncMsg(commitLine(commit)));
@@ -22258,7 +21089,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         // Position indicator
-        if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, '◀', false));
+        if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, false));
         if (hasJumpMenu) {
             const jumpDetails = document.createElement('details');
             Object.assign(jumpDetails.style, { position: 'relative', flex: '0 0 auto' });
@@ -22614,7 +21445,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             bar.appendChild(pos);
         }
-        if (nextCommit) bar.appendChild(makeNavBtn(nextCommit, '▶', true));
+        if (nextCommit) bar.appendChild(makeNavBtn(nextCommit, true));
 
         if (gen !== commitNavGeneration) return;
         const existing = document.getElementById('ack-commit-nav');
@@ -22868,7 +21699,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
                     '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, ' +
                     '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
-                    `#${DIFF_SELECTION_TOOLBAR_ID}, #${DIFF_SELECTION_TOOLTIP_ID}`,
+                    `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
             .forEach((el) => el.remove());
         document.querySelectorAll('[data-ack-prefilled]').forEach((el) => delete el.dataset.ackPrefilled);
@@ -23052,7 +21883,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.154
+// @version      1.155
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -24060,10 +22891,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const refs = (_ackSource.match(/MARKDOWN_BODY_SELECTOR/g) || []).length;
         ackAssert(refs >= 5, `expected at least 5 references to MARKDOWN_BODY_SELECTOR, found ${refs}`);
-    });
-
-    ackTest('findSubmitBtn helper is defined', () => {
-        ackAssert(_ackSource.includes('const findSubmitBtn'), 'findSubmitBtn is defined');
     });
 
     ackTest('functional command uses Debug build and build/test/functional/test_runner.py', () => {
@@ -28156,29 +26983,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!btnLabelPattern.test(source), 'no Analyze in createBtn call');
     });
 
-    ackTest('runAnalysis opens chat panel, not old analyzers', () => {
+    ackTest('runAnalysis opens chat panel', () => {
         const source = _ackSource;
         // runAnalysis should call buildChatPanel
         ackAssert(
             sourceIncludesLoose(source, 'buildChatPanel({initialRecipe: recipe, promptOnly})'),
             'runAnalysis uses buildChatPanel',
         );
-        // runAnalysis should NOT call analyzePR/analyzeCommitsList/analyzeSingleCommit
-        const runAnalysisBody = source.slice(
-            source.indexOf('async function runAnalysis'),
-            source.indexOf('// --- Proofread'),
-        );
-        ackAssert(!runAnalysisBody.includes('analyzePR'), 'runAnalysis does not call analyzePR');
-        ackAssert(!runAnalysisBody.includes('analyzeCommitsList'), 'runAnalysis does not call analyzeCommitsList');
-        ackAssert(!runAnalysisBody.includes('analyzeSingleCommit'), 'runAnalysis does not call analyzeSingleCommit');
     });
 
     // ============================================================================
-    // addResultCard uses innerHTML (SVG rendering fix)
+    // PROVIDER_META icons require innerHTML rendering
     // ============================================================================
 
-    ackTest('addResultCard label with SVG should not be escaped', () => {
-        // The fix changed textContent to innerHTML in addResultCard
+    ackTest('PROVIDER_META icon labels with SVG should not be escaped', () => {
+        // Card/panel headers render provider icons via innerHTML.
         // Verify the PROVIDER_META icons contain SVG that would be escaped by textContent
         const icon = PROVIDER_META.claude.icon;
         ackAssert(icon.includes('<svg'), 'icon is SVG');
@@ -28353,7 +27172,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('commitHeader.prepend(btn)'), 'prepends into header');
     });
 
-    ackTest('showHidden detects hidden-item pagination buttons without ajax-pagination-form wrapper', () => {
+    ackTest('hidden-item pagination buttons are detected without ajax-pagination-form wrapper', () => {
         const source = _ackSource;
         const block = source.slice(
             source.indexOf('const AJAX_PAGINATION_BTN_SELECTOR'),
@@ -28375,7 +27194,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('showHidden detects React issue timeline load-more items', () => {
+    ackTest('getLoadableElements detects React issue timeline load-more items', () => {
         const host = document.createElement('div');
         host.innerHTML = `
             <div data-testid="issue-timeline-load-more-container-load-top">
@@ -28483,23 +27302,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('showHidden, showResolved, and revealAll use progress feedback in compact mode', () => {
+    ackTest('revealAll uses progress feedback in compact mode', () => {
         const source = _ackSource;
-        const showHiddenFn = source.slice(
-            source.indexOf('async function showHidden'),
-            source.indexOf('async function showResolved'),
-        );
-        ackAssert(showHiddenFn.includes("GM_getValue('compactToolbar'"), 'showHidden checks compact mode');
-        ackAssert(showHiddenFn.includes('startSpin(btn)'), 'uses startSpin overlay in compact');
-        ackAssert(sourceIncludesLoose(showHiddenFn, 'compact ? null :'), 'skips text animation in compact');
-
-        const showResolvedFn = source.slice(
-            source.indexOf('async function showResolved'),
-            source.indexOf('\n    // --- ACK Panel'),
-        );
-        ackAssert(showResolvedFn.includes("GM_getValue('compactToolbar'"), 'showResolved checks compact mode');
-        ackAssert(showResolvedFn.includes('startSpin(btn)'), 'uses startSpin overlay in compact');
-
         const revealFn = source.slice(
             source.indexOf('async function revealAllContext'),
             source.indexOf('function buildContextCopyGroup'),
@@ -28530,27 +27334,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('showResolved disables button after successful completion', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('async function showResolved'),
-            source.indexOf('\n    // --- ACK Panel'),
-        );
-        ackAssert(fn.includes("finish('✓ all shown'"), 'has success finish call');
-        const afterSuccess = fn.slice(fn.indexOf("finish('✓ all shown'"));
-        ackAssert(afterSuccess.includes('btn.disabled = true'), 'disables button after success');
-        ackAssert(afterSuccess.includes('getCollapsedResolved()'), 'rechecks collapsed resolved count');
-        // Also covers the early "all visible" path
-        ackAssert(fn.includes("finish('✓ all visible'"), 'handles nothing-to-do case');
-        const earlyReturn = fn.slice(fn.indexOf("finish('✓ all visible'"), fn.indexOf("finish('✓ all shown'"));
-        ackAssert(earlyReturn.includes('btn.disabled = true'), 'disables on early return too');
-    });
-
     ackTest('getCollapsedResolved handles modern conversation review-thread-collapsible markup', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function getCollapsedResolved'),
-            source.indexOf('async function showResolved'),
+            source.indexOf('\n    // --- ACK Panel'),
         );
         ackAssert(
             fn.includes("primaryToggle.getAttribute('aria-expanded') === 'false'"),
@@ -30106,7 +28894,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!source.includes('Uint16Array(m + 1)'), 'no custom DP matrix');
     });
 
-    ackTest('setCache tracks timestamps for eviction', () => {
+    ackTest('recordCacheTimestamp tracks timestamps for eviction', () => {
         const source = _ackSource;
         ackAssert(source.includes('llm_cache_timestamps'), 'tracks cache timestamps');
         ackAssert(source.includes('Date.now()'), 'records current time on set');
@@ -30295,7 +29083,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!cfg.includes('ack-tooltips-model'), 'config panel has no selection helper model input');
     });
 
-    ackTest('selection helper one-line summary uses fixed throttle and high max-chars (no settings)', () => {
+    ackTest('selection helper waits for a stable selection (no settings)', () => {
         const source = _ackSource;
         const install = source.slice(
             source.indexOf('function installDiffSelectionActions'),
@@ -30306,18 +29094,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'selection helper waits for a stable 300ms selection before showing',
         );
         ackAssert(install.includes('sel.isCollapsed'), 'stable-selection delay aborts if selection was cleared');
-        const fn = source.slice(
-            source.indexOf('function updateDiffSelectionOneLiner'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
-        );
-        ackAssert(fn.includes('const maxChars = 4000'), 'high max chars constant (4000)');
-        ackAssert(fn.includes('const throttleMs = 250'), 'fast throttle constant (250ms)');
-        ackAssert(fn.includes('startBrailleAnimation'), 'shows a spinner while loading one-line summary');
-        ackAssert(
-            fn.includes('_diffSelectionOneLinerTimer = ackSetTimeout'),
-            'throttles one-liner requests with timer',
-        );
-        ackAssert(!fn.includes('llm_tooltips_oneliner_'), 'does not read deprecated one-liner settings');
 
         const diff = source.slice(
             source.indexOf('async function runDiffSelectionLLM'),
@@ -30373,7 +29149,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const recipeFn = source.slice(
             source.indexOf('function buildChatPanel'),
-            source.indexOf('function addResultCard'),
+            source.indexOf('function base64ToBlobUrl'),
         );
         ackAssert(
             sourceIncludesLoose(recipeFn, 'modelOverride: getHighContextModelOverride(provider)'),
@@ -30444,12 +29220,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('selection helpers include cached PR overview from main lightbulb when available', () => {
         const source = _ackSource;
-        const one = source.slice(
-            source.indexOf('function updateDiffSelectionOneLiner'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
-        );
-        ackAssert(one.includes('getCachedPRLightbulbOverview'), 'one-liner reads cached PR overview');
-        ackAssert(one.includes('PR overview:'), 'one-liner adds PR overview block to prompt');
         const diff = source.slice(
             source.indexOf('async function runDiffSelectionLLM'),
             source.indexOf('async function openChatWithDiffSelection'),
@@ -30502,7 +29272,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('getImmediatePRHeadSHA only uses cached or SSR PR head SHA', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function getImmediatePRHeadSHA'), source.indexOf('function flash'));
+        const fn = source.slice(source.indexOf('function getImmediatePRHeadSHA'), source.indexOf('function createBtn'));
         ackAssert(fn.includes('_prContextCache'), 'uses cached PR context head SHA');
         ackAssert(fn.includes('readHeadShaFromSSR'), 'uses embedded SSR PR head SHA');
         ackAssert(!fn.includes('parseCommitsFromPage'), 'does not infer from commit list ordering');
@@ -30560,7 +29330,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function showDiffSelectionTooltipAt'),
+            source.indexOf('function getCachedCommitReviewAid'),
         );
         ackAssert(fn.includes('EXPLAIN_ICON'), 'Explain button uses icon');
         ackAssert(fn.includes('FACTCHECK_ICON'), 'Fact-check button uses icon');
@@ -30580,7 +29350,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function showDiffSelectionTooltipAt'),
+            source.indexOf('function getCachedCommitReviewAid'),
         );
         ackAssert(fn.includes("flexDirection: 'column'"), 'toolbar uses column layout');
         ackAssert(fn.includes('const btnRow'), 'uses a button row container');
@@ -30594,7 +29364,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const ensure = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function showDiffSelectionTooltipAt'),
+            source.indexOf('function getCachedCommitReviewAid'),
         );
         ackAssert(ensure.includes("flexWrap: 'nowrap'"), 'buttons stay in a single row');
         ackAssert(ensure.includes("overflow: 'hidden'"), 'button row does not rely on inaccessible scrollbars');
@@ -30620,7 +29390,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function updateDiffSelectionToolbar'),
-            source.indexOf('function updateDiffSelectionOneLiner'),
+            source.indexOf('async function fetchBatchCommitExplanations'),
         );
         ackAssert(fn.includes('.ack-diff-selection-btnrow'), 'queries button row');
         ackAssert(fn.includes("bar.style.width = 'auto'"), 'resets width before measuring');
@@ -30634,26 +29404,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function updateDiffSelectionToolbar'),
-            source.indexOf('async function updateDiffSelectionOneLiner'),
+            source.indexOf('async function fetchBatchCommitExplanations'),
         );
-        ackAssert(!fn.includes('updateDiffSelectionOneLiner(ctx)'), 'selection update does not start one-liner LLM');
         ackAssert(fn.includes("_diffSelectionOneLinerEl.style.display = 'none'"), 'new selections keep output hidden');
-        const oneLinerFn = source.slice(
-            source.indexOf('async function updateDiffSelectionOneLiner'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
-        );
-        ackAssert(oneLinerFn.includes('fetchPRContext(pr)'), 'explicit one-liner helper remains contextual when used');
-    });
-
-    ackTest('diff selection one-liner does not truncate output with hard 200-char ellipsis', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function updateDiffSelectionOneLiner'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
-        );
-        ackAssert(!fn.includes('out.length > 200'), 'no hard 200-char truncation');
-        ackAssert(!fn.includes("out.slice(0, 197) + '…'"), 'no hard ellipsis fallback');
-        ackAssert(fn.includes("el.textContent = lines.join('\\n')"), 'renders full short response text');
     });
 
     ackTest('diff selection helper only updates on mouseup (no selectionchange listener)', () => {
@@ -30691,47 +29444,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes("addEventListener('keyup'"), 'does not use keyup to show helper');
     });
 
-    ackTest('diff selection tooltip has no explicit close button (click outside to dismiss)', () => {
-        const rect = { left: 8, top: 200, bottom: 210 };
-        const { tip } = showDiffSelectionTooltipAt(rect, 'Test', 'Hello');
-        try {
-            ackEq(tip.querySelectorAll('button').length, 0, 'no close button');
-            const source = _ackSource;
-            const fn = source.slice(
-                source.indexOf('function installDiffSelectionActions'),
-                source.indexOf('function hideDiffSelectionToolbar'),
-            );
-            ackAssert(
-                fn.includes('_diffSelectionTooltip.contains(t)'),
-                'outside-click handler ignores clicks inside tooltip',
-            );
-            ackAssert(
-                fn.includes('_diffSelectionToolbar.contains(t)'),
-                'outside-click handler ignores clicks inside toolbar',
-            );
-            ackAssert(
-                sourceIncludesLoose(fn, "window.addEventListener('scroll', (e) =>"),
-                'scroll dismissal inspects the scroll target',
-            );
-        } finally {
-            hideDiffSelectionTooltip();
-        }
-    });
-
-    ackTest('diff selection tooltip positioning is viewport-clamped using measured popup size', () => {
+    ackTest('diff selection outside-click and scroll dismissal target the toolbar', () => {
         const source = _ackSource;
         const fn = source.slice(
-            source.indexOf('function showDiffSelectionTooltipAt'),
-            source.indexOf('function getCachedCommitReviewAid'),
+            source.indexOf('function installDiffSelectionActions'),
+            source.indexOf('function hideDiffSelectionToolbar'),
         );
-        ackAssert(fn.includes('getBoundingClientRect'), 'measures popup size before final placement');
-        ackAssert(fn.includes('aboveTop'), 'computes above-placement candidate');
-        ackAssert(fn.includes('belowTop'), 'computes below-placement candidate');
         ackAssert(
-            fn.indexOf('belowTop + tipH') < fn.indexOf('aboveTop >= pad'),
-            'prefers below placement before above fallback',
+            fn.includes('_diffSelectionToolbar.contains(t)'),
+            'outside-click handler ignores clicks inside toolbar',
         );
-        ackAssert(fn.includes("tip.style.transform = ''"), 'clears transform and uses explicit top/left');
+        ackAssert(
+            sourceIncludesLoose(fn, "window.addEventListener('scroll', (e) =>"),
+            'scroll dismissal inspects the scroll target',
+        );
     });
 
     ackTest('diff selection recognizes modern React diff text cells', () => {
@@ -30795,22 +29521,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             llmFn.includes('!ctx.isPRDescription'),
             'selection prompt avoids duplicating PR description when selection is inside it',
-        );
-    });
-
-    ackTest('selection one-liner prompt also includes parent text and PR description context', () => {
-        const source = _ackSource;
-        const oneLiner = source.slice(
-            source.indexOf('function updateDiffSelectionOneLiner'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
-        );
-        ackAssert(oneLiner.includes('Containing text block:'), 'one-liner prompt includes parent text block');
-        ackAssert(oneLiner.includes('PR description:'), 'one-liner prompt includes PR description context');
-        ackAssert(oneLiner.includes('fetchPRContext(pr)'), 'one-liner prompt fetches PR context');
-        ackAssert(oneLiner.includes('ctx.parentText'), 'one-liner prompt uses captured parent text');
-        ackAssert(
-            oneLiner.includes('!ctx.isPRDescription'),
-            'one-liner avoids duplicating PR description when selection is inside it',
         );
     });
 
@@ -31529,14 +30239,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!source.includes('frame++ % BRAILLE.length'), 'legacy modulo spinner loop removed');
     });
 
-    ackTest('findSubmitBtn accepts optional ta parameter for form fallback', () => {
-        const source = _ackSource;
-        const fn = source.slice(source.indexOf('const findSubmitBtn'), source.indexOf('// Find the comment container'));
-        ackAssert(fn.includes('(container, ta)'), 'findSubmitBtn takes ta parameter');
-        ackAssert(fn.includes("ta.closest('form')"), 'falls back to textarea form');
-        ackAssert(fn.includes('update-comment-button'), 'checks data-testid="update-comment-button"');
-    });
-
     ackTest('container search anchors from .ack-quick-actions header', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -31751,7 +30453,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const panelFn = source.slice(
             source.indexOf('function buildChatPanel'),
-            source.indexOf('function addResultCard'),
+            source.indexOf('function base64ToBlobUrl'),
         );
         ackAssert(panelFn.includes('.ack-ref-link'), 'delegates on ack-ref-link class');
         ackAssert(panelFn.includes('scrollToAndHighlight'), 'calls scrollToAndHighlight');
@@ -31838,7 +30540,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(injectFn.includes('const onCompare = isComparePage()'), 'inject checks compare mode');
         ackAssert(injectFn.includes('if (onPR)'), 'gates features behind onPR');
         // ACK toggle and SHA group only on PR
-        const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('function disableBtn'));
+        const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('💬 Comment navigator'));
         ackAssert(ackSection.includes('if (onPR)'), 'ACK toggle gated behind onPR');
         ackAssert(
             injectFn.includes('toolbar.appendChild(buildContextCopyGroup())'),
@@ -32234,9 +30936,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function gatherFullPRContext'),
             source.indexOf('function scrollToAndHighlight'),
         );
-        ackAssert(fn.includes('fmtLoc'), 'has fmtLoc helper for location formatting');
+        ackAssert(fn.includes("loc += ':' + first.line"), 'formats thread location as file:line');
         ackAssert(fn.includes('c.commitSha'), 'references commitSha in formatting');
-        ackAssert(fn.includes("'@' + c.commitSha"), 'formats as file:line@sha');
+        ackAssert(fn.includes("'@' + first.commitSha"), 'formats as file:line@sha');
     });
 
     ackTest('gatherFullPRContext groups comments by thread', () => {
@@ -32261,7 +30963,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'collapses multiple comment permalinks into thread header metadata',
         );
         ackAssert(fn.includes('Code context:'), 'includes thread code context when available');
-        ackAssert(fn.includes('Reactions:'), 'includes reaction summary when available');
+        ackAssert(fn.includes('c.reactions ? ` [${c.reactions}]`'), 'includes reaction summary when available');
         ackAssert(
             !fn.includes('> * Thread: ${c.threadId}'),
             'does not inject per-comment thread metadata into quoted conversation',
@@ -32791,7 +31493,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const inject = source.slice(source.indexOf('function inject()'));
         const shaIdx = inject.indexOf('toolbar.appendChild(buildSHAGroup())');
         const contextGroupIdx = inject.indexOf('toolbar.appendChild(buildContextCopyGroup())');
-        const expandIdx = inject.indexOf('toolbar.appendChild(expandGroup)');
         const commentIdx = inject.indexOf('toolbar.appendChild(commentNavBtn)');
         const robotIdx = inject.indexOf('toolbar.appendChild(buildRobotRecipeGroup(wrapper))');
         const settingsIdx = inject.indexOf('toolbar.appendChild(settingsGroup)');
@@ -32799,7 +31500,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(shaIdx > -1, 'SHA copy group exists');
         ackAssert(contextGroupIdx > -1, 'context copy group exists');
         ackAssert(shaIdx < contextGroupIdx, 'context copy group sits next to SHA copy group');
-        ackEq(expandIdx, -1, 'separate expand group is no longer appended to the toolbar');
         ackAssert(contextGroupIdx < commentIdx, 'context copy group before 💬');
         ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
         ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
@@ -33570,8 +32270,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('recordCacheTimestamp tracks explain/lightbulb/overview saves', () => {
         const source = _ackSource;
         ackAssert(source.includes('function recordCacheTimestamp'), 'helper exists');
-        const cacheHelpers = sourceSection(source, 'function getCache', 'function evictStaleCache');
-        ackAssert(cacheHelpers.includes('recordCacheTimestamp(key)'), 'setCache records timestamp');
+        const cacheHelpers = sourceSection(source, 'function setInfographicCache', 'function getCache');
+        ackAssert(cacheHelpers.includes('recordCacheTimestamp(key)'), 'setInfographicCache records timestamp');
         const callFn = sourceSection(source, 'function callLLM(', 'function parseProviderError');
         ackAssert(callFn.includes('recordCacheTimestamp(promptKey)'), 'prompt cache records timestamp');
         // Both save sites should call it
@@ -33590,80 +32290,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function schedulePostEditRefresh'),
         );
         ackAssert(prOverviewSave.includes('recordCacheTimestamp(overviewKey)'), 'PR overview save records timestamp');
-    });
-
-    ackTest('createPendingReviewViaPatGraphQL picks auth scheme from PAT prefix', async () => {
-        const orig = GM_xmlhttpRequest;
-        const auths = [];
-        try {
-            GM_xmlhttpRequest = (opts) => {
-                auths.push(opts.headers?.Authorization);
-                opts.onload?.({
-                    status: 200,
-                    responseText: JSON.stringify({
-                        data: { addPullRequestReview: { pullRequestReview: { id: 'R', state: 'PENDING' } } },
-                    }),
-                });
-            };
-            GM_setValue('github_pat', 'ghp_testtoken');
-            await createPendingReviewViaPatGraphQL('NODE');
-            GM_setValue('github_pat', 'finegrainedtoken');
-            await createPendingReviewViaPatGraphQL('NODE');
-            ackEq(auths[0], 'token ghp_testtoken');
-            ackEq(auths[1], 'Bearer finegrainedtoken');
-        } finally {
-            GM_xmlhttpRequest = orig;
-        }
-    });
-
-    ackTest('tryClickStartReview only clicks visible Start a review button', () => {
-        const host = document.createElement('div');
-        host.style.position = 'absolute';
-        host.style.left = '-99999px';
-        host.innerHTML = `
-            <button id="hidden" style="display:none">Start a review</button>
-            <button id="visible">Start a review</button>
-        `;
-        // Prepend so our deterministic fixture button is found before any real
-        // GitHub UI button that might be present on live pages.
-        document.body.prepend(host);
-        let clicks = 0;
-        host.querySelector('#hidden').addEventListener('click', () => clicks++);
-        host.querySelector('#visible').addEventListener('click', () => clicks++);
-        try {
-            const ok = tryClickStartReview();
-            ackEq(ok, true, 'should return true when it found and clicked a visible button');
-            ackEq(clicks, 1, 'should click exactly one button');
-        } finally {
-            host.remove();
-        }
-    });
-
-    ackTest('startPendingReview uses PAT GraphQL when no DOM Start a review button exists', async () => {
-        const origParsePR = parsePR;
-        const origFetchNode = fetchPullRequestNodeId;
-        const origCreate = createPendingReviewViaPatGraphQL;
-        const origTryClick = tryClickStartReview;
-        let called = 0;
-        try {
-            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '1' });
-            GM_setValue('github_pat', 'ghp_testtoken');
-            tryClickStartReview = () => false;
-            fetchPullRequestNodeId = async () => 'NODE';
-            createPendingReviewViaPatGraphQL = async (nodeId) => {
-                called++;
-                ackEq(nodeId, 'NODE');
-                return { id: 'R', state: 'PENDING' };
-            };
-            const res = await startPendingReview();
-            ackDeepEq(res, { ok: true, method: 'pat_graphql' });
-            ackEq(called, 1);
-        } finally {
-            parsePR = origParsePR;
-            fetchPullRequestNodeId = origFetchNode;
-            createPendingReviewViaPatGraphQL = origCreate;
-            tryClickStartReview = origTryClick;
-        }
     });
 
     ackTest('findReviewThreadPathForReplyForm can find file path via diff hash link', () => {
@@ -34450,9 +33076,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('submitPendingReview supports reviewEvent radios and generic dialog textarea', () => {
+    ackTest('prepareNativeReviewDialog supports reviewEvent radios and generic dialog textarea', () => {
         const source = _ackSource;
-        const start = source.indexOf('async function submitPendingReview(pr');
+        const start = source.indexOf('async function prepareNativeReviewDialog(');
         const fn = source.slice(start, source.indexOf('function getGitHubVerifiedFetchNonce', start));
         ackAssert(fn.includes('input[name="reviewEvent"]'), 'supports current reviewEvent radios');
         ackAssert(fn.includes("REQUEST_CHANGES: 'request changes'"), 'supports request changes lowercase radio value');
@@ -34466,7 +33092,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const nativeDialogFn = source.slice(
             source.indexOf('function getNativeDialogRoots'),
-            source.indexOf('function findNativeReviewSubmitButton'),
+            source.indexOf('function findNativeReviewTrigger'),
         );
         ackAssert(fn.includes('findNativeReviewDialog()'), 'submits through native review dialog lookup');
         ackAssert(
@@ -35286,7 +33912,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(runner.includes('callOpenAIImage(prompt)'), 'generates image from the visual prompt');
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
         ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
-        const card = source.slice(source.indexOf('function addInfographicCard'), source.indexOf('function addErrorDiv'));
+        const card = source.slice(source.indexOf('function addInfographicCard'), source.indexOf('function parseCommitsFromPage'));
         ackAssert(card.includes("closeBtn.title = 'Close infographic'"), 'infographic card has close button');
         ackAssert(card.includes('closed = true'), 'infographic close marks card closed');
         ackAssert(card.includes('if (closed) return'), 'infographic close prevents late render');
@@ -35335,7 +33961,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('chat panel recipe mode supports full-context robot prompts', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         const robotActions = source.slice(source.indexOf('const ROBOT_RECIPE_ACTIONS'), source.indexOf('const SYSTEM_BASE'));
         ackAssert(fn.includes('reimplementation: {'), 'defines reimplementation recipe');
         ackAssert(robotActions.includes("label: 'Reproducer'"), 'titles reimplementation recipe as reproducer');
@@ -35442,7 +34068,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('reimplementation user prompt generates the inspectable reproducer prompt', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         const recipeSystem = source.slice(
             source.indexOf('function getRecipeSystemPrompt'),
             source.indexOf('function scrollToAndHighlight'),
@@ -35600,7 +34226,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('suggestion stack recipe generates inspectable follow-up prompt', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         ackAssert(fn.includes('Generate the suggestion-stack prompt now.'), 'suggestion recipe has trigger text');
         ackAssert(fn.includes('Generated suggestion-stack prompt'), 'suggestion prompt details title exists');
         ackAssert(fn.includes('after the no-peek local reproducer exists'), 'recipe assumes reproducer exists');
@@ -35693,7 +34319,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('reproducer recipe omits head/PR-URL metadata from source context', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         ackAssert(fn.includes('omitHeadMetadata: true'), 'reproducer recipe sets omitHeadMetadata');
         ackAssert(
             fn.includes('PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, CODE BLOCKS, AND HEAD/PR-URL METADATA OMITTED)'),
@@ -35768,7 +34394,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('audio guide recipe generates an inspectable prompt', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function addResultCard'));
+        const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         const recipeSystem = source.slice(
             source.indexOf('function getRecipeSystemPrompt'),
             source.indexOf('function scrollToAndHighlight'),
@@ -36628,7 +35254,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function navigateCommit'),
-            source.indexOf('async function analyzeCommitsList'),
+            source.indexOf('async function runPRInfographic'),
         );
         ackAssert(
             fn.includes('(currentCommitIdx + dir + commits.length) % commits.length'),
@@ -36689,7 +35315,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function getLoadableElements'),
-            source.indexOf('async function showHidden'),
+            source.indexOf('function getPendingReviewRevealTargets'),
         );
         ackAssert(sourceIncludesLoose(fn, ".closest('button')).filter(Boolean)"), 'filters null after closest()');
     });
@@ -36731,9 +35357,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.154', () => {
+    ackTest('version bumped to 1.155', () => {
         const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.154' || _ackSource.includes('@version      1.154'), 'version is 1.154');
+        ackAssert(versionFromMeta === '1.155' || _ackSource.includes('@version      1.155'), 'version is 1.155');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -36817,13 +35443,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             await new Promise((resolve) => setTimeout(resolve, 0));
             ackEq(submitEvents, 1, 'accepting the diff submits once');
             ackEq(form._ackEditInitialValue, 'Hello **world**!!', 'accepted edit becomes the new no-op baseline');
-            ackEq(form._ackEditDirty, false, 'accepted edit clears the dirty flag');
             delete form._ackEditDiffAcceptedUntil;
             ackEq(isNoOpEditSave(form), true, 'same text after accepted edit is treated as no-op');
             ackEq(shouldConfirmEditSave(form), false, 'same text after accepted edit does not show the old diff');
         } finally {
             delete form._ackEditTracked;
-            delete form._ackEditDirty;
             delete form._ackEditInitialValue;
             delete form._ackEditDiffAcceptedUntil;
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
@@ -36880,7 +35504,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(form._ackEditTracked, 'edit form was tracked');
         } finally {
             delete form._ackEditTracked;
-            delete form._ackEditDirty;
             delete form._ackEditInitialValue;
             host.remove();
         }
@@ -37052,7 +35675,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(submitEvents, 1, 'accepting Changes-view diff submits once');
         } finally {
             delete form._ackEditTracked;
-            delete form._ackEditDirty;
             delete form._ackEditInitialValue;
             document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
             host.remove();
@@ -37238,17 +35860,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('createPendingReviewViaPatGraphQL uses PAT GraphQL helper and official mutation', () => {
-        const createFn = _ackSource.slice(
-            _ackSource.indexOf('function createPendingReviewViaPatGraphQL'),
-            _ackSource.indexOf('function isAckOwnedReviewControl'),
-        );
-        ackAssert(createFn.includes('patGraphQL('), 'delegates to PAT GraphQL helper');
-        ackAssert(createFn.includes('addPullRequestReview'), 'uses addPullRequestReview mutation');
-
+    ackTest('patGraphQL uses official GraphQL API via PAT auth helper', () => {
         const patFn = _ackSource.slice(
             _ackSource.indexOf('async function patGraphQL'),
-            _ackSource.indexOf('async function createPendingReviewViaPatGraphQL'),
+            _ackSource.indexOf('function isAckOwnedReviewControl'),
         );
         ackAssert(patFn.includes('api.github.com/graphql'), 'uses official GraphQL API');
         ackAssert(patFn.includes('GM_xmlhttpRequest'), 'uses GM_xmlhttpRequest (bypasses CORS)');
@@ -37261,16 +35876,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(authFn.includes('ghp_'), 'handles classic PAT prefix');
     });
 
-    ackTest('tryClickStartReview clicks DOM button with zero API calls', () => {
-        const fn = _ackSource.slice(
-            _ackSource.indexOf('function tryClickStartReview'),
-            _ackSource.indexOf('async function startPendingReview'),
-        );
-        ackAssert(fn.includes('start a review'), 'searches for "Start a review" button');
-        ackAssert(fn.includes('btn.click()'), 'clicks the button');
-        ackAssert(fn.includes('offsetParent'), 'checks button is visible');
-    });
-
     ackTest('config panel text mentions GitHub PAT write permission', () => {
         ackAssert(_ackSource.includes('Read and write'), 'mentions Read and write permission');
     });
@@ -37280,7 +35885,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const sites = [
             { name: 'API helpers header', search: 'prefer DOM-first for writes' },
             { name: 'applyReactionChoice', search: 'DOM-first for writes — clicking native UI buttons' },
-            { name: 'tryClickStartReview', search: 'DOM-first for writes — uses GitHub' },
             { name: 'triggerMenuAction', search: 'DOM-first for writes — clicking native menu' },
         ];
         for (const { name, search } of sites) {
@@ -37748,24 +36352,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!isPRConversationPage('/owner/repo/pull/123/changes'));
     });
 
-    // --- isHttpStatus behavioral tests ---
-    ackTest('isHttpStatus matches "HTTP 422" format', () => {
-        ackAssert(isHttpStatus({ message: 'HTTP 422' }, 422));
-    });
-    ackTest('isHttpStatus matches "422:" format', () => {
-        ackAssert(isHttpStatus({ message: 'server 422: Unprocessable' }, 422));
-    });
-    ackTest('isHttpStatus matches space-delimited " 404 " format', () => {
-        ackAssert(isHttpStatus({ message: 'error 404 not found' }, 404));
-    });
-    ackTest('isHttpStatus returns false for wrong code', () => {
-        ackAssert(!isHttpStatus({ message: 'HTTP 200' }, 404));
-    });
-    ackTest('isHttpStatus handles null/undefined error', () => {
-        ackAssert(!isHttpStatus(null, 404));
-        ackAssert(!isHttpStatus(undefined, 404));
-    });
-
     // --- hashPrompt additional tests ---
     ackTest('hashPrompt produces different hashes for different inputs', () => {
         const h1 = hashPrompt('hello world');
@@ -37777,34 +36363,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(h.includes('_'), 'hash should contain underscore separator for length');
         const lengthPart = h.split('_').pop();
         ackEq(lengthPart, (4).toString(36), 'length component should encode input length');
-    });
-
-    // --- extractCsrfFromHtml behavioral tests ---
-    ackTest('extractCsrfFromHtml extracts from meta tag', () => {
-        const html = '<html><head><meta name="csrf-token" content="abc123token"></head></html>';
-        ackEq(extractCsrfFromHtml(html), 'abc123token');
-    });
-    ackTest('extractCsrfFromHtml extracts from JSON pattern', () => {
-        const html = '<html><body><script>{"csrfToken":"longtoken1234567890ab"}</script></body></html>';
-        ackEq(extractCsrfFromHtml(html), 'longtoken1234567890ab');
-    });
-    ackTest('extractCsrfFromHtml returns empty for missing CSRF', () => {
-        ackEq(extractCsrfFromHtml('<html><body>no csrf here</body></html>'), '');
-    });
-    ackTest('getCsrfToken includes authenticity_token fallback after meta token', () => {
-        ensureSelfSource();
-        const fn = _ackSource.slice(
-            _ackSource.indexOf('function getCsrfToken()'),
-            _ackSource.indexOf('// Create a pending review using the official GitHub GraphQL API with PAT.'),
-        );
-        ackAssert(fn.includes(`document.querySelector('meta[name="csrf-token"]')`), 'checks csrf meta token first');
-        ackAssert(
-            fn.includes(`document.querySelector('input[name="authenticity_token"]')`),
-            'falls back to authenticity_token input',
-        );
-        const metaIdx = fn.indexOf(`document.querySelector('meta[name="csrf-token"]')`);
-        const inputIdx = fn.indexOf(`document.querySelector('input[name="authenticity_token"]')`);
-        ackAssert(metaIdx >= 0 && inputIdx > metaIdx, 'authenticity_token fallback comes after meta lookup');
     });
 
     // --- WIDE_COMMENT_CONTAINER_SELECTOR structural tests ---
@@ -37988,10 +36546,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             document.querySelectorAll(`#${DIFF_SELECTION_TOOLBAR_ID}`).length <= 1,
             'duplicate diff selection toolbar nodes found',
-        );
-        ackAssert(
-            document.querySelectorAll(`#${DIFF_SELECTION_TOOLTIP_ID}`).length <= 1,
-            'duplicate diff selection tooltip nodes found',
         );
     });
 
@@ -38549,7 +37103,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         BRAILLE_PHASES,
         BRAILLE_START_FRAME,
         BRAILLE_STATES,
-        BRAILLE,
         rewriteProofreadCommitDiffUrls,
         postProcessProofreadMarkdown,
         showDiffDialog,
@@ -38609,8 +37162,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         EXTENDED_COMMENT_CONTAINER_SELECTOR,
         WIDE_COMMENT_CONTAINER_SELECTOR,
         COMMENT_CONTAINER_SELECTOR,
-        isHttpStatus,
-        extractCsrfFromHtml,
         shouldExposeTestExports,
         parseGitHubRepoPath,
         parseRepoMirrorConfig,
