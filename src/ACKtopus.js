@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.155
+// @version      1.156
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -484,13 +484,7 @@
         if (isMacKeyboardPlatform()) {
             return !!e?.metaKey && !!e?.altKey && !e.ctrlKey && !e.shiftKey;
         }
-        return (
-            !!e?.altKey &&
-            !!e?.shiftKey &&
-            !e.ctrlKey &&
-            !e.metaKey &&
-            sameKey
-        );
+        return !!e?.altKey && !!e?.shiftKey && !e.ctrlKey && !e.metaKey;
     }
 
     function notifyShiftAlternateRenderers() {
@@ -1936,8 +1930,8 @@
 
     // GitHub recently stopped wrapping these buttons in `.ajax-pagination-form`
     // in some views (buttons now appear directly under `.discussion-item-header`).
-    const AJAX_PAGINATION_BTN_SELECTOR = '.ajax-pagination-form .ajax-pagination-btn, .ajax-pagination-btn';
-    const HIDDEN_CONVERSATION_SELECTOR = '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form';
+    const AJAX_PAGINATION_BTN_SELECTOR = '.ajax-pagination-btn';
+    const HIDDEN_CONVERSATION_SELECTOR = '.ajax-pagination-form';
     const ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR =
         'button[data-testid^="issue-timeline-load-more-"], ' +
         '[data-testid^="issue-timeline-load-more-container-"] button';
@@ -4889,7 +4883,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 k.startsWith('llm_lightbulb_') ||
                 k.startsWith('llm_explain_') ||
                 k.startsWith('llm_pr_overview_') ||
-                k.startsWith('llm_lightbulb_autoopen_') ||
                 k.startsWith('llm_infographic_');
             if (!isLLM || k === 'llm_cache_timestamps') continue;
             const age = ts[k] ? now - ts[k] : Infinity;
@@ -4949,7 +4942,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             k.startsWith('llm_explain_') ||
             k.startsWith('llm_lightbulb_') ||
             k.startsWith('llm_pr_overview_') ||
-            k.startsWith('llm_lightbulb_autoopen_') ||
             k.startsWith('llm_infographic_') ||
             k.startsWith('llm_cache_') ||
             k.startsWith('llm_prompt_') ||
@@ -5094,7 +5086,6 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         if (!m) return '';
         const cost = (inputTokens * m.inputPrice + outputTokens * m.outputPrice) / 1_000_000;
         if (cost < 0.005) return '$0.00';
-        if (cost < 1) return `$${cost.toFixed(2)}`;
         return `$${cost.toFixed(2)}`;
     }
 
@@ -7339,8 +7330,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             .filter(Boolean);
         return {
             isResolved: !!container.closest('details[data-resolved="true"]'),
-            isOutdated: labels.some((label) => /(^|: )outdated$/.test(label) || label === 'outdated'),
-            isPending: labels.some((label) => /(^|: )pending$/.test(label) || label === 'pending'),
+            isOutdated: labels.some((label) => /(^|: )outdated$/.test(label)),
+            isPending: labels.some((label) => /(^|: )pending$/.test(label)),
         };
     }
 
@@ -8277,55 +8268,59 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     });
                     parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
                 } else {
-                    // Group by thread
-                    const threads = new Map(); // anchor/thread key -> [comment, ...]
-                    for (const c of comments) {
-                        const groupKey = getCommentAnchorGroupKey(c);
-                        if (!threads.has(groupKey)) threads.set(groupKey, []);
-                        threads.get(groupKey).push(c);
-                    }
-                    const commentParts = [];
-                    // Threaded comments
-                    for (const [tid, rawThread] of threads) {
-                        const thread = sortCommentsChronologically(rawThread);
-                        const first = thread[0];
-                        let loc = '';
-                        if (first.file) {
-                            loc = ` - ${first.file}`;
-                            if (first.line) loc += ':' + first.line;
-                            if (first.commitSha) loc += '@' + first.commitSha;
-                        }
-                        const threadMeta = [];
-                        const threadIds = [...new Set(thread.map((c) => c.threadId).filter(Boolean))];
-                        if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
-                        else if (threadIds.length > 1) threadMeta.push(`* Threads: ${threadIds.join(', ')}`);
-                        const permalinks = [...new Set(thread.map((c) => c.permalink).filter(Boolean))];
-                        if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
-                        else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
-                        if (includeCommentCodeContext && first.codeContext)
-                            threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
-                        const threadLines = thread
-                            .map((c) => {
-                                const datePart = c.date ? ` (${c.date})` : '';
-                                const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
-                                const quoted = [
-                                    `> **${c.author}**${datePart}${pendingPart}${c.reactions ? ` [${c.reactions}]` : ''}:`,
-                                ];
-                                quoted.push(`> ${c.markdown.replace(/\n/g, '\n> ')}`);
-                                return quoted.join('\n');
-                            })
-                            .join('\n>\n');
-                        commentParts.push(
-                            [`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'),
-                        );
-                    }
-                    parts.push(`## Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+                    parts.push(
+                        `## Comments (${comments.length})\n${formatThreadGroupLines(comments, { includeCodeContext: includeCommentCodeContext })}`,
+                    );
                 }
             }
         }
 
         onProgress('Done');
         return parts.join('\n\n');
+    }
+
+    // Shared thread-grouped comment formatter for gatherFullPRContext / gatherSingleCommitContext
+    function formatThreadGroupLines(comments, { includeCodeContext = true } = {}) {
+        // Group by thread
+        const threads = new Map(); // anchor/thread key -> [comment, ...]
+        for (const c of comments) {
+            const groupKey = getCommentAnchorGroupKey(c);
+            if (!threads.has(groupKey)) threads.set(groupKey, []);
+            threads.get(groupKey).push(c);
+        }
+        const commentParts = [];
+        for (const rawThread of threads.values()) {
+            const thread = sortCommentsChronologically(rawThread);
+            const first = thread[0];
+            let loc = '';
+            if (first.file) {
+                loc = ` - ${first.file}`;
+                if (first.line) loc += ':' + first.line;
+                if (first.commitSha) loc += '@' + first.commitSha;
+            }
+            const threadMeta = [];
+            const threadIds = [...new Set(thread.map((c) => c.threadId).filter(Boolean))];
+            if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
+            else if (threadIds.length > 1) threadMeta.push(`* Threads: ${threadIds.join(', ')}`);
+            const permalinks = [...new Set(thread.map((c) => c.permalink).filter(Boolean))];
+            if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
+            else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
+            if (includeCodeContext && first.codeContext)
+                threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
+            const threadLines = thread
+                .map((c) => {
+                    const datePart = c.date ? ` (${c.date})` : '';
+                    const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
+                    const quoted = [
+                        `> **${c.author}**${datePart}${pendingPart}${c.reactions ? ` [${c.reactions}]` : ''}:`,
+                    ];
+                    quoted.push(`> ${c.markdown.replace(/\n/g, '\n> ')}`);
+                    return quoted.join('\n');
+                })
+                .join('\n>\n');
+            commentParts.push([`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'));
+        }
+        return commentParts.join('\n\n---\n\n');
     }
 
     function currentCommitRepoContext(path = location.pathname) {
@@ -8415,46 +8410,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 (c) => c.commitSha && (sha.startsWith(c.commitSha) || c.commitSha.startsWith(shortSha)),
             );
             if (comments.length > 0) {
-                const threads = new Map();
-                for (const c of comments) {
-                    const groupKey = getCommentAnchorGroupKey(c);
-                    if (!threads.has(groupKey)) threads.set(groupKey, []);
-                    threads.get(groupKey).push(c);
-                }
-                const commentParts = [];
-                for (const [tid, rawThread] of threads) {
-                    const thread = sortCommentsChronologically(rawThread);
-                    const first = thread[0];
-                    let loc = '';
-                    if (first.file) {
-                        loc = ` - ${first.file}`;
-                        if (first.line) loc += ':' + first.line;
-                        if (first.commitSha) loc += '@' + first.commitSha;
-                    }
-                    const threadMeta = [];
-                    const threadIds = [...new Set(thread.map((c) => c.threadId).filter(Boolean))];
-                    if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
-                    else if (threadIds.length > 1) threadMeta.push(`* Threads: ${threadIds.join(', ')}`);
-                    const permalinks = [...new Set(thread.map((c) => c.permalink).filter(Boolean))];
-                    if (permalinks.length === 1) threadMeta.push(`* Permalink: ${permalinks[0]}`);
-                    else if (permalinks.length > 1) threadMeta.push(`* Permalinks: ${permalinks.join(', ')}`);
-                    if (first.codeContext) threadMeta.push(`* Code context:\n\`\`\`\n${first.codeContext}\n\`\`\``);
-                    const threadLines = thread
-                        .map((c) => {
-                            const datePart = c.date ? ` (${c.date})` : '';
-                            const pendingPart = !c.date && c.isPending ? ' [pending]' : '';
-                            const quoted = [
-                                `> **${c.author}**${datePart}${pendingPart}${c.reactions ? ` [${c.reactions}]` : ''}:`,
-                            ];
-                            quoted.push(`> ${c.markdown.replace(/\n/g, '\n> ')}`);
-                            return quoted.join('\n');
-                        })
-                        .join('\n>\n');
-                    commentParts.push(
-                        [`### Thread${loc}${formatCommentFlags(first)}`, ...threadMeta, threadLines].join('\n'),
-                    );
-                }
-                parts.push(`## Visible Comments (${comments.length})\n${commentParts.join('\n\n---\n\n')}`);
+                parts.push(`## Visible Comments (${comments.length})\n${formatThreadGroupLines(comments)}`);
             }
         }
 
@@ -9711,12 +9667,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 chat: {
                     label: 'Open chat',
                     userText: '',
-                    sendAsConversation: false,
                 },
                 reimplementation: {
                     label: 'Reproducer',
                     userText: 'Generate the local reproducer prompt now.',
-                    sendAsConversation: false,
                     fullPRContext: true,
                     sourceContextLabel:
                         'PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, CODE BLOCKS, AND HEAD/PR-URL METADATA OMITTED)',
@@ -9737,7 +9691,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 suggestion_stack: {
                     label: 'Suggestions',
                     userText: 'Generate the suggestion-stack prompt now.',
-                    sendAsConversation: false,
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated suggestion-stack prompt',
                     finalTask:
@@ -9746,7 +9699,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 audio_walkthrough: {
                     label: 'Audio guide',
                     userText: 'Generate the direct audio-agent prompt now.',
-                    sendAsConversation: false,
                     fullPRContext: true,
                     sourceContextLabel: 'FULL PR CONTEXT SOURCE MATERIAL (PATCH ATTACHED AFTER GENERATED PROMPT)',
                     contextOptions: {
@@ -9764,7 +9716,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 maintainer_summary: {
                     label: 'Maintainer summary',
                     userText: 'Generate the maintainer-facing PR status summary now.',
-                    sendAsConversation: false,
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated maintainer-summary prompt',
                     finalTask:
@@ -9774,7 +9725,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const recipeCfg = recipe ? recipeMap[recipe] : null;
             title.textContent = `🤖 ${getRobotRecipeTitle(recipe)}`;
             const text = recipeCfg ? recipeCfg.userText : input.value.trim();
-            if (recipeCfg?.sendAsConversation === false && recipeCfg.userText === '') return;
             if (!recipeCfg && !text) return;
             if (!copyPromptOnly && !isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
@@ -11180,7 +11130,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         const fm = trimmed.match(FENCE_RE);
                         if (fm) {
                             inFence = true;
-                            fenceMarker = fm[1].charAt(0).repeat(fm[1].length);
+                            fenceMarker = fm[1];
                             isFenceOpenLine = true;
                         }
                     } else if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
@@ -11307,7 +11257,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // `.js-line-comments`, which may contain multiple textareas.
             let container =
                 quickActions?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
-                null ||
                 searchAnchor.closest(COMMENT_CONTAINER_SELECTOR) ||
                 searchAnchor.closest(containerSelectors);
             // If not found, walk up manually (limited to 8 levels to avoid crossing comment boundaries)
@@ -15777,7 +15726,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function openMenuTrigger(trigger) {
         if (!trigger) return false;
-        const details = trigger.tagName === 'SUMMARY' ? trigger.closest('details') : trigger.closest?.('details');
+        const details = trigger.closest?.('details');
         if (details) {
             if (!details.hasAttribute('open')) trigger.click();
             return true;
@@ -19511,13 +19460,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     for (const cc of commits) {
                         if (cc.el.querySelector('.ack-commit-explain-panel')) continue;
                         const shortSha = cc.sha.slice(0, 8);
-                        const explanation =
-                            explanations[shortSha] ||
-                            explanations[cc.sha.slice(0, 7)] ||
-                            explanations[cc.sha] ||
-                            Object.values(explanations).find((_, i) =>
-                                Object.keys(explanations)[i].startsWith(shortSha.slice(0, 6)),
-                            );
+                        let explanation =
+                            explanations[shortSha] || explanations[cc.sha.slice(0, 7)] || explanations[cc.sha];
+                        if (!explanation) {
+                            const key = Object.keys(explanations).find((k) => k.startsWith(shortSha.slice(0, 6)));
+                            if (key) explanation = explanations[key];
+                        }
                         if (!explanation) continue;
 
                         const panel = document.createElement('div');
@@ -21880,10 +21828,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             const fnSrc = typeof ACKtopusMain === 'function' ? ACKtopusMain.toString() : '';
             if (!fnSrc || fnSrc.length < 1000) return '';
+            const ver = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '0.0';
             const meta = `// ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.155
+// @version      ${ver}
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
@@ -31424,7 +31373,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(helper.includes('llm_prompt_'), 'buildPromptCacheKey uses llm_prompt_ cache prefix');
     });
 
-    ackTest('evictStaleCache handles all LLM key prefixes including overview/autoopen', () => {
+    ackTest('evictStaleCache handles all LLM key prefixes including overview', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function evictStaleCache'), source.indexOf('evictStaleCache();'));
         ackAssert(fn.includes("'llm_prompt_'"), 'checks llm_prompt_ prefix');
@@ -31432,7 +31381,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("'llm_lightbulb_'"), 'checks llm_lightbulb_ prefix');
         ackAssert(fn.includes("'llm_explain_'"), 'checks llm_explain_ prefix');
         ackAssert(fn.includes("'llm_pr_overview_'"), 'checks llm_pr_overview_ prefix');
-        ackAssert(fn.includes("'llm_lightbulb_autoopen_'"), 'checks llm_lightbulb_autoopen_ prefix');
         ackAssert(fn.includes("'llm_infographic_'"), 'checks infographic cache prefix');
     });
 
@@ -32190,7 +32138,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('llm_explain_'), 'clears explain caches');
         ackAssert(fn.includes('llm_lightbulb_'), 'clears lightbulb caches');
         ackAssert(fn.includes('llm_pr_overview_'), 'clears PR overview caches');
-        ackAssert(fn.includes('llm_lightbulb_autoopen_'), 'clears lightbulb auto-open flags');
         ackAssert(fn.includes('llm_infographic_'), 'clears infographic caches');
         ackAssert(fn.includes('llm_cache_'), 'clears LLM response caches');
         ackAssert(fn.includes('llm_prompt_'), 'clears LLM prompt caches');
@@ -34613,7 +34560,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // --- v1.17: lightbulb panel beside header, bold members, Python pseudocode ---
 
     ackTest('version bumped to 1.17+', () => {
-        ackAssert(!_ackSource.includes('@version      1.16'), 'version is past 1.16');
+        ackAssert(!/@version\s+1\.16(\D|$)/.test(_ackSource), 'version is past 1.16');
     });
 
     ackTest('pseudocode instruction requires Python-like syntax with original identifiers', () => {
@@ -35357,9 +35304,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('mailto'), 'no mailto in safeImgSrc');
     });
 
-    ackTest('version bumped to 1.155', () => {
-        const versionFromMeta = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
-        ackAssert(versionFromMeta === '1.155' || _ackSource.includes('@version      1.155'), 'version is 1.155');
+    ackTest('userscript @version metadata present and consistent', () => {
+        const m = _ackSource.match(/@version\s+(\S+)/);
+        ackAssert(m, '@version directive present');
+        const gmVer = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '';
+        if (gmVer) ackEq(m[1], gmVer, 'source @version matches GM_info');
     });
 
     ackTest('prefillCommitHash always applies (no mode guard)', () => {
@@ -37207,8 +37156,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     navWindow.addEventListener('popstate', () => {
         if (_ackTesting) return;
         checkUrlChange();
-        tryInject();
-        addFloatingCommitNav();
         hideNativeCommitNav();
         scheduleReviewCommentHashNavigation('popstate');
     });
