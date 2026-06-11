@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.159
+// @version      1.160
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -14517,6 +14517,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const ta = findEditTextarea(form);
         if (!ta) return false;
+
+        // A thread scope can contain a NEW-comment compose form (inline review
+        // reply) as a descendant; the guards above only catch compose ANCESTORS.
+        // If the matched textarea lives in such a form, the scope must not be
+        // promoted to an existing-post edit form.
+        const taOwnerForm = ta.closest?.('form');
+        if (taOwnerForm && taOwnerForm !== ownerForm && isNewPostComposeForm(taOwnerForm, path)) return false;
 
         const action = form.getAttribute?.('action') || ownerForm?.getAttribute?.('action') || '';
         if (/\/(?:issues|pull)\/\d+(?:\/|$)|\/issue_comments\/|\/review_comment\/|\/reviews\//.test(action))
