@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.161
+// @version      1.166
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -83,7 +83,7 @@
     const FORCE_PUSH_BURST_WINDOW_MS = 15 * 60 * 1000;
     const AUDIO_GUIDE_READY_GATE = 'Respond with OK only once you have all the data and can start the audio conversation';
     const RECIPE_CONTEXT_MAX_CHARS = 160000;
-    const REPRODUCER_CONTEXT_MAX_CHARS = 80000;
+    const REPRODUCER_CONTEXT_MAX_CHARS = RECIPE_CONTEXT_MAX_CHARS;
     const LLM_DEFAULT_MAX_TOKENS = 16384;
     const REPRODUCER_MAX_TOKENS = LLM_DEFAULT_MAX_TOKENS;
     const LLM_REQUEST_TIMEOUT_MS = 180000;
@@ -1045,16 +1045,27 @@
         const push = (el) => {
             if (el && el.nodeType === 1 && !containers.includes(el)) containers.push(el);
         };
+        push(root.closest?.('[data-testid="issue-body"]'));
         push(root.closest?.(COMMENT_CONTAINER_SELECTOR));
         push(root.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR));
-        if (root.matches?.(COMMENT_CONTAINER_SELECTOR) || root.matches?.(WIDE_COMMENT_CONTAINER_SELECTOR)) push(root);
+        if (
+            root.matches?.('[data-testid="issue-body"]') ||
+            root.matches?.(COMMENT_CONTAINER_SELECTOR) ||
+            root.matches?.(WIDE_COMMENT_CONTAINER_SELECTOR)
+        ) {
+            push(root);
+        }
+        qsa(root, '[data-testid="issue-body"]').forEach(push);
         qsa(root, COMMENT_CONTAINER_SELECTOR).forEach(push);
         qsa(root, WIDE_COMMENT_CONTAINER_SELECTOR).forEach(push);
 
         for (const container of containers) {
             if (!isVisible(container)) continue;
             const header =
-                container.querySelector?.('[data-testid="comment-header"], .timeline-comment-header, .review-comment-header') ||
+                (container.matches?.('[data-testid="issue-body"]') ? container : null) ||
+                container.querySelector?.(
+                    '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header',
+                ) ||
                 container;
             const menuTrigger =
                 header.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR) ||
@@ -1070,6 +1081,7 @@
             if (target) return target;
         }
         const visibleRoots = [
+            ...qsa(document, '[data-testid="issue-body"]'),
             ...qsa(document, COMMENT_CONTAINER_SELECTOR),
             ...qsa(document, WIDE_COMMENT_CONTAINER_SELECTOR),
         ].filter((el, idx, arr) => arr.indexOf(el) === idx && isInViewport(el));
@@ -4461,7 +4473,7 @@ Produce a local reproducer prompt whose only target artifact is useful independe
 # Success criteria
 - The generated prompt is context-specific to the supplied PR, not a generic meta-prompt.
 - The generated prompt defines target outcomes first: desired behavior, invariants, failure modes, constraints, commit-by-commit target jobs, and validation evidence.
-- The generated prompt uses the supplied commit metadata to infer the intended local commit count, states that count explicitly, and describes the current job commit by commit where the source metadata supports it. Each commit job should state what that commit is supposed to accomplish, why it matters, and what would prove it, not the submitted implementation.
+- The generated prompt uses the supplied PR description, commit metadata, commit messages, and changed content to infer the intended local commit count, states that count explicitly, and describes the current job commit by commit where the source metadata supports it. Each commit job should state what that commit is supposed to accomplish as a technical issue needing implementation, why it matters, and what would prove it, not the submitted implementation.
 - The generated prompt is an abstract issue, not an implementation recipe. It must let the target agent discover the design from the repository.
 - The generated prompt frames the task as an independent reinvention from the problem description and a clean no-peek base tree. It may use latest master/current upstream as the starting point unless the user asks for the PR parent/base specifically, but it must record the exact base branch/commit used for later comparison. The user will provide the actual commits or PR separately after the local result is ready; the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation.
 - The target artifact is a coherent local branch with reviewable commits, focused tests or clear verification evidence, an explanation of the independently chosen design, and explicit uncertainty.
@@ -4470,8 +4482,8 @@ Produce a local reproducer prompt whose only target artifact is useful independe
 
 # Constraints
 - Treat the supplied PR context as private source material for prompt construction.
-- The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Convert anything that slips through into behavior, invariant, risk, or validation language, or omit it.
-- Commit-by-commit target jobs may use commit ordinals and short high-level titles inferred from the source, but they must be written as outcomes to rediscover, not as copied commit messages.
+- The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, raw diff hunks, copied code, changed-file lists, line numbers, include churn, or verbatim commit messages. It may mention code areas, existing public symbols, externally visible options, behavioral constants, tests, logs, and failure modes when they are required to define the issue. Convert patch detail into technical requirements, invariants, risks, and validation evidence.
+- Commit-by-commit target jobs may use commit ordinals and short high-level titles inferred from the source, but they must be written as exact technical outcomes to rediscover, not as copied commit messages or a line-by-line patch recipe.
 - Leave room for the local agent to discover a different valid design.
 - Require grounded claims. The local agent uses its chosen no-peek base tree, tests, build errors, logs, and project documentation as evidence, and marks missing evidence instead of guessing.
 - Do not tell the local agent to push. Keep history changes local and ask before destructive or remote-affecting operations.
@@ -4488,7 +4500,7 @@ No-peek rules, approval gate, grounding requirements, commit hygiene, and stop r
 A high-level description of the change to reproduce from the chosen no-peek base tree: desired behavior, invariants, failure modes, constraints, and validation signals.
 
 ## Commit-By-Commit Target Jobs
-Start by stating the exact or inferred number of local commits to create from the supplied commit metadata. Then use one concise subsection per logical author commit, in original order, labeled "Commit N of M". Each subsection should describe what that commit is supposed to accomplish as the outcome to reproduce, why that outcome matters for review, and what evidence would validate it. Keep this abstract enough that the local agent must rediscover the implementation.
+Start by stating the exact or inferred number of local commits to create from the supplied commit metadata. Then use one concise subsection per logical author commit, in original order, labeled "Commit N of M". Each subsection should describe what that commit is supposed to accomplish as the technical issue to implement, using the PR description, commit message, and changed content as source signals. State why that outcome matters for review and what evidence would validate it. Keep this abstract enough that the local agent must rediscover the implementation, but specific enough that the agent can actually implement the behavior without opening the submitted PR.
 
 ## Local Commit Expectations
 How to keep the local branch reviewable: create exactly the stated number of local commits when the commit metadata is complete, tests that document existing behavior before a refactor should come first, real reproducers should live with fixes, each commit should compile or clearly explain why it cannot, and commit messages should explain the problem and result.
@@ -9328,6 +9340,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .map((thread) => ({
                     id: String(thread.id || `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`),
                     title: String(thread.title || '').slice(0, 80),
+                    recipe: String(thread.recipe || ''),
+                    recipePromptKey: String(thread.recipePromptKey || ''),
+                    recipePromptHash: String(thread.recipePromptHash || ''),
                     updatedAt: Number(thread.updatedAt || Date.now()),
                     messages: thread.messages
                         .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
@@ -9347,6 +9362,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .map((thread) => ({
                     ...thread,
                     title: String(thread.title || '').slice(0, 80),
+                    recipe: String(thread.recipe || ''),
+                    recipePromptKey: String(thread.recipePromptKey || ''),
+                    recipePromptHash: String(thread.recipePromptHash || ''),
                     messages: thread.messages.slice(-40).map((m) => ({
                         role: m.role,
                         content: String(m.content || '').slice(0, 30000),
@@ -9356,16 +9374,54 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_setValue(chatThreadStorageKey, sorted);
         }
 
-        function createRobotThread() {
+        function createRobotThread(meta = {}) {
             const thread = {
                 id: `thread-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                title: 'New discussion',
+                title: meta.title || 'New discussion',
+                recipe: meta.recipe || '',
+                recipePromptKey: meta.recipePromptKey || '',
+                recipePromptHash: meta.recipePromptHash || '',
                 updatedAt: Date.now(),
                 messages: [],
             };
             robotThreads.unshift(thread);
             saveRobotChatThreads();
             return thread;
+        }
+
+        function markRobotThreadRecipe(thread, meta = {}) {
+            if (!thread) return;
+            thread.recipe = meta.recipe || '';
+            thread.recipePromptKey = meta.recipePromptKey || '';
+            thread.recipePromptHash = meta.recipePromptHash || '';
+            if (meta.title && (!thread.title || thread.title === 'New discussion')) thread.title = meta.title;
+        }
+
+        function findRobotThreadForRecipe(recipe, recipePromptKey, recipePromptHash) {
+            if (!recipe || (!recipePromptKey && !recipePromptHash)) return null;
+            return (
+                robotThreads.find(
+                    (thread) =>
+                        thread.recipe === recipe &&
+                        thread.messages.some((m) => m.role === 'assistant') &&
+                        ((recipePromptKey && thread.recipePromptKey === recipePromptKey) ||
+                            (recipePromptHash && thread.recipePromptHash === recipePromptHash)),
+                ) || null
+            );
+        }
+
+        function buildRecipePromptMeta(recipe, recipeCfg, provider, system, userContent, reasoningEffort, modelOverride) {
+            const model = (modelOverride || getLLMConfig()[provider]?.model || '').trim();
+            const recipePromptKey = buildPromptCacheKey(provider, model, system, userContent, reasoningEffort) || '';
+            const recipePromptHash = hashPrompt(
+                [recipe, provider, model, reasoningEffort || 'default', system, userContent].join('\0'),
+            );
+            return {
+                recipe,
+                title: recipeCfg?.label || getRobotRecipeTitle(recipe),
+                recipePromptKey,
+                recipePromptHash,
+            };
         }
 
         function getActiveRobotThread() {
@@ -9387,6 +9443,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             threadList.textContent = '';
             if (!robotThreads.length) robotThreads = [createRobotThread()];
             for (const thread of robotThreads) {
+                const row = document.createElement('div');
+                Object.assign(row.style, {
+                    position: 'relative',
+                    width: '100%',
+                });
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.textContent = robotThreadTitle(thread);
@@ -9394,7 +9455,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 Object.assign(btn.style, {
                     width: '100%',
                     textAlign: 'left',
-                    padding: '5px 6px',
+                    padding: '5px 22px 5px 6px',
                     border: '1px solid',
                     borderColor: thread.id === activeThreadId ? '#58a6ff' : '#21262d',
                     borderRadius: '4px',
@@ -9408,7 +9469,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     whiteSpace: 'nowrap',
                 });
                 btn.addEventListener('click', () => selectRobotThread(thread.id));
-                threadList.appendChild(btn);
+                const deleteBtn = document.createElement('button');
+                deleteBtn.type = 'button';
+                deleteBtn.textContent = 'x';
+                deleteBtn.title = 'Delete discussion';
+                deleteBtn.setAttribute('aria-label', 'Delete discussion');
+                Object.assign(deleteBtn.style, {
+                    position: 'absolute',
+                    top: '2px',
+                    right: '3px',
+                    width: '18px',
+                    height: '18px',
+                    padding: '0',
+                    border: '0',
+                    background: 'transparent',
+                    color: '#8b949e',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    lineHeight: '18px',
+                });
+                deleteBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    deleteRobotThread(thread.id);
+                });
+                row.appendChild(btn);
+                row.appendChild(deleteBtn);
+                threadList.appendChild(row);
             }
         }
 
@@ -9431,6 +9518,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             renderRobotThreadList();
             renderRobotThreadMessages();
             input.focus();
+        }
+
+        function deleteRobotThread(id) {
+            const index = robotThreads.findIndex((thread) => thread.id === id);
+            if (index === -1) return;
+            const wasActive = activeThreadId === id;
+            robotThreads.splice(index, 1);
+            if (!robotThreads.length) {
+                const thread = createRobotThread();
+                activeThreadId = thread.id;
+            } else if (wasActive || !robotThreads.some((thread) => thread.id === activeThreadId)) {
+                activeThreadId = robotThreads[0].id;
+            }
+            saveRobotChatThreads();
+            renderRobotThreadList();
+            renderRobotThreadMessages();
         }
 
         function rememberMessage(role, content) {
@@ -9679,20 +9782,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     userText: 'Generate the local reproducer prompt now.',
                     fullPRContext: true,
                     sourceContextLabel:
-                        'PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, CODE BLOCKS, AND HEAD/PR-URL METADATA OMITTED)',
+                        'PR REPRODUCER SOURCE MATERIAL (PR DESCRIPTION, COMMIT MESSAGES, AND PATCH CONTENT FOR DISTILLATION; COMMENTS AND HEAD/PR-URL METADATA OMITTED)',
                     contextOptions: {
-                        includePatch: false,
+                        includePatch: true,
                         includeComments: false,
                         includeCommits: true,
                         includeCommentCodeContext: false,
-                        stripFencedBlocks: true,
+                        stripFencedBlocks: false,
                         omitHeadMetadata: true,
                         maxChars: REPRODUCER_CONTEXT_MAX_CHARS,
                     },
                     maxTokens: REPRODUCER_MAX_TOKENS,
                     promptDetailsTitle: 'Generated reproducer prompt',
                     finalTask:
-                        'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from a clean no-peek base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. The generated prompt may let the target agent start from latest master/current upstream, not necessarily the PR parent commit, unless the user explicitly requests the exact PR parent/base; it must require the target agent to record the exact base branch/commit used for later comparison. Use the supplied PR context to describe the current job commit by commit in original order, but phrase each commit as a high-level outcome to reproduce rather than a copied commit message or implementation recipe. The generated prompt must explicitly state the intended number of local commits to create from the supplied commit metadata. Use "Commit 1 of N", "Commit 2 of N", etc.; for each commit, state the high-level job it is supposed to accomplish, why it matters for review, and what validation/evidence would prove it. If commit metadata is truncated or incomplete, state the inferred count as incomplete and tell the target agent not to invent missing commits. The generated prompt must frame the task as an independent reinvention from the problem description and a clean no-peek base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, changed-file lists, concrete helpers, replacement mechanisms, control-flow structure, exact values, assertion choices, include churn, implementation-shaped fix verbs, or verbatim commit messages. Preserve only the problem, desired behavior, invariants, behavior surfaces, risks, validation signals, and the allowed no-peek base choice plus the exact base recording requirement the agent needs to start from. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
+                        'Now write the actual outcome-focused no-peek local reproducer prompt for a target coding agent. Internal generation constraint: answer with the ready-to-paste target-agent prompt itself, and do not include this constraint or any checks about whether the text is a prompt in the prompt you output. Center the generated prompt on the artifact and acceptance criteria, not on a step-by-step imitation recipe. The target outcome is an independently rediscovered local implementation of the full change derived from a clean no-peek base tree, with focused tests or verification, and a closing line asking the user to supply the actual PR or commits when ready for the separate comparison/suggestion prompt. The generated prompt may let the target agent start from latest master/current upstream, not necessarily the PR parent commit, unless the user explicitly requests the exact PR parent/base; it must require the target agent to record the exact base branch/commit used for later comparison. Use the supplied PR description, commit messages, and changed content to describe the current job commit by commit in original order, but phrase each commit as a high-level technical issue to implement rather than a copied commit message or patch recipe. The generated prompt must explicitly state the intended number of local commits to create from the supplied commit metadata. Use "Commit 1 of N", "Commit 2 of N", etc.; for each commit, state the technical behavior it is supposed to accomplish, why it matters for review, the important constraints/invariants/failure modes, and what validation/evidence would prove it. Include enough context-specific detail for a no-peek agent to implement the behavior without opening the submitted PR, while still leaving the design to be rediscovered from the repository. If commit metadata is truncated or incomplete, state the inferred count as incomplete and tell the target agent not to invent missing commits. The generated prompt must frame the task as an independent reinvention from the problem description and a clean no-peek base tree, and tell the agent that the user will supply the actual PR or commits after the local result is ready, so the agent must not search for, fetch, browse to, or otherwise inspect the existing implementation. The generated prompt must not leak the head branch, head commit SHA, PR number, PR URL, commit SHAs, raw diff hunks, copied code, changed-file lists, line numbers, include churn, or verbatim commit messages. It may mention code areas, existing public symbols, externally visible options, behavioral constants, tests, logs, and failure modes when they are required to define the issue. Convert patch detail into technical requirements, invariants, risks, and validation evidence. If the supplied context is truncated or incomplete, tell the target agent to mark missing evidence and proceed from the problem description without trying to locate the existing implementation. Include explicit approval and stop rules. Include follow-up handoff notes that make the later dedicated Suggestions prompt simpler, but do not ask the target agent to perform that follow-up. Before answering, internally verify that the generated prompt is grounded in the source context, honors the leakage rules above, handles truncated/incomplete source context, and satisfies the requested output format. Do not include generator-only final checks in the generated prompt.',
                 },
                 suggestion_stack: {
                     label: 'Suggestions',
@@ -9741,14 +9844,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 input.style.height = 'auto';
             }
 
-            addMessage('user', recipeCfg ? recipeCfg.label : text);
-            rememberMessage('user', recipeCfg ? recipeCfg.label : text);
+            let assistantMsg = null;
+            let stopSpin = () => {};
+            const startAssistantSpinner = () => {
+                assistantMsg = addMessage('assistant', '');
+                stopSpin = startBrailleAnimation((frame) => {
+                    setAssistantText(assistantMsg, frame);
+                });
+            };
+            const startPersistedExchange = (userLabel, threadMeta = null) => {
+                addMessage('user', userLabel);
+                rememberMessage('user', userLabel);
+                if (threadMeta) {
+                    markRobotThreadRecipe(getActiveRobotThread(), threadMeta);
+                    saveRobotChatThreads();
+                    renderRobotThreadList();
+                }
+                startAssistantSpinner();
+            };
 
-            // Spinner message
-            const assistantMsg = addMessage('assistant', '');
-            const stopSpin = startBrailleAnimation((frame) => {
-                setAssistantText(assistantMsg, frame);
-            });
+            if (recipeCfg?.fullPRContext) {
+                messages.textContent = '';
+                startAssistantSpinner();
+                setAssistantText(assistantMsg, `Preparing ${recipeCfg.label}...`);
+            } else {
+                startPersistedExchange(recipeCfg ? recipeCfg.label : text);
+            }
 
             // Build/refresh page index (shared across regular chat and /find)
             chatPageIndex = gatherPageIndex();
@@ -9804,7 +9925,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 open: true,
                             },
                         );
-                        rememberMessage('assistant', prompt);
                         messages.scrollTop = messages.scrollHeight;
                         return;
                     }
@@ -9835,12 +9955,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     );
                     const userContent = `${sourceContext}\n\n${recipeCfg.finalTask}`;
                     const generatedPrompt = copyableRecipe ? formatLLMPromptPreview(system, userContent) : '';
-                    if (generatedPrompt) {
-                        assistantMsg._ackPromptDetails = {
-                            title: recipeCfg.promptDetailsTitle,
-                            prompt: generatedPrompt,
-                        };
-                    }
+                    const modelOverride = getHighContextModelOverride(provider);
+                    const reasoningEffort = getHighContextReasoningEffort(provider);
+                    const recipePromptMeta = buildRecipePromptMeta(
+                        recipe,
+                        recipeCfg,
+                        provider,
+                        system,
+                        userContent,
+                        reasoningEffort,
+                        modelOverride,
+                    );
                     if (copyPromptOnly) {
                         stopSpin();
                         if (!generatedPrompt) {
@@ -9856,13 +9981,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt, {
                             open: true,
                         });
-                        rememberMessage('assistant', generatedPrompt);
                         messages.scrollTop = messages.scrollHeight;
                         return;
                     }
+                    const existingRecipeThread = findRobotThreadForRecipe(
+                        recipe,
+                        recipePromptMeta.recipePromptKey,
+                        recipePromptMeta.recipePromptHash,
+                    );
+                    if (existingRecipeThread) {
+                        stopSpin();
+                        selectRobotThread(existingRecipeThread.id);
+                        return;
+                    }
+                    stopSpin();
+                    const recipeThread = createRobotThread(recipePromptMeta);
+                    activeThreadId = recipeThread.id;
+                    messages.textContent = '';
+                    renderRobotThreadList();
+                    startPersistedExchange(recipeCfg.label, recipePromptMeta);
+                    if (generatedPrompt) {
+                        assistantMsg._ackPromptDetails = {
+                            title: recipeCfg.promptDetailsTitle,
+                            prompt: generatedPrompt,
+                        };
+                    }
                     const result = await callLLM(provider, system, userContent, {
-                        modelOverride: getHighContextModelOverride(provider),
-                        reasoningEffort: getHighContextReasoningEffort(provider),
+                        modelOverride,
+                        reasoningEffort,
                         maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
                         timeoutMs: getHighContextTimeoutMs(provider),
                         requestLabel: recipe,
@@ -15360,6 +15506,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const headerSet = new Set(
             qsa(root, '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header'),
         );
+        for (const issueBody of qsa(root, '[data-testid="issue-body"]')) {
+            if (
+                issueBody.querySelector(
+                    '[data-testid="issue-body-header-author"], [data-testid="issue-body-header-link"], ' +
+                        'button[aria-haspopup="true"], button[aria-label*="action" i]',
+                )
+            ) {
+                headerSet.add(issueBody);
+            }
+        }
         for (const group of qsa(root, '.timeline-comment-group.comment')) {
             const actions = group.querySelector('.timeline-comment-actions');
             if (!actions) continue;
@@ -15370,6 +15526,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const headers = [...headerSet];
         const headerPriority = (h) => {
             try {
+                if (h.matches?.('[data-testid="issue-body"]')) return 0;
                 if (h.matches?.('[data-testid="comment-header"]')) return 0;
                 if (h.matches?.('.timeline-comment-header, .review-comment-header')) return 1;
             } catch (_) {}
@@ -15387,15 +15544,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         const extractAuthorLogin = (header) => {
-            // Prefer avatar-link testid (React), then .author (Classic).
+            // Prefer explicit React author anchors, then .author (Classic).
             // Fall back to parsing the login from href/img alt if text is missing (React variants).
             const authorEl =
-                header.querySelector('[data-testid="avatar-link"], .author') ||
+                header.querySelector('[data-testid="issue-body-header-author"], [data-testid="avatar-link"], .author') ||
                 header.querySelector('a[data-hovercard-type="user"]');
             let author = authorEl?.textContent?.trim() || '';
             if (!author) {
                 const href = authorEl?.getAttribute?.('href') || '';
-                const m = href.match(/^\/([^/?#]+)$/);
+                const m = href.match(/^(?:https:\/\/github\.com)?\/([^/?#]+)$/);
                 if (m) author = m[1];
             }
             if (!author) {
@@ -15407,7 +15564,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         const isPRBodyFromPermalink = (permalinkEl) => {
-            return permalinkEl?.getAttribute?.('href')?.startsWith?.('#issue-') || false;
+            const href = permalinkEl?.getAttribute?.('href') || '';
+            if (!href) return false;
+            try {
+                return new URL(href, location.origin).hash.startsWith('#issue-');
+            } catch (_) {
+                return href.startsWith('#issue-');
+            }
         };
 
         const ensureChangesLink = (header, permalinkEl) => {
@@ -15503,7 +15666,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         for (const header of headers) {
             // Detect edit mode early (needed for guard + button swap)
-            const headerContainer = header.closest(COMMENT_CONTAINER_SELECTOR) || header.parentElement || header;
+            const headerContainer =
+                (header.matches?.('[data-testid="issue-body"]') ? header : null) ||
+                header.closest(COMMENT_CONTAINER_SELECTOR) ||
+                header.closest('[data-testid="issue-body"]') ||
+                header.parentElement ||
+                header;
             // Skip hidden clones (GitHub React sometimes keeps both view/edit trees).
             // Use actual visibility, not aria-hidden: GitHub sometimes toggles
             // aria-hidden on containers that still contain focused elements.
@@ -15557,7 +15725,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const author = extractAuthorLogin(header);
             // Detect PR body via permalink anchor: "#issue-..." = main description.
-            const permalink = header.querySelector('a[id$="-permalink"]');
+            const permalink = header.querySelector(
+                'a[id$="-permalink"], [data-testid="issue-body-header-link"], a[href*="#issue-"]',
+            );
             const isPRBody = isPRBodyFromPermalink(permalink);
             // Find the comment container (for edit/delete/proofread to find textarea/body)
             const container = headerContainer;
@@ -15616,9 +15786,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             EDIT_POST_SHORTCUT_KEY,
                         ),
                         () => {
-                            // Edit is behind a lazily-rendered kebab menu
-                            // (<include-fragment>). Open the menu and then click
-                            // Edit with retries so we don't race the fragment.
+                            // Prefer GitHub's native edit_form fragment when present;
+                            // fall back to the lazily-rendered kebab menu for React UI.
                             triggerMenuEdit(container, header);
                         },
                     );
@@ -15660,7 +15829,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // between badges and kebab (Classic -- parent has flex-row-reverse,
             // so DOM order is reversed visually: insert BEFORE badges in DOM
             // to appear AFTER badges visually).
-            const badgesGroup = header.querySelector('[class*="BadgesGroupContainer"], [class*="__BadgesGroup"]');
+            const badgesGroup = header.querySelector(
+                '[class*="BadgesGroupContainer"], [class*="__BadgesGroup"], [class*="badgeGroup"], [class*="badgesSection"]',
+            );
             const classicActions = header.querySelector('.timeline-comment-actions');
             if (editState === 'e' && classicActions && !badgesGroup) {
                 actionContainer.style.marginLeft = '0';
@@ -15687,9 +15858,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     // Opens the kebab menu invisibly and clicks the specified action.
-    // Design principle: DOM-first for writes — clicking native menu items avoids
-    // PAT permission issues. For React UI where edit/delete buttons don't exist
-    // in DOM until the popover renders. Uses opacity:0 to prevent visible menu flash.
+    // Design principle: use GitHub's native edit_form fragment when it exists.
+    // For React UI where edit/delete buttons don't exist in DOM until the
+    // popover renders, fall back to clicking native menu items. Uses opacity:0
+    // to prevent visible menu flash.
     // Safety: only these actions are allowed via triggerMenuAction.
     // Prevents accidental clicks on dangerous menu items (e.g. "Report", "Lock").
     const SAFE_MENU_ACTIONS = new Set(['edit', 'delete']);
@@ -15877,7 +16049,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const uniqueRoots = (roots || []).filter((root, idx, arr) => root && arr.indexOf(root) === idx);
         const directSelector =
             '.is-comment-editing textarea, form.js-comment-update textarea, ' +
-            '[data-testid="edit-comment-form"] textarea, form[action*="/update"] textarea';
+            'form.js-issue-update textarea, [data-testid="edit-comment-form"] textarea, ' +
+            'form[action*="/update"] textarea, textarea[name="issue[body]"], textarea[name="pull_request[body]"]';
         for (const root of uniqueRoots) {
             const ta = root.querySelector?.(directSelector);
             if (ta && isVisible(ta)) return ta;
@@ -15913,12 +16086,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
+    function findOpenEditTextarea(container, extraRoots = []) {
+        const roots = [container, ...extraRoots].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
+        const ta = findVisibleEditTextarea(roots);
+        if (ta) return ta;
+        const active = document.activeElement;
+        if (active?.matches?.('textarea') && isVisible(active)) {
+            const activeRoot = active.closest?.(COMMENT_CONTAINER_SELECTOR) || active.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR);
+            if (roots.includes(activeRoot) || roots.some((root) => root.contains?.(active))) {
+                return active;
+            }
+        }
+        return null;
+    }
+
     async function waitForEditTextarea(container, lt, ms = 1200, extraRoots = []) {
         const roots = [container, ...extraRoots].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
         const deadline = Date.now() + ms;
         while (Date.now() < deadline) {
             if (lt.signal.aborted) return null;
-            const ta = findVisibleEditTextarea(roots);
+            const ta = findOpenEditTextarea(container, roots);
             if (ta) return ta;
             if (await ackSleep(120, lt)) return null;
         }
@@ -16052,12 +16239,69 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return { frag: null, url: '', roots };
     }
 
+    function activateEditFormForFragment(frag, container) {
+        const form = frag?.closest?.('form.js-comment-update, form[action]');
+        if (!form?.isConnected) return null;
+        const scope =
+            form.closest(COMMENT_CONTAINER_SELECTOR) ||
+            form.closest(WIDE_COMMENT_CONTAINER_SELECTOR) ||
+            form.closest('[data-testid="issue-body"]') ||
+            container;
+        const hadEditingClass = !!scope?.classList?.contains('is-comment-editing');
+        const hadHidden = form.hasAttribute('hidden');
+        const formStyle = {
+            display: form.style.display,
+            visibility: form.style.visibility,
+            opacity: form.style.opacity,
+        };
+        const hiddenViews = [];
+
+        scope?.classList?.add('is-comment-editing');
+        form.hidden = false;
+        form.removeAttribute('hidden');
+        form.style.removeProperty('display');
+        form.style.removeProperty('visibility');
+        form.style.removeProperty('opacity');
+        if (getComputedStyle(form).display === 'none') form.style.display = 'block';
+
+        for (const view of scope?.querySelectorAll?.('.edit-comment-hide') || []) {
+            if (view.contains(form)) continue;
+            hiddenViews.push({
+                el: view,
+                display: view.style.display,
+                visibility: view.style.visibility,
+            });
+            view.style.display = 'none';
+            view.style.visibility = 'hidden';
+        }
+
+        return {
+            cleanup() {
+                if (!hadEditingClass) scope?.classList?.remove('is-comment-editing');
+                if (hadHidden) form.setAttribute('hidden', '');
+                else form.removeAttribute('hidden');
+                form.style.display = formStyle.display;
+                form.style.visibility = formStyle.visibility;
+                form.style.opacity = formStyle.opacity;
+                for (const state of hiddenViews) {
+                    if (!state.el.isConnected) continue;
+                    state.el.style.display = state.display;
+                    state.el.style.visibility = state.visibility;
+                }
+            },
+        };
+    }
+
     async function tryOpenEditFormFromFragment(container, lt, reason, opts = {}) {
         if (lt.signal.aborted) return null;
         const existingTa = await waitForEditTextarea(container, lt, 150);
         if (existingTa) return existingTa;
+        let activation = null;
+        let roots = [];
         try {
-            const { frag, url, roots } = getEditFormRequest(container);
+            const request = getEditFormRequest(container);
+            const { frag, url } = request;
+            roots = request.roots || [];
             if (!url) return null;
             const nativeWaitMs = Math.max(0, opts.nativeWaitMs || 0);
             if (frag?.isConnected && nativeWaitMs > 0) {
@@ -16066,12 +16310,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             if (opts.allowGM === false) return null;
             if (!frag?.isConnected) return null;
-            // Only replace a fragment whose host form is actually visible
-            // (GitHub entered edit mode). Replacing it inside a hidden form
-            // consumes the only native edit_form fragment without ever showing
-            // an editor, permanently breaking edit for this comment.
+            // Activate GitHub's native edit form before replacing the deferred
+            // fragment. Loading inside the hidden form consumes the only native
+            // placeholder without exposing the editor.
             const fragHost = frag.closest('form') || frag.parentElement || frag;
-            if (!isVisible(fragHost)) return null;
+            if (!isVisible(fragHost)) {
+                activation = activateEditFormForFragment(frag, container);
+                if (!activation) return null;
+                const nativeTa = await waitForEditTextarea(container, lt, 250, roots);
+                if (nativeTa) return nativeTa;
+            }
             console.log(`ACKtopus: triggerMenuEdit: ${reason}, trying GM fragment load:`, url);
             const html = await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
@@ -16091,11 +16339,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (nodes.length) {
                 frag.replaceWith(...nodes);
             }
-            return await waitForEditTextarea(container, lt, 1500, roots);
+            const ta = await waitForEditTextarea(container, lt, 1500, roots);
+            if (!ta) activation?.cleanup();
+            return ta;
         } catch (e) {
+            const nativeTa = findOpenEditTextarea(container, roots);
+            if (nativeTa) {
+                console.log('ACKtopus: triggerMenuEdit: native edit form is already open; ignoring GM fragment failure');
+                return nativeTa;
+            }
+            activation?.cleanup();
             const msg = String(e?.message || e || '');
             if (/HTTP 403/i.test(msg)) {
-                console.log('ACKtopus: triggerMenuEdit: GM fragment load forbidden, leaving native edit flow alone');
+                console.log('ACKtopus: triggerMenuEdit: GM fragment load forbidden and no native editor was visible');
                 return null;
             }
             console.warn('ACKtopus: triggerMenuEdit: GM fragment load failed:', e);
@@ -16117,9 +16373,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let origOpacity = '';
         let clickedEdit = false;
         try {
-            const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', {
-                allowGM: false,
-            });
+            const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup');
             if (taDirect) {
                 schedulePostEditRefresh(container);
                 return true;
@@ -16240,6 +16494,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function triggerMenuAction(container, header, actionName) {
+        // DOM-first for writes — clicking native menu
         if (!SAFE_MENU_ACTIONS.has(actionName.toLowerCase())) {
             console.warn('ACKtopus: triggerMenuAction blocked unsafe action:', actionName);
             return;
@@ -25025,8 +25280,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const fragFn = sourceSection(source, 'async function tryOpenEditFormFromFragment', 'async function triggerMenuEdit');
         ackAssert(
-            fragFn.includes('if (!isVisible(fragHost)) return null'),
-            'GM fragment replacement requires a visible (edit-mode) host form',
+            fragFn.includes('activateEditFormForFragment(frag, container)'),
+            'GM fragment replacement activates the native edit form before loading',
         );
     });
 
@@ -25127,8 +25382,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = source.slice(fnStart, fnEnd);
         // Must NOT use .includes(actionName) which matches "edited"
         ackAssert(!fn.includes('.includes(actionName)'), 'does not use loose .includes() matching');
-        // Must use regex word-boundary or startsWith pattern
-        ackAssert(fn.includes('actionRe.test'), 'uses regex test for word-boundary matching');
+        // Must use the shared token-aware matcher.
+        ackAssert(fn.includes('commentMenuItemMatchesAction(item, actionName)'), 'uses token-aware action matcher');
         // Must NOT search container (which contains the "edited" link)
         ackAssert(!fn.includes('[container,'), 'does not search container for menu items');
     });
@@ -26694,6 +26949,75 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(qa, 'missing .ack-quick-actions');
             ackAssert(badgesGroup.nextElementSibling === qa, 'quick-actions inserted after badgesGroup');
             ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
+        } finally {
+            if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
+            if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
+            created.forEach((m) => m.remove());
+            root.remove();
+        }
+    });
+
+    ackTest('addQuickCommentActions injects edit icon for React issue body', () => {
+        const root = document.createElement('div');
+        root.id = 'acktest-qactions-react-issue-body';
+        Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
+
+        const issueBody = document.createElement('div');
+        issueBody.setAttribute('data-testid', 'issue-body');
+
+        const headerRow = document.createElement('div');
+        const badgesGroup = document.createElement('div');
+        badgesGroup.className = 'IssueBodyHeader-module__badgeGroup__hS0t2';
+        headerRow.appendChild(badgesGroup);
+
+        const actionButton = document.createElement('button');
+        actionButton.type = 'button';
+        actionButton.setAttribute('aria-haspopup', 'true');
+        actionButton.setAttribute('aria-label', 'Issue body actions');
+        headerRow.appendChild(actionButton);
+
+        const author = document.createElement('a');
+        author.setAttribute('data-testid', 'issue-body-header-author');
+        author.setAttribute('href', 'https://github.com/acktest_user');
+        author.textContent = 'acktest_user';
+
+        const permalink = document.createElement('a');
+        permalink.setAttribute('data-testid', 'issue-body-header-link');
+        permalink.setAttribute('href', 'https://github.com/owner/repo/issues/123#issue-444');
+        permalink.textContent = 'opened';
+
+        issueBody.appendChild(headerRow);
+        issueBody.appendChild(author);
+        issueBody.appendChild(permalink);
+        root.appendChild(issueBody);
+        document.body.appendChild(root);
+
+        const created = [];
+        const metaUserExisting = document.querySelector('meta[name="user-login"]');
+        const metaActorExisting = document.querySelector('meta[name="octolytics-actor-login"]');
+        const oldUser = metaUserExisting?.getAttribute('content');
+        const oldActor = metaActorExisting?.getAttribute('content');
+        const ensureMeta = (name) => {
+            let m = document.querySelector(`meta[name="${name}"]`);
+            if (!m) {
+                m = document.createElement('meta');
+                m.setAttribute('name', name);
+                document.head.appendChild(m);
+                created.push(m);
+            }
+            return m;
+        };
+
+        try {
+            ensureMeta('user-login').setAttribute('content', '');
+            ensureMeta('octolytics-actor-login').setAttribute('content', 'acktest_user');
+
+            addQuickCommentActions(root);
+            const qa = issueBody.querySelector('.ack-quick-actions');
+            ackAssert(qa, 'missing .ack-quick-actions');
+            ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit PR description button');
+            ackAssert(!qa.querySelector('button[title="Expected author reply"]'), 'PR body should not get reply button');
+            ackAssert(!qa.querySelector('button[title="Delete comment"]'), 'PR body should not get delete button');
         } finally {
             if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
             if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
@@ -28923,12 +29247,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function base64ToBlobUrl'),
         );
         ackAssert(
-            sourceIncludesLoose(recipeFn, 'modelOverride: getHighContextModelOverride(provider)'),
-            'recipe path uses high-context model override',
+            sourceIncludesLoose(recipeFn, 'const modelOverride = getHighContextModelOverride(provider)') &&
+                sourceIncludesLoose(recipeFn, 'modelOverride,'),
+            'recipe path computes and passes high-context model override',
         );
         ackAssert(
-            sourceIncludesLoose(recipeFn, 'reasoningEffort: getHighContextReasoningEffort(provider)'),
-            'recipe path uses high-context reasoning effort',
+            sourceIncludesLoose(recipeFn, 'const reasoningEffort = getHighContextReasoningEffort(provider)') &&
+                sourceIncludesLoose(recipeFn, 'reasoningEffort,'),
+            'recipe path computes and passes high-context reasoning effort',
         );
         ackAssert(
             sourceIncludesLoose(recipeFn, 'maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider)'),
@@ -30148,7 +30474,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("threadTitle.textContent = 'History'"), 'shows history sidebar');
         ackAssert(fn.includes('rememberMessage('), 'persists messages as the discussion continues');
         ackAssert(fn.includes('newThreadBtn'), 'new discussion control exists');
+        ackAssert(fn.includes('function deleteRobotThread'), 'has discussion delete helper');
+        ackAssert(fn.includes("deleteBtn.textContent = 'x'"), 'renders x delete control for each discussion');
+        ackAssert(fn.includes('e.stopPropagation()'), 'delete control does not select the thread first');
+        ackAssert(!fn.includes('confirm('), 'discussion deletion does not ask for confirmation');
         ackAssert(_ackSource.includes('ack_reopen_robot_panel'), 'reopens robot panel after exact permalink navigation');
+    });
+
+    ackTest('Robot recipes reuse exact prompt threads and start new threads when changed', () => {
+        const fn = sourceSection(_ackSource, 'function buildChatPanel', 'function addPromptDetails');
+        ackAssert(fn.includes('recipePromptKey'), 'robot threads persist recipe prompt cache keys');
+        ackAssert(fn.includes('recipePromptHash'), 'robot threads persist recipe prompt hashes');
+        ackAssert(fn.includes('function findRobotThreadForRecipe'), 'has recipe thread lookup helper');
+        ackAssert(
+            fn.includes('const existingRecipeThread = findRobotThreadForRecipe'),
+            'recipe send path looks for exact existing prompt thread',
+        );
+        ackAssert(
+            fn.includes('selectRobotThread(existingRecipeThread.id)'),
+            'same prompt selects existing generated thread instead of appending',
+        );
+        ackAssert(
+            fn.includes('createRobotThread(recipePromptMeta)'),
+            'changed prompt creates a fresh recipe thread',
+        );
+        ackAssert(
+            fn.includes('startPersistedExchange(recipeCfg.label, recipePromptMeta)'),
+            'recipe messages are persisted only after the prompt signature is known',
+        );
+        ackAssert(
+            fn.includes('setAssistantText(assistantMsg, `Preparing ${recipeCfg.label}...`)'),
+            'recipe gathering uses a temporary non-persisted status message',
+        );
     });
 
     ackTest('gatherChatContext accepts pageIndex and annotates comments with [ref:N]', () => {
@@ -30948,6 +31305,169 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             ackAssert(ta, 'finds delayed native textarea');
             ackEq(gmCalls, 0, 'does not call GM_xmlhttpRequest when native textarea appears');
+        } finally {
+            GM_xmlhttpRequest = origGM;
+            getEditFormRequest = origGetEditFormRequest;
+            abortAckLifetime('test cleanup');
+            host.remove();
+        }
+    });
+
+    ackTest('tryOpenEditFormFromFragment activates hidden native edit form before GM fallback', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <div class="edit-comment-hide"><div class="markdown-body">hello</div></div>
+                <form class="js-comment-update" hidden action="/owner/repo/issues/123">
+                    <div class="previewable-comment-form js-comment-edit-form-deferred-include-fragment"
+                        src="/owner/repo/issues/123/edit_form?textarea_id=issue-444-body&comment_context=">
+                        Loading...
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const form = host.querySelector('form.js-comment-update');
+        const fakeFrag = host.querySelector('.js-comment-edit-form-deferred-include-fragment');
+        const lt = ensureAckLifetime('test hidden native edit activation');
+        const origGM = GM_xmlhttpRequest;
+        const origGetEditFormRequest = getEditFormRequest;
+        let gmCalls = 0;
+        const targetUrl = new URL(fakeFrag.getAttribute('src'), location.origin).href;
+        GM_xmlhttpRequest = (opts) => {
+            if (opts?.url === targetUrl) gmCalls++;
+            opts.onload({
+                status: 200,
+                responseText:
+                    '<textarea name="issue[body]" style="width:200px;height:60px">native</textarea>' +
+                    '<button type="button">Cancel</button><button type="submit">Update comment</button>',
+            });
+        };
+        getEditFormRequest = () => ({
+            frag: fakeFrag,
+            url: targetUrl,
+            roots: [container],
+        });
+        try {
+            const ta = await tryOpenEditFormFromFragment(container, lt, 'unit test direct native', {
+                allowGM: true,
+                nativeWaitMs: 0,
+            });
+            ackAssert(ta, 'finds textarea loaded from native edit_form fragment');
+            ackEq(ta.value, 'native', 'uses edit_form response textarea');
+            ackEq(gmCalls, 1, 'loads the native edit_form fragment');
+            ackAssert(container.classList.contains('is-comment-editing'), 'activates native edit mode class');
+            ackAssert(!form.hidden, 'reveals the native update form');
+        } finally {
+            GM_xmlhttpRequest = origGM;
+            getEditFormRequest = origGetEditFormRequest;
+            abortAckLifetime('test cleanup');
+            host.remove();
+        }
+    });
+
+    ackTest('tryOpenEditFormFromFragment keeps activated native textarea open without GM fallback', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <div class="edit-comment-hide"><div class="markdown-body">hello</div></div>
+                <form class="js-comment-update" hidden action="/owner/repo/issues/123">
+                    <textarea style="width:200px;height:60px">already loaded</textarea>
+                    <button type="button">Cancel</button>
+                    <button type="submit">Update comment</button>
+                    <div class="previewable-comment-form js-comment-edit-form-deferred-include-fragment"
+                        src="/owner/repo/issues/123/edit_form?textarea_id=issue-444-body&comment_context=">
+                        Loading...
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const form = host.querySelector('form.js-comment-update');
+        const fakeFrag = host.querySelector('.js-comment-edit-form-deferred-include-fragment');
+        const lt = ensureAckLifetime('test keep native edit open');
+        const origGM = GM_xmlhttpRequest;
+        const origGetEditFormRequest = getEditFormRequest;
+        let gmCalls = 0;
+        GM_xmlhttpRequest = (opts) => {
+            gmCalls++;
+            opts.onload({ status: 404, responseText: '' });
+        };
+        getEditFormRequest = () => ({
+            frag: fakeFrag,
+            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            roots: [container],
+        });
+        try {
+            const ta = await tryOpenEditFormFromFragment(container, lt, 'unit test loaded native', {
+                allowGM: true,
+                nativeWaitMs: 0,
+            });
+            ackAssert(ta, 'finds the textarea revealed by native edit activation');
+            ackEq(ta.value, 'already loaded', 'keeps the already-loaded native textarea');
+            ackEq(gmCalls, 0, 'does not call GM fallback when activation reveals a textarea');
+            ackAssert(container.classList.contains('is-comment-editing'), 'keeps native edit mode class');
+            ackAssert(!form.hidden, 'does not close the native update form');
+        } finally {
+            GM_xmlhttpRequest = origGM;
+            getEditFormRequest = origGetEditFormRequest;
+            abortAckLifetime('test cleanup');
+            host.remove();
+        }
+    });
+
+    ackTest('tryOpenEditFormFromFragment ignores GM failure after native textarea appears', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <div class="edit-comment-hide"><div class="markdown-body">hello</div></div>
+                <form class="js-comment-update" hidden action="/owner/repo/issues/123">
+                    <div class="previewable-comment-form js-comment-edit-form-deferred-include-fragment"
+                        src="/owner/repo/issues/123/edit_form?textarea_id=issue-444-body&comment_context=">
+                        Loading...
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const form = host.querySelector('form.js-comment-update');
+        const fakeFrag = host.querySelector('.js-comment-edit-form-deferred-include-fragment');
+        const lt = ensureAckLifetime('test GM failure after native edit');
+        const origGM = GM_xmlhttpRequest;
+        const origGetEditFormRequest = getEditFormRequest;
+        let gmCalls = 0;
+        GM_xmlhttpRequest = (opts) => {
+            gmCalls++;
+            fakeFrag.insertAdjacentHTML(
+                'beforebegin',
+                '<textarea style="width:200px;height:60px">native after failure</textarea>',
+            );
+            opts.onload({ status: 404, responseText: '' });
+        };
+        getEditFormRequest = () => ({
+            frag: fakeFrag,
+            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            roots: [container],
+        });
+        try {
+            const ta = await tryOpenEditFormFromFragment(container, lt, 'unit test GM failure', {
+                allowGM: true,
+                nativeWaitMs: 0,
+            });
+            ackAssert(ta, 'finds the native textarea after GM failure');
+            ackEq(ta.value, 'native after failure', 'keeps the native textarea visible');
+            ackEq(gmCalls, 1, 'attempted the GM fallback once');
+            ackAssert(container.classList.contains('is-comment-editing'), 'keeps native edit mode class after GM failure');
+            ackAssert(!form.hidden, 'does not close the native update form after GM failure');
         } finally {
             GM_xmlhttpRequest = origGM;
             getEditFormRequest = origGetEditFormRequest;
@@ -33808,18 +34328,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('reimplementation prompt keeps no-peek task abstract and non-prescriptive', () => {
         const prompt = DEFAULT_INSTRUCTIONS.reimplementation;
-        ackAssert(
-            prompt.includes('outcome to reproduce') && prompt.includes('implementation recipe'),
-            'no-peek task is outcome-level',
-        );
+        ackAssert(prompt.includes('technical issue needing implementation'), 'frames each commit as an implementable issue');
+        ackAssert(prompt.includes('PR description, commit metadata, commit messages, and changed content'), 'uses rich PR source material');
         ackAssert(prompt.includes('desired behavior'), 'uses desired behavior');
         ackAssert(prompt.includes('invariants'), 'uses invariants');
         ackAssert(prompt.includes('failure modes'), 'uses failure modes');
-        ackAssert(prompt.includes('concrete helpers'), 'forbids concrete helpers');
+        ackAssert(prompt.includes('raw diff hunks'), 'forbids raw diff leakage');
+        ackAssert(prompt.includes('copied code'), 'forbids copied code leakage');
         ackAssert(prompt.includes('changed-file lists'), 'forbids changed-file lists');
-        ackAssert(prompt.includes('replacement mechanisms'), 'forbids replacement mechanisms');
-        ackAssert(prompt.includes('control-flow structure'), 'forbids control-flow structure');
-        ackAssert(prompt.includes('implementation-shaped fix verbs'), 'forbids implementation-shaped verbs');
+        ackAssert(prompt.includes('line numbers'), 'forbids line-number leakage');
+        ackAssert(prompt.includes('technical requirements, invariants, risks, and validation evidence'), 'requires patch detail to be distilled');
         ackAssert(prompt.includes('verbatim commit messages'), 'forbids verbatim commit messages');
         ackAssert(prompt.includes('commit SHAs'), 'forbids exposing commit SHAs');
         ackAssert(prompt.includes('different valid design'), 'leaves room for alternate design');
@@ -33859,14 +34377,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes("'FULL PR CONTEXT SOURCE MATERIAL'"), 'default recipe prompt labels long source context');
         ackAssert(
-            fn.includes('PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, CODE BLOCKS, AND HEAD/PR-URL METADATA OMITTED)'),
-            'reproducer source label warns patch/comment/head-metadata omission',
+            fn.includes('PR REPRODUCER SOURCE MATERIAL (PR DESCRIPTION, COMMIT MESSAGES, AND PATCH CONTENT FOR DISTILLATION; COMMENTS AND HEAD/PR-URL METADATA OMITTED)'),
+            'reproducer source label says patch content is generator-only source material',
         );
-        ackAssert(fn.includes('includePatch: false'), 'reproducer omits raw patch context');
+        ackAssert(fn.includes('includePatch: true'), 'reproducer includes raw patch context for distillation');
         ackAssert(fn.includes('includeComments: false'), 'reproducer omits raw comment context');
         ackAssert(fn.includes('includeCommits: true'), 'reproducer includes commit metadata for commit-by-commit jobs');
         ackAssert(fn.includes('includeCommentCodeContext: false'), 'reproducer omits comment code context');
-        ackAssert(fn.includes('stripFencedBlocks: true'), 'reproducer strips fenced source blocks');
+        ackAssert(fn.includes('stripFencedBlocks: false'), 'reproducer lets the generator inspect patch content');
         ackAssert(fn.includes('maxChars: REPRODUCER_CONTEXT_MAX_CHARS'), 'reproducer uses a bounded source budget');
         ackAssert(fn.includes('maxTokens: REPRODUCER_MAX_TOKENS'), 'reproducer uses a larger bounded output budget');
         ackAssert(fn.includes('requestLabel: recipe'), 'recipe LLM calls are labeled in error diagnostics');
@@ -33880,12 +34398,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('not necessarily the PR parent commit'), 'recipe does not require author parent commit');
         ackAssert(fn.includes('record the exact base branch/commit used'), 'recipe requires recording chosen base');
         ackAssert(fn.includes('commit by commit in original order'), 'asks for commit-by-commit target jobs');
+        ackAssert(fn.includes('PR description, commit messages, and changed content'), 'uses description, commit messages, and patch content');
         ackAssert(fn.includes('intended number of local commits'), 'asks generated prompt to state commit count');
         ackAssert(fn.includes('Commit 1 of N'), 'asks generated prompt to number each commit');
-        ackAssert(fn.includes('what validation/evidence would prove it'), 'asks each commit job to name validation evidence');
+        ackAssert(fn.includes('technical behavior it is supposed to accomplish'), 'asks each commit job to name the technical behavior');
+        ackAssert(fn.includes('important constraints/invariants/failure modes'), 'asks each commit job to include constraints and failure modes');
+        ackAssert(fn.includes('enough context-specific detail'), 'prevents under-specified reproducer prompts');
         ackAssert(fn.includes('not to invent missing commits'), 'handles incomplete commit metadata without guessing');
         ackAssert(fn.includes('copied commit message'), 'forbids copied commit-message leakage');
-        ackAssert(fn.includes('concrete helpers'), 'forbids helper leakage');
+        ackAssert(fn.includes('raw diff hunks'), 'forbids raw patch leakage');
+        ackAssert(fn.includes('copied code'), 'forbids copied code leakage');
         ackAssert(fn.includes('verbatim commit messages'), 'forbids verbatim commit-message leakage');
         ackAssert(fn.includes('truncated or incomplete'), 'requires oversized-context fallback');
         ackAssert(
@@ -33922,11 +34444,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'prompt recipe preview is shown after successful result',
         );
         ackAssert(
-            fn.includes('modelOverride: getHighContextModelOverride(provider)'),
+            fn.includes('const modelOverride = getHighContextModelOverride(provider)') &&
+                fn.includes('modelOverride,'),
             'reimplementation recipe uses the visible high-context Claude model override',
         );
         ackAssert(
-            fn.includes('reasoningEffort: getHighContextReasoningEffort(provider)'),
+            fn.includes('const reasoningEffort = getHighContextReasoningEffort(provider)') &&
+                fn.includes('reasoningEffort,'),
             'reimplementation recipe uses high-context OpenAI reasoning effort',
         );
         ackAssert(
@@ -34094,8 +34618,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = source.slice(source.indexOf('function buildChatPanel'), source.indexOf('function base64ToBlobUrl'));
         ackAssert(fn.includes('omitHeadMetadata: true'), 'reproducer recipe sets omitHeadMetadata');
         ackAssert(
-            fn.includes('PR REPRODUCER SOURCE MATERIAL (PATCH, COMMENTS, CODE BLOCKS, AND HEAD/PR-URL METADATA OMITTED)'),
-            'reproducer source label warns head/PR-URL omission',
+            fn.includes('PR REPRODUCER SOURCE MATERIAL (PR DESCRIPTION, COMMIT MESSAGES, AND PATCH CONTENT FOR DISTILLATION; COMMENTS AND HEAD/PR-URL METADATA OMITTED)'),
+            'reproducer source label warns head/PR-URL omission while allowing patch distillation',
         );
     });
 

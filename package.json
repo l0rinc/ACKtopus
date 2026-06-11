@@ -1,6 +1,6 @@
 {
   "name": "ACKtopus",
-  "version": "1.161.0",
+  "version": "1.166.0",
   "description": "",
   "scripts": {
     "check": "node --check src/ACKtopus.js",
