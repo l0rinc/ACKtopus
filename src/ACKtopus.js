@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.160
+// @version      1.161
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -557,6 +557,7 @@
         'details.details-overlay summary, summary.timeline-comment-action';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
+    const COMMENT_MENU_ITEM_SELECTOR = 'button, a, [role="menuitem"], .ActionListContent';
     const NATIVE_DIALOG_ROOT_SELECTOR =
         'details-dialog, modal-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"], ' +
         '[popover], anchored-position[popover], [class*="Dialog-module__"], [class*="Overlay-module__"], .prc-Dialog-Dialog';
@@ -15749,6 +15750,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
+    function commentMenuItemTextCandidates(item) {
+        const values = [];
+        const push = (value) => {
+            const text = String(value || '').replace(/\s+/g, ' ').trim();
+            if (text && !values.includes(text)) values.push(text);
+        };
+        push(item?.querySelector?.('.ActionListItem-label')?.textContent);
+        push(item?.textContent);
+        push(item?.getAttribute?.('aria-label'));
+        push(item?.getAttribute?.('title'));
+        push(item?.getAttribute?.('data-menu-button-text'));
+        push(item?.getAttribute?.('data-testid'));
+        push(item?.getAttribute?.('data-command-id'));
+        return values;
+    }
+
+    function commentMenuItemMatchesAction(item, actionName) {
+        const literal = String(actionName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (!literal) return false;
+        const tokenAction = new RegExp(`(^|[\\s_-])${literal}([\\s_-]|$)`, 'i');
+        return commentMenuItemTextCandidates(item).some((text) => tokenAction.test(text));
+    }
+
     function buildClassicCommentContextMenuItem(container) {
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -15942,7 +15966,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (href) hrefs.add(href);
             root.querySelectorAll?.(
                 '[id], a[href*="#discussion_r"], a[href*="#issuecomment-"], ' +
-                    'a[href*="#pullrequestreview-"], a[href*="#issue-"]',
+                    'a[href*="#pullrequest-"], a[href*="#pullrequestreview-"], ' +
+                    'a[href*="#pullrequestreviewcomment-"], a[href*="#issue-"]',
             )?.forEach((el) => {
                 const childId = el.getAttribute?.('id') || el.id || '';
                 if (childId) ids.add(childId);
@@ -15972,6 +15997,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const url = frag?.getAttribute?.('src')
                 ? new URL(frag.getAttribute('src'), location.origin).href
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=discussion_r${match}-body&comment_context=discussion`;
+            return { frag, url, roots };
+        }
+
+        match = findId(/pullrequest-(\d+)/);
+        if (match) {
+            const frag = document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
+            const url = frag?.getAttribute?.('src')
+                ? new URL(frag.getAttribute('src'), location.origin).href
+                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequest-${match}-body&comment_context=discussion`;
+            return { frag, url, roots };
+        }
+
+        match = findId(/pullrequestreviewcomment-(\d+)/);
+        if (match) {
+            const frag = document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
+            const url = frag?.getAttribute?.('src')
+                ? new URL(frag.getAttribute('src'), location.origin).href
+                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequestreviewcomment-${match}-body&comment_context=discussion`;
             return { frag, url, roots };
         }
 
@@ -16102,7 +16145,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             console.log('ACKtopus: triggerMenuEdit: opening kebab menu');
             openMenuTrigger(kebab);
 
-            const actionRe = /^edit(\s|$)/i;
             const ok = await clickWithRetry(
                 container,
                 () => {
@@ -16113,9 +16155,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     for (const root of getCommentMenuRoots(kebab, container)) {
                         const direct = root.querySelector?.('button.js-comment-edit-button');
                         if (direct && isVisible(direct)) return direct;
-                        for (const item of root.querySelectorAll?.('button, a, [role="menuitem"]') || []) {
+                        for (const item of root.querySelectorAll?.(COMMENT_MENU_ITEM_SELECTOR) || []) {
                             if (!isVisible(item)) continue;
-                            if (actionRe.test(item.textContent.trim())) return item;
+                            if (commentMenuItemMatchesAction(item, 'edit')) return item;
                         }
                     }
 
@@ -16126,10 +16168,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const ky = (kr?.top || 0) + (kr?.height || 0) / 2;
                     const maxDist2 = 650 * 650;
                     const candidates = [];
-                    for (const el of document.querySelectorAll('button, a, [role="menuitem"]')) {
+                    for (const el of document.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
                         if (!isVisible(el)) continue;
-                        const txt = (el.textContent || '').trim();
-                        if (!actionRe.test(txt)) continue;
+                        if (!commentMenuItemMatchesAction(el, 'edit')) continue;
                         if (
                             !el.closest(
                                 '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]',
@@ -16159,9 +16200,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         .filter(isVisible)
                         .slice(0, 3);
                     const items = visibleMenus.flatMap((m) =>
-                        [...m.querySelectorAll('button, a, [role="menuitem"]')]
+                        [...m.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)]
                             .filter(isVisible)
-                            .map((el) => (el.textContent || el.getAttribute?.('aria-label') || '').trim())
+                            .map((el) => commentMenuItemTextCandidates(el).join(' | '))
                             .filter(Boolean),
                     );
                     console.warn('ACKtopus: triggerMenuEdit: could not find Edit item. Visible menu items:', items);
@@ -16229,7 +16270,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             ackSetTimeout(
                 () => {
-                    const actionRe = new RegExp(`^${actionName}(\\s|$)`, 'i');
                     // Search only menus that are descendants of or adjacent to
                     // the container — never click items in unrelated menus.
                     const searchRoots = [
@@ -16246,8 +16286,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         }
                     }
                     for (const root of searchRoots) {
-                        for (const item of root.querySelectorAll('button, a, [role="menuitem"]')) {
-                            if (actionRe.test(item.textContent.trim())) {
+                        for (const item of root.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
+                            if (commentMenuItemMatchesAction(item, actionName)) {
                                 menu.style.opacity = origOpacity;
                                 item.click();
                                 if (/delete/i.test(actionName)) scheduleDeleteConfirmDefault();
@@ -25153,6 +25193,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('comment menu action matcher supports accessible and ActionList labels', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <button id="aria" aria-label="Edit comment"></button>
+            <button id="title" title="Delete comment"></button>
+            <button id="testid" data-testid="comment-edit-button"></button>
+            <div id="action-list" role="menuitem"><span class="ActionListItem-label">Edit</span></div>
+            <button id="edited">edited</button>
+        `;
+        ackAssert(commentMenuItemMatchesAction(host.querySelector('#aria'), 'edit'), 'matches aria-label edit');
+        ackAssert(commentMenuItemMatchesAction(host.querySelector('#title'), 'delete'), 'matches title delete');
+        ackAssert(commentMenuItemMatchesAction(host.querySelector('#testid'), 'edit'), 'matches data-testid edit token');
+        ackAssert(commentMenuItemMatchesAction(host.querySelector('#action-list'), 'edit'), 'matches ActionList label');
+        ackAssert(!commentMenuItemMatchesAction(host.querySelector('#edited'), 'edit'), 'does not match edited');
+    });
+
     ackTest('getEditFormRequest derives review-comment edit_form URL from React r-id containers', () => {
         const origParsePageContext = parsePageContext;
         const host = document.createElement('div');
@@ -25164,6 +25220,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 req.url,
                 `${location.origin}/bitcoin/bitcoin/pull/34684/review_comment/2889037362/edit_form?textarea_id=discussion_r2889037362-body&comment_context=discussion`,
                 'derives direct review-comment edit_form URL',
+            );
+        } finally {
+            parsePageContext = origParsePageContext;
+        }
+    });
+
+    ackTest('getEditFormRequest derives review-comment edit_form URL from pending pullrequest containers', () => {
+        const origParsePageContext = parsePageContext;
+        const host = document.createElement('div');
+        host.id = 'pullrequest-3804298183';
+        try {
+            parsePageContext = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '34684' });
+            const req = getEditFormRequest(host);
+            ackEq(
+                req.url,
+                `${location.origin}/bitcoin/bitcoin/pull/34684/review_comment/3804298183/edit_form?textarea_id=pullrequest-3804298183-body&comment_context=discussion`,
+                'derives direct pending review-comment edit_form URL',
             );
         } finally {
             parsePageContext = origParsePageContext;
