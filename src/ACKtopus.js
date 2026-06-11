@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.158
+// @version      1.159
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -36617,6 +36617,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         };
 
+        // Fixture forms must never actually submit: untrusted clicks on
+        // type=submit buttons still run activation behavior, so a fixture form
+        // that our edit machinery deliberately does not intercept would
+        // GET-navigate the live page mid-suite (e.g.
+        // .../issues/123/comments?comment%5Bbody%5D=...). preventDefault only,
+        // so tests can still observe the submit events themselves.
+        const blockTestFormSubmit = (e) => e.preventDefault();
+        document.addEventListener('submit', blockTestFormSubmit, true);
+
         _ackTesting = true;
         if (!hasSource) console.error('ACKtopus: self source unavailable; structural tests will likely fail');
 
@@ -36648,6 +36657,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         } finally {
             _ackTesting = false;
+            document.removeEventListener('submit', blockTestFormSubmit, true);
             // Restore mutable globals.
             lastForcePush = stateSnapshot.lastForcePush;
             lastForcePushRange = stateSnapshot.lastForcePushRange;
@@ -36691,6 +36701,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = String(runACKtopusTests);
         ackAssert(fn.includes('resyncAfterSelfTests'), 'triggers a post-test re-sync');
         ackAssert(fn.includes('setTimeout('), 're-sync is deferred until testing flag clears');
+    });
+
+    ackTest('runACKtopusTests blocks real form submissions from fixture clicks', () => {
+        const fn = String(runACKtopusTests);
+        ackAssert(
+            fn.includes("document.addEventListener('submit', blockTestFormSubmit, true)"),
+            'installs a capture-phase submit blocker for the suite',
+        );
+        ackAssert(
+            fn.includes("document.removeEventListener('submit', blockTestFormSubmit, true)"),
+            'removes the blocker when the suite finishes',
+        );
+        const install = fn.indexOf("document.addEventListener('submit', blockTestFormSubmit, true)");
+        const firstTestLoop = fn.indexOf('for (let i = 0; i < _ackTests.length; i++)');
+        ackAssert(install !== -1 && install < firstTestLoop, 'blocker is armed before any test runs');
     });
 
     function resyncAfterSelfTests() {
