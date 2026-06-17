@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.166
+// @version      1.168
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2472,6 +2472,7 @@
     }
 
     let reviewCommentHashNavigationKey = '';
+    let reviewCommentHashNavigationCompletedKey = '';
     let reviewCommentHashNavigationTimer = null;
     let reviewCommentHashRevealActive = false;
 
@@ -2504,6 +2505,10 @@
         if (!target) return null;
         scrollToAndHighlight(target);
         return target;
+    }
+
+    function currentReviewCommentHashNavigationKey() {
+        return `${location.pathname}${location.search}${location.hash}`;
     }
 
     function getReviewCommentRevealState() {
@@ -2552,7 +2557,8 @@
         if (!id) return false;
         const pr = parsePR();
         if (!pr) return false;
-        const key = `${location.pathname}${location.search}${location.hash}`;
+        const key = currentReviewCommentHashNavigationKey();
+        if (reviewCommentHashNavigationCompletedKey === key) return false;
         if (reviewCommentHashNavigationKey === key) return false;
         reviewCommentHashNavigationKey = key;
 
@@ -2564,6 +2570,7 @@
                 if (location.href !== startedAt) return false;
                 const target = navigateToReviewCommentHashTarget(id);
                 if (target) {
+                    reviewCommentHashNavigationCompletedKey = key;
                     if (popup) popup.textContent = 'Opened linked review comment';
                     if (popup) setTimeout(() => popup.remove(), 1200);
                     return true;
@@ -2605,6 +2612,7 @@
     function scheduleReviewCommentHashNavigation(reason = '') {
         if (_ackTesting || !reviewCommentDiscussionHashId()) return;
         if (shouldSkipHashRevealOnce(location.hash, { consume: reason !== 'hashchange' })) return;
+        if (reviewCommentHashNavigationCompletedKey === currentReviewCommentHashNavigationKey()) return;
         if (reviewCommentHashNavigationTimer) ackClearTimeout(reviewCommentHashNavigationTimer);
         reviewCommentHashNavigationTimer = ackSetTimeout(() => {
             reviewCommentHashNavigationTimer = null;
@@ -2618,6 +2626,7 @@
 
     function resetReviewCommentHashNavigation() {
         reviewCommentHashNavigationKey = '';
+        reviewCommentHashNavigationCompletedKey = '';
         reviewCommentHashRevealActive = false;
         if (reviewCommentHashNavigationTimer) {
             ackClearTimeout(reviewCommentHashNavigationTimer);
@@ -16100,6 +16109,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
+    function findOpenEditScope(container, extraRoots = []) {
+        const roots = [container, ...extraRoots].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
+        const scopeSelector =
+            '.is-comment-editing, form.js-comment-update:not([hidden]), form.js-issue-update:not([hidden]), ' +
+            '[data-testid="edit-comment-form"]';
+        const usableScope = (scope) => {
+            if (!scope?.isConnected) return null;
+            if (scope.matches?.('form') && scope.hasAttribute('hidden')) return null;
+            return scope;
+        };
+        for (const root of roots) {
+            const self = root.matches?.(scopeSelector) ? usableScope(root) : null;
+            if (self) return self;
+            const nested = usableScope(root.querySelector?.(scopeSelector));
+            if (nested) return nested;
+        }
+        const active = document.activeElement;
+        if (active?.matches?.('textarea') && isVisible(active)) {
+            return findEditForm(active);
+        }
+        return null;
+    }
+
     async function waitForEditTextarea(container, lt, ms = 1200, extraRoots = []) {
         const roots = [container, ...extraRoots].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
         const deadline = Date.now() + ms;
@@ -16275,19 +16307,41 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             view.style.visibility = 'hidden';
         }
 
+        let cleaned = false;
+        const cleanup = () => {
+            if (cleaned) return;
+            cleaned = true;
+            try {
+                form.removeEventListener('submit', scheduleCleanup, true);
+                form.removeEventListener('click', onActivationClick, true);
+            } catch (_) {}
+            if (!hadEditingClass) scope?.classList?.remove('is-comment-editing');
+            if (hadHidden) form.setAttribute('hidden', '');
+            else form.removeAttribute('hidden');
+            form.style.display = formStyle.display;
+            form.style.visibility = formStyle.visibility;
+            form.style.opacity = formStyle.opacity;
+            for (const state of hiddenViews) {
+                if (!state.el.isConnected) continue;
+                state.el.style.display = state.display;
+                state.el.style.visibility = state.visibility;
+            }
+        };
+        const scheduleCleanup = () => {
+            ackSetTimeout(cleanup, 0);
+            ackSetTimeout(cleanup, 400);
+            ackSetTimeout(cleanup, 1500);
+        };
+        const onActivationClick = (e) => {
+            const btn = e.target?.closest?.('button');
+            if (isEditCancelButton(btn)) scheduleCleanup();
+        };
+        form.addEventListener('submit', scheduleCleanup, true);
+        form.addEventListener('click', onActivationClick, true);
+
         return {
             cleanup() {
-                if (!hadEditingClass) scope?.classList?.remove('is-comment-editing');
-                if (hadHidden) form.setAttribute('hidden', '');
-                else form.removeAttribute('hidden');
-                form.style.display = formStyle.display;
-                form.style.visibility = formStyle.visibility;
-                form.style.opacity = formStyle.opacity;
-                for (const state of hiddenViews) {
-                    if (!state.el.isConnected) continue;
-                    state.el.style.display = state.display;
-                    state.el.style.visibility = state.visibility;
-                }
+                cleanup();
             },
         };
     }
@@ -16297,6 +16351,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const existingTa = await waitForEditTextarea(container, lt, 150);
         if (existingTa) return existingTa;
         let activation = null;
+        let activatedNativeEdit = false;
         let roots = [];
         try {
             const request = getEditFormRequest(container);
@@ -16317,6 +16372,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!isVisible(fragHost)) {
                 activation = activateEditFormForFragment(frag, container);
                 if (!activation) return null;
+                activatedNativeEdit = true;
                 const nativeTa = await waitForEditTextarea(container, lt, 250, roots);
                 if (nativeTa) return nativeTa;
             }
@@ -16340,13 +16396,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 frag.replaceWith(...nodes);
             }
             const ta = await waitForEditTextarea(container, lt, 1500, roots);
-            if (!ta) activation?.cleanup();
-            return ta;
+            const nativeScope = findOpenEditScope(container, roots);
+            if (!ta && !nativeScope) activation?.cleanup();
+            return ta || nativeScope;
         } catch (e) {
-            const nativeTa = findOpenEditTextarea(container, roots);
+            const nativeFailureWaitMs = Math.max(0, opts.nativeFailureWaitMs ?? 1200);
+            const nativeTa =
+                (activatedNativeEdit && nativeFailureWaitMs
+                    ? await waitForEditTextarea(container, lt, nativeFailureWaitMs, roots)
+                    : null) || findOpenEditTextarea(container, roots);
             if (nativeTa) {
                 console.log('ACKtopus: triggerMenuEdit: native edit form is already open; ignoring GM fragment failure');
                 return nativeTa;
+            }
+            const nativeScope = activatedNativeEdit ? findOpenEditScope(container, roots) : null;
+            if (nativeScope) {
+                console.log('ACKtopus: triggerMenuEdit: native edit form is opening; leaving native edit flow alone');
+                return nativeScope;
             }
             activation?.cleanup();
             const msg = String(e?.message || e || '');
@@ -16474,6 +16540,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // that placeholder. Never synthesize a second editor beside React.
                 const { frag, roots } = getEditFormRequest(container);
                 const ta = await waitForEditTextarea(container, lt, frag?.isConnected ? 2800 : 1200, roots);
+                if (!ta && findOpenEditScope(container, roots)) return ok;
                 if (!ta) {
                     if (lt.signal.aborted) return ok;
                     await tryOpenEditFormFromFragment(container, lt, 'edit textarea missing', {
@@ -21143,22 +21210,37 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let commitNavTimer = null;
     const commitListCache = new Map(); // "owner/repo/pr" -> [{sha, message}]
 
-    function addFloatingCommitNav() {
+    function runFloatingCommitNavBuild() {
+        _addFloatingCommitNavInner().catch((e) => {
+            if (!_ackTesting) console.warn('ACKtopus: floating commit nav failed:', e);
+        });
+    }
+
+    function addFloatingCommitNav(opts = {}) {
         // Remove ALL instances including turbo-cached ones
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
         hideNativeCommitNav(false);
 
+        if (commitNavTimer) {
+            ackClearTimeout(commitNavTimer);
+            commitNavTimer = null;
+        }
+        if (opts.immediate) {
+            const pendingJob = _ackBackgroundJobs.get('floating-commit-nav');
+            if (pendingJob) {
+                clearAckBackgroundJobTimer(pendingJob);
+                _ackBackgroundJobs.delete('floating-commit-nav');
+            }
+            runFloatingCommitNavBuild();
+            return;
+        }
+
         // Debounce the API call and keep it out of the active interaction path.
-        if (commitNavTimer) ackClearTimeout(commitNavTimer);
         commitNavTimer = ackSetTimeout(() => {
             commitNavTimer = null;
             scheduleAckBackgroundWork(
                 'floating-commit-nav',
-                () => {
-                    _addFloatingCommitNavInner().catch((e) => {
-                        if (!_ackTesting) console.warn('ACKtopus: floating commit nav failed:', e);
-                    });
-                },
+                runFloatingCommitNavBuild,
                 { delayMs: 0, reason: 'commit-nav' },
             );
         }, 300);
@@ -21794,7 +21876,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         lastInjectedPath = null;
         tryInject();
         if (isPRPage()) {
-            addFloatingCommitNav();
+            addFloatingCommitNav({ immediate: true });
             hideNativeCommitNav();
         }
     }
@@ -21849,7 +21931,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         if (isToolbarPage()) {
             // If PR or page view changed, tear down old toolbar and state.
-            if (prKey !== lastInjectedPR || location.pathname !== lastInjectedPath) {
+            const prChanged = prKey !== lastInjectedPR;
+            if (prChanged || location.pathname !== lastInjectedPath) {
                 const old = document.getElementById(BUTTON_CONTAINER_ID);
                 if (old) old.remove();
                 const oldAcks = document.getElementById(ACK_PANEL_ID);
@@ -21862,14 +21945,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 document.querySelector('.ack-config-overlay')?.remove();
                 document.querySelectorAll('.ack-commit-explain-panel, .ack-explain-panel').forEach((el) => el.remove());
                 document.querySelector('.ack-submit-review-wrap')?.remove();
-                lastForcePush = null;
-                lastForcePushRange = null;
-                lastForcePushSignature = '';
                 userAckSha = null;
                 prFileCategories = null;
-                commitListCache.clear();
-                clearCommitPatchCache();
-                invalidatePRContext();
+                if (prChanged) {
+                    lastForcePush = null;
+                    lastForcePushRange = null;
+                    lastForcePushSignature = '';
+                    commitListCache.clear();
+                    clearCommitPatchCache();
+                    invalidatePRContext();
+                }
                 resetCommentNav();
                 resetCompareFileNav();
                 resetReviewCommentHashNavigation();
@@ -21903,7 +21988,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     tryInject();
     scheduleReviewCommentHashNavigation('initial load');
     if (isPRPage() && !_ackTesting) {
-        addFloatingCommitNav();
+        addFloatingCommitNav({ immediate: true });
         hideNativeCommitNav();
     }
     document.addEventListener('turbo:load', () => {
@@ -21911,7 +21996,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         tryInject();
         scheduleReviewCommentHashNavigation('turbo load');
         if (isPRPage()) {
-            addFloatingCommitNav();
+            addFloatingCommitNav({ immediate: true });
             hideNativeCommitNav();
         }
     });
@@ -21920,7 +22005,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         tryInject();
         scheduleReviewCommentHashNavigation('turbo render');
         if (isPRPage()) {
-            addFloatingCommitNav();
+            addFloatingCommitNav({ immediate: true });
             hideNativeCommitNav();
         }
     });
@@ -21932,7 +22017,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         tryInject();
         scheduleReviewCommentHashNavigation('pageshow');
         if (isPRPage()) {
-            addFloatingCommitNav();
+            addFloatingCommitNav({ immediate: true });
             hideNativeCommitNav();
         }
         try {
@@ -24994,6 +25079,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!source.includes('schedulePostHashRevealToolbarRefresh'), 'does not schedule delayed toolbar rebuild after hash reveal');
     });
 
+    ackTest('review comment hash navigation stops after successful jump', () => {
+        const source = _ackSource;
+        const helper = source.slice(
+            source.indexOf('async function handleReviewCommentHashNavigation'),
+            source.indexOf('\n    function scheduleReviewCommentHashNavigation'),
+        );
+        const scheduler = source.slice(
+            source.indexOf('function scheduleReviewCommentHashNavigation'),
+            source.indexOf('\n    function shouldSuppressHiddenConversationRefresh'),
+        );
+        const reset = source.slice(
+            source.indexOf('function resetReviewCommentHashNavigation'),
+            source.indexOf('\n    function findUserAcks'),
+        );
+        ackAssert(helper.includes('reviewCommentHashNavigationCompletedKey === key'), 'completed hash key blocks repeated handler runs');
+        ackAssert(
+            helper.includes('reviewCommentHashNavigationCompletedKey = key') &&
+                helper.indexOf('reviewCommentHashNavigationCompletedKey = key') < helper.indexOf("popup.textContent = 'Opened linked review comment'"),
+            'successful target reveal marks the hash as completed',
+        );
+        ackAssert(
+            scheduler.includes('reviewCommentHashNavigationCompletedKey === currentReviewCommentHashNavigationKey()'),
+            'scheduler skips hashes already reached',
+        );
+        ackAssert(reset.includes("reviewCommentHashNavigationCompletedKey = ''"), 'reset clears completed hash key');
+    });
+
     // ============================================================================
     // LLM_MODELS -- extended
     // ============================================================================
@@ -27149,7 +27261,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(block.includes('lastInjectedPR = null'), 'clears injected PR cache before reinject');
         ackAssert(block.includes('lastInjectedPath = null'), 'clears injected path cache before reinject');
         ackAssert(block.includes('tryInject()'), 'forces fresh reinject on pageshow');
-        ackAssert(block.includes('addFloatingCommitNav()'), 'rebuilds floating commit nav on pageshow');
+        ackAssert(block.includes('addFloatingCommitNav({ immediate: true })'), 'rebuilds floating commit nav immediately on pageshow');
     });
 
     ackTest('floating commit nav matches conversation, /changes/SHA and /commits routes', () => {
@@ -27166,8 +27278,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('addFloatingCommitNav runs on all navigation events', () => {
         const source = _ackSource;
-        const calls = (source.match(/addFloatingCommitNav\(\)/g) || []).length;
-        ackAssert(calls >= 5, `addFloatingCommitNav called at least 5 times, found ${calls}`);
+        const immediateCalls = (source.match(/addFloatingCommitNav\(\{ immediate: true \}\)/g) || []).length;
+        ackAssert(immediateCalls >= 5, `addFloatingCommitNav immediate navigation calls >= 5, found ${immediateCalls}`);
     });
 
     ackTest('overlayImgSpinner fades image and overlays spinner without replacing it', () => {
@@ -31476,6 +31588,94 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('tryOpenEditFormFromFragment keeps activated native edit scope open after GM failure', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <div class="edit-comment-hide"><div class="markdown-body">hello</div></div>
+                <form class="js-comment-update" hidden action="/owner/repo/issues/123">
+                    <div class="previewable-comment-form js-comment-edit-form-deferred-include-fragment"
+                        src="/owner/repo/issues/123/edit_form?textarea_id=issue-444-body&comment_context=">
+                        Loading...
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const form = host.querySelector('form.js-comment-update');
+        const fakeFrag = host.querySelector('.js-comment-edit-form-deferred-include-fragment');
+        const lt = ensureAckLifetime('test GM failure keeps native scope');
+        const origGM = GM_xmlhttpRequest;
+        const origGetEditFormRequest = getEditFormRequest;
+        let gmCalls = 0;
+        GM_xmlhttpRequest = (opts) => {
+            gmCalls++;
+            opts.onload({ status: 404, responseText: '' });
+        };
+        getEditFormRequest = () => ({
+            frag: fakeFrag,
+            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            roots: [container],
+        });
+        try {
+            const opened = await tryOpenEditFormFromFragment(container, lt, 'unit test GM failure without textarea', {
+                allowGM: true,
+                nativeWaitMs: 0,
+                nativeFailureWaitMs: 0,
+            });
+            ackAssert(opened, 'returns the already-open native edit scope instead of continuing fallbacks');
+            ackEq(gmCalls, 1, 'attempted the GM fallback once');
+            ackAssert(container.classList.contains('is-comment-editing'), 'keeps native edit mode class after GM failure');
+            ackAssert(!form.hidden, 'does not close the native update form after GM failure');
+        } finally {
+            GM_xmlhttpRequest = origGM;
+            getEditFormRequest = origGetEditFormRequest;
+            abortAckLifetime('test cleanup');
+            host.remove();
+        }
+    });
+
+    ackTest('manual native edit activation restores rendered body after submit', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = `
+            <div class="timeline-comment">
+                <div class="edit-comment-hide"><div class="markdown-body">rendered body</div></div>
+                <form class="js-comment-update" hidden action="/owner/repo/issues/123">
+                    <textarea style="width:200px;height:60px">edited body</textarea>
+                    <button type="button" class="js-comment-cancel-button">Cancel</button>
+                    <button type="submit">Update comment</button>
+                    <div class="previewable-comment-form js-comment-edit-form-deferred-include-fragment"
+                        src="/owner/repo/issues/123/edit_form?textarea_id=issue-444-body&comment_context=">
+                        Loading...
+                    </div>
+                </form>
+            </div>
+        `;
+        document.body.appendChild(host);
+        const container = host.querySelector('.timeline-comment');
+        const hiddenView = host.querySelector('.edit-comment-hide');
+        const form = host.querySelector('form.js-comment-update');
+        const fakeFrag = host.querySelector('.js-comment-edit-form-deferred-include-fragment');
+        try {
+            const activation = activateEditFormForFragment(fakeFrag, container);
+            ackAssert(activation, 'activates native edit form');
+            ackEq(hiddenView.style.display, 'none', 'activation hides rendered body while editing');
+            ackEq(form.hidden, false, 'activation reveals edit form while editing');
+            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            ackEq(hiddenView.style.display, '', 'submit restores rendered body display');
+            ackEq(hiddenView.style.visibility, '', 'submit restores rendered body visibility');
+            ackEq(form.hidden, true, 'submit restores hidden form state');
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('tryOpenEditFormFromFragment does not synthesize duplicate editors without a fragment', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -35423,15 +35623,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('(currentIdx + 1) % commits.length'), 'next wraps to first');
     });
 
-    ackTest('floating commit nav rebuild is interaction-aware', () => {
+    ackTest('floating commit nav supports immediate navigation rebuilds', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function addFloatingCommitNav'),
             source.indexOf('async function fetchCommitList'),
         );
+        ackAssert(fn.includes('opts.immediate'), 'has an immediate navigation mode');
+        ackAssert(fn.includes('runFloatingCommitNavBuild()'), 'immediate mode starts the build directly');
+        ackAssert(fn.includes("_ackBackgroundJobs.delete('floating-commit-nav')"), 'immediate mode cancels stale background jobs');
         ackAssert(fn.includes('ackSetTimeout'), 'uses lifetime-aware debounce timer');
         ackAssert(fn.includes("scheduleAckBackgroundWork(\n                'floating-commit-nav'"), 'schedules API work in background');
         ackAssert(!fn.includes('commitNavTimer = setTimeout'), 'does not use raw setTimeout for nav fetch');
+    });
+
+    ackTest('same-PR route changes keep the commit navigation cache', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function tryInject'),
+            source.indexOf('\n    tryInject();'),
+        );
+        ackAssert(fn.includes('const prChanged = prKey !== lastInjectedPR'), 'distinguishes PR changes from route changes');
+        const clearIdx = fn.indexOf('commitListCache.clear()');
+        const prChangedBlockIdx = fn.lastIndexOf('if (prChanged)', clearIdx);
+        ackAssert(clearIdx >= 0 && prChangedBlockIdx >= 0, 'clears commit list cache only in the PR-changed block');
     });
 
     ackTest('floating commit nav has no disabled/null button state', () => {
@@ -37503,7 +37718,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (location.href !== lastUrl) {
             lastUrl = location.href;
             tryInject();
-            addFloatingCommitNav();
+            addFloatingCommitNav({ immediate: true });
             scheduleReviewCommentHashNavigation('url change');
             // Some SPA navigations update the main content without recreating the toolbar.
             // Re-run cheap DOM passes so hover reactions + commit-prefix prefill stay reliable.
@@ -37527,27 +37742,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     let pending = false;
-    let _urlObserverAbortGen = 0;
     new MutationObserver(() => {
         if (_ackTesting) return;
         if (pending || location.href === lastUrl) return;
-        const lt = ensureAckLifetime('url-observer');
-        if (lt.gen !== _urlObserverAbortGen) {
-            _urlObserverAbortGen = lt.gen;
-            lt.onAbort(() => {
-                pending = false;
-            });
-        }
         pending = true;
-        scheduleAckBackgroundWork(
-            'url-observer',
-            () => {
-                pending = false;
-                checkUrlChange();
-                if (isToolbarPage() || isGitHubRepoPage()) tryInject();
-            },
-            { delayMs: 500, reason: 'url-mutation' },
-        );
+        ackSetTimeout(() => {
+            pending = false;
+            checkUrlChange();
+            if (isToolbarPage() || isGitHubRepoPage()) tryInject();
+        }, 0);
     }).observe(document.body, { childList: true, subtree: true });
 
     let liveRefreshPending = false;
@@ -37556,8 +37759,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackTesting) return;
         if (liveRefreshPending || location.href !== lastUrl) return;
         if (!mutationBatchMightContainForcePush(mutations)) return;
-        // A lifetime abort drops the scheduled job (and its flag reset) -- clear the
-        // flag on abort like the url-observer above, or live refresh stays disabled.
+        // A lifetime abort drops the scheduled job and its flag reset; clear the
+        // flag on abort or live refresh stays disabled.
         const lt = ensureAckLifetime('live-toolbar-refresh');
         if (lt.gen !== _liveRefreshAbortGen) {
             _liveRefreshAbortGen = lt.gen;
