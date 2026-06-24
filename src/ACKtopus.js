@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.168
+// @version      1.169
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1070,7 +1070,10 @@
             const menuTrigger =
                 header.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR) ||
                 container.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR);
-            if (menuTrigger && isVisible(menuTrigger)) return { container, header };
+            const isPRBody =
+                container.matches?.('[data-testid="issue-body"]') ||
+                !!header.querySelector?.('[data-testid="issue-body-header-link"][href*="#issue-"], a[href*="#issue-"]');
+            if (menuTrigger && isVisible(menuTrigger)) return { container, header, isPRBody };
         }
         return null;
     }
@@ -1097,7 +1100,7 @@
         if (pressAckButton(findFocusedOrVisibleShortcutButton('.ack-edit-post-btn'))) return true;
         const target = findFocusedOrVisiblePostEditTarget();
         if (!target) return false;
-        triggerMenuEdit(target.container, target.header);
+        triggerMenuEdit(target.container, target.header, { isPRBody: !!target.isPRBody });
         return true;
     }
 
@@ -15797,7 +15800,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         () => {
                             // Prefer GitHub's native edit_form fragment when present;
                             // fall back to the lazily-rendered kebab menu for React UI.
-                            triggerMenuEdit(container, header);
+                            triggerMenuEdit(container, header, { isPRBody });
                         },
                     );
                     editBtn.classList.add('ack-edit-post-btn');
@@ -16144,7 +16147,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    function getEditFormRequest(container) {
+    function getEditFormRequest(container, opts = {}) {
         const roots = [];
         const push = (el) => {
             if (!el || el.nodeType !== 1 || roots.includes(el)) return;
@@ -16166,11 +16169,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'include-fragment.js-comment-edit-form-deferred-include-fragment,' +
             'include-fragment.previewable-comment-form,' +
             'include-fragment[src*="/edit_form"]';
-        for (const root of roots) {
-            const frag = root.querySelector?.(fragSelector);
+        const localEditFragments = [];
+        const pushLocalFragment = (frag) => {
             const src = frag?.getAttribute?.('src') || '';
-            if (frag && src) return { frag, url: new URL(src, location.origin).href, roots };
+            if (!frag || !src || localEditFragments.some((item) => item.frag === frag)) return;
+            localEditFragments.push({ frag, src });
+        };
+        for (const root of roots) {
+            root.querySelectorAll?.(fragSelector)?.forEach(pushLocalFragment);
         }
+        const findLocalFragment = (...needles) =>
+            localEditFragments.find(({ src }) => needles.every((needle) => src.includes(needle)))?.frag || null;
+        const fragmentHref = (frag) => {
+            const src = frag?.getAttribute?.('src') || '';
+            return src ? new URL(src, location.origin).href : '';
+        };
 
         const ctx = parsePageContext();
         if (!ctx) return { frag: null, url: '', roots };
@@ -16209,48 +16222,81 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return '';
         };
 
+        const isIssueBodyScope = !!(
+            opts.isPRBody ||
+            container?.matches?.('[data-testid="issue-body"], [id^="issue-"]') ||
+            container?.querySelector?.('[data-testid="issue-body-header-link"][href*="#issue-"], a[id$="-permalink"][href*="#issue-"]')
+        );
+
+        if (isIssueBodyScope) {
+            match = findId(/issue-(\d+)/);
+            if (match) {
+                const frag =
+                    findLocalFragment(`/issues/${ctx.pr}/edit_form`, `textarea_id=issue-${match}-body`) ||
+                    document.querySelector(
+                        `include-fragment[src*="/issues/${ctx.pr}/edit_form"][src*="textarea_id=issue-${match}-body"]`,
+                    );
+                // Main issue/PR-body editing now often comes from React UI. Synthesizing
+                // `/issues/.../edit_form` URLs when GitHub has not rendered a native
+                // fragment just produces noisy 403s, so only reuse an existing fragment.
+                const url = fragmentHref(frag);
+                return { frag: url ? frag : null, url, roots };
+            }
+            return { frag: null, url: '', roots };
+        }
+
         match = findId(/discussion_r(\d+)/);
         if (!match) match = findId(/^r(\d+)$/);
         if (match) {
-            const frag = document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = frag?.getAttribute?.('src')
-                ? new URL(frag.getAttribute('src'), location.origin).href
+            const frag =
+                findLocalFragment(`/review_comment/${match}/edit_form`) ||
+                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
+            const url = fragmentHref(frag)
+                ? fragmentHref(frag)
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=discussion_r${match}-body&comment_context=discussion`;
             return { frag, url, roots };
         }
 
         match = findId(/pullrequest-(\d+)/);
         if (match) {
-            const frag = document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = frag?.getAttribute?.('src')
-                ? new URL(frag.getAttribute('src'), location.origin).href
+            const frag =
+                findLocalFragment(`/review_comment/${match}/edit_form`) ||
+                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
+            const url = fragmentHref(frag)
+                ? fragmentHref(frag)
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequest-${match}-body&comment_context=discussion`;
             return { frag, url, roots };
         }
 
         match = findId(/pullrequestreviewcomment-(\d+)/);
         if (match) {
-            const frag = document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = frag?.getAttribute?.('src')
-                ? new URL(frag.getAttribute('src'), location.origin).href
+            const frag =
+                findLocalFragment(`/review_comment/${match}/edit_form`) ||
+                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
+            const url = fragmentHref(frag)
+                ? fragmentHref(frag)
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequestreviewcomment-${match}-body&comment_context=discussion`;
             return { frag, url, roots };
         }
 
         match = findId(/issuecomment-(\d+)/);
         if (match) {
-            const frag = document.querySelector(`include-fragment[src*="/issue_comments/${match}/edit_form"]`);
-            const url = frag?.getAttribute?.('src')
-                ? new URL(frag.getAttribute('src'), location.origin).href
+            const frag =
+                findLocalFragment(`/issue_comments/${match}/edit_form`) ||
+                document.querySelector(`include-fragment[src*="/issue_comments/${match}/edit_form"]`);
+            const url = fragmentHref(frag)
+                ? fragmentHref(frag)
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/issue_comments/${match}/edit_form?textarea_id=issuecomment-${match}-body&comment_context=`;
             return { frag, url, roots };
         }
 
         match = findId(/pullrequestreview-(\d+)/);
         if (match) {
-            const frag = document.querySelector(`include-fragment[src*="/reviews/${match}/update/edit_form"]`);
-            const url = frag?.getAttribute?.('src')
-                ? new URL(frag.getAttribute('src'), location.origin).href
+            const frag =
+                findLocalFragment(`/reviews/${match}/update/edit_form`) ||
+                document.querySelector(`include-fragment[src*="/reviews/${match}/update/edit_form"]`);
+            const url = fragmentHref(frag)
+                ? fragmentHref(frag)
                 : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/reviews/${match}/update/edit_form?textarea_id=pullrequestreview-${match}-body&comment_context=discussion`;
             return { frag, url, roots };
         }
@@ -16266,6 +16312,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const src = frag?.getAttribute?.('src') || '';
             const url = src ? new URL(src, location.origin).href : '';
             return { frag: src ? frag : null, url, roots };
+        }
+
+        if (localEditFragments.length === 1) {
+            const { frag } = localEditFragments[0];
+            return { frag, url: fragmentHref(frag), roots };
         }
 
         return { frag: null, url: '', roots };
@@ -16354,7 +16405,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let activatedNativeEdit = false;
         let roots = [];
         try {
-            const request = getEditFormRequest(container);
+            const request = getEditFormRequest(container, opts);
             const { frag, url } = request;
             roots = request.roots || [];
             if (!url) return null;
@@ -16425,7 +16476,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    async function triggerMenuEdit(container, header) {
+    async function triggerMenuEdit(container, header, opts = {}) {
         const lt = ensureAckLifetime('triggerMenuEdit');
         // Re-entry guard with a short takeover window: a stuck attempt (e.g.
         // waiting on slow menu fragments for several seconds) must not swallow
@@ -16439,16 +16490,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let origOpacity = '';
         let clickedEdit = false;
         try {
-            const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup');
+            const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', opts);
             if (taDirect) {
                 schedulePostEditRefresh(container);
                 return true;
             }
             const kebabSelector = COMMENT_MENU_TRIGGER_SELECTOR;
-            kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
+            kebab =
+                header.querySelector(kebabSelector) ||
+                (!opts.isPRBody ? container.querySelector(kebabSelector) : null);
             if (!kebab) {
                 console.warn('ACKtopus: triggerMenuEdit: kebab not found');
-                const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', { nativeWaitMs: 1200 });
+                const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', {
+                    ...opts,
+                    nativeWaitMs: 1200,
+                });
                 if (ta) {
                     schedulePostEditRefresh(container);
                     return true;
@@ -16527,7 +16583,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     );
                     console.warn('ACKtopus: triggerMenuEdit: could not find Edit item. Visible menu items:', items);
                 } catch (_) {}
-                const ta = await tryOpenEditFormFromFragment(container, lt, 'edit item missing', { nativeWaitMs: 1200 });
+                const ta = await tryOpenEditFormFromFragment(container, lt, 'edit item missing', {
+                    ...opts,
+                    nativeWaitMs: 1200,
+                });
                 if (ta) {
                     schedulePostEditRefresh(container);
                     return true;
@@ -16538,12 +16597,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // GitHub sometimes loads edit forms via <include-fragment>. If a
                 // real fragment placeholder exists and does not resolve, replace
                 // that placeholder. Never synthesize a second editor beside React.
-                const { frag, roots } = getEditFormRequest(container);
+                const { frag, roots } = getEditFormRequest(container, opts);
                 const ta = await waitForEditTextarea(container, lt, frag?.isConnected ? 2800 : 1200, roots);
                 if (!ta && findOpenEditScope(container, roots)) return ok;
                 if (!ta) {
                     if (lt.signal.aborted) return ok;
                     await tryOpenEditFormFromFragment(container, lt, 'edit textarea missing', {
+                        ...opts,
                         allowGM: !!frag?.isConnected,
                         nativeWaitMs: frag?.isConnected ? 1200 : 0,
                     });
@@ -25536,7 +25596,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('edit button uses clickWithRetry via triggerMenuEdit', () => {
         const source = _ackSource;
         ackAssert(source.includes('async function triggerMenuEdit'), 'has triggerMenuEdit helper');
-        ackAssert(source.includes('triggerMenuEdit(container, header)'), 'edit uses triggerMenuEdit');
+        ackAssert(source.includes('triggerMenuEdit(container, header, { isPRBody })'), 'edit uses triggerMenuEdit');
         ackAssert(source.includes("'edit comment button'"), 'edit passes labeled retry to clickWithRetry');
         const fn = source.slice(
             source.indexOf('async function triggerMenuEdit'),
@@ -25552,6 +25612,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('tryOpenEditFormFromFragment'), 'reuses direct edit-form fallback helper');
         ackAssert(fn.includes('direct edit_form lookup'), 'tries direct edit-form lookup before opening kebab');
+        ackAssert(
+            fn.includes("tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', opts)"),
+            'direct edit-form lookup preserves PR-body scope',
+        );
+        ackAssert(
+            fn.includes('!opts.isPRBody ? container.querySelector(kebabSelector) : null'),
+            'PR-body edit only uses the header menu trigger',
+        );
         ackAssert(reqFn.includes('include-fragment'), 'has include-fragment fallback for edit form');
         ackAssert(fallbackFn.includes('GM_xmlhttpRequest'), 'can load edit fragment via GM_xmlhttpRequest');
         ackAssert(
@@ -25619,6 +25687,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const req = getEditFormRequest(host);
             ackEq(req.url, '', 'avoids unsupported synthetic issue-body edit_form URL');
             ackEq(req.frag, null, 'returns no fragment when GitHub has not rendered one');
+        } finally {
+            parsePageContext = origParsePageContext;
+        }
+    });
+
+    ackTest('getEditFormRequest ignores nested review edit fragments for PR body', () => {
+        const origParsePageContext = parsePageContext;
+        const host = document.createElement('div');
+        host.setAttribute('data-testid', 'issue-body');
+        host.innerHTML = `
+            <a data-testid="issue-body-header-link" href="https://github.com/owner/repo/pull/123#issue-444">opened</a>
+            <include-fragment class="js-comment-edit-form-deferred-include-fragment"
+                src="/owner/repo/pull/123/reviews/4540440508/update/edit_form?textarea_id=pullrequestreview-4540440508-body&comment_context=discussion"></include-fragment>
+        `;
+        try {
+            parsePageContext = () => ({ owner: 'owner', repo: 'repo', pr: '123' });
+            const req = getEditFormRequest(host, { isPRBody: true });
+            ackEq(req.url, '', 'does not use nested review edit_form for PR body');
+            ackEq(req.frag, null, 'does not return unrelated review fragment for PR body');
+        } finally {
+            parsePageContext = origParsePageContext;
+        }
+    });
+
+    ackTest('getEditFormRequest prefers pending review-comment target over unrelated review fragment', () => {
+        const origParsePageContext = parsePageContext;
+        const host = document.createElement('div');
+        host.id = 'pullrequest-3906742716';
+        host.innerHTML = `
+            <include-fragment class="js-comment-edit-form-deferred-include-fragment"
+                src="/owner/repo/pull/123/reviews/4540440508/update/edit_form?textarea_id=pullrequestreview-4540440508-body&comment_context=discussion"></include-fragment>
+        `;
+        try {
+            parsePageContext = () => ({ owner: 'owner', repo: 'repo', pr: '123' });
+            const req = getEditFormRequest(host);
+            ackEq(
+                req.url,
+                `${location.origin}/owner/repo/pull/123/review_comment/3906742716/edit_form?textarea_id=pullrequest-3906742716-body&comment_context=discussion`,
+                'uses the pending review-comment URL instead of the unrelated review edit_form',
+            );
+            ackAssert(!req.url.includes('/reviews/4540440508/update/edit_form'), 'does not reuse the wrong review form');
         } finally {
             parsePageContext = origParsePageContext;
         }
