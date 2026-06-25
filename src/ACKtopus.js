@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.170
+// @version      1.171
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -106,7 +106,8 @@
     }
 
     // Post-proofread processing is intentionally limited to mechanical URL
-    // preservation. Prose/style markdown changes belong in the LLM prompt.
+    // preservation and punctuation cleanup that is safe outside inline code.
+    // Broader prose/style markdown changes belong in the LLM prompt.
 
     const GITHUB_COMMIT_DIFF_LINE_URL_RE =
         /\bhttps:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-fA-F]{40})(#diff-[A-Za-z0-9]+L\d+-L\d+)\b/g;
@@ -120,8 +121,38 @@
         return { text: out, count };
     }
 
+    function normalizeProofreadDoubleHyphenPunctuation(text) {
+        const normalizeProseChunk = (chunk) => String(chunk || '').replace(/[ \t]+--[ \t]+/g, ', ');
+        const immutableLineRe =
+            /^(>|_Originally posted by |<!--|<\/?details|<\/?summary|\[!\[|<img |https?:\/\/\S+$|_.*https:\/\/github\.com\/.*_$)/;
+        let inFence = false;
+        let fenceMarker = '';
+        return String(text || '')
+            .split('\n')
+            .map((line) => {
+                const trimmed = line.trimStart();
+                const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+                if (inFence) {
+                    if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
+                        inFence = false;
+                        fenceMarker = '';
+                    }
+                    return line;
+                }
+                if (fenceMatch) {
+                    inFence = true;
+                    fenceMarker = fenceMatch[1];
+                    return line;
+                }
+                if (immutableLineRe.test(trimmed)) return line;
+                const parts = String(line).split(/(`+[^`]*`+)/g);
+                return parts.map((part, i) => (i % 2 ? part : normalizeProseChunk(part))).join('');
+            })
+            .join('\n');
+    }
+
     function postProcessProofreadMarkdown(text) {
-        return rewriteProofreadCommitDiffUrls(String(text || '')).text;
+        return normalizeProofreadDoubleHyphenPunctuation(rewriteProofreadCommitDiffUrls(String(text || '')).text);
     }
 
     function unwrapProofreadXmlSectionContent(content) {
@@ -4668,9 +4699,11 @@ Output only these markdown sections:
 Under each section, keep bullets short and high signal.`,
         proofread: `Use American English.
 Fix grammar, spelling, and clarity with minimal edits. Preserve the author's tone and intent.
+Prefer simple, plain language. Do not add jargon, abstract reviewer-speak, or more formal wording unless the original technical meaning requires it.
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
 If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages, or thread context, fix it minimally. Only correct objective errors, not opinions.
-Make the reply make sense in light of the commit messages and the current thread (if any). If the surrounding thread has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
+Make the reply make sense in light of the commit messages, current thread, and surrounding text (if any). If the surrounding thread or nearby text has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
+Remove accidental duplication: repeated words, repeated phrases or sentences, and repeated points that nearby text or thread context already covers.
 Keep replies friendly and professional without making them more verbose or less direct.
 Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it by rephrasing as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
@@ -4679,7 +4712,7 @@ Do not change quoted text (lines starting with >) in any way. Those are someone 
 Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
 Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.
 Blank lines after blockquotes are semantic in GitHub Markdown. Preserve them so following prose does not become part of the quote.
-Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or double-hyphen ("--") punctuation. Preserve command-line flags such as \`--connect\`, quoted text, and any double hyphens that were already present in the original text.
+Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or bare double hyphen punctuation. Do not introduce or preserve a bare double hyphen as prose punctuation, and do not mention this punctuation rule in the output. Preserve command-line flags such as \`--connect\`, quoted text, links, and code.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
 When a fenced code block has no language (or only a generic one like text/plain), add a language tag only when the language is obvious.
@@ -11183,7 +11216,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (ctx.diff) parts.push(wrapPromptBlock('Diff', ctx.diff.slice(0, 120000)));
                 if (parts.length) {
                     proofreadContext =
-                        '\n\nThe following is the actual PR diff and commit messages. Flag any claims in the description that are inaccurate, such as renamed files, removed/changed variables, obsolete function names, incorrect behavior descriptions, etc.\n\n' +
+                        '\n\nThe following is the actual PR diff and commit messages. Use this context only to fact-check and remove redundant or outdated wording. Fix inaccurate claims in the description, such as renamed files, removed/changed variables, obsolete function names, incorrect behavior descriptions, etc.\n\n' +
                         parts.join('\n\n');
                 }
             } else {
@@ -11251,7 +11284,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
                 if (parts.length) {
                     proofreadContext =
-                        '\n\nContext for fact-checking (do not include in output). If the comment makes claims that contradict this context, fix them minimally:\n\n' +
+                        '\n\nContext for fact-checking and surrounding discussion (do not include in output). Use it to resolve references, remove duplicated or redundant points, and fix claims that contradict the context:\n\n' +
                         parts.join('\n\n');
                 }
             }
@@ -11369,7 +11402,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return { segments, mutableCount, toXML, fromXML };
             };
 
-            const makePrompt = (text) => {
+            const buildSurroundingProofreadContext = (fullText, start, end) => {
+                if (!Number.isFinite(start) || !Number.isFinite(end) || start === end) return '';
+                const before = String(fullText || '').slice(Math.max(0, start - 2000), start);
+                const after = String(fullText || '').slice(end, Math.min(String(fullText || '').length, end + 2000));
+                const parts = [];
+                if (before.trim()) parts.push(wrapPromptBlock('Text before selection', before));
+                if (after.trim()) parts.push(wrapPromptBlock('Text after selection', after));
+                if (!parts.length) return '';
+                return (
+                    '\n\nSurrounding draft context (do not include in output). Use it only to keep references coherent and avoid duplicating nearby points:\n\n' +
+                    parts.join('\n\n')
+                );
+            };
+
+            const makePrompt = (text, localContext = '') => {
                 const cleaned = stripGitHubMeta(text);
                 const parsed = splitSegments(cleaned);
                 const xmlInput = parsed.toXML();
@@ -11388,8 +11435,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, or correcting factual errors. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Preserve existing blank lines and structural separators. Blank lines after blockquotes are semantic in GitHub Markdown; preserve them so following prose does not become part of the quote. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
-                    user: `Proofread the following sections:\n\n${xmlInput}${proofreadContext}`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, or removing duplicated wording. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators. Blank lines after blockquotes are semantic in GitHub Markdown; preserve them so following prose does not become part of the quote. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
                 };
@@ -11573,7 +11620,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     let linkRewriteCount = initialUrlRewrite.count;
                     let strippedOriginal = stripGitHubMeta(textForProofread);
                     let result = stripGitHubMeta(textForProofread);
-                    const { system, user, parsed, noOp } = makePrompt(textForProofread);
+                    const localProofreadContext = hasSelection
+                        ? buildSurroundingProofreadContext(ta.value, selStart, selEnd)
+                        : '';
+                    const { system, user, parsed, noOp } = makePrompt(textForProofread, localProofreadContext);
                     if (noOp) {
                         console.log('ACKtopus: proofread: no mutable segments, running URL-preservation pass only');
                         result = postProcessProofreadMarkdown(strippedOriginal);
@@ -19564,7 +19614,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    'Proofread ONLY prose. If the selection is code, do not rewrite it; only fix obvious typos inside comments/strings if present. Preserve all blank lines and indentation. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
+                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, blank lines, and indentation. If the selection is code, do not rewrite it; only fix obvious typos inside comments/strings if present. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -22985,7 +23035,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(_ackSource.includes('toXML'), 'converts mutable segments to XML');
         ackAssert(_ackSource.includes('fromXML'), 'reassembles from XML response');
         ackAssert(!_ackSource.includes('<<KEEP_'), 'no longer uses KEEP placeholders');
-        ackAssert(_ackSource.includes('makePrompt(textForProofread)'), 'used in EDIT mode');
+        ackAssert(_ackSource.includes('makePrompt(textForProofread, localProofreadContext)'), 'used in EDIT mode');
         // v1.03: extended patterns
         ackAssert(_ackSource.includes('<\\/?details'), 'protects <details> / </details> tags');
         ackAssert(_ackSource.includes('<\\/?summary'), 'protects <summary> / </summary> tags');
@@ -24147,6 +24197,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('proofread instructions prefer simple language and remove duplication', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('simple, plain language'), 'prefers plain language');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('abstract reviewer-speak'), 'mentions avoiding jargon');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental duplication'), 'removes duplication');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('surrounding text'), 'uses surrounding text');
+    });
+
     ackTest('proofread instructions preserve quoted text', () => {
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('quoted text'), 'mentions quoted text');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('verbatim'), 'says copy verbatim');
@@ -24154,7 +24211,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('proofread instructions avoid double-hyphen punctuation', () => {
         ackAssert(
-            DEFAULT_INSTRUCTIONS.proofread.includes('double-hyphen ("--") punctuation'),
+            DEFAULT_INSTRUCTIONS.proofread.includes('bare double hyphen punctuation'),
             'mentions double-hyphen punctuation',
         );
         ackAssert(
@@ -24210,6 +24267,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes('current thread'),
             'aligns reply to current thread',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('surrounding text'),
+            'aligns reply to surrounding text',
         );
     });
 
@@ -28808,6 +28869,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('fact-checking'), 'labels context for fact-checking');
     });
 
+    ackTest('selected-text proofreading includes surrounding draft context', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function runProofreadOnComment'),
+            source.indexOf('const cleanResult'),
+        );
+        ackAssert(fn.includes('buildSurroundingProofreadContext'), 'has surrounding-context helper');
+        ackAssert(fn.includes('Text before selection'), 'includes text before selected proofread range');
+        ackAssert(fn.includes('Text after selection'), 'includes text after selected proofread range');
+        ackAssert(
+            fn.includes('avoid duplicating nearby points'),
+            'uses surrounding text to avoid duplicate points',
+        );
+        ackAssert(
+            fn.includes('makePrompt(textForProofread, localProofreadContext)'),
+            'passes local selection context into proofread prompt',
+        );
+    });
+
     ackTest('autoCollapseCompareFiles is called from tryInject', () => {
         const source = _ackSource;
         const start = source.indexOf('function tryInject');
@@ -29992,6 +30072,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('renderInlineProofreadResult(ctx.text, out)'),
             'renders inline proofread diff/result for selections',
         );
+        ackAssert(fn.includes('simple, plain language'), 'selection proofread prefers plain language');
+        ackAssert(fn.includes('accidental duplicate'), 'selection proofread removes duplicate wording');
+        ackAssert(fn.includes('bare double-hyphen punctuation'), 'selection proofread avoids double-hyphen punctuation');
         ackAssert(
             !fn.includes('showDiffDialog(ctx.text, out)'),
             'selection proofread no longer opens modal diff dialog',
@@ -31018,8 +31101,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             DEFAULT_INSTRUCTIONS.proofread.includes('demonstrably wrong'),
             'DEFAULT_INSTRUCTIONS.proofread checks factual accuracy',
         );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('simple, plain language'),
+            'DEFAULT_INSTRUCTIONS.proofread prefers simple language',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental duplication'),
+            'DEFAULT_INSTRUCTIONS.proofread removes duplicates',
+        );
         // Inline RULES add accuracy examples and output format
         ackAssert(makePromptSection.includes('exaggerated'), 'RULES block has accuracy examples');
+        ackAssert(makePromptSection.includes('Use surrounding context'), 'RULES block uses surrounding context');
+        ackAssert(makePromptSection.includes('removing duplicated wording'), 'RULES block allows de-duplication');
         ackAssert(makePromptSection.includes('<output>...</output>'), 'wraps output in <output> tags');
         // Strips GitHub metadata before proofreading
         ackAssert(source.includes('stripGitHubMeta'), 'strips GitHub metadata footer');
@@ -34083,7 +34176,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('not a fixed list of heading names'), 'prompt covers generic markdown heading compaction');
         ackAssert(
             source.includes('postProcessProofreadMarkdown(parsed.fromXML'),
-            'only URL-preservation post-processing is applied to proofread results',
+            'only safe URL/punctuation post-processing is applied to proofread results',
         );
         ackAssert(!source.includes('function applyProofreadAlertBlocks'), 'no deterministic alert conversion helper');
         ackAssert(!source.includes('function applyProofreadPRDescriptionHeadingPrefixes'), 'no deterministic heading conversion helper');
@@ -34127,6 +34220,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
     });
 
+    ackTest('postProcessProofreadMarkdown removes prose double-hyphen separators safely', () => {
+        const input = [
+            'This repeats -- trim it.',
+            'Keep `--connect` and `a -- b` unchanged.',
+            '> Quoted -- text stays exact.',
+            '```bash',
+            'echo before -- after',
+            '```',
+        ].join('\n');
+        const out = postProcessProofreadMarkdown(input);
+        ackAssert(out.includes('This repeats, trim it.'), 'normalizes prose double-hyphen punctuation');
+        ackAssert(out.includes('Keep `--connect` and `a -- b` unchanged.'), 'preserves inline code and flags');
+        ackAssert(out.includes('> Quoted -- text stays exact.'), 'preserves quoted text');
+        ackAssert(out.includes('echo before -- after'), 'preserves fenced code content');
+    });
+
     ackTest('rewriteProofreadCommitDiffUrls preserves commit diff line-range fragments', () => {
         const input =
             'https://github.com/bitcoin/bitcoin/commit/d2716e9e5bcd7029153875b06f4606903d46fd83#diff-cc0c6a9039a1c9fe38b8a21fe28391fffbac9b8531dfda0f658919a9f74b46baL1055-L1085';
@@ -34160,7 +34269,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
         ackAssert(fn.includes('initialUrlRewrite'), 'rewrites commit diff URLs before prompt creation');
-        ackAssert(fn.includes('makePrompt(textForProofread)'), 'sends rewritten text to the proofreader');
+        ackAssert(
+            fn.includes('makePrompt(textForProofread, localProofreadContext)'),
+            'sends rewritten text and surrounding context to the proofreader',
+        );
         ackAssert(
             fn.includes('let strippedOriginal = stripGitHubMeta(textForProofread)'),
             'uses rewritten text as diff baseline',
