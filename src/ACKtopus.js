@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.169
+// @version      1.170
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -554,7 +554,7 @@
     const COMMENT_MENU_TRIGGER_SELECTOR =
         'button[data-testid="comment-header-hamburger"], ' +
         'button[aria-label*="action" i][data-component="IconButton"], ' +
-        'details.details-overlay summary, summary.timeline-comment-action';
+        'summary.timeline-comment-action, .timeline-comment-actions details.details-overlay summary';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
     const COMMENT_MENU_ITEM_SELECTOR = 'button, a, [role="menuitem"], .ActionListContent';
@@ -1067,9 +1067,7 @@
                     '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header',
                 ) ||
                 container;
-            const menuTrigger =
-                header.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR) ||
-                container.querySelector?.(COMMENT_MENU_TRIGGER_SELECTOR);
+            const menuTrigger = findCommentMenuTrigger(header, container);
             const isPRBody =
                 container.matches?.('[data-testid="issue-body"]') ||
                 !!header.querySelector?.('[data-testid="issue-body-header-link"][href*="#issue-"], a[href*="#issue-"]');
@@ -15878,6 +15876,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Prevents accidental clicks on dangerous menu items (e.g. "Report", "Lock").
     const SAFE_MENU_ACTIONS = new Set(['edit', 'delete']);
 
+    function isCommentActionMenuTrigger(trigger) {
+        if (!trigger?.matches?.(COMMENT_MENU_TRIGGER_SELECTOR)) return false;
+        if (
+            trigger.closest?.(
+                '.js-comment-edit-history, .js-reaction-popover-container, .js-all-reactions-popover',
+            )
+        ) {
+            return false;
+        }
+        if (trigger.closest?.('.timeline-comment-actions')) return true;
+        const text = commentMenuItemTextCandidates(trigger).join(' ');
+        return !/\b(?:edited|created)\b|edit history|reaction/i.test(text);
+    }
+
+    function findCommentMenuTrigger(header, container) {
+        const roots = [header, container].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
+        for (const root of roots) {
+            for (const trigger of root.querySelectorAll?.(COMMENT_MENU_TRIGGER_SELECTOR) || []) {
+                if (isCommentActionMenuTrigger(trigger)) return trigger;
+            }
+        }
+        return null;
+    }
+
     function getCommentMenuRoots(trigger, container) {
         const roots = [];
         const push = (el) => {
@@ -16037,7 +16059,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             (e) => {
                 if (_ackTesting) return;
                 const trigger = e.target?.closest?.(COMMENT_MENU_TRIGGER_SELECTOR);
-                if (!trigger) return;
+                if (!isCommentActionMenuTrigger(trigger)) return;
                 const container =
                     trigger.closest(COMMENT_CONTAINER_SELECTOR) || trigger.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
                 if (!container) return;
@@ -16495,10 +16517,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 schedulePostEditRefresh(container);
                 return true;
             }
-            const kebabSelector = COMMENT_MENU_TRIGGER_SELECTOR;
-            kebab =
-                header.querySelector(kebabSelector) ||
-                (!opts.isPRBody ? container.querySelector(kebabSelector) : null);
+            kebab = findCommentMenuTrigger(header, !opts.isPRBody ? container : null);
             if (!kebab) {
                 console.warn('ACKtopus: triggerMenuEdit: kebab not found');
                 const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', {
@@ -16627,13 +16646,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         const lt = ensureAckLifetime('triggerMenuAction');
-        const kebabSelector =
-            'button[data-testid="comment-header-hamburger"], ' +
-            'button[aria-label*="action" i][data-component="IconButton"], ' +
-            'details.details-overlay summary';
         // React UI: kebab is often a sibling of the header, not a descendant.
         // Search header first, then the full container.
-        const kebab = header.querySelector(kebabSelector) || container.querySelector(kebabSelector);
+        const kebab = findCommentMenuTrigger(header, container);
         if (!kebab) return;
         const menu =
             kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
@@ -25617,7 +25632,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'direct edit-form lookup preserves PR-body scope',
         );
         ackAssert(
-            fn.includes('!opts.isPRBody ? container.querySelector(kebabSelector) : null'),
+            fn.includes('findCommentMenuTrigger(header, !opts.isPRBody ? container : null)'),
             'PR-body edit only uses the header menu trigger',
         );
         ackAssert(reqFn.includes('include-fragment'), 'has include-fragment fallback for edit form');
@@ -25642,6 +25657,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#testid'), 'edit'), 'matches data-testid edit token');
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#action-list'), 'edit'), 'matches ActionList label');
         ackAssert(!commentMenuItemMatchesAction(host.querySelector('#edited'), 'edit'), 'does not match edited');
+    });
+
+    ackTest('comment menu trigger ignores edit history dropdowns before the action menu', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="timeline-comment current-user">
+                <div class="timeline-comment-header">
+                    <span class="js-comment-edit-history">
+                        <details class="details-overlay details-reset d-inline-block dropdown">
+                            <summary class="btn-link js-notice">edited</summary>
+                        </details>
+                    </span>
+                    <div class="timeline-comment-actions">
+                        <details class="details-overlay details-reset position-relative d-inline-block">
+                            <summary id="actions" class="timeline-comment-action">Actions</summary>
+                        </details>
+                    </div>
+                </div>
+            </div>
+        `;
+        const container = host.querySelector('.timeline-comment');
+        const header = host.querySelector('.timeline-comment-header');
+        const history = host.querySelector('.js-comment-edit-history summary');
+        const actions = host.querySelector('#actions');
+        ackAssert(!history.matches(COMMENT_MENU_TRIGGER_SELECTOR), 'history summary does not match menu trigger selector');
+        ackAssert(!isCommentActionMenuTrigger(history), 'history summary is rejected defensively');
+        ackEq(findCommentMenuTrigger(header, container), actions, 'finds the real action menu after edit history');
     });
 
     ackTest('getEditFormRequest derives review-comment edit_form URL from React r-id containers', () => {
@@ -36470,8 +36512,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('function triggerMenuAction'),
             _ackSource.indexOf('function makeStickyEditToolbar'),
         );
-        ackAssert(fn.includes('container.querySelector(kebabSelector)'), 'searches container for kebab button');
-        ackAssert(fn.includes('header.querySelector(kebabSelector)'), 'searches header first');
+        ackAssert(fn.includes('findCommentMenuTrigger(header, container)'), 'searches header and container for kebab');
     });
 
     ackTest('attribute observer watches class/open/data-resolved for edit state changes', () => {
@@ -37194,7 +37235,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const broadSel =
             '[data-testid*="hamburger" i], [data-testid*="kebab" i], ' +
             'button[aria-haspopup="menu"], button[aria-expanded][data-component="IconButton"], ' +
-            'summary.timeline-comment-action, details.details-overlay summary';
+            'summary.timeline-comment-action, .timeline-comment-actions details.details-overlay summary';
         for (const c of containers) {
             const header = c.querySelector('[data-morpheus-enabled], [class*="__activityHeader"]') || c;
             if (header.querySelector(COMMENT_MENU_TRIGGER_SELECTOR)) found++;
