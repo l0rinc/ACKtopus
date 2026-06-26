@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.171
+// @version      1.172
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16242,11 +16242,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'include-fragment.previewable-comment-form,' +
             'include-fragment[src*="/edit_form"]';
         const localEditFragments = [];
+        const targetEditFragments = [];
         const pushLocalFragment = (frag) => {
             const src = frag?.getAttribute?.('src') || '';
             if (!frag || !src || localEditFragments.some((item) => item.frag === frag)) return;
             localEditFragments.push({ frag, src });
         };
+        const pushTargetFragment = (frag) => {
+            const src = frag?.getAttribute?.('src') || '';
+            if (!frag || !src || targetEditFragments.some((item) => item.frag === frag)) return;
+            targetEditFragments.push({ frag, src });
+        };
+        container.querySelectorAll?.(fragSelector)?.forEach(pushTargetFragment);
         for (const root of roots) {
             root.querySelectorAll?.(fragSelector)?.forEach(pushLocalFragment);
         }
@@ -16388,6 +16395,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (localEditFragments.length === 1) {
             const { frag } = localEditFragments[0];
+            return { frag, url: fragmentHref(frag), roots };
+        }
+        if (targetEditFragments.length === 1) {
+            const { frag } = targetEditFragments[0];
             return { frag, url: fragmentHref(frag), roots };
         }
 
@@ -28873,7 +28884,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function runProofreadOnComment'),
-            source.indexOf('const cleanResult'),
+            source.indexOf('// --- Start a review ---'),
         );
         ackAssert(fn.includes('buildSurroundingProofreadContext'), 'has surrounding-context helper');
         ackAssert(fn.includes('Text before selection'), 'includes text before selected proofread range');
@@ -28934,7 +28945,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('.body'), 'extracts PR description');
     });
 
-    ackTest('PR context cache is invalidated on force push, navigation, and proofread submit', () => {
+    ackTest('PR context cache is invalidated on force push, PR change, and proofread submit', () => {
         const source = _ackSource;
         // Force push detection - look at the specific inject section
         const injectSection = sourceSection(
@@ -28950,11 +28961,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(injectSection.includes('lightbulbAutoOpenKey'), 'auto-open lightbulb flags cleared on force push');
         // PR navigation teardown
         const teardown = source.slice(
-            source.indexOf('prKey !== lastInjectedPR || location.pathname !== lastInjectedPath'),
+            source.indexOf('const prChanged = prKey !== lastInjectedPR'),
             source.indexOf('lastInjectedPR = prKey'),
         );
-        ackAssert(teardown.includes('invalidatePRContext'), 'invalidated on PR navigation');
-        ackAssert(teardown.includes('lastInjectedPath'), 'same-PR page changes also trigger teardown');
+        ackAssert(teardown.includes('if (prChanged || location.pathname !== lastInjectedPath)'), 'PR/path changes trigger teardown');
+        ackAssert(teardown.includes('if (prChanged)'), 'cache invalidation is scoped to PR changes');
+        ackAssert(teardown.includes('invalidatePRContext'), 'invalidated when PR changes');
+        ackAssert(teardown.includes('lastInjectedPath'), 'same-PR page changes still rebuild toolbar state');
         // Native edit save paths after proofreading or manual edits.
         const editSaveSection = sourceSection(
             source,
@@ -36094,15 +36107,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(sourceIncludesLoose(fn, ".closest('button')).filter(Boolean)"), 'filters null after closest()');
     });
 
-    ackTest('commitListCache is cleared on PR navigation teardown', () => {
+    ackTest('commitListCache is cleared on PR-key teardown', () => {
         const source = _ackSource;
-        const startIdx = source.indexOf('if (prKey !== lastInjectedPR || location.pathname !== lastInjectedPath)');
+        const startIdx = source.indexOf('const prChanged = prKey !== lastInjectedPR');
         ackAssert(startIdx >= 0, 'found navigation teardown block');
         const endIdx = source.indexOf('inject();', startIdx);
         ackAssert(endIdx > startIdx, 'found inject() after teardown block');
         const teardown = source.slice(startIdx, endIdx);
-        ackAssert(teardown.includes('commitListCache.clear()'), 'clears commit cache on navigation');
-        ackAssert(teardown.includes('clearCommitPatchCache()'), 'clears commit patch cache on navigation');
+        ackAssert(teardown.includes('if (prChanged)'), 'clears expensive caches only when the PR key changes');
+        ackAssert(teardown.includes('commitListCache.clear()'), 'clears commit cache when the PR key changes');
+        ackAssert(teardown.includes('clearCommitPatchCache()'), 'clears commit patch cache when the PR key changes');
         ackAssert(teardown.includes('invalidatePRContext()'), 'invalidates PR context');
         ackAssert(teardown.includes('prFileCategories = null'), 'clears file categories');
         ackAssert(
@@ -37305,14 +37319,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!isPRPage(location.pathname)) return;
         // When running the test suite, observers are disabled and GitHub may still be hydrating
         // fragments in the background. Ensure the pass runs at least once.
-        // autoOpenReactionPopup marks triggers (details or button) with data-ack-reaction-hover
-        const smileys = document.querySelectorAll('.octicon-smiley');
-        if (smileys.length === 0) return; // no reactions section, skip
+        // autoOpenReactionPopup marks add-reaction triggers (details or button) with
+        // data-ack-reaction-hover. Existing reaction buttons may also contain smiley
+        // icons and are intentionally ignored.
+        const isExistingReactionButton = (el) => {
+            if (!el) return false;
+            if (el.hasAttribute?.('data-reaction-content')) return true;
+            if (el.classList?.contains?.('js-reaction-group-button')) return true;
+            if (
+                el.tagName === 'BUTTON' &&
+                el.querySelector?.(':scope > g-emoji, :scope > .emoji, :scope > * > g-emoji, :scope > * > .emoji')
+            ) {
+                return true;
+            }
+            const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+            return /\breacted with\b|\byou reacted\b|\busers? reacted\b|\bpeople reacted\b/.test(aria);
+        };
+        const triggerSet = new Set();
+        qsa(
+            document,
+            'details.js-reaction-popover-container, details.new-reactions-dropdown, details.js-comment-header-reaction-button',
+        ).forEach((el) => triggerSet.add(el));
+        qsa(document, 'summary[aria-label*="reaction" i], summary[aria-label*="react" i]').forEach((summary) => {
+            const details = summary.closest('details');
+            if (details) triggerSet.add(details);
+        });
+        qsa(document, 'button[aria-label*="reaction" i], button[aria-label*="react" i], .octicon-smiley').forEach(
+            (el) => {
+                const trigger = el.closest('button, summary');
+                if (!trigger) return;
+                triggerSet.add(trigger.closest('details') || trigger);
+            },
+        );
+        const addReactionTriggers = [...triggerSet].filter(
+            (el) => !isExistingReactionButton(el) && !isOwnReactionTrigger(el),
+        );
+        if (addReactionTriggers.length === 0) return; // no add-reaction trigger on this page state, skip
         autoOpenReactionPopup(document);
-        const processed = document.querySelectorAll('[data-ack-reaction-hover]');
+        const processed = addReactionTriggers.filter((el) => el.dataset.ackReactionHover);
         ackAssert(
             processed.length > 0,
-            `${smileys.length} smiley icons found but 0 elements have [data-ack-reaction-hover] — autoOpenReactionPopup may not have run`,
+            `${addReactionTriggers.length} add-reaction trigger(s) found but 0 have [data-ack-reaction-hover] - autoOpenReactionPopup may not have run`,
         );
     });
 
