@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.173
+// @version      1.174
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -106,8 +106,7 @@
     }
 
     // Post-proofread processing is intentionally limited to mechanical URL
-    // preservation and punctuation cleanup that is safe outside inline code.
-    // Broader prose/style markdown changes belong in the LLM prompt.
+    // preservation and details spacing. Prose/style changes belong in the LLM prompt.
 
     const GITHUB_COMMIT_DIFF_LINE_URL_RE =
         /\bhttps:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-fA-F]{40})(#diff-[A-Za-z0-9]+L\d+-L\d+)\b/g;
@@ -121,38 +120,52 @@
         return { text: out, count };
     }
 
-    function normalizeProofreadDoubleHyphenPunctuation(text) {
-        const normalizeProseChunk = (chunk) => String(chunk || '').replace(/[ \t]+--[ \t]+/g, ', ');
-        const immutableLineRe =
-            /^(>|_Originally posted by |<!--|<\/?details|<\/?summary|\[!\[|<img |https?:\/\/\S+$|_.*https:\/\/github\.com\/.*_$)/;
+    function normalizeProofreadDetailsSpacing(text) {
+        const fences = [];
+        const lines = String(text || '').split('\n');
+        const protectedLines = [];
         let inFence = false;
         let fenceMarker = '';
-        return String(text || '')
-            .split('\n')
-            .map((line) => {
-                const trimmed = line.trimStart();
-                const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
-                if (inFence) {
-                    if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
-                        inFence = false;
-                        fenceMarker = '';
-                    }
-                    return line;
+        let fenceLines = [];
+        const pushFence = () => {
+            const token = `\uE000ACK_FENCE_${fences.length}\uE000`;
+            fences.push(fenceLines.join('\n'));
+            protectedLines.push(token);
+            fenceLines = [];
+        };
+        for (const line of lines) {
+            const trimmed = line.trimStart();
+            if (inFence) {
+                fenceLines.push(line);
+                if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
+                    inFence = false;
+                    fenceMarker = '';
+                    pushFence();
                 }
-                if (fenceMatch) {
-                    inFence = true;
-                    fenceMarker = fenceMatch[1];
-                    return line;
-                }
-                if (immutableLineRe.test(trimmed)) return line;
-                const parts = String(line).split(/(`+[^`]*`+)/g);
-                return parts.map((part, i) => (i % 2 ? part : normalizeProseChunk(part))).join('');
-            })
-            .join('\n');
+                continue;
+            }
+            const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+            if (fenceMatch) {
+                inFence = true;
+                fenceMarker = fenceMatch[1];
+                fenceLines = [line];
+                continue;
+            }
+            protectedLines.push(line);
+        }
+        if (inFence) pushFence();
+        let normalized = protectedLines
+            .join('\n')
+            .replace(/(<summary\b[^>]*>[\s\S]*?<\/summary>)[ \t]*(?:\r?\n[ \t]*)*/gi, '$1\n\n')
+            .replace(/\n[ \t]*\n[ \t]*(<\/details>)/gi, '\n$1');
+        fences.forEach((fence, i) => {
+            normalized = normalized.split(`\uE000ACK_FENCE_${i}\uE000`).join(fence);
+        });
+        return normalized;
     }
 
     function postProcessProofreadMarkdown(text) {
-        return normalizeProofreadDoubleHyphenPunctuation(rewriteProofreadCommitDiffUrls(String(text || '')).text);
+        return normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls(String(text || '')).text);
     }
 
     function cleanPlainProofreadResult(raw) {
@@ -3533,42 +3546,6 @@
         window.open(url, '_blank', 'noopener');
     }
 
-    function shouldOfferRepoMirrorForSlowPage() {
-        if (!isPRPage() || !repoMirrorUrlForPath()) return false;
-        if (isHeavyPRForMirror()) return true;
-        if (document.readyState !== 'complete') return true;
-        if (getHiddenActionCount() > 0 || getCollapsedResolved().length > 0 || getCollapsedSectionCount() > 0) return true;
-        return !!document.querySelector(
-            'include-fragment:not([data-loaded]), [data-testid*="load-more"], .js-diff-load-container, .js-diff-progressive-loader',
-        );
-    }
-
-    function scheduleRepoMirrorSlowPageHint(wrapper) {
-        if (!isPRPage() || !repoMirrorUrlForPath()) return;
-        const key = `ack_repo_mirror_hint:${location.pathname}`;
-        ackSetTimeout(() => {
-            if (!wrapper.isConnected || !shouldOfferRepoMirrorForSlowPage()) return;
-            try {
-                if (sessionStorage.getItem(key)) return;
-                sessionStorage.setItem(key, '1');
-            } catch (_) {}
-            const mirrorUrl = repoMirrorUrlForPath();
-            if (!mirrorUrl) return;
-            const popup = makeStatusPopup('');
-            popup.textContent = '';
-            const msg = document.createElement('div');
-            msg.textContent = 'GitHub still looks heavy. Open the configured mirror?';
-            msg.style.marginBottom = '8px';
-            const actions = document.createElement('div');
-            Object.assign(actions.style, { display: 'flex', gap: '6px', justifyContent: 'flex-end' });
-            const openBtn = createBtn('🪞 Open mirror', () => openRepoMirror(), mirrorUrl);
-            const closeBtn = createBtn('Dismiss', () => popup.remove(), 'Hide this mirror hint');
-            openBtn.style.padding = closeBtn.style.padding = '3px 8px';
-            actions.append(openBtn, closeBtn);
-            popup.append(msg, actions);
-        }, 8000);
-    }
-
     function repositoryMetaValue(name, root = document) {
         const doc = root?.ownerDocument || document;
         const roots = root === doc ? [doc] : [root, doc];
@@ -4230,7 +4207,7 @@
     // --- LLM Config & Analysis ---
 
     const LLM_MODELS = {
-        claude: 'claude-sonnet-4-6',
+        claude: 'claude-sonnet-5',
         claude_high_context: 'claude-opus-4-8',
         openai: 'gpt-5.5',
         gemini: 'gemini-3.5-flash',
@@ -4719,13 +4696,14 @@ Prefer collaborative phrasing over adversarial second-person. When the original 
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
 Do not change technical meaning unless it is factually incorrect.
 Do not change quoted text (lines starting with >) in any way. Those are someone else's words, so copy them verbatim.
-Do not change code blocks, inline code, links, or formatting unless it is clearly broken.
-Preserve existing blank lines and structural separators. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.
-Blank lines after blockquotes are semantic in GitHub Markdown. Preserve them so following prose does not become part of the quote.
+Do not change inline code, links, or code tokens unless they are clearly broken. A generic collapsible summary is a clarity issue, so changing only the summary text is allowed when the section content supports a better label.
+Preserve existing blank lines and structural separators, except for collapsible details spacing. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.
+Blank lines after blockquotes are semantic in GitHub Markdown. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote.
 Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or bare double hyphen punctuation. Do not introduce or preserve a bare double hyphen as prose punctuation, and do not mention this punctuation rule in the output. Preserve command-line flags such as \`--connect\`, quoted text, links, and code.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
-When a collapsible section uses a generic summary (for example "Details"), make it more specific only when the content clearly supports it.
-When a fenced code block has no language (or only a generic one like text/plain), add a language tag only when the language is obvious.
+When a collapsible section uses a generic summary (for example "Details"), replace it with a short, specific summary when the content clearly supports one. Preserve the <details><summary> and </summary> tags; change only the summary text. For benchmark or test output, prefer a result-based summary such as "aarch64 RPi5 SSD: 1024 MiB 1.5% faster".
+For fenced code blocks, check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.
+Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.
 Return only the corrected text. If nothing needs fixing, return the original text unchanged.`,
     };
 
@@ -5317,7 +5295,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         panel.appendChild(mirrorInput);
         const mirrorHelp = document.createElement('div');
-        mirrorHelp.textContent = 'Used by the toolbar mirror button and the slow-page mirror hint.';
+        mirrorHelp.textContent = 'Used by the toolbar mirror button.';
         Object.assign(mirrorHelp.style, { fontSize: '11px', color: '#8b949e', marginTop: '3px' });
         panel.appendChild(mirrorHelp);
 
@@ -10676,6 +10654,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         return new Promise((resolve) => {
             const mount = opts.mount && document.body.contains(opts.mount) ? opts.mount : document.body;
+            const pageScrollX = window.scrollX ?? window.pageXOffset ?? 0;
+            const pageScrollY = window.scrollY ?? window.pageYOffset ?? 0;
             const overlay = document.createElement('div');
             overlay.className = 'ack-diff-dialog-overlay';
             overlay.tabIndex = -1;
@@ -10751,6 +10731,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             let navIndex = -1;
             let navPrevBtn = null;
             let navNextBtn = null;
+
+            const restorePageScroll = () => {
+                const currentX = window.scrollX ?? window.pageXOffset ?? 0;
+                const currentY = window.scrollY ?? window.pageYOffset ?? 0;
+                if (currentX === pageScrollX && currentY === pageScrollY) return;
+                try {
+                    window.scrollTo(pageScrollX, pageScrollY);
+                } catch (_) {}
+            };
+
+            const focusDialogAtTop = () => {
+                dialog.scrollTop = 0;
+                dialog.focus({ preventScroll: true });
+                restorePageScroll();
+                ackRaf(() => {
+                    if (!overlay.isConnected) return;
+                    if (navIndex < 0) dialog.scrollTop = 0;
+                    restorePageScroll();
+                });
+            };
 
             let settled = false;
             const settle = (action, text) => {
@@ -11115,7 +11115,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             setMode(activeMode);
 
             const btnRow = document.createElement('div');
-            Object.assign(btnRow.style, { marginTop: '14px', display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+            Object.assign(btnRow.style, {
+                marginTop: '14px',
+                display: 'flex',
+                gap: '8px',
+                justifyContent: 'flex-end',
+                position: 'sticky',
+                bottom: '0',
+                zIndex: '1',
+                background: '#161b22',
+                borderTop: '1px solid #30363d',
+                paddingTop: '12px',
+            });
 
             if (readOnly) {
                 const closeBtn = document.createElement('button');
@@ -11147,8 +11158,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                 });
                 mount.appendChild(overlay);
-                dialog.focus({ preventScroll: true });
-                scrollDiffNav(1);
+                focusDialogAtTop();
                 return;
             }
 
@@ -11197,8 +11207,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             });
             mount.appendChild(overlay);
-            dialog.focus({ preventScroll: true });
-            scrollDiffNav(1);
+            focusDialogAtTop();
         });
     }
 
@@ -11354,11 +11363,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             // Protect lines the LLM must never alter: quotes, cross-references,
             // HTML comments, image tags, raw URLs. Split text into alternating
-            // immutable/mutable segments. Only mutable segments are sent to the LLM
-            // inside numbered XML tags; immutable lines are never seen by the LLM
-            // and are spliced back in during reassembly.
+            // immutable/mutable segments. Generic collapsible summaries stay mutable
+            // so proofreading can replace "Details" with a specific label.
             const IMMUTABLE_LINE_RE =
                 /^(>|_Originally posted by |<!--|<\/?details|<\/?summary|\[!\[|<img |https?:\/\/\S+$|_.*https:\/\/github\.com\/.*_$)/;
+            const GENERIC_DETAILS_SUMMARY_TEXT_RE = /^(details?|summary|more|more details)$/i;
+            const isGenericDetailsSummaryLine = (line) => {
+                const summary = line.match(/^<summary>\s*([^<]+?)\s*<\/summary>$/i);
+                if (summary) return GENERIC_DETAILS_SUMMARY_TEXT_RE.test(summary[1].trim());
+                const inline = line.match(/^<details\b[^>]*>\s*<summary>\s*([^<]+?)\s*<\/summary>\s*$/i);
+                return !!inline && GENERIC_DETAILS_SUMMARY_TEXT_RE.test(inline[1].trim());
+            };
             const FENCE_RE = /^(`{3,}|~{3,})/;
 
             // Returns { segments, toXML(), fromXML(response) }
@@ -11370,29 +11385,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 let fenceMarker = '';
                 for (const line of lines) {
                     const trimmed = line.trimStart();
-                    // Keep fenced code *content* immutable. Fence opener stays mutable so
-                    // the LLM can label code fences (e.g. ```cpp) without static guessing.
-                    let isFenceOpenLine = false;
+                    // Keep fenced code blocks mutable so the LLM can adjust language
+                    // hints and whitespace-only formatting. The prompt forbids code-token
+                    // changes.
                     if (!inFence) {
                         const fm = trimmed.match(FENCE_RE);
                         if (fm) {
                             inFence = true;
                             fenceMarker = fm[1];
-                            isFenceOpenLine = true;
                         }
                     } else if (trimmed.startsWith(fenceMarker) && trimmed.slice(fenceMarker.length).trim() === '') {
-                        // Closing fence: this line is immutable
                         const last = segments[segments.length - 1];
-                        if (last && last.type === 'immutable') {
-                            last.lines.push(line);
-                        } else {
-                            segments.push({ type: 'immutable', lines: [line] });
-                        }
+                        if (last && last.type === 'mutable') last.lines.push(line);
+                        else segments.push({ type: 'mutable', lines: [line] });
                         inFence = false;
                         fenceMarker = '';
                         continue;
                     }
-                    const immutable = (inFence && !isFenceOpenLine) || IMMUTABLE_LINE_RE.test(trimmed);
+                    const immutable =
+                        !inFence && IMMUTABLE_LINE_RE.test(trimmed) && !isGenericDetailsSummaryLine(trimmed);
                     const type = immutable ? 'immutable' : 'mutable';
                     const last = segments[segments.length - 1];
                     if (last && last.type === type) {
@@ -11483,11 +11494,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     };
                 const headingNormalizationRule =
                     '- Heading compaction is a required proofreading style change, not optional cleanup. For GitHub comments and PR descriptions, replace Markdown headings (any line that starts with one or more # characters) or standalone label lines with compact inline bold prefixes whenever the result remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. Do not leave a Markdown heading unchanged merely because its words are grammatical. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. If several paragraphs or later bullets follow, fold only the first normal prose block onto the prefix line and keep the rest below. Later block content does not prevent compaction. If the first following content is a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line. Never leave a bold prefix alone on a line when normal prose follows.';
+                const fenceLanguageRule =
+                    '- For fenced code blocks: check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.';
+                const fenceFormattingRule =
+                    '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
                 const prDescriptionRule = isPRBody
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, or removing duplicated wording. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators. Blank lines after blockquotes are semantic in GitHub Markdown; preserve them so following prose does not become part of the quote. Do not add empty lines around fenced code blocks, HTML tags, or collapsible details blocks.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, or removing duplicated wording. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -18125,7 +18140,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (!hasSelection) {
             // Insert empty template at cursor with fenced code block
-            const template = `\n<details><summary>${summaryLabel}</summary>\n\n\`\`\`bash\n\n\`\`\`\n\n</details>\n`;
+            const template = `\n<details><summary>${summaryLabel}</summary>\n\n\`\`\`bash\n\n\`\`\`\n</details>`;
             const fence = '```bash\n';
             const cursorPos = start + template.indexOf(fence) + fence.length; // start of the empty line inside the code block
             setTextareaValue(ta, text.slice(0, start) + template + text.slice(end));
@@ -18139,8 +18154,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const inner = '```\n' + selected + '\n```';
 
-        // Blank lines around <details> are required for GitHub rendering
-        const wrapped = `\n<details><summary>${summaryLabel}</summary>\n\n${inner}\n\n</details>\n`;
+        // Keep a blank line before the fenced content for GitHub rendering.
+        const wrapped = `\n<details><summary>${summaryLabel}</summary>\n\n${inner}\n</details>`;
         setTextareaValue(ta, text.slice(0, start) + wrapped + text.slice(end));
 
         // Reselect the summary label so it is easy to rename immediately.
@@ -19894,7 +19909,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, blank lines, and indentation. If the selection is code, do not rewrite it; only fix obvious typos inside comments/strings if present. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
+                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, blank lines, and indentation. Preserve the blank line between a Markdown blockquote (`> ...`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -21573,7 +21588,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         toolbar.style.cursor = 'pointer';
         toolbar.title = 'Click background to toggle compact mode';
 
-        scheduleRepoMirrorSlowPageHint(wrapper);
         try {
             if (sessionStorage.getItem('ack_reopen_robot_panel') === '1') {
                 sessionStorage.removeItem('ack_reopen_robot_panel');
@@ -23348,8 +23362,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
     });
 
-    ackTest('LLM_MODELS.claude is claude-sonnet-4-6', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+    ackTest('LLM_MODELS.claude is claude-sonnet-5', () => {
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-5');
     });
 
     ackTest('LLM_MODELS.claude_high_context is claude-opus-4-8', () => {
@@ -24724,6 +24738,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("d.type === 'add'") && fn.includes("d.type === 'del'"), 'side panes color only their own changed text');
         ackAssert(fn.includes("window.addEventListener('keydown', onDialogKeydown, true)"), 'captures dialog shortcuts before page handlers');
         ackAssert(fn.includes("dialog.focus({ preventScroll: true })"), 'focuses the diff dialog while open');
+        ackAssert(fn.includes('restorePageScroll'), 'restores page scroll after opening the diff dialog');
+        ackAssert(fn.includes("position: 'sticky'") && fn.includes("bottom: '0'"), 'keeps the action row visible while scrolling');
         ackAssert(fn.includes('opts.mount'), 'can mount inside a native GitHub dialog');
         ackAssert(fn.includes("dialog.addEventListener(eventName, stopDialogEvent)"), 'stops diff dialog clicks from bubbling');
         ackAssert(fn.includes('ack-diff-nav-prev'), 'has previous-diff navigation button');
@@ -24795,8 +24811,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const nextDiffBtn = overlay.querySelector('.ack-diff-nav-next');
             ackAssert(prevDiffBtn && nextDiffBtn, 'diff navigation buttons are shown');
             ackAssert(
-                overlay.querySelector('[data-ack-diff-nav-active="1"]'),
-                'diff dialog opens at the first changed section',
+                !overlay.querySelector('[data-ack-diff-nav-active="1"]'),
+                'diff dialog opens without jumping to a changed section',
             );
             nextDiffBtn.click();
             ackAssert(overlay.querySelector('[data-ack-diff-nav-active="1"]'), 'next diff button selects a changed section');
@@ -25002,25 +25018,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('corrected[s.index]'), 'uses corrected content for mutable segments');
     });
 
-    ackTest('proofread prompt handles blank-line preservation without deterministic normalization', () => {
+    ackTest('proofread prompt preserves semantic blank lines and normalizes details spacing', () => {
         const promptSection = _ackSource.slice(_ackSource.indexOf('proofread: `'), _ackSource.indexOf('CONFIG_INSTRUCTION_DEFS'));
         const makePromptSection = _ackSource.slice(_ackSource.indexOf('const makePrompt'), _ackSource.indexOf('const cleanResult'));
         ackAssert(
-            promptSection.includes('Do not add empty lines around fenced code blocks'),
-            'default prompt forbids extra empty lines around protected blocks',
+            promptSection.includes('For <details> blocks, use exactly one blank line after the <summary> line'),
+            'default prompt normalizes details summary spacing',
         );
         ackAssert(
-            makePromptSection.includes('Do not add empty lines around fenced code blocks'),
-            'XML prompt forbids extra empty lines around protected blocks',
+            makePromptSection.includes('For <details> blocks, use exactly one blank line after the <summary> line'),
+            'XML prompt normalizes details summary spacing',
         );
+        ackAssert(promptSection.includes('no blank line before </details>'), 'default prompt trims spacing before </details>');
+        ackAssert(makePromptSection.includes('no blank line before </details>'), 'XML prompt trims spacing before </details>');
         ackAssert(
             promptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown'),
             'default prompt preserves blockquote separators',
         );
         ackAssert(
+            promptSection.includes('following reply so GitHub does not render the reply as part of the quote'),
+            'default prompt explains why blockquote reply separators are semantic',
+        );
+        ackAssert(
             makePromptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown') ||
                 makePromptSection.includes('Blank lines after blockquotes are semantic in GitHub Markdown; preserve them'),
             'XML prompt preserves blockquote separators',
+        );
+        ackAssert(
+            makePromptSection.includes('following reply so GitHub does not render the reply as part of the quote'),
+            'XML prompt explains why blockquote reply separators are semantic',
         );
         ackAssert(
             _ackSource.includes('unwrapProofreadXmlSectionContent(m[1])'),
@@ -25030,8 +25056,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             !_ackSource.includes('new RegExp(`<s${i}>\\\\s*([\\\\s\\\\S]*?)\\\\s*<\\\\/s${i}>`'),
             'XML section parsing does not greedily trim semantic whitespace',
         );
-        ackAssert(!_ackSource.includes('function normalizeProofreadMutableSegment'), 'no deterministic blank-line normalizer');
-        ackAssert(!makePromptSection.includes('normalizeProofreadMutableSegment'), 'fromXML does not normalize LLM output');
+        ackAssert(_ackSource.includes('function normalizeProofreadDetailsSpacing'), 'details spacing has a deterministic normalizer');
+        ackAssert(
+            _ackSource.includes('normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls'),
+            'postprocess normalizes details spacing after URL preservation',
+        );
     });
 
     ackTest('proofread falls back when LLM omits <sN> tags', () => {
@@ -30537,6 +30566,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('accidental duplicate'), 'selection proofread removes duplicate wording');
         ackAssert(fn.includes('bare double-hyphen punctuation'), 'selection proofread avoids double-hyphen punctuation');
         ackAssert(
+            fn.includes('following reply so GitHub does not render the reply as part of the quote'),
+            'selection proofread preserves blockquote reply separators',
+        );
+        ackAssert(fn.includes('useful GitHub highlighting'), 'selection proofread checks fenced code highlighting hints');
+        ackAssert(
+            fn.includes('the hint does not have to be the exact real language'),
+            'selection proofread optimizes fence hints for useful coloring',
+        );
+        ackAssert(fn.includes('Do not choose boring ```text'), 'selection proofread avoids text for runnable shell');
+        ackAssert(fn.includes('keep or choose ```bash or ```sh'), 'selection proofread prefers shell fence hints');
+        ackAssert(fn.includes('whitespace-only edits'), 'selection proofread allows whitespace-only fenced code formatting');
+        ackAssert(
+            fn.includes('Long single-line shell commands should usually be split'),
+            'selection proofread asks to reflow ugly long shell commands',
+        );
+        ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
+        ackAssert(
             !fn.includes('showDiffDialog(ctx.text, out)'),
             'selection proofread no longer opens modal diff dialog',
         );
@@ -31575,6 +31621,67 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(makePromptSection.includes('Use surrounding context'), 'RULES block uses surrounding context');
         ackAssert(makePromptSection.includes('removing duplicated wording'), 'RULES block allows de-duplication');
         ackAssert(makePromptSection.includes('<output>...</output>'), 'wraps output in <output> tags');
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('result-based summary'),
+            'DEFAULT_INSTRUCTIONS.proofread asks for useful collapsible summaries',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('change only the summary text'),
+            'DEFAULT_INSTRUCTIONS.proofread preserves details tags while improving summaries',
+        );
+        ackAssert(
+            makePromptSection.includes('For generic collapsible summaries'),
+            'inline proofread rules cover generic details summaries',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('useful GitHub highlighting'),
+            'DEFAULT_INSTRUCTIONS.proofread checks fenced code language hints',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('best practical coloring'),
+            'DEFAULT_INSTRUCTIONS.proofread optimizes fence hints for GitHub coloring',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Do not choose boring ```text for runnable shell scripts'),
+            'DEFAULT_INSTRUCTIONS.proofread does not downgrade runnable shell to text',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('keep or choose ```bash or ```sh'),
+            'DEFAULT_INSTRUCTIONS.proofread prefers shell highlighting for runnable shell blocks',
+        );
+        ackAssert(
+            makePromptSection.includes('fenceLanguageRule'),
+            'inline proofread rules include fenced code language hint guidance',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('whitespace-only edits'),
+            'DEFAULT_INSTRUCTIONS.proofread allows whitespace-only fenced code formatting',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Long single-line shell commands should usually be split'),
+            'DEFAULT_INSTRUCTIONS.proofread asks to reflow ugly long shell commands',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Do not change tokens'),
+            'DEFAULT_INSTRUCTIONS.proofread forbids code-token changes during formatting',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('following reply so GitHub does not render the reply as part of the quote'),
+            'DEFAULT_INSTRUCTIONS.proofread preserves blockquote reply separators',
+        );
+        ackAssert(
+            makePromptSection.includes('fenceFormattingRule'),
+            'inline proofread rules include fenced code whitespace formatting guidance',
+        );
+        const proofreadSection = source.slice(
+            source.indexOf('async function runProofreadOnComment'),
+            source.indexOf('// --- Start a review ---'),
+        );
+        ackAssert(proofreadSection.includes('isGenericDetailsSummaryLine'), 'generic details summaries are mutable');
+        ackAssert(
+            proofreadSection.includes('GENERIC_DETAILS_SUMMARY_TEXT_RE'),
+            'generic details summary text is detected explicitly',
+        );
         // Strips GitHub metadata before proofreading
         ackAssert(source.includes('stripGitHubMeta'), 'strips GitHub metadata footer');
         ackAssert(source.includes('_Originally posted by'), 'matches cross-post footer');
@@ -31597,7 +31704,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('!hasSelection'), 'checks for no selection');
         ackAssert(fn.includes("const summaryLabel = 'Details';"), 'defines default details summary label');
         ackAssert(fn.includes('<details><summary>${summaryLabel}</summary>'), 'inserts details template');
+        ackAssert(fn.includes('</summary>\\n\\n'), 'template leaves a blank line before the opening code fence');
         ackAssert(fn.includes("const fence = '```bash\\n'"), 'template includes empty bash code block');
+        ackAssert(!fn.includes('\\n\\n</details>'), 'template has no blank line before closing details');
+        ackAssert(!fn.includes('</details>\\n`'), 'template has no trailing newline after closing details');
         ackAssert(fn.includes('ta.selectionStart = ta.selectionEnd = cursorPos'), 'positions cursor inside code block');
     });
 
@@ -34601,15 +34711,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('detectCodeLang'), 'no language detection - proofreader adds hints');
     });
 
-    ackTest('wrapSelectionInDetails ensures blank lines around details tags', () => {
+    ackTest('wrapSelectionInDetails keeps blank lines before fenced content only', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function wrapSelectionInDetails'),
             source.indexOf('// --- Commit Explain'),
         );
-        // Template and wrapped output should have \n before <details> and after </details>
+        // Template and wrapped output should have a newline before <details>
+        // and a blank line before the fenced content, but no padding at the end.
         ackAssert(fn.includes('`\\n<details><summary>${summaryLabel}</summary>'), 'newline before <details>');
-        ackAssert(fn.includes('</details>\\n`'), 'newline after </details>');
+        ackAssert(fn.includes('</summary>\\n\\n'), 'blank line before fenced content');
+        ackAssert(!fn.includes('\\n\\n</details>'), 'no blank line before </details>');
+        ackAssert(!fn.includes('</details>\\n`'), 'no newline after </details>');
     });
 
     ackTest('wrapSelectionInDetails reselects summary label after wrapping', () => {
@@ -34644,7 +34757,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('not a fixed list of heading names'), 'prompt covers generic markdown heading compaction');
         ackAssert(
             source.includes('postProcessProofreadMarkdown(parsed.fromXML'),
-            'only safe URL/punctuation post-processing is applied to proofread results',
+            'only safe URL/details-spacing post-processing is applied to proofread results',
         );
         ackAssert(!source.includes('function applyProofreadAlertBlocks'), 'no deterministic alert conversion helper');
         ackAssert(!source.includes('function applyProofreadPRDescriptionHeadingPrefixes'), 'no deterministic heading conversion helper');
@@ -34676,32 +34789,55 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(out, input);
     });
 
-    ackTest('postProcessProofreadMarkdown leaves details summaries unchanged', () => {
+    ackTest('postProcessProofreadMarkdown normalizes details spacing without rewriting summaries', () => {
         const input = '<details><summary>Details</summary>\n\n```bash\ngit status\n```\n\n</details>';
         const out = postProcessProofreadMarkdown(input);
+        ackEq(out, '<details><summary>Details</summary>\n\n```bash\ngit status\n```\n</details>');
         ackAssert(out.includes('<summary>Details</summary>'), 'does not rewrite details summary labels locally');
     });
 
-    ackTest('postProcessProofreadMarkdown keeps specific details summary unchanged', () => {
+    ackTest('postProcessProofreadMarkdown keeps specific details summary unchanged while fixing spacing', () => {
         const input = '<details><summary>Benchmark setup</summary>\n\n`bench_bitcoin`\n\n</details>';
         const out = postProcessProofreadMarkdown(input);
+        ackEq(out, '<details><summary>Benchmark setup</summary>\n\n`bench_bitcoin`\n</details>');
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
     });
 
-    ackTest('postProcessProofreadMarkdown removes prose double-hyphen separators safely', () => {
+    ackTest('postProcessProofreadMarkdown does not normalize details-looking text inside fences', () => {
+        const input = [
+            '```html',
+            '<details><summary>Details</summary>',
+            '',
+            '</details>',
+            '```',
+            '',
+            '<details><summary>Details</summary>',
+            '',
+            'body',
+            '',
+            '</details>',
+        ].join('\n');
+        const out = postProcessProofreadMarkdown(input);
+        ackAssert(out.includes('<summary>Details</summary>\n\n</details>\n```'), 'leaves fenced details-looking text alone');
+        ackAssert(out.endsWith('<details><summary>Details</summary>\n\nbody\n</details>'), 'normalizes real details block');
+    });
+
+    ackTest('postProcessProofreadMarkdown leaves promptable prose punctuation to the LLM', () => {
         const input = [
             'This repeats -- trim it.',
             'Keep `--connect` and `a -- b` unchanged.',
             '> Quoted -- text stays exact.',
-            '```bash',
-            'echo before -- after',
-            '```',
         ].join('\n');
         const out = postProcessProofreadMarkdown(input);
-        ackAssert(out.includes('This repeats, trim it.'), 'normalizes prose double-hyphen punctuation');
-        ackAssert(out.includes('Keep `--connect` and `a -- b` unchanged.'), 'preserves inline code and flags');
-        ackAssert(out.includes('> Quoted -- text stays exact.'), 'preserves quoted text');
-        ackAssert(out.includes('echo before -- after'), 'preserves fenced code content');
+        ackEq(out, input, 'postprocessing does not rewrite promptable punctuation');
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('bare double hyphen punctuation'),
+            'double-hyphen cleanup is still requested in the proofread prompt',
+        );
+        ackAssert(
+            !_ackSource.includes('function normalizeProofreadDoubleHyphenPunctuation'),
+            'no deterministic double-hyphen punctuation normalizer',
+        );
     });
 
     ackTest('rewriteProofreadCommitDiffUrls preserves commit diff line-range fragments', () => {
@@ -34782,7 +34918,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('splitSegments keeps fenced code content immutable but fence opener mutable', () => {
+    ackTest('splitSegments keeps fenced code blocks mutable for prompted hint and whitespace fixes', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('const splitSegments'),
@@ -34791,10 +34927,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('FENCE_RE'), 'has fence regex');
         ackAssert(fn.includes('inFence'), 'tracks fence state');
         ackAssert(fn.includes('fenceMarker'), 'tracks fence marker for proper closing');
-        ackAssert(fn.includes('isFenceOpenLine'), 'tracks fence opener line separately');
+        ackAssert(!fn.includes('isFenceOpenLine'), 'no longer treats only the fence opener as mutable');
         ackAssert(
-            fn.includes('(inFence && !isFenceOpenLine) || IMMUTABLE_LINE_RE.test(trimmed)'),
-            'inside-fence content immutable, opener mutable',
+            fn.includes('!inFence && IMMUTABLE_LINE_RE.test(trimmed)'),
+            'inside-fence content stays mutable for prompt-only code-block formatting',
         );
     });
 
@@ -37516,7 +37652,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('LLM_MODELS match documented provider models', () => {
-        ackEq(LLM_MODELS.claude, 'claude-sonnet-4-6');
+        ackEq(LLM_MODELS.claude, 'claude-sonnet-5');
         ackEq(LLM_MODELS.claude_high_context, 'claude-opus-4-8');
         ackEq(LLM_MODELS.openai, 'gpt-5.5');
         ackEq(LLM_MODELS.gemini, 'gemini-3.5-flash');
