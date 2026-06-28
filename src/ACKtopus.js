@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.172
+// @version      1.173
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -153,6 +153,16 @@
 
     function postProcessProofreadMarkdown(text) {
         return normalizeProofreadDoubleHyphenPunctuation(rewriteProofreadCommitDiffUrls(String(text || '')).text);
+    }
+
+    function cleanPlainProofreadResult(raw) {
+        let s = String(raw || '')
+            .trim()
+            .replace(/^```[a-z]*\n?|\n?```$/g, '')
+            .trim();
+        const outputMatch = s.match(/<output>\s*([\s\S]*?)\s*<\/output>/i);
+        if (outputMatch) s = outputMatch[1].trim();
+        return postProcessProofreadMarkdown(s);
     }
 
     function unwrapProofreadXmlSectionContent(content) {
@@ -10658,6 +10668,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function showDiffDialog(original, corrected, opts = {}) {
+        const readOnly = !!opts.readOnly;
         const diff = wordDiff(original, corrected);
         const hasChanges = diff.some((d) => d.type !== 'same');
         if (!hasChanges) return Promise.resolve({ action: 'unchanged', text: corrected });
@@ -10705,7 +10716,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 dialog.addEventListener(eventName, stopDialogEvent);
             }
             const heading = document.createElement('div');
-            heading.textContent = opts.title || 'Proofreading changes - click diffs to revert';
+            heading.textContent = opts.title || (readOnly ? 'Proofreading changes' : 'Proofreading changes - click diffs to revert');
             Object.assign(heading.style, { fontWeight: '600', fontSize: '14px', marginBottom: '12px' });
             dialog.appendChild(heading);
 
@@ -10749,11 +10760,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 overlay.remove();
                 resolve({ action, text });
             };
-            const acceptDialog = () => settle('edit', buildText());
-            const rejectDialog = () => settle(false, original);
+            const acceptDialog = () => settle(readOnly ? 'close' : 'edit', buildText());
+            const rejectDialog = () => settle(readOnly ? 'close' : false, readOnly ? corrected : original);
             const onDialogKeydown = (e) => {
                 if (!overlay.isConnected) return;
-                const isSubmit = e.key === 'Enter' && (e.metaKey || e.ctrlKey);
+                const isSubmit = !readOnly && e.key === 'Enter' && (e.metaKey || e.ctrlKey);
                 const isReject = e.key === 'Escape';
                 const isNextDiff = e.key === 'ArrowDown' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey;
                 const isPrevDiff = e.key === 'ArrowUp' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey;
@@ -10856,14 +10867,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
                 const reverted = revertState[idx];
                 span.textContent = d.text;
-                span.style.cursor = 'pointer';
-                span.title = reverted
-                    ? d.type === 'del'
-                        ? 'Reverted: text kept. Click to re-apply deletion.'
-                        : 'Reverted: addition removed. Click to re-apply.'
-                    : d.type === 'del'
-                      ? 'Deleted text. Click to keep original.'
-                      : 'Added text. Click to remove.';
+                span.style.cursor = readOnly ? 'default' : 'pointer';
+                span.title = readOnly
+                    ? ''
+                    : reverted
+                      ? d.type === 'del'
+                          ? 'Reverted: text kept. Click to re-apply deletion.'
+                          : 'Reverted: addition removed. Click to re-apply.'
+                      : d.type === 'del'
+                        ? 'Deleted text. Click to keep original.'
+                        : 'Added text. Click to remove.';
 
                 if (d.type === 'del') {
                     if (reverted) {
@@ -10912,7 +10925,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const span = document.createElement('span');
                     span.dataset.ackDiffIndex = String(i);
                     renderSpan(span, d, i);
-                    if (d.type !== 'same') {
+                    if (d.type !== 'same' && !readOnly) {
                         span.addEventListener('click', () => {
                             revertState[i] = !revertState[i];
                             renderSpan(span, d, i);
@@ -11025,7 +11038,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             const modes = [
-                { key: 'word', label: 'Words', title: 'Word-level diff with click-to-revert changes' },
+                {
+                    key: 'word',
+                    label: 'Words',
+                    title: readOnly ? 'Word-level diff' : 'Word-level diff with click-to-revert changes',
+                },
                 { key: 'side', label: 'Before/After', title: 'Read both versions side by side with changed text colored' },
             ];
             let activeMode = 'word';
@@ -11099,6 +11116,41 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const btnRow = document.createElement('div');
             Object.assign(btnRow.style, { marginTop: '14px', display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+
+            if (readOnly) {
+                const closeBtn = document.createElement('button');
+                closeBtn.type = 'button';
+                closeBtn.className = 'ack-diff-close';
+                closeBtn.textContent = opts.closeLabel || 'Close';
+                Object.assign(closeBtn.style, {
+                    padding: '6px 20px',
+                    background: '#21262d',
+                    color: '#c9d1d9',
+                    border: '1px solid #30363d',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                });
+                closeBtn.addEventListener('click', () => {
+                    settle('close', corrected);
+                });
+                btnRow.appendChild(closeBtn);
+                dialog.appendChild(btnRow);
+                overlay.appendChild(dialog);
+                overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
+                overlay.addEventListener('mousedown', (e) => e.stopPropagation());
+                overlay.addEventListener('mouseup', (e) => e.stopPropagation());
+                overlay.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (e.target === overlay) {
+                        settle('close', corrected);
+                    }
+                });
+                mount.appendChild(overlay);
+                dialog.focus({ preventScroll: true });
+                scrollDiffNav(1);
+                return;
+            }
 
             const rejectBtn = document.createElement('button');
             rejectBtn.textContent = opts.rejectLabel || 'Reject';
@@ -11776,6 +11828,215 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             try {
                 if (commentEl instanceof HTMLButtonElement) commentEl.disabled = wasDisabled;
             } catch (_) {}
+        }
+    }
+
+    function commitMessageText(commit) {
+        return String(commit?.commit?.message || commit?.message || commit?.msg || commit?.messageHeadline || '').trimEnd();
+    }
+
+    function formatCommitMessagesForProofread(commits) {
+        if (!Array.isArray(commits)) return String(commits || '').trimEnd();
+        return commits
+            .map((commit) => {
+                const sha = String(commit?.sha || commit?.oid || '').trim();
+                const msg = commitMessageText(commit);
+                if (!msg) return '';
+                return `${sha ? `COMMIT ${sha.slice(0, 12)}\n` : ''}${msg}`;
+            })
+            .filter(Boolean)
+            .join('\n\n---\n\n')
+            .trimEnd();
+    }
+
+    async function fetchFullCommitMessagesForProofread(pr, fallback = '') {
+        if (pr) {
+            try {
+                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+                const formatted = formatCommitMessagesForProofread(commits);
+                if (formatted) return formatted;
+            } catch (e) {
+                console.warn('ACKtopus: proofread commit list fetch failed:', e?.message || e);
+            }
+        }
+        const pageCommits = formatCommitMessagesForProofread(parseCommitsFromPage());
+        return pageCommits || String(fallback || '').trimEnd();
+    }
+
+    function wrapLimitedPromptBlock(label, content, maxChars) {
+        const text = String(content || '').trimEnd();
+        if (!text) return '';
+        const clipped =
+            text.length > maxChars
+                ? `${text.slice(0, maxChars)}\n\n[truncated after ${maxChars} chars; original length ${text.length}]`
+                : text;
+        return wrapPromptBlock(label, clipped);
+    }
+
+    function buildReadOnlyProofreadContext({
+        title = '',
+        description = '',
+        commitMessages = '',
+        diff = '',
+        diffLabel = 'FULL PR PATCH',
+    } = {}) {
+        const parts = [];
+        if (title) parts.push(wrapLimitedPromptBlock('PR TITLE', title, 1000));
+        if (description) parts.push(wrapLimitedPromptBlock('PR DESCRIPTION', description, 12000));
+        if (commitMessages) parts.push(wrapLimitedPromptBlock('ALL COMMIT MESSAGES', commitMessages, 80000));
+        if (diff) parts.push(wrapLimitedPromptBlock(diffLabel, diff, 180000));
+        return parts.filter(Boolean).join('\n\n');
+    }
+
+    function extractVisiblePRDescription(container) {
+        const issueBody = document.querySelector('[data-testid="issue-body"]');
+        const bodyEl =
+            container?.querySelector?.(MARKDOWN_BODY_SELECTOR) || issueBody?.querySelector?.(MARKDOWN_BODY_SELECTOR);
+        return String(bodyEl?.innerText || bodyEl?.textContent || '').trimEnd();
+    }
+
+    async function runReadOnlyPRDescriptionProofread(container, btn) {
+        const provider = getActiveProvider();
+        if (!isProviderAvailable(provider)) {
+            document.body.appendChild(buildConfigPanel());
+            return;
+        }
+        if (btn?.dataset.ackReadOnlyProofreadBusy === '1') return;
+        if (btn) btn.dataset.ackReadOnlyProofreadBusy = '1';
+        const origText = btn?.textContent || '';
+        const origTitle = btn?.title || '';
+        const stopSpin = btn ? startSpin(btn) : null;
+        try {
+            const pr = parsePR();
+            const ctx = await fetchPRContext(pr);
+            const original = String(ctx.description || extractVisiblePRDescription(container) || '').trimEnd();
+            if (!original) {
+                if (stopSpin) stopSpin('∅');
+                return;
+            }
+            const commitMessages = await fetchFullCommitMessagesForProofread(pr, ctx.commitMessages);
+            const extra = getLLMConfig().instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
+            const context = buildReadOnlyProofreadContext({
+                title: ctx.title || getPRTitleText(),
+                commitMessages,
+                diff: ctx.diff,
+            });
+            const system = `${SYSTEM_BASE}\n\nYou are proofreading another author's GitHub PR description in read-only mode. ${extra}\n\nRULES:\n- Return only the corrected PR description. No preamble, no explanation, no markdown fence.\n- Make the smallest useful edits so the description matches the actual change.\n- Use the PR patch and all commit messages to fix objective inaccuracies, outdated names, stale file paths, wrong behavior claims, and duplicated points.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not invent new sections, review advice, risk lists, tests, or claims not supported by the patch.\n- Preserve markdown structure unless a small wording or heading change is needed for clarity.\n- If the description is already accurate and clear, return it unchanged.`;
+            const user = [
+                wrapPromptBlock('ORIGINAL PR DESCRIPTION', original),
+                context ? `Read-only grounding context:\n\n${context}` : '',
+            ]
+                .filter(Boolean)
+                .join('\n\n');
+            const raw = await callLLM(provider, system, user, { skipCache: true });
+            const corrected = cleanPlainProofreadResult(raw);
+            if (stopSpin) stopSpin('✅');
+            await showDiffDialog(original, corrected, {
+                title: 'PR description proofread (read-only)',
+                readOnly: true,
+            });
+        } catch (e) {
+            try {
+                if (stopSpin) stopSpin('❌');
+            } catch (_) {}
+            console.error('ACKtopus: read-only PR description proofread failed:', e?.message || e);
+        } finally {
+            if (btn) {
+                setTimeout(() => {
+                    try {
+                        btn.textContent = origText;
+                        btn.title = origTitle;
+                        delete btn.dataset.ackReadOnlyProofreadBusy;
+                    } catch (_) {}
+                }, 1200);
+            }
+        }
+    }
+
+    function findCommitBySha(commits, sha) {
+        const target = String(sha || '').trim();
+        if (!target || !Array.isArray(commits)) return null;
+        return (
+            commits.find((commit) => {
+                const commitSha = commitHashFromEntry(commit);
+                return commitSha && (commitSha.startsWith(target) || target.startsWith(commitSha));
+            }) || null
+        );
+    }
+
+    async function runReadOnlyCommitMessagesProofread(btn) {
+        const provider = getActiveProvider();
+        if (!isProviderAvailable(provider)) {
+            document.body.appendChild(buildConfigPanel());
+            return;
+        }
+        if (!isPRPage()) return;
+        if (btn?.dataset.ackReadOnlyProofreadBusy === '1') return;
+        if (btn) btn.dataset.ackReadOnlyProofreadBusy = '1';
+        const origText = btn?.textContent || '';
+        const origHTML = btn?.innerHTML || '';
+        const stopSpin = btn ? startSpin(btn) : null;
+        try {
+            const pr = parsePR();
+            const ctx = await fetchPRContext(pr);
+            const currentSha = pathCommitSha();
+            let original = '';
+            let commitPatch = '';
+            let allCommitMessages = ctx.commitMessages || '';
+            if (currentSha && pr) {
+                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
+                allCommitMessages = formatCommitMessagesForProofread(commits) || allCommitMessages;
+                const commit = findCommitBySha(commits, currentSha);
+                const fullSha = commitHashFromEntry(commit) || currentSha;
+                original = formatCommitMessagesForProofread(commit ? [commit] : '');
+                try {
+                    commitPatch = await fetchCommitPatch(pr, fullSha);
+                } catch (e) {
+                    console.warn('ACKtopus: read-only commit-message proofread patch fetch failed:', e?.message || e);
+                }
+            }
+            if (!original) original = await fetchFullCommitMessagesForProofread(pr, ctx.commitMessages);
+            if (!original.trim()) {
+                if (stopSpin) stopSpin('∅');
+                return;
+            }
+            const extra = getLLMConfig().instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
+            const context = buildReadOnlyProofreadContext({
+                title: ctx.title || getPRTitleText(),
+                description: ctx.description,
+                commitMessages: allCommitMessages,
+                diff: commitPatch || ctx.diff,
+                diffLabel: commitPatch ? 'CURRENT COMMIT PATCH' : 'FULL PR PATCH',
+            });
+            const system = `${SYSTEM_BASE}\n\nYou are proofreading GitHub PR commit-message text in read-only mode. ${extra}\n\nRULES:\n- Return the full corrected commit-message text only. No preamble, no explanation, no markdown fence.\n- Preserve commit order, separators, and every \`COMMIT <sha>\` label exactly.\n- Make the smallest useful edits so each message reflects the code it describes and the PR patch as a whole.\n- Fix grammar, spelling, duplicated wording, outdated names, stale file paths, and objective claims contradicted by the patch.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not rewrite the commit history, add new commits, or invent details not supported by the patch.\n- If the messages are already accurate and clear, return them unchanged.`;
+            const user = [
+                wrapPromptBlock('ORIGINAL COMMIT MESSAGES', original),
+                context ? `Read-only grounding context:\n\n${context}` : '',
+            ]
+                .filter(Boolean)
+                .join('\n\n');
+            const raw = await callLLM(provider, system, user, { skipCache: true });
+            const corrected = cleanPlainProofreadResult(raw);
+            if (stopSpin) stopSpin('✅');
+            await showDiffDialog(original, corrected, {
+                title: 'Commit messages proofread (read-only)',
+                readOnly: true,
+            });
+        } catch (e) {
+            try {
+                if (stopSpin) stopSpin('❌');
+            } catch (_) {}
+            console.error('ACKtopus: read-only commit-message proofread failed:', e?.message || e);
+        } finally {
+            if (btn) {
+                setTimeout(() => {
+                    try {
+                        if (origHTML) btn.innerHTML = origHTML;
+                        else btn.textContent = origText;
+                        delete btn.dataset.ackReadOnlyProofreadBusy;
+                    } catch (_) {}
+                }, 1200);
+            }
         }
     }
 
@@ -14087,7 +14348,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         // Clone header and remove our injected elements before reading text
         const headerClone = header?.cloneNode(true);
-        headerClone?.querySelectorAll('.ack-commit-explain').forEach((el) => el.remove());
+        headerClone?.querySelectorAll('.ack-commit-explain, .ack-commit-proofread').forEach((el) => el.remove());
         const msg = headerClone?.textContent?.trim()?.split('\n')[0]?.trim() || '';
         return `> [${shortSha}](${url}) _${msg}_:\n\n`;
     }
@@ -15870,6 +16131,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                 }
             } else if (author) {
+                // Other people's PR descriptions can be proofread in read-only mode.
+                if (isPRBody) {
+                    actionContainer.appendChild(
+                        makeIconBtn('✏️', 'Proofread PR description (read-only)', (btn) => {
+                            runReadOnlyPRDescriptionProofread(container, btn);
+                        }),
+                    );
+                }
                 // Other people's comments (including PR description): explain
                 actionContainer.appendChild(
                     makeIconBtn(
@@ -20046,27 +20315,46 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             commitHeader.closest('.bgColor-inset, .tmp-p-3, .commit-desc, .full-commit') || commitHeader.parentElement;
         if (container.querySelector('.ack-commit-explain')) return;
 
-        const btn = document.createElement('button');
-        btn.className = 'ack-commit-explain';
-        btn.textContent = '💡';
-        btn.title = 'Commit review aid: background context, pseudocode, verify/repro, concerns, message check';
-        Object.assign(btn.style, {
-            background: 'none',
-            border: 'none',
-            cursor: 'pointer',
-            padding: '0 4px 0 0',
-            fontSize: '14px',
-            opacity: '0.4',
-            lineHeight: 'inherit',
-            verticalAlign: 'middle',
-            display: 'inline',
-            float: 'left',
-        });
-        btn.addEventListener('mouseenter', () => {
-            btn.style.opacity = '1';
-        });
-        btn.addEventListener('mouseleave', () => {
-            btn.style.opacity = '0.4';
+        const makeCommitHeaderButton = (className, text, title) => {
+            const button = document.createElement('button');
+            button.className = className;
+            button.textContent = text;
+            button.title = title;
+            Object.assign(button.style, {
+                background: 'none',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '0 4px 0 0',
+                fontSize: '14px',
+                opacity: '0.4',
+                lineHeight: 'inherit',
+                verticalAlign: 'middle',
+                display: 'inline',
+                float: 'left',
+            });
+            button.addEventListener('mouseenter', () => {
+                button.style.opacity = '1';
+            });
+            button.addEventListener('mouseleave', () => {
+                button.style.opacity = '0.4';
+            });
+            return button;
+        };
+
+        const btn = makeCommitHeaderButton(
+            'ack-commit-explain',
+            '💡',
+            'Commit review aid: background context, pseudocode, verify/repro, concerns, message check',
+        );
+        const proofreadBtn = makeCommitHeaderButton(
+            'ack-commit-proofread',
+            '✏️',
+            'Proofread this commit message against its patch (read-only)',
+        );
+        proofreadBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            runReadOnlyCommitMessagesProofread(proofreadBtn);
         });
         btn.addEventListener('click', async (e) => {
             e.preventDefault();
@@ -20225,6 +20513,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         });
 
+        commitHeader.prepend(proofreadBtn);
         commitHeader.prepend(btn);
 
         // Auto-show if lightbulb was open on previous commit (cached data = instant)
@@ -22175,7 +22464,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             .querySelectorAll(
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
                     '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, ' +
-                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
+                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
             .forEach((el) => el.remove());
@@ -24414,6 +24703,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("'Reject'"), 'has Reject button');
         ackAssert(source.includes("'Accept'"), 'has Accept button');
         const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
+        ackAssert(fn.includes('const readOnly = !!opts.readOnly'), 'supports read-only mode');
+        ackAssert(fn.includes("settle('close', corrected)"), 'read-only close returns corrected text');
         ackAssert(fn.includes("settle('edit', buildText())"), 'Accept resolves with action edit');
         ackAssert(fn.includes('settle(false, original)'), 'Reject resolves with action false');
         ackAssert(fn.includes('countDiffLines(original, corrected)'), 'computes line-based diff counts');
@@ -24441,6 +24732,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('scrollDiffNav(1)') && fn.includes('scrollDiffNav(-1)'), 'shortcuts jump between diff targets');
         ackAssert(fn.includes('dataset.ackSelfTestHidden'), 'hides self-test diff dialogs');
         ackAssert(fn.includes('!opts.showDuringSelfTests'), 'self-test dialog hiding can be bypassed explicitly');
+    });
+
+    ackTest('showDiffDialog read-only mode has no accept or reject buttons', async () => {
+        const promise = showDiffDialog('old text', 'new text', { readOnly: true, showDuringSelfTests: true });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const overlay = document.querySelector('.ack-diff-dialog-overlay');
+        try {
+            ackAssert(overlay, 'diff dialog overlay exists');
+            const labels = [...overlay.querySelectorAll('button')].map((btn) => btn.textContent.trim());
+            ackAssert(!labels.includes('Accept'), 'read-only dialog has no Accept button');
+            ackAssert(!labels.includes('Reject'), 'read-only dialog has no Reject button');
+            const closeBtn = overlay.querySelector('.ack-diff-close');
+            ackAssert(closeBtn, 'read-only dialog has a Close button');
+            closeBtn.click();
+            const result = await promise;
+            ackDeepEq(result, { action: 'close', text: 'new text' }, 'Close returns corrected text without applying');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+        }
     });
 
     ackTest('showDiffDialog can stay inside native review dialogs', async () => {
@@ -27361,6 +27671,87 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest("addQuickCommentActions injects read-only proofread for another user's PR body", () => {
+        const root = document.createElement('div');
+        root.id = 'acktest-qactions-react-other-pr-body';
+        Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
+
+        const issueBody = document.createElement('div');
+        issueBody.setAttribute('data-testid', 'issue-body');
+
+        const headerRow = document.createElement('div');
+        const badgesGroup = document.createElement('div');
+        badgesGroup.className = 'IssueBodyHeader-module__badgeGroup__hS0t2';
+        headerRow.appendChild(badgesGroup);
+
+        const actionButton = document.createElement('button');
+        actionButton.type = 'button';
+        actionButton.setAttribute('aria-haspopup', 'true');
+        actionButton.setAttribute('aria-label', 'Issue body actions');
+        headerRow.appendChild(actionButton);
+
+        const author = document.createElement('a');
+        author.setAttribute('data-testid', 'issue-body-header-author');
+        author.setAttribute('href', 'https://github.com/pr_author');
+        author.textContent = 'pr_author';
+
+        const permalink = document.createElement('a');
+        permalink.setAttribute('data-testid', 'issue-body-header-link');
+        permalink.setAttribute('href', 'https://github.com/owner/repo/issues/123#issue-444');
+        permalink.textContent = 'opened';
+
+        const body = document.createElement('div');
+        body.className = 'markdown-body';
+        body.textContent = 'Original PR description.';
+
+        issueBody.appendChild(headerRow);
+        issueBody.appendChild(author);
+        issueBody.appendChild(permalink);
+        issueBody.appendChild(body);
+        root.appendChild(issueBody);
+        document.body.appendChild(root);
+
+        const created = [];
+        const metaUserExisting = document.querySelector('meta[name="user-login"]');
+        const metaActorExisting = document.querySelector('meta[name="octolytics-actor-login"]');
+        const oldUser = metaUserExisting?.getAttribute('content');
+        const oldActor = metaActorExisting?.getAttribute('content');
+        const ensureMeta = (name) => {
+            let m = document.querySelector(`meta[name="${name}"]`);
+            if (!m) {
+                m = document.createElement('meta');
+                m.setAttribute('name', name);
+                document.head.appendChild(m);
+                created.push(m);
+            }
+            return m;
+        };
+
+        try {
+            ensureMeta('user-login').setAttribute('content', '');
+            ensureMeta('octolytics-actor-login').setAttribute('content', 'acktest_user');
+
+            addQuickCommentActions(root);
+            const qa = issueBody.querySelector('.ack-quick-actions');
+            ackAssert(qa, 'missing .ack-quick-actions');
+            ackAssert(
+                qa.querySelector('button[title="Proofread PR description (read-only)"]'),
+                'missing read-only PR description proofread button',
+            );
+            ackAssert(
+                qa.querySelector('button[title="Explain this PR at a high level"]'),
+                'missing PR-body explain button',
+            );
+            ackAssert(!qa.querySelector('button.ack-edit-post-btn'), 'other user PR body should not get edit button');
+            ackAssert(!qa.querySelector('button[title="Delete comment"]'), 'PR body should not get delete button');
+        } finally {
+            if (metaUserExisting) metaUserExisting.setAttribute('content', oldUser ?? '');
+            if (metaActorExisting) metaActorExisting.setAttribute('content', oldActor ?? '');
+            created.forEach((m) => m.remove());
+            root.remove();
+        }
+    });
+
     ackTest('invariant check: marked header with 0 buttons forces rebuild', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -27457,6 +27848,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         // DOM elements removed
         ackAssert(cacheBlock.includes('ack-commit-nav'), 'removes commit nav floater');
+        ackAssert(cacheBlock.includes('ack-commit-explain'), 'removes commit lightbulb buttons');
+        ackAssert(cacheBlock.includes('ack-commit-proofread'), 'removes commit proofread buttons');
         ackAssert(cacheBlock.includes('ack-quick-actions'), 'removes quick action buttons');
         ackAssert(cacheBlock.includes('ack-start-review-btn'), 'removes start review helper buttons');
         ackAssert(cacheBlock.includes('ack-reactor-avatars'), 'removes reactor avatar stacks');
@@ -27600,6 +27993,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("float: 'left'"), 'button uses float:left for inline positioning');
         ackAssert(fn.includes("display: 'inline'"), 'button has display: inline');
         ackAssert(fn.includes('commitHeader.prepend(btn)'), 'prepends into header');
+    });
+
+    ackTest('single commit proofread button is inserted inline beside the lightbulb', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function addSingleCommitExplainButton'),
+            source.indexOf('// --- Co-authored-by'),
+        );
+        ackAssert(fn.includes('ack-commit-proofread'), 'creates commit-message proofread button');
+        ackAssert(
+            fn.includes('Proofread this commit message against its patch (read-only)'),
+            'proofread button title describes read-only commit-message check',
+        );
+        ackAssert(
+            fn.includes('runReadOnlyCommitMessagesProofread(proofreadBtn)'),
+            'proofread button runs read-only commit-message proofreading',
+        );
+        ackAssert(fn.includes('commitHeader.prepend(proofreadBtn)'), 'prepends proofread button into header');
+        ackAssert(
+            fn.indexOf('commitHeader.prepend(proofreadBtn)') < fn.indexOf('commitHeader.prepend(btn)'),
+            'lightbulb remains first after both prepends',
+        );
     });
 
     ackTest('hidden-item pagination buttons are detected without ajax-pagination-form wrapper', () => {
@@ -28112,8 +28527,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('.commit-title'), 'looks for commit title header');
         ackAssert(fn.includes('_${msg}_:'), 'wraps message in italic underscores with trailing colon');
         ackAssert(fn.includes(' _$'), 'prefixes message with markdown italic underscore');
-        // Strips our injected lightbulb button text
+        // Strips our injected lightbulb/proofread button text
         ackAssert(fn.includes('ack-commit-explain'), 'removes injected explain buttons before reading text');
+        ackAssert(fn.includes('ack-commit-proofread'), 'removes injected proofread buttons before reading text');
         ackAssert(fn.includes('cloneNode'), 'clones header to avoid mutating DOM');
     });
 
@@ -28863,6 +29279,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('proofreadContext'), 'appends context to prompt');
         ackAssert(fn.includes('renamed files'), 'instructs LLM to check renamed files');
         ackAssert(fn.includes('changed variable'), 'instructs LLM to check changed variables');
+    });
+
+    ackTest('read-only PR description proofreading uses commits, patch, and read-only diff', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function runReadOnlyPRDescriptionProofread'),
+            source.indexOf('async function runReadOnlyCommitMessagesProofread'),
+        );
+        ackAssert(fn.includes('fetchFullCommitMessagesForProofread'), 'loads full commit messages');
+        ackAssert(fn.includes('buildReadOnlyProofreadContext'), 'builds grounding context');
+        ackAssert(source.includes('ALL COMMIT MESSAGES'), 'includes commit-message context');
+        ackAssert(source.includes('FULL PR PATCH'), 'includes PR patch context');
+        ackAssert(fn.includes('make the smallest useful edits'), 'prompt asks for minimal edits');
+        ackAssert(fn.includes('simple, plain language'), 'prompt prefers simple language');
+        ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
+    });
+
+    ackTest('read-only commit-message proofreading checks messages against actual changes', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function runReadOnlyCommitMessagesProofread'),
+            source.indexOf('// --- Start a review ---'),
+        );
+        ackAssert(fn.includes('pathCommitSha()'), 'detects viewed commit SHA');
+        ackAssert(fn.includes('findCommitBySha'), 'selects the viewed commit message');
+        ackAssert(fn.includes('fetchCommitPatch(pr, fullSha)'), 'fetches the viewed commit patch');
+        ackAssert(fn.includes('fetchFullCommitMessagesForProofread'), 'loads commit messages');
+        ackAssert(source.includes('PR DESCRIPTION'), 'uses PR description as context');
+        ackAssert(fn.includes("diffLabel: commitPatch ? 'CURRENT COMMIT PATCH'"), 'uses current commit patch as context');
+        ackAssert(fn.includes('reflects the code it describes'), 'checks messages against changes');
+        ackAssert(fn.includes('Preserve commit order'), 'preserves commit order');
+        ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
 
     ackTest('non-PR-body proofreading uses messages, thread, and code context (no full diff)', () => {
@@ -32253,6 +32701,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
         ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
+    });
+
+    ackTest('commit-message proofread is not wired into the fixed toolbar', () => {
+        const source = _ackSource;
+        const inject = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
+        ackAssert(!source.includes('function buildReadOnlyProofreadGroup'), 'no read-only proofread toolbar group');
+        ackAssert(!inject.includes('buildReadOnlyProofreadGroup'), 'toolbar does not add commit-message proofread');
     });
 
     ackTest('toolbar shell is attached before optional groups are built', () => {
