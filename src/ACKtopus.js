@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.185
+// @version      1.186
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17989,21 +17989,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             })
             .join('\n');
         if (rewrittenBlock === originalBlock) return false;
-        // Prefer execCommand('insertText') so the browser records an undo
-        // entry - a plain value reassignment would wipe Ctrl+Z history for
-        // the user's own typing. Verify it took; fall back to the React-safe
-        // setter when the command is unavailable or rejected.
-        let applied = false;
-        if (rewrittenBlock !== '') {
-            try {
-                ta.focus();
-                ta.setSelectionRange(blockStart, blockEnd);
-                applied =
-                    document.execCommand('insertText', false, rewrittenBlock) &&
-                    ta.value.slice(blockStart, blockStart + rewrittenBlock.length) === rewrittenBlock;
-            } catch (_) {}
-        }
-        if (!applied) setTextareaValue(ta, value.slice(0, blockStart) + rewrittenBlock + value.slice(blockEnd));
+        setTextareaValue(ta, value.slice(0, blockStart) + rewrittenBlock + value.slice(blockEnd));
         ta.selectionStart = Math.max(blockStart, start + startDelta);
         ta.selectionEnd = Math.max(ta.selectionStart, end + endDelta);
         return true;
