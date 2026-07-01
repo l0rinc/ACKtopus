@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.183
+// @version      1.184
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17989,7 +17989,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             })
             .join('\n');
         if (rewrittenBlock === originalBlock) return false;
-        setTextareaValue(ta, value.slice(0, blockStart) + rewrittenBlock + value.slice(blockEnd));
+        // Prefer execCommand('insertText') so the browser records an undo
+        // entry - a plain value reassignment would wipe Ctrl+Z history for
+        // the user's own typing. Verify it took; fall back to the React-safe
+        // setter when the command is unavailable or rejected.
+        let applied = false;
+        if (rewrittenBlock !== '') {
+            try {
+                ta.focus();
+                ta.setSelectionRange(blockStart, blockEnd);
+                applied =
+                    document.execCommand('insertText', false, rewrittenBlock) &&
+                    ta.value.slice(blockStart, blockStart + rewrittenBlock.length) === rewrittenBlock;
+            } catch (_) {}
+        }
+        if (!applied) setTextareaValue(ta, value.slice(0, blockStart) + rewrittenBlock + value.slice(blockEnd));
         ta.selectionStart = Math.max(blockStart, start + startDelta);
         ta.selectionEnd = Math.max(ta.selectionStart, end + endDelta);
         return true;
@@ -18024,6 +18038,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ta.dataset.ackEditorErgonomicsBound = '1';
                 ta.addEventListener('keydown', (e) => {
                     if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey) return;
+                    // GitHub's text-expander accepts @mention/#issue/:emoji:
+                    // suggestions with Tab; never hijack an accepted keystroke
+                    // or an IME composition.
+                    if (e.defaultPrevented || e.isComposing) return;
+                    const expander = ta.closest('text-expander, slash-command-expander');
+                    if (expander?.querySelector('[role="listbox"]:not([hidden]), .suggester:not([hidden])')) return;
                     e.preventDefault();
                     indentTextareaSelection(ta, e.shiftKey);
                     fitCommentTextarea(ta);
