@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.181
+// @version      1.182
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -653,9 +653,13 @@
         comments: 'Comments',
         unresolved: 'Unresolved',
     });
-    const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], .file';
+    // React "Files changed" views use hashed CSS-module classes (see the
+    // saved DOMs): container [class*="Diff-module__diff__"], header
+    // [class*="DiffFileHeader-module__"]; classic selectors kept as fallback.
+    const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], [class*="Diff-module__diff__"], .file';
     const DIFF_FILE_HEADER_SELECTOR =
-        '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header';
+        '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header, ' +
+        '[class*="DiffFileHeader-module__diff-file-header"]';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
@@ -36846,6 +36850,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             <div class="file-header">unviewed</div>
             <input class="js-reviewed-checkbox" type="checkbox" aria-label="Viewed">
           </div>
+          <div class="Diff-module__diff__rx9XH" id="react-unviewed-file">
+            <div class="DiffFileHeader-module__diff-file-header__UuNN4">react header</div>
+            <input type="checkbox" aria-label="Viewed">
+          </div>
         `;
         document.body.appendChild(host);
         host.querySelectorAll('*').forEach((el) => {
@@ -36853,6 +36861,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         try {
             ackEq(findFirstUnviewedDiffFile(host)?.id, 'unviewed-file', 'returns the first unchecked viewed control');
+            ackEq(gatherDiffFiles(host).length, 3, 'React CSS-module diff containers are recognized too');
+            host.querySelector('#unviewed-file').remove();
+            ackEq(
+                findFirstUnviewedDiffFile(host)?.id,
+                'react-unviewed-file',
+                'finds unviewed files in the React diff DOM',
+            );
         } finally {
             host.remove();
         }
