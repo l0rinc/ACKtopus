@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.179
+// @version      1.180
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -157,7 +157,7 @@
         let normalized = protectedLines
             .join('\n')
             .replace(/(<summary\b[^>]*>[\s\S]*?<\/summary>)[ \t]*(?:\r?\n[ \t]*)*/gi, '$1\n\n')
-            .replace(/\n[ \t]*\n[ \t]*(<\/details>)/gi, '\n$1');
+            .replace(/\n(?:[ \t]*\n)+[ \t]*(<\/details>)/gi, '\n$1');
         fences.forEach((fence, i) => {
             normalized = normalized.split(`\uE000ACK_FENCE_${i}\uE000`).join(fence);
         });
@@ -165,7 +165,32 @@
     }
 
     function trimProofreadTrailingWhitespace(text) {
-        return String(text || '').replace(/[ \t]+$/gm, '');
+        const lines = String(text || '').split('\n');
+        let inFence = false;
+        let fenceMarker = '';
+        return lines
+            .map((line, idx) => {
+                const trimmedStart = line.trimStart();
+                if (inFence) {
+                    if (trimmedStart.startsWith(fenceMarker) && trimmedStart.slice(fenceMarker.length).trim() === '') {
+                        inFence = false;
+                        fenceMarker = '';
+                    }
+                    return line; // fenced code content is never reformatted
+                }
+                const fenceMatch = trimmedStart.match(/^(`{3,}|~{3,})/);
+                if (fenceMatch) {
+                    inFence = true;
+                    fenceMarker = fenceMatch[1];
+                    return line;
+                }
+                // Two or more trailing spaces before a non-blank line are a
+                // Markdown hard break: normalize to exactly two instead of
+                // stripping, so proofreading cannot merge separated lines.
+                const isHardBreak = / {2,}$/.test(line) && line.trim() !== '' && (lines[idx + 1] || '').trim() !== '';
+                return isHardBreak ? line.replace(/[ \t]+$/, '  ') : line.replace(/[ \t]+$/, '');
+            })
+            .join('\n');
     }
 
     function postProcessProofreadMarkdown(text) {
@@ -35399,10 +35424,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
     });
 
-    ackTest('postProcessProofreadMarkdown trims trailing spaces on every line', () => {
-        const input = 'First line  \n```bash\nprintf x \t\n```\n<details><summary>Details</summary> \n\nbody\t\n\n</details>   ';
+    ackTest('postProcessProofreadMarkdown trims trailing whitespace but keeps fences and hard breaks', () => {
+        const input =
+            'Hard break  \nnext line\nnoise \nmessy break    \nlast line\n```bash\nprintf x \t\n```\n<details><summary>Details</summary> \n\nbody\t\n\n\n</details>   ';
         const out = postProcessProofreadMarkdown(input);
-        ackEq(out, 'First line\n```bash\nprintf x\n```\n<details><summary>Details</summary>\n\nbody\n</details>');
+        ackEq(
+            out,
+            'Hard break  \nnext line\nnoise\nmessy break  \nlast line\n```bash\nprintf x \t\n```\n<details><summary>Details</summary>\n\nbody\n</details>',
+        );
     });
 
     ackTest('postProcessProofreadMarkdown does not normalize details-looking text inside fences', () => {
