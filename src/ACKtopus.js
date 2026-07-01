@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.178
+// @version      1.179
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -25221,8 +25221,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('const readOnly = !!opts.readOnly'), 'supports read-only mode');
         ackAssert(fn.includes("settle('close', corrected)"), 'read-only close returns corrected text');
-        ackAssert(fn.includes("settle('edit', buildText())"), 'Accept resolves with action edit');
-        ackAssert(fn.includes('settle(false, original)'), 'Reject resolves with action false');
+        ackAssert(
+            fn.includes("settle(readOnly ? 'close' : 'edit', buildText())"),
+            'Accept resolves with action edit (close in read-only)',
+        );
+        ackAssert(
+            fn.includes("settle(readOnly ? 'close' : false, readOnly ? corrected : original)"),
+            'Reject resolves with action false (close in read-only)',
+        );
         ackAssert(fn.includes('countDiffLines(original, corrected)'), 'computes line-based diff counts');
         ackAssert(
             fn.includes('+${lineCounts.added}') && fn.includes('-${lineCounts.removed}'),
@@ -29881,7 +29887,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('buildReadOnlyProofreadContext'), 'builds grounding context');
         ackAssert(source.includes('ALL COMMIT MESSAGES'), 'includes commit-message context');
         ackAssert(source.includes('FULL PR PATCH'), 'includes PR patch context');
-        ackAssert(fn.includes('make the smallest useful edits'), 'prompt asks for minimal edits');
+        ackAssert(fn.includes('Make the smallest useful edits'), 'prompt asks for minimal edits');
         ackAssert(fn.includes('simple, plain language'), 'prompt prefers simple language');
         ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
@@ -32104,7 +32110,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             injectFn.includes('toolbar.appendChild(buildContextCopyGroup())'),
             'context copy group is available on toolbar pages, not only PRs',
         );
-        ackAssert(!injectFn.includes('if (!onCompare)'), 'context copy group is not hidden on compare pages');
+        ackAssert(
+            !injectFn.includes('if (!onCompare) toolbar.appendChild(buildContextCopyGroup())'),
+            'context copy group is not hidden on compare pages',
+        );
         ackAssert(
             !injectFn.includes('getAnalysisMode() !== ANALYSIS_MODES.commit'),
             'context copy group is not hidden on single commit pages',
