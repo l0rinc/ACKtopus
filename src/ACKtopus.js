@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.180
+// @version      1.181
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18456,12 +18456,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const text = ta.value;
         const hasSelection = start !== end;
 
+        // <details> opens a CommonMark type-7 HTML block that only a blank
+        // line terminates: following non-blank content would be swallowed
+        // into the block. Separate it with a blank line at insertion time
+        // instead of padding the template, so nothing dangles at text end.
+        const blockSuffix = (after) => {
+            if (!after.trim()) return '';
+            if (after.startsWith('\n\n')) return '';
+            if (after.startsWith('\n')) return '\n';
+            return '\n\n';
+        };
+
         if (!hasSelection) {
             // Insert empty template at cursor with fenced code block
             const template = `\n<details><summary>${summaryLabel}</summary>\n\n\`\`\`bash\n\n\`\`\`\n</details>`;
             const fence = '```bash\n';
             const cursorPos = start + template.indexOf(fence) + fence.length; // start of the empty line inside the code block
-            setTextareaValue(ta, text.slice(0, start) + template + text.slice(end));
+            setTextareaValue(ta, text.slice(0, start) + template + blockSuffix(text.slice(end)) + text.slice(end));
             ta.focus();
             ta.selectionStart = ta.selectionEnd = cursorPos;
             return;
@@ -18474,7 +18485,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // Keep a blank line before the fenced content for GitHub rendering.
         const wrapped = `\n<details><summary>${summaryLabel}</summary>\n\n${inner}\n</details>`;
-        setTextareaValue(ta, text.slice(0, start) + wrapped + text.slice(end));
+        setTextareaValue(ta, text.slice(0, start) + wrapped + blockSuffix(text.slice(end)) + text.slice(end));
 
         // Reselect the summary label so it is easy to rename immediately.
         const summaryStart = start + wrapped.indexOf(summaryLabel);
@@ -35343,7 +35354,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('`\\n<details><summary>${summaryLabel}</summary>'), 'newline before <details>');
         ackAssert(fn.includes('</summary>\\n\\n'), 'blank line before fenced content');
         ackAssert(!fn.includes('\\n\\n</details>'), 'no blank line before </details>');
-        ackAssert(!fn.includes('</details>\\n`'), 'no newline after </details>');
+        ackAssert(!fn.includes('</details>\\n`'), 'no newline after </details> inside the template');
+        ackAssert(
+            fn.includes('blockSuffix(text.slice(end))'),
+            'a blank line still separates </details> from following content (type-7 HTML block)',
+        );
     });
 
     ackTest('wrapSelectionInDetails reselects summary label after wrapping', () => {
