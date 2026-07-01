@@ -14212,6 +14212,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn: () => applyTimelineFilter(document),
         },
         { name: 'diffHeaderToggle', when: (ctx) => ctx.onToolbar, fn: installDiffHeaderToggle },
+        { name: 'outOfViewMenuCloser', when: (ctx) => ctx.onToolbar, fn: installOutOfViewMenuCloser },
         {
             name: 'commentMenuAugmenter',
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
@@ -18682,6 +18683,65 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         group.appendChild(unviewedBtn);
 
         return group;
+    }
+
+    function isAckOwnedOverlay(el) {
+        return !!el?.closest?.(
+            `#${BUTTON_CONTAINER_ID}, #acktopus-analysis, #acktopus-queue, .ack-config-overlay, .ack-diff-dialog-overlay`,
+        );
+    }
+
+    function isElementOutsideViewport(el, margin = 16) {
+        const rect = el?.getBoundingClientRect?.();
+        if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+        const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+        return rect.bottom < -margin || rect.top > vh + margin || rect.right < -margin || rect.left > vw + margin;
+    }
+
+    function isOpenNativePopover(el) {
+        if (!el?.matches?.('[popover]')) return false;
+        try {
+            return el.matches(':popover-open');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function closeOutOfViewMenus() {
+        let closed = 0;
+        for (const details of document.querySelectorAll('details[open]')) {
+            if (isAckOwnedOverlay(details)) continue;
+            if (!details.matches?.('.details-overlay, .js-reaction-popover-container, .new-reactions-dropdown')) continue;
+            if (!isElementOutsideViewport(details)) continue;
+            details.removeAttribute('open');
+            closed++;
+        }
+        for (const popover of document.querySelectorAll('[popover]')) {
+            if (isAckOwnedOverlay(popover) || !isOpenNativePopover(popover)) continue;
+            if (!isElementOutsideViewport(popover)) continue;
+            popover.hidePopover?.();
+            closed++;
+        }
+        return closed;
+    }
+
+    let _outOfViewMenuCloserInstalled = false;
+    let _outOfViewMenuCloseTimer = null;
+    function scheduleCloseOutOfViewMenus() {
+        if (_ackTesting || _outOfViewMenuCloseTimer) return;
+        _outOfViewMenuCloseTimer = ackSetTimeout(() => {
+            _outOfViewMenuCloseTimer = null;
+            closeOutOfViewMenus();
+        }, 120);
+    }
+
+    function installOutOfViewMenuCloser() {
+        if (_outOfViewMenuCloserInstalled) return;
+        _outOfViewMenuCloserInstalled = true;
+        document.addEventListener('scroll', scheduleCloseOutOfViewMenus, { passive: true, capture: true });
+        window.addEventListener('scroll', scheduleCloseOutOfViewMenus, { passive: true });
+        window.addEventListener('resize', scheduleCloseOutOfViewMenus, { passive: true });
     }
 
     // --- Commit Badges on Comments ---
@@ -36574,6 +36634,69 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("name: 'diffHeaderToggle'"), 'has header-toggle injector');
         ackAssert(source.includes('toggleWhitespaceQueryParam'), 'has whitespace query toggle');
         ackAssert(source.includes('jumpToFirstUnviewedDiffFile'), 'has first-unviewed jump');
+    });
+
+    ackTest('isElementOutsideViewport detects only fully out-of-view elements', () => {
+        const el = document.createElement('div');
+        el.getBoundingClientRect = () => ({ width: 10, height: 10, top: 10, left: 10, right: 20, bottom: 20 });
+        ackEq(isElementOutsideViewport(el), false, 'visible element stays in view');
+        el.getBoundingClientRect = () => ({ width: 10, height: 10, top: -80, left: 10, right: 20, bottom: -40 });
+        ackEq(isElementOutsideViewport(el), true, 'fully above viewport is out of view');
+    });
+
+    ackTest('closeOutOfViewMenus closes stale GitHub details menus only', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+          <details open class="details-overlay" id="visible-menu"><summary>Visible</summary></details>
+          <details open class="details-overlay" id="offscreen-menu"><summary>Offscreen</summary></details>
+          <div class="ack-diff-dialog-overlay"><details open class="details-overlay" id="ack-menu"><summary>ACK</summary></details></div>
+        `;
+        document.body.appendChild(host);
+        host.querySelector('#visible-menu').getBoundingClientRect = () => ({
+            width: 10,
+            height: 10,
+            top: 10,
+            left: 10,
+            right: 20,
+            bottom: 20,
+        });
+        host.querySelector('#offscreen-menu').getBoundingClientRect = () => ({
+            width: 10,
+            height: 10,
+            top: -100,
+            left: 10,
+            right: 20,
+            bottom: -80,
+        });
+        host.querySelector('#ack-menu').getBoundingClientRect = () => ({
+            width: 10,
+            height: 10,
+            top: -100,
+            left: 10,
+            right: 20,
+            bottom: -80,
+        });
+        const origQS = document.querySelectorAll;
+        document.querySelectorAll = (sel) => {
+            if (sel === 'details[open]' || sel === '[popover]') return host.querySelectorAll(sel);
+            return origQS.call(document, sel);
+        };
+        try {
+            ackEq(closeOutOfViewMenus(), 1, 'closes only one stale GitHub menu');
+            ackAssert(host.querySelector('#visible-menu').open, 'visible menu stays open');
+            ackAssert(!host.querySelector('#offscreen-menu').open, 'offscreen menu closes');
+            ackAssert(host.querySelector('#ack-menu').open, 'ACKtopus-owned menu is ignored');
+        } finally {
+            document.querySelectorAll = origQS;
+            host.remove();
+        }
+    });
+
+    ackTest('out-of-view menu closer is wired into DOM refresh', () => {
+        const source = _ackSource;
+        ackAssert(source.includes('function installOutOfViewMenuCloser'), 'has installer');
+        ackAssert(source.includes("name: 'outOfViewMenuCloser'"), 'has document injector');
+        ackAssert(source.includes('closeOutOfViewMenus'), 'has close helper');
     });
 
     ackTest('gatherCommentElements exists and sorts posted comments newest first', () => {
