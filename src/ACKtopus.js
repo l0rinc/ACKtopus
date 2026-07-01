@@ -621,6 +621,13 @@
     const NATIVE_DIALOG_ROOT_SELECTOR =
         'details-dialog, modal-dialog, dialog, [role="dialog"], .Overlay, .overlay, [aria-modal="true"], ' +
         '[popover], anchored-position[popover], [class*="Dialog-module__"], [class*="Overlay-module__"], .prc-Dialog-Dialog';
+    const TIMELINE_FILTER_STORAGE_PREFIX = 'ack_timeline_filter:';
+    const TIMELINE_FILTER_MODES = Object.freeze(['all', 'comments', 'unresolved']);
+    const TIMELINE_FILTER_LABELS = Object.freeze({
+        all: 'All',
+        comments: 'Comments',
+        unresolved: 'Unresolved',
+    });
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
@@ -13514,6 +13521,164 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return popup;
     }
 
+    const TIMELINE_FILTER_ITEM_SELECTOR = [
+        '.js-timeline-item',
+        '.TimelineItem',
+        '.timeline-comment-group',
+        '.timeline-comment',
+        '.review-comment',
+        '.js-resolvable-timeline-thread-container',
+        'details[data-resolved]',
+        '[data-testid="review-thread"]',
+        '.review-thread-component',
+        '[data-testid="issue-body"]',
+        '[data-testid^="issue-comment"]',
+        'div[id^="issuecomment-"]',
+        'div[id^="discussion_r"]',
+        'div[id^="pullrequestreview-"]',
+    ].join(', ');
+
+    function isTimelineFilterPage(path = location.pathname) {
+        return isPRConversationPage(path) || isIssuePage(path);
+    }
+
+    function timelineFilterStorageKey(path = location.pathname) {
+        return `${TIMELINE_FILTER_STORAGE_PREFIX}${path}`;
+    }
+
+    function getTimelineFilterMode(path = location.pathname) {
+        try {
+            const mode = sessionStorage.getItem(timelineFilterStorageKey(path)) || 'all';
+            return TIMELINE_FILTER_MODES.includes(mode) ? mode : 'all';
+        } catch (_) {
+            return 'all';
+        }
+    }
+
+    function setTimelineFilterMode(mode, path = location.pathname) {
+        const safeMode = TIMELINE_FILTER_MODES.includes(mode) ? mode : 'all';
+        try {
+            if (safeMode === 'all') sessionStorage.removeItem(timelineFilterStorageKey(path));
+            else sessionStorage.setItem(timelineFilterStorageKey(path), safeMode);
+        } catch (_) {}
+        return safeMode;
+    }
+
+    function nextTimelineFilterMode(mode, dir = 1) {
+        const idx = TIMELINE_FILTER_MODES.indexOf(mode);
+        const start = idx >= 0 ? idx : 0;
+        return TIMELINE_FILTER_MODES[(start + dir + TIMELINE_FILTER_MODES.length) % TIMELINE_FILTER_MODES.length];
+    }
+
+    function timelineFilterItemInfo(item) {
+        const hasComment =
+            !!item?.matches?.(
+                '.timeline-comment, .review-comment, .timeline-comment-group, [data-testid="issue-body"], ' +
+                    '[data-testid^="issue-comment"], [data-testid="review-thread"], .review-thread-component, ' +
+                    'div[id^="issuecomment-"], div[id^="discussion_r"], div[id^="pullrequestreview-"]',
+            ) || !!item?.querySelector?.(MARKDOWN_BODY_SELECTOR);
+        const resolved =
+            !!item?.matches?.('details[data-resolved="true"]') ||
+            !!item?.closest?.('details[data-resolved="true"]') ||
+            !!item?.querySelector?.('details[data-resolved="true"]');
+        return { hasComment, resolved };
+    }
+
+    function timelineFilterPinnedItem(item) {
+        const hash = location.hash || '';
+        if (!hash || hash === '#') return false;
+        const id = decodeURIComponent(hash.slice(1));
+        const byId = document.getElementById(id);
+        if (byId && item.contains(byId)) return true;
+        if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+            const target = document.querySelector(`[name="${CSS.escape(id)}"]`);
+            if (target && item.contains(target)) return true;
+        }
+        return false;
+    }
+
+    function timelineFilterShouldShowItem(item, mode, pinned = timelineFilterPinnedItem(item)) {
+        if (mode === 'all' || pinned) return true;
+        const { hasComment, resolved } = timelineFilterItemInfo(item);
+        if (!hasComment) return false;
+        if (mode === 'unresolved' && resolved) return false;
+        return true;
+    }
+
+    function gatherTimelineFilterItems(root = document) {
+        const items = qsa(root, TIMELINE_FILTER_ITEM_SELECTOR).filter(
+            (item) => !item.closest?.(`#${BUTTON_CONTAINER_ID}, #acktopus-analysis, .ack-config-overlay`),
+        );
+        const itemSet = new Set(items);
+        return items.filter((item) => {
+            let parent = item.parentElement?.closest?.(TIMELINE_FILTER_ITEM_SELECTOR);
+            while (parent) {
+                if (itemSet.has(parent)) return false;
+                parent = parent.parentElement?.closest?.(TIMELINE_FILTER_ITEM_SELECTOR);
+            }
+            return true;
+        });
+    }
+
+    function restoreTimelineFilterItems(root = document) {
+        qsa(root, '[data-ack-timeline-filter-hidden="1"]').forEach((item) => {
+            item.style.display = item.dataset.ackTimelineFilterDisplay || '';
+            delete item.dataset.ackTimelineFilterHidden;
+            delete item.dataset.ackTimelineFilterDisplay;
+        });
+    }
+
+    function renderTimelineFilterButton(btn, hiddenCount = null) {
+        const mode = getTimelineFilterMode();
+        const compact = GM_getValue('compactToolbar', false);
+        const label = TIMELINE_FILTER_LABELS[mode] || TIMELINE_FILTER_LABELS.all;
+        const countText = hiddenCount && mode !== 'all' ? ` (${hiddenCount})` : '';
+        btn.textContent = compact ? `🧹${countText}` : `🧹 ${label}${countText}`;
+        btn.title = `Timeline filter: ${label}\nClick to cycle All, Comments, and Unresolved.\nShift+click: cycle backward.`;
+        btn.dataset.ackTimelineFilterMode = mode;
+    }
+
+    function updateTimelineFilterButtons(hiddenCount = null) {
+        for (const btn of document.querySelectorAll('.ack-timeline-filter-btn')) {
+            renderTimelineFilterButton(btn, hiddenCount);
+        }
+    }
+
+    function applyTimelineFilter(root = document) {
+        if (!isTimelineFilterPage()) {
+            restoreTimelineFilterItems(document);
+            updateTimelineFilterButtons(0);
+            return 0;
+        }
+        const mode = getTimelineFilterMode();
+        restoreTimelineFilterItems(document);
+        let hidden = 0;
+        if (mode !== 'all') {
+            for (const item of gatherTimelineFilterItems(document)) {
+                if (timelineFilterShouldShowItem(item, mode)) continue;
+                item.dataset.ackTimelineFilterHidden = '1';
+                item.dataset.ackTimelineFilterDisplay = item.style.display || '';
+                item.style.display = 'none';
+                hidden++;
+            }
+        }
+        updateTimelineFilterButtons(hidden);
+        return hidden;
+    }
+
+    function buildTimelineFilterButton() {
+        const btn = createBtn('', (e) => {
+            const dir = eventUsesShiftAlternate(e) ? -1 : 1;
+            const mode = nextTimelineFilterMode(getTimelineFilterMode(), dir);
+            setTimelineFilterMode(mode);
+            applyTimelineFilter(document);
+        });
+        btn.classList.add('ack-timeline-filter-btn');
+        btn.style.padding = GM_getValue('compactToolbar', false) ? '4px 8px' : '4px 10px';
+        renderTimelineFilterButton(btn, 0);
+        return btn;
+    }
+
     function gatherCommentContext(container) {
         const root =
             container?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
@@ -14038,6 +14203,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'normalizePRHeaderHeadBranch', when: (ctx) => ctx.onPR, fn: normalizePRHeaderHeadBranch },
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
         { name: 'enhanceForcePushLinks', when: (ctx) => ctx.onPR, fn: enhanceForcePushLinks },
+        {
+            name: 'timelineFilter',
+            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
+            fn: () => applyTimelineFilter(document),
+        },
         {
             name: 'commentMenuAugmenter',
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
@@ -21449,6 +21619,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         registerShiftAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
+
+        if (isTimelineFilterPage()) toolbar.appendChild(buildTimelineFilterButton());
 
         _ackPendingReviewActive = onPR ? detectPendingReview() && hasPendingReviewChanges() : false;
 
@@ -36149,6 +36321,46 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     // --- Comment navigator & commit badges ---
+
+    ackTest('timeline filter classifies comments, noise, and resolved threads', () => {
+        const event = document.createElement('div');
+        event.className = 'js-timeline-item';
+        event.textContent = 'force-pushed some commits';
+        const comment = document.createElement('div');
+        comment.className = 'timeline-comment';
+        comment.innerHTML = '<div class="markdown-body">real comment</div>';
+        const resolved = document.createElement('details');
+        resolved.setAttribute('data-resolved', 'true');
+        resolved.innerHTML = '<div class="markdown-body">resolved thread</div>';
+
+        ackEq(timelineFilterShouldShowItem(event, 'comments', false), false, 'comments mode hides timeline noise');
+        ackEq(timelineFilterShouldShowItem(comment, 'comments', false), true, 'comments mode keeps comments');
+        ackEq(timelineFilterShouldShowItem(resolved, 'comments', false), true, 'comments mode keeps resolved comments');
+        ackEq(timelineFilterShouldShowItem(resolved, 'unresolved', false), false, 'unresolved mode hides resolved threads');
+        ackEq(timelineFilterShouldShowItem(event, 'comments', true), true, 'hash-pinned items stay visible');
+    });
+
+    ackTest('timeline filter cycles and stores the mode per path', () => {
+        const path = '/owner/repo/pull/123';
+        setTimelineFilterMode('all', path);
+        ackEq(getTimelineFilterMode(path), 'all', 'all is default');
+        ackEq(nextTimelineFilterMode('all'), 'comments', 'all cycles to comments');
+        ackEq(nextTimelineFilterMode('comments'), 'unresolved', 'comments cycles to unresolved');
+        ackEq(nextTimelineFilterMode('all', -1), 'unresolved', 'shift cycle wraps backward');
+        setTimelineFilterMode('comments', path);
+        ackEq(getTimelineFilterMode(path), 'comments', 'stores comments mode');
+        setTimelineFilterMode('all', path);
+        ackEq(getTimelineFilterMode(path), 'all', 'all clears stored override');
+    });
+
+    ackTest('timeline filter is wired into toolbar and DOM refresh', () => {
+        const source = _ackSource;
+        ackAssert(source.includes('function buildTimelineFilterButton'), 'has toolbar button');
+        ackAssert(source.includes("toolbar.appendChild(buildTimelineFilterButton())"), 'adds button to toolbar');
+        ackAssert(source.includes("name: 'timelineFilter'"), 'has document injector');
+        ackAssert(source.includes('fn: () => applyTimelineFilter(document)'), 'injector reapplies filter');
+        ackAssert(source.includes('sessionStorage.setItem(timelineFilterStorageKey(path), safeMode)'), 'persists mode');
+    });
 
     ackTest('gatherCommentElements exists and sorts posted comments newest first', () => {
         const source = _ackSource;
