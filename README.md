@@ -264,6 +264,8 @@ Inline review comments also get a quick link back to the Changes tab when ACKtop
 
 ACKtopus does not activate proofreading while drafting a new PR, issue, or comment. Proofreading is limited to existing comments and PR descriptions that are already in edit mode, so compose forms are left to GitHub's native flow.
 
+Markdown textareas get small editor ergonomics: **Tab** indents selected lines, **Shift+Tab** unindents them, and comment boxes grow with their content up to a viewport-sized cap.
+
 ### Wrap selection in collapsible details
 
 Adds a helper button near the comment editor to wrap the current selection in a collapsible details block (handy for long logs or optional context).
