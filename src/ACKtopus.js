@@ -628,6 +628,9 @@
         comments: 'Comments',
         unresolved: 'Unresolved',
     });
+    const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], .file';
+    const DIFF_FILE_HEADER_SELECTOR =
+        '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     function escapeHTML(s) {
@@ -14208,6 +14211,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
             fn: () => applyTimelineFilter(document),
         },
+        { name: 'diffHeaderToggle', when: (ctx) => ctx.onToolbar, fn: installDiffHeaderToggle },
         {
             name: 'commentMenuAugmenter',
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
@@ -18536,6 +18540,150 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         navigateComment(dir);
     }
 
+    function isDiffReviewPage(path = location.pathname) {
+        return (
+            isComparePage(path) ||
+            isCommitPage(path) ||
+            /\/pull\/\d+\/files\/?$/.test(path) ||
+            /\/pull\/\d+\/(?:changes|commits)\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path)
+        );
+    }
+
+    function gatherDiffFiles(root = document) {
+        return qsa(root, DIFF_FILE_SELECTOR).filter((file) => {
+            if (!isVisible(file)) return false;
+            if (file.closest?.(`#${BUTTON_CONTAINER_ID}, #acktopus-analysis, .ack-config-overlay`)) return false;
+            return !!file.querySelector?.(DIFF_FILE_HEADER_SELECTOR);
+        });
+    }
+
+    function diffFileViewedState(file) {
+        const control = [
+            ...file.querySelectorAll(
+                'input.js-reviewed-checkbox, input[type="checkbox"][aria-label*="viewed" i], ' +
+                    'button[aria-label*="viewed" i], button[aria-pressed][data-testid*="viewed" i]',
+            ),
+        ].find((el) => isVisible(el) || el.matches?.('input[type="checkbox"]'));
+        if (!control) return null;
+        if (control.matches?.('input[type="checkbox"]')) return !!control.checked;
+        const pressed = control.getAttribute('aria-pressed') || control.getAttribute('aria-checked');
+        if (pressed) return pressed === 'true';
+        return /\bviewed\b/i.test(control.textContent || '') ? true : false;
+    }
+
+    function findFirstUnviewedDiffFile(root = document) {
+        for (const file of gatherDiffFiles(root)) {
+            if (diffFileViewedState(file) === false) return file;
+        }
+        return null;
+    }
+
+    function jumpToFirstUnviewedDiffFile(btn = null) {
+        const file = findFirstUnviewedDiffFile(document);
+        if (file) {
+            const header = file.querySelector(DIFF_FILE_HEADER_SELECTOR) || file;
+            scrollToAndHighlight(header);
+            return true;
+        }
+        const popup = makeStatusPopup('No unviewed files found');
+        if (btn) {
+            const orig = btn.textContent;
+            btn.textContent = '✅';
+            ackSetTimeout(() => {
+                if (btn.isConnected) btn.textContent = orig;
+                popup.remove();
+            }, 1200);
+        } else {
+            ackSetTimeout(() => popup.remove(), 1200);
+        }
+        return false;
+    }
+
+    function toggleWhitespaceQueryParam() {
+        const url = new URL(location.href);
+        if (url.searchParams.get('w') === '1') url.searchParams.delete('w');
+        else url.searchParams.set('w', '1');
+        location.assign(url.href);
+    }
+
+    function findDiffFileToggle(file, header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR)) {
+        if (!file || !header) return null;
+        const candidates = [
+            ...header.querySelectorAll('button, summary, [role="button"]'),
+            ...file.querySelectorAll('button.js-details-target, summary.js-details-target'),
+        ].filter((el, idx, arr) => arr.indexOf(el) === idx && isVisible(el));
+        const labelOf = (el) =>
+            [
+                el.getAttribute?.('aria-label'),
+                el.getAttribute?.('title'),
+                el.getAttribute?.('data-testid'),
+                el.className,
+                el.textContent,
+            ]
+                .map((v) => String(v || '').replace(/\s+/g, ' ').trim())
+                .filter(Boolean)
+                .join(' ');
+        return (
+            candidates.find((el) => /toggle diff|collapse|expand|show diff|hide diff|details-target/i.test(labelOf(el))) ||
+            candidates.find((el) => el.querySelector?.('.octicon-chevron-down, .octicon-chevron-right')) ||
+            null
+        );
+    }
+
+    let _diffHeaderToggleInstalled = false;
+    function installDiffHeaderToggle() {
+        if (_diffHeaderToggleInstalled) return;
+        _diffHeaderToggleInstalled = true;
+        document.addEventListener('click', (e) => {
+            if (_ackTesting || !isDiffReviewPage()) return;
+            if (e.defaultPrevented || (e.button != null && e.button !== 0)) return;
+            const header = e.target?.closest?.(DIFF_FILE_HEADER_SELECTOR);
+            if (!header) return;
+            if (
+                e.target.closest?.(
+                    'a, button, input, label, select, textarea, summary, details, [role="button"], [role="menuitem"]',
+                )
+            )
+                return;
+            const file = header.closest(DIFF_FILE_SELECTOR);
+            const toggle = findDiffFileToggle(file, header);
+            if (!toggle) return;
+            e.preventDefault();
+            e.stopPropagation();
+            toggle.click();
+        });
+    }
+
+    function buildDiffReviewToolsGroup() {
+        const compact = GM_getValue('compactToolbar', false);
+        const group = document.createElement('div');
+        Object.assign(group.style, { display: 'flex', gap: compact ? '2px' : '4px' });
+
+        const whitespaceOn = new URL(location.href).searchParams.get('w') === '1';
+        const whitespaceBtn = createBtn(
+            compact ? '␠' : whitespaceOn ? '␠ Show WS' : '␠ Ignore WS',
+            toggleWhitespaceQueryParam,
+            whitespaceOn ? 'Show whitespace-sensitive diff (remove ?w=1)' : 'Hide whitespace-only diff noise (add ?w=1)',
+        );
+        whitespaceBtn.classList.add('ack-diff-whitespace-btn');
+        whitespaceBtn.style.padding = compact ? '4px 8px' : '4px 10px';
+        group.appendChild(whitespaceBtn);
+
+        const unviewedBtn = createBtn(
+            compact ? '⇥' : '⇥ Unviewed',
+            (e) => {
+                e.preventDefault();
+                jumpToFirstUnviewedDiffFile(unviewedBtn);
+            },
+            'Jump to the first visible file that is not marked viewed',
+        );
+        unviewedBtn.classList.add('ack-first-unviewed-btn');
+        unviewedBtn.style.padding = compact ? '4px 8px' : '4px 10px';
+        group.appendChild(unviewedBtn);
+
+        return group;
+    }
+
     // --- Commit Badges on Comments ---
     // Adds a small clickable commit SHA badge to each review comment that was
     // posted on a specific commit, so reviewers can jump to that commit view.
@@ -21619,6 +21767,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         registerShiftAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
+
+        if (isDiffReviewPage()) toolbar.appendChild(buildDiffReviewToolsGroup());
 
         if (isTimelineFilterPage()) toolbar.appendChild(buildTimelineFilterButton());
 
@@ -36360,6 +36510,70 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("name: 'timelineFilter'"), 'has document injector');
         ackAssert(source.includes('fn: () => applyTimelineFilter(document)'), 'injector reapplies filter');
         ackAssert(source.includes('sessionStorage.setItem(timelineFilterStorageKey(path), safeMode)'), 'persists mode');
+    });
+
+    ackTest('diff review helpers detect diff-like review pages', () => {
+        ackEq(isDiffReviewPage('/owner/repo/pull/123/files'), true, 'PR files page is a diff review page');
+        ackEq(
+            isDiffReviewPage('/owner/repo/pull/123/changes/abcdef1'),
+            true,
+            'PR commit changes page is a diff review page',
+        );
+        ackEq(isDiffReviewPage('/owner/repo/commit/abcdef1'), true, 'standalone commit page is a diff review page');
+        ackEq(isDiffReviewPage('/owner/repo/pull/123'), false, 'conversation page is not a diff review page');
+    });
+
+    ackTest('findFirstUnviewedDiffFile finds unchecked viewed controls', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+          <div class="js-file" id="viewed-file">
+            <div class="file-header">viewed</div>
+            <input class="js-reviewed-checkbox" type="checkbox" checked aria-label="Viewed">
+          </div>
+          <div class="js-file" id="unviewed-file">
+            <div class="file-header">unviewed</div>
+            <input class="js-reviewed-checkbox" type="checkbox" aria-label="Viewed">
+          </div>
+        `;
+        document.body.appendChild(host);
+        host.querySelectorAll('*').forEach((el) => {
+            el.getBoundingClientRect = () => ({ width: 120, height: 20, top: 0, left: 0, right: 120, bottom: 20 });
+        });
+        try {
+            ackEq(findFirstUnviewedDiffFile(host)?.id, 'unviewed-file', 'returns the first unchecked viewed control');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('findDiffFileToggle prefers native diff toggle controls', () => {
+        const file = document.createElement('div');
+        file.className = 'js-file';
+        file.innerHTML = `
+          <div class="file-header">
+            <button class="js-details-target" aria-label="Toggle diff contents">toggle</button>
+            <a href="#diff">src/file.cpp</a>
+          </div>
+        `;
+        document.body.appendChild(file);
+        file.querySelectorAll('*').forEach((el) => {
+            el.getBoundingClientRect = () => ({ width: 120, height: 20, top: 0, left: 0, right: 120, bottom: 20 });
+        });
+        try {
+            const header = file.querySelector('.file-header');
+            ackEq(findDiffFileToggle(file, header), file.querySelector('button'), 'uses GitHub native toggle');
+        } finally {
+            file.remove();
+        }
+    });
+
+    ackTest('diff review helpers are wired into toolbar and DOM refresh', () => {
+        const source = _ackSource;
+        ackAssert(source.includes('function buildDiffReviewToolsGroup'), 'has toolbar group');
+        ackAssert(source.includes("toolbar.appendChild(buildDiffReviewToolsGroup())"), 'adds group to toolbar');
+        ackAssert(source.includes("name: 'diffHeaderToggle'"), 'has header-toggle injector');
+        ackAssert(source.includes('toggleWhitespaceQueryParam'), 'has whitespace query toggle');
+        ackAssert(source.includes('jumpToFirstUnviewedDiffFile'), 'has first-unviewed jump');
     });
 
     ackTest('gatherCommentElements exists and sorts posted comments newest first', () => {
