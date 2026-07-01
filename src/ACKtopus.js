@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.182
+// @version      1.183
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18860,12 +18860,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    // Primer dropdowns absolutely position the menu, so an open <details>'
+    // own box reflects only the in-flow <summary> trigger. Measure the
+    // rendered popup child instead, or a menu the user is reading closes as
+    // soon as its trigger scrolls past the viewport edge.
+    function menuGeometrySource(details) {
+        for (const child of details.children) {
+            if (child.tagName === 'SUMMARY') continue;
+            const rect = child.getBoundingClientRect?.();
+            if (rect && (rect.width > 0 || rect.height > 0)) return child;
+        }
+        return details;
+    }
+
     function closeOutOfViewMenus() {
         let closed = 0;
         for (const details of document.querySelectorAll('details[open]')) {
             if (isAckOwnedOverlay(details)) continue;
             if (!details.matches?.('.details-overlay, .js-reaction-popover-container, .new-reactions-dropdown')) continue;
-            if (!isElementOutsideViewport(details)) continue;
+            if (!isElementOutsideViewport(menuGeometrySource(details))) continue;
             details.removeAttribute('open');
             closed++;
         }
@@ -36916,6 +36929,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         host.innerHTML = `
           <details open class="details-overlay" id="visible-menu"><summary>Visible</summary></details>
           <details open class="details-overlay" id="offscreen-menu"><summary>Offscreen</summary></details>
+          <details open class="details-overlay" id="dropdown-menu-open">
+            <summary>Trigger scrolled out</summary>
+            <ul class="dropdown-menu" id="dropdown-popup">popup</ul>
+          </details>
           <div class="ack-diff-dialog-overlay"><details open class="details-overlay" id="ack-menu"><summary>ACK</summary></details></div>
         `;
         document.body.appendChild(host);
@@ -36943,6 +36960,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             right: 20,
             bottom: -80,
         });
+        // Trigger box out of view but the absolutely-positioned popup visible:
+        // the menu must stay open (geometry comes from the popup, not <details>).
+        host.querySelector('#dropdown-menu-open').getBoundingClientRect = () => ({
+            width: 10,
+            height: 10,
+            top: -100,
+            left: 10,
+            right: 20,
+            bottom: -80,
+        });
+        host.querySelector('#dropdown-popup').getBoundingClientRect = () => ({
+            width: 200,
+            height: 150,
+            top: 5,
+            left: 10,
+            right: 210,
+            bottom: 155,
+        });
         const origQS = document.querySelectorAll;
         document.querySelectorAll = (sel) => {
             if (sel === 'details[open]' || sel === '[popover]') return host.querySelectorAll(sel);
@@ -36952,6 +36987,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(closeOutOfViewMenus(), 1, 'closes only one stale GitHub menu');
             ackAssert(host.querySelector('#visible-menu').open, 'visible menu stays open');
             ackAssert(!host.querySelector('#offscreen-menu').open, 'offscreen menu closes');
+            ackAssert(
+                host.querySelector('#dropdown-menu-open').open,
+                'menu with a visible popup stays open even when its trigger scrolled out',
+            );
             ackAssert(host.querySelector('#ack-menu').open, 'ACKtopus-owned menu is ignored');
         } finally {
             document.querySelectorAll = origQS;
