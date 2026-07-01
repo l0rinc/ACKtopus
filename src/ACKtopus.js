@@ -14191,6 +14191,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             when: (ctx) => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose,
             fn: trackEditForms,
         },
+        {
+            name: 'editorErgonomics',
+            when: (ctx) => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose,
+            fn: installEditorErgonomics,
+        },
         { name: 'prTitleProofread', when: (ctx) => ctx.onPR, fn: addPRTitleProofreadButton },
         {
             name: 'stickyEditToolbar',
@@ -14266,7 +14271,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ', [data-testid="comment-header"], .timeline-comment-header, .review-comment-header, ' +
         'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, ' +
         '[class*="Toolbar-module__toolbar"], textarea';
-    const FAST_EDITOR_INJECTORS = ['detailsButtons', 'trackEditForms', 'quickActions'];
+    const FAST_EDITOR_INJECTORS = ['detailsButtons', 'trackEditForms', 'editorErgonomics', 'quickActions'];
     let fastEditorAffordanceTimer = null;
     const pendingFastEditorRoots = new Set();
 
@@ -14495,7 +14500,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!root.isConnected) continue;
             runRootInjectorsForNames(
                 root,
-                ['detailsButtons', 'trackEditForms', 'stickyEditToolbar', 'quickActions', 'reactionHover'],
+                ['detailsButtons', 'trackEditForms', 'editorErgonomics', 'stickyEditToolbar', 'quickActions', 'reactionHover'],
                 ctx,
             );
         }
@@ -17896,6 +17901,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function isProofreadableComposeToolbar(toolbar, path = location.pathname) {
         return isProofreadableComposeTextarea(getToolbarTextarea(toolbar), path);
+    }
+
+    function rewriteTextareaSelectionByLine(ta, rewriteLine) {
+        const value = String(ta.value || '');
+        const start = Number.isFinite(ta.selectionStart) ? ta.selectionStart : value.length;
+        const end = Number.isFinite(ta.selectionEnd) ? ta.selectionEnd : start;
+        const blockStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+        const selectionEnd = end > start && value[end - 1] === '\n' ? end - 1 : end;
+        const blockEnd = selectionEnd + value.slice(selectionEnd).search(/\n|$/);
+        const originalBlock = value.slice(blockStart, blockEnd);
+        let startDelta = 0;
+        let endDelta = 0;
+        const rewrittenBlock = originalBlock
+            .split('\n')
+            .map((line, idx) => {
+                const next = rewriteLine(line);
+                const delta = next.length - line.length;
+                if (idx === 0 && start > blockStart) startDelta = delta;
+                endDelta += delta;
+                return next;
+            })
+            .join('\n');
+        if (rewrittenBlock === originalBlock) return false;
+        setTextareaValue(ta, value.slice(0, blockStart) + rewrittenBlock + value.slice(blockEnd));
+        ta.selectionStart = Math.max(blockStart, start + startDelta);
+        ta.selectionEnd = Math.max(ta.selectionStart, end + endDelta);
+        return true;
+    }
+
+    function indentTextareaSelection(ta, unindent = false) {
+        if (!ta) return false;
+        return rewriteTextareaSelectionByLine(ta, (line) => {
+            if (!unindent) return `    ${line}`;
+            if (line.startsWith('    ')) return line.slice(4);
+            if (line.startsWith('\t')) return line.slice(1);
+            if (/^ {1,3}\S/.test(line)) return line.replace(/^ {1,3}/, '');
+            return line;
+        });
+    }
+
+    function fitCommentTextarea(ta) {
+        if (!ta?.isConnected || ta.dataset.ackFitTextarea !== '1') return;
+        if (ta.closest('#acktopus-analysis, #acktopus-queue, .ack-config-overlay, .ack-diff-dialog-overlay')) return;
+        const maxHeight = Math.max(160, Math.round((window.innerHeight || 800) * 0.55));
+        const minHeight = parseFloat(ta.dataset.ackFitTextareaMinHeight || '') || ta.offsetHeight || 80;
+        ta.style.height = 'auto';
+        const nextHeight = Math.max(minHeight, Math.min(ta.scrollHeight + 2, maxHeight));
+        ta.style.height = `${nextHeight}px`;
+        ta.style.overflowY = ta.scrollHeight + 2 > maxHeight ? 'auto' : 'hidden';
+    }
+
+    function installEditorErgonomics(root = document, path = location.pathname) {
+        const textareas = qsa(root, 'textarea').filter((ta) => isProofreadableComposeTextarea(ta, path));
+        for (const ta of textareas) {
+            if (!ta.dataset.ackEditorErgonomicsBound) {
+                ta.dataset.ackEditorErgonomicsBound = '1';
+                ta.addEventListener('keydown', (e) => {
+                    if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey) return;
+                    e.preventDefault();
+                    indentTextareaSelection(ta, e.shiftKey);
+                    fitCommentTextarea(ta);
+                });
+                ta.addEventListener('input', () => fitCommentTextarea(ta));
+                ta.addEventListener('change', () => fitCommentTextarea(ta));
+            }
+            if (!ta.dataset.ackFitTextarea) {
+                ta.dataset.ackFitTextarea = '1';
+                ta.dataset.ackFitTextareaMinHeight = String(ta.offsetHeight || 0);
+            }
+            fitCommentTextarea(ta);
+        }
     }
 
     function normalizeExpectedReplyResult(raw) {
@@ -27169,6 +27245,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         addDetailsButtons(root, '/bitcoin-core/leveldb-subtree/pull/61');
         ackEq(root.querySelectorAll('.ack-details-btn').length, 1, 'details remains available in compose toolbar');
         ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 1, 'proofread is injected into compose toolbar');
+    });
+
+    ackTest('editor ergonomics indents and unindents selected lines', () => {
+        const ta = document.createElement('textarea');
+        ta.value = 'alpha\nbeta';
+        ta.selectionStart = 0;
+        ta.selectionEnd = ta.value.length;
+        ackEq(indentTextareaSelection(ta, false), true, 'indent changed selected lines');
+        ackEq(ta.value, '    alpha\n    beta', 'adds four-space indentation');
+        ta.selectionStart = 0;
+        ta.selectionEnd = ta.value.length;
+        ackEq(indentTextareaSelection(ta, true), true, 'unindent changed selected lines');
+        ackEq(ta.value, 'alpha\nbeta', 'removes four-space indentation');
+    });
+
+    ackTest('installEditorErgonomics binds GitHub comment textareas', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+              <div class="js-previewable-comment-form">
+                <textarea id="comment-body">hello</textarea>
+              </div>
+            `;
+        document.body.appendChild(root);
+        const ta = root.querySelector('textarea');
+        ta.getBoundingClientRect = () => ({ width: 200, height: 80, top: 0, left: 0, right: 200, bottom: 80 });
+        Object.defineProperty(ta, 'offsetHeight', { value: 80, configurable: true });
+        Object.defineProperty(ta, 'scrollHeight', { value: 120, configurable: true });
+        try {
+            installEditorErgonomics(root, '/owner/repo/pull/123');
+            ackEq(ta.dataset.ackEditorErgonomicsBound, '1', 'textarea is bound once');
+            ackEq(ta.dataset.ackFitTextarea, '1', 'textarea fit marker set');
+            ackAssert(ta.style.height, 'textarea height is adjusted');
+        } finally {
+            root.remove();
+        }
+    });
+
+    ackTest('editor ergonomics are wired into normal and fast injectors', () => {
+        const source = _ackSource;
+        ackAssert(source.includes("name: 'editorErgonomics'"), 'has root injector entry');
+        ackAssert(source.includes("'editorErgonomics', 'quickActions'"), 'fast editor injector includes ergonomics');
+        ackAssert(source.includes("['detailsButtons', 'trackEditForms', 'editorErgonomics'"), 'attr refresh includes ergonomics');
     });
 
     ackTest('edit toolbar buttons activate on pointerdown with keyboard click fallback', () => {
