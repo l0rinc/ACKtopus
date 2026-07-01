@@ -178,6 +178,8 @@ Copies page context to your clipboard for sharing or pasting into an LLM. The dr
 Hold **Shift** while clicking **Patch**, **Comments**, or **Full** to reveal hidden/resolved/collapsed content first, then run the chosen copy action. ACKtopus shows a 📂 hint next to the active context-copy button while Shift is held.
 
 On single-commit pages like `/changes/<sha>`, `/commits/<sha>`, and standalone commit URLs like `/commit/<sha>`, the same button copies **commit-only** context instead: the parent PR metadata/description when available, the current commit patch, and visible comments tied to that commit.
+
+On compare pages like `/compare/base...head`, **Patch** copies the corresponding compare `.patch`, including cross-fork ranges such as `/compare/master...owner:repo:branch`.
 Each comment’s `...` menu also gets a **Copy comment context** action, which copies just that comment plus its surrounding thread and location metadata (file, line, commit, author, permalink).
 
 ### 🪞 Repo mirrors

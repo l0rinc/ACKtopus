@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.175
+// @version      1.176
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -6458,6 +6458,19 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         );
     }
 
+    function comparePatchUrl(path = location.pathname) {
+        const m = String(path || '').match(/^\/([^/?#]+)\/([^/?#]+)\/compare\/([^?#]+)$/);
+        if (!m) return '';
+        const [, owner, repo, range] = m;
+        if (!range.includes('..')) return '';
+        return `https://github.com/${owner}/${repo}/compare/${range.endsWith('.patch') ? range : `${range}.patch`}`;
+    }
+
+    function fetchComparePatch(path = location.pathname) {
+        const url = comparePatchUrl(path);
+        return url ? gmFetchText(url).then(stripDeletedFileBodiesFromPatch) : Promise.resolve('');
+    }
+
     // Shared context helper: fetches diff, commit messages, PR description.
     // Cached in-memory per PR. Requires explicit invalidatePRContext() on
     // force-push detection and on page re-inject (handles edited descriptions).
@@ -8484,6 +8497,17 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     async function gatherPatchContext(onProgress = () => {}) {
+        if (isComparePage()) {
+            onProgress('Fetching compare patch...');
+            try {
+                const patch = await fetchComparePatch();
+                onProgress('Done');
+                return patch ? `# Compare: ${location.href}\n\n## Patch\n\`\`\`patch\n${patch}\n\`\`\`` : '';
+            } catch (_) {
+                onProgress('Done');
+                return '';
+            }
+        }
         return gatherFullPRContext(onProgress, { includePatch: true, includeComments: false });
     }
 
@@ -21140,11 +21164,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function copyPatchContext(btn) {
         const mode = getAnalysisMode();
         const isCommitPage = mode === ANALYSIS_MODES.commit;
+        const isCompare = isComparePage();
         return copyContextWith(btn, {
             gather: isCommitPage ? gatherSingleCommitPatchContext : gatherPatchContext,
             initialStatus: isCommitPage
                 ? 'Gathering commit patch context...'
-                : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} patch context...`,
+                : `Gathering ${isCompare ? 'compare' : pageKind() === 'issue' ? 'issue' : 'PR'} patch context...`,
             successLabel: 'Copied',
             errorLabel: 'copy patch context',
         });
@@ -21304,6 +21329,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const group = document.createElement('div');
         Object.assign(group.style, { display: 'flex', position: 'relative' });
         const isIssue = pageKind() === 'issue';
+        const isCompare = isComparePage();
 
         const actions = [
             {
@@ -21311,11 +21337,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 emoji: '📄',
                 label: 'Patch',
                 tip:
-                    getAnalysisMode() === ANALYSIS_MODES.commit
+                    isCompare
+                        ? 'Copy this compare page patch to clipboard'
+                        : getAnalysisMode() === ANALYSIS_MODES.commit
                         ? 'Copy only the patch of the currently viewed commit to clipboard'
                         : 'Copy PR description, commits, and full patch to clipboard',
-                revealBeforeCopy: 'all',
-                enabled: () => !isIssue,
+                revealBeforeCopy: isCompare ? null : 'all',
+                enabled: () => isCompare || !isIssue,
                 run: (btn) => copyPatchContext(btn),
             },
             {
@@ -21327,7 +21355,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         ? 'Copy PR description and visible comments for the currently viewed commit, without any patch'
                         : `Copy ${isIssue ? 'issue' : 'PR'} description and comments, without any patch`,
                 revealBeforeCopy: 'all',
-                enabled: () => true,
+                enabled: () => !isCompare,
                 run: (btn) => copyCommentsContext(btn),
             },
             {
@@ -21336,7 +21364,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 label: 'Pending',
                 tip: 'Copy pending review comments only, with file, line, thread, permalink, and target context',
                 revealBeforeCopy: 'pending',
-                enabled: () => !isIssue && getAnalysisMode() !== ANALYSIS_MODES.commit,
+                enabled: () => !isCompare && !isIssue && getAnalysisMode() !== ANALYSIS_MODES.commit,
                 run: (btn) => copyPendingReviewCommentsContext(btn),
             },
             {
@@ -21345,11 +21373,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 label: 'Full',
                 tip: 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)',
                 revealBeforeCopy: 'all',
-                enabled: () => true,
+                enabled: () => !isCompare,
                 run: (btn) => copyPRContext(btn),
             },
         ];
-        let selectedAction = GM_getValue('contextCopyAction', 'patch');
+        let selectedAction = isCompare ? 'patch' : GM_getValue('contextCopyAction', 'patch');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
         const contextModeSuffix = (action) => {
             if (!action.revealBeforeCopy) return '';
@@ -21869,9 +21897,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             toolbar.appendChild(buildSHAGroup());
         }
-        if (!onCompare) {
-            toolbar.appendChild(buildContextCopyGroup());
-        }
+        toolbar.appendChild(buildContextCopyGroup());
 
         const mirrorUrl = repoMirrorUrlForPath();
         if (mirrorUrl) {
@@ -31488,7 +31514,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('gmFetchText helper exists and is used by fetchPatch, fetchRawFile, fetchCommitPatch', () => {
+    ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
         const source = _ackSource;
         ackAssert(source.includes('function gmFetchText(url)'), 'gmFetchText defined');
         const fetchPatch = source.slice(
@@ -31496,6 +31522,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function categorizePRFiles'),
         );
         ackAssert(fetchPatch.includes('gmFetchText('), 'fetchPatch uses gmFetchText');
+        ackAssert(fetchPatch.includes('function fetchComparePatch'), 'fetchComparePatch is near patch helpers');
+        ackAssert(fetchPatch.includes('comparePatchUrl(path)'), 'fetchComparePatch builds a compare patch URL');
         ackAssert(fetchPatch.includes('stripDeletedFileBodiesFromPatch'), 'fetchPatch strips deleted-file bodies');
         const fetchRaw = source.slice(
             source.indexOf('function fetchRawFile'),
@@ -31512,12 +31540,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('no standalone GM_xmlhttpRequest GET wrappers outside shared GET helpers', () => {
         const source = _ackSource;
-        // fetchPatch, fetchRawFile, fetchCommitPatch should no longer have raw GM_xmlhttpRequest
+        // fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch should no longer have raw GM_xmlhttpRequest
         const fetchPatch = source.slice(
             source.indexOf('function fetchPatch'),
             source.indexOf('function categorizePRFiles'),
         );
-        ackAssert(!fetchPatch.includes('GM_xmlhttpRequest'), 'fetchPatch has no raw GM_xmlhttpRequest');
+        ackAssert(!fetchPatch.includes('GM_xmlhttpRequest'), 'fetchPatch/fetchComparePatch have no raw GM_xmlhttpRequest');
         const fetchRaw = source.slice(
             source.indexOf('function fetchRawFile'),
             source.indexOf('async function fetchPRFileCategories'),
@@ -32022,6 +32050,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(parsePageContext('/bitcoin/bitcoin'), null);
     });
 
+    ackTest('comparePatchUrl builds patch URLs for cross-fork compare pages', () => {
+        ackEq(
+            comparePatchUrl('/bitcoin/bitcoin/compare/master...hodlinator:bitcoin:pr/35208_alt.extract_compute'),
+            'https://github.com/bitcoin/bitcoin/compare/master...hodlinator:bitcoin:pr/35208_alt.extract_compute.patch',
+        );
+        ackEq(
+            comparePatchUrl('/bitcoin/bitcoin/compare/base...owner:repo:topic/with/slashes.patch'),
+            'https://github.com/bitcoin/bitcoin/compare/base...owner:repo:topic/with/slashes.patch',
+        );
+        ackEq(comparePatchUrl('/bitcoin/bitcoin/pull/35208'), '');
+    });
+
     ackTest('inject gates PR-only features behind isPRPage', () => {
         const source = _ackSource;
         const injectFn = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
@@ -32035,6 +32075,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             injectFn.includes('toolbar.appendChild(buildContextCopyGroup())'),
             'context copy group is available on toolbar pages, not only PRs',
         );
+        ackAssert(!injectFn.includes('if (!onCompare)'), 'context copy group is not hidden on compare pages');
         ackAssert(
             !injectFn.includes('getAnalysisMode() !== ANALYSIS_MODES.commit'),
             'context copy group is not hidden on single commit pages',
@@ -33350,7 +33391,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(group.includes('copyCommentsContext'), 'context split group offers comments-only context copy');
         ackAssert(group.includes('copyPRContext'), 'context split group offers full context copy');
         ackAssert(group.includes("const isIssue = pageKind() === 'issue'"), 'context split group detects issue pages');
-        ackAssert(group.includes('enabled: () => !isIssue'), 'patch action is disabled on issues');
+        ackAssert(group.includes('const isCompare = isComparePage()'), 'context split group detects compare pages');
+        ackAssert(
+            group.includes('enabled: () => isCompare || !isIssue'),
+            'patch action is enabled on compare pages and disabled on issues',
+        );
+        ackAssert(group.includes("let selectedAction = isCompare ? 'patch'"), 'compare pages default to patch copy');
+        ackAssert(group.includes('Copy this compare page patch'), 'patch action tooltip specializes on compare pages');
+        ackAssert(group.includes('enabled: () => !isCompare'), 'non-patch context actions are disabled on compare pages');
         ackAssert(group.includes('mainBtn.disabled = !enabled'), 'main button disables unavailable action');
         ackAssert(
             group.includes('getAnalysisMode() === ANALYSIS_MODES.commit'),
@@ -33417,6 +33465,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(patchFn.includes('patch context'), 'shows patch-specific status text');
         ackAssert(patchFn.includes('Gathering commit patch context'), 'shows commit-specific patch status text');
+        ackAssert(patchFn.includes("'compare'"), 'shows compare-specific initial gathering message');
 
         const commentsFn = source.slice(
             source.indexOf('async function copyCommentsContext'),
@@ -33448,6 +33497,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function gatherPatchContext'),
             source.indexOf('async function gatherCommentsContext'),
         );
+        ackAssert(fn.includes('isComparePage()'), 'handles compare pages directly');
+        ackAssert(fn.includes('fetchComparePatch()'), 'fetches compare page patches');
+        ackAssert(fn.includes('# Compare:'), 'labels compare patch context');
         ackAssert(fn.includes('gatherFullPRContext'), 'reuses full PR context helper');
         ackAssert(fn.includes('includePatch: true'), 'keeps patch content');
         ackAssert(fn.includes('includeComments: false'), 'omits conversations');
