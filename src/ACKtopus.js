@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.176
+// @version      1.177
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16519,8 +16519,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function commentMenuItemMatchesAction(item, actionName) {
         const literal = String(actionName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         if (!literal) return false;
+        const candidates = commentMenuItemTextCandidates(item);
+        // Audit-trail items token-match action words too ("Edit history" matches
+        // 'edit') but open the history dialog instead of performing the action.
+        if (candidates.some((text) => /edit[\s_-]*history|show[\s_-]*edits|user[\s_-]*content[\s_-]*edits/i.test(text)))
+            return false;
         const tokenAction = new RegExp(`(^|[\\s_-])${literal}([\\s_-]|$)`, 'i');
-        return commentMenuItemTextCandidates(item).some((text) => tokenAction.test(text));
+        return candidates.some((text) => tokenAction.test(text));
     }
 
     function buildClassicCommentContextMenuItem(container) {
@@ -26552,12 +26557,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             <button id="testid" data-testid="comment-edit-button"></button>
             <div id="action-list" role="menuitem"><span class="ActionListItem-label">Edit</span></div>
             <button id="edited">edited</button>
+            <button id="history">Edit history</button>
+            <div id="history-list" role="menuitem"><span class="ActionListItem-label">Edit history</span></div>
+            <button id="history-testid" data-testid="comment-edit-history-item">View changes</button>
+            <a id="history-href" role="menuitem" aria-label="Show edits">edits</a>
         `;
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#aria'), 'edit'), 'matches aria-label edit');
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#title'), 'delete'), 'matches title delete');
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#testid'), 'edit'), 'matches data-testid edit token');
         ackAssert(commentMenuItemMatchesAction(host.querySelector('#action-list'), 'edit'), 'matches ActionList label');
         ackAssert(!commentMenuItemMatchesAction(host.querySelector('#edited'), 'edit'), 'does not match edited');
+        ackAssert(!commentMenuItemMatchesAction(host.querySelector('#history'), 'edit'), 'does not match Edit history');
+        ackAssert(
+            !commentMenuItemMatchesAction(host.querySelector('#history-list'), 'edit'),
+            'does not match Edit history ActionList item',
+        );
+        ackAssert(
+            !commentMenuItemMatchesAction(host.querySelector('#history-testid'), 'edit'),
+            'does not match edit-history testid',
+        );
+        ackAssert(
+            !commentMenuItemMatchesAction(host.querySelector('#history-href'), 'edit'),
+            'does not match Show edits items',
+        );
     });
 
     ackTest('comment menu trigger ignores edit history dropdowns before the action menu', () => {
