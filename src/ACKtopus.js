@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.184
+// @version      1.185
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18625,6 +18625,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         while (node) {
             if (node.tagName === 'DETAILS' && !node.hasAttribute('open')) {
                 node.setAttribute('open', '');
+            }
+            // The timeline activity filter hides items with display:none, but
+            // navigation still targets them; reveal the item so scrolling and
+            // highlighting actually work (the filter counter refreshes on the
+            // next apply pass).
+            if (node.dataset?.ackTimelineFilterHidden === '1') {
+                node.style.display = node.dataset.ackTimelineFilterDisplay || '';
+                delete node.dataset.ackTimelineFilterHidden;
+                delete node.dataset.ackTimelineFilterDisplay;
             }
             node = node.parentElement;
         }
