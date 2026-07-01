@@ -164,8 +164,14 @@
         return normalized;
     }
 
+    function trimProofreadTrailingWhitespace(text) {
+        return String(text || '').replace(/[ \t]+$/gm, '');
+    }
+
     function postProcessProofreadMarkdown(text) {
-        return normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls(String(text || '')).text);
+        return trimProofreadTrailingWhitespace(
+            normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls(String(text || '')).text),
+        );
     }
 
     function cleanPlainProofreadResult(raw) {
@@ -34801,6 +34807,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const out = postProcessProofreadMarkdown(input);
         ackEq(out, '<details><summary>Benchmark setup</summary>\n\n`bench_bitcoin`\n</details>');
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
+    });
+
+    ackTest('postProcessProofreadMarkdown trims trailing spaces on every line', () => {
+        const input = 'First line  \n```bash\nprintf x \t\n```\n<details><summary>Details</summary> \n\nbody\t\n\n</details>   ';
+        const out = postProcessProofreadMarkdown(input);
+        ackEq(out, 'First line\n```bash\nprintf x\n```\n<details><summary>Details</summary>\n\nbody\n</details>');
     });
 
     ackTest('postProcessProofreadMarkdown does not normalize details-looking text inside fences', () => {
