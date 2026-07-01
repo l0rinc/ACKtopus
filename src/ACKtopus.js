@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.177
+// @version      1.178
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16688,19 +16688,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const scopeSelector =
             '.is-comment-editing, form.js-comment-update:not([hidden]), form.js-issue-update:not([hidden]), ' +
             '[data-testid="edit-comment-form"]';
+        // Wide roots (.js-discussion, turbo-frame parents) can contain OTHER
+        // comments' open editors; only accept scopes tied to this comment, or
+        // the whole lookup reports false success while nothing opened here.
+        const relatedToContainer = (el) =>
+            !container || el === container || !!container.contains?.(el) || !!el?.contains?.(container);
         const usableScope = (scope) => {
             if (!scope?.isConnected) return null;
             if (scope.matches?.('form') && scope.hasAttribute('hidden')) return null;
-            return scope;
+            return relatedToContainer(scope) ? scope : null;
         };
         for (const root of roots) {
             const self = root.matches?.(scopeSelector) ? usableScope(root) : null;
             if (self) return self;
-            const nested = usableScope(root.querySelector?.(scopeSelector));
-            if (nested) return nested;
+            for (const nested of root.querySelectorAll?.(scopeSelector) || []) {
+                const usable = usableScope(nested);
+                if (usable) return usable;
+            }
         }
         const active = document.activeElement;
-        if (active?.matches?.('textarea') && isVisible(active)) {
+        if (active?.matches?.('textarea') && isVisible(active) && relatedToContainer(active)) {
             return findEditForm(active);
         }
         return null;
