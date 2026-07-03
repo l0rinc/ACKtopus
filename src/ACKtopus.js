@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.188
+// @version      1.189
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -14373,6 +14373,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }, 40);
     }
 
+    function scheduleFastEditorAffordancesForMutation(root) {
+        if (_ackTesting) return;
+        if (isPullRequestBulkDiffPage() && !attrTargetMayNeedFastEditorAffordances(root)) return;
+        scheduleFastEditorAffordances(root);
+    }
+
     function runDocInjectors(ctx = currentInjectContext()) {
         for (const inj of DOC_INJECTORS) {
             if (inj.when && !inj.when(ctx)) continue;
@@ -14389,12 +14395,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const HIDDEN_LOADER_SELECTOR =
         '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn, ' +
         ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR;
+    const ACK_MUTATION_ROOT_BATCH_SIZE = 16;
     let mutationPending = false;
     const pendingMutationRoots = new Set();
     let pendingMutationHadRemovals = false;
     let pendingMutationPrTitleBtnRemoved = false;
     let pendingMutationHiddenLoadersChanged = false;
     let _domObserverAbortGen = 0;
+
+    function mutationRootHasHiddenLoader(root) {
+        try {
+            if (root.matches?.(HIDDEN_LOADER_SELECTOR)) return true;
+            if (isPullRequestBulkDiffPage()) return false;
+            return !!root.querySelector?.(HIDDEN_LOADER_SELECTOR);
+        } catch (_) {
+            return false;
+        }
+    }
 
     function collectDomMutationBatch(mutations) {
         let changed = false;
@@ -14403,11 +14420,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (n.nodeType !== 1) continue;
                 changed = true;
                 pendingMutationRoots.add(n);
-                scheduleFastEditorAffordances(n);
+                scheduleFastEditorAffordancesForMutation(n);
                 scheduleFastCommitPrefill(n);
-                if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
-                    pendingMutationHiddenLoadersChanged = true;
-                }
+                if (mutationRootHasHiddenLoader(n)) pendingMutationHiddenLoadersChanged = true;
             }
             for (const n of m.removedNodes) {
                 if (n.nodeType !== 1) continue;
@@ -14416,12 +14431,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (n.matches?.('.ack-pr-title-proofread') || n.querySelector?.('.ack-pr-title-proofread')) {
                     pendingMutationPrTitleBtnRemoved = true;
                 }
-                if (n.matches?.(HIDDEN_LOADER_SELECTOR) || n.querySelector?.(HIDDEN_LOADER_SELECTOR)) {
-                    pendingMutationHiddenLoadersChanged = true;
-                }
+                if (mutationRootHasHiddenLoader(n)) pendingMutationHiddenLoadersChanged = true;
             }
         }
         return changed;
+    }
+
+    function shouldRunDocInjectorsAfterMutation(ctx) {
+        if (ctx.onPR && isPullRequestBulkDiffPage()) return false;
+        return true;
+    }
+
+    function requeueDomMutationBatch(roots, startIndex, flags, delayMs, reason) {
+        for (let j = startIndex; j < roots.length; j++) pendingMutationRoots.add(roots[j]);
+        pendingMutationHadRemovals ||= flags.hadRemovals;
+        pendingMutationPrTitleBtnRemoved ||= flags.prTitleBtnRemoved;
+        pendingMutationHiddenLoadersChanged ||= flags.hiddenLoadersChanged;
+        mutationPending = true;
+        scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
+            delayMs,
+            reason,
+        });
     }
 
     function drainDomMutationBatch(isCanceled) {
@@ -14443,29 +14473,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             last_activity: _ackLastActivityReason,
         });
         let processed = 0;
+        let processedThisRun = 0;
+        const flags = { hadRemovals, prTitleBtnRemoved, hiddenLoadersChanged };
         for (const root of roots) {
             if (isCanceled()) {
                 // Re-queue the current root plus all unprocessed ones and restore the
                 // consumed flags, so the rescheduled drain does not lose work.
-                for (let j = processed; j < roots.length; j++) pendingMutationRoots.add(roots[j]);
-                pendingMutationHadRemovals ||= hadRemovals;
-                pendingMutationPrTitleBtnRemoved ||= prTitleBtnRemoved;
-                pendingMutationHiddenLoadersChanged ||= hiddenLoadersChanged;
-                mutationPending = true;
-                scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
-                    delayMs: 160,
-                    reason: 'canceled-mid-batch',
-                });
+                requeueDomMutationBatch(roots, processed, flags, 160, 'canceled-mid-batch');
                 return;
             }
             processed++;
             if (root !== document && !root.isConnected) continue;
             runRootInjectors(root, ctx);
+            processedThisRun++;
+            if (processed < roots.length && processedThisRun >= ACK_MUTATION_ROOT_BATCH_SIZE) {
+                requeueDomMutationBatch(roots, processed, flags, 80, 'root-batch-budget');
+                return;
+            }
         }
         // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
         focusVisibleDeleteCommentConfirmButton();
         if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
-        runDocInjectors(ctx);
+        if (shouldRunDocInjectorsAfterMutation(ctx)) runDocInjectors(ctx);
         if (hiddenLoadersChanged) {
             if (!shouldSuppressHiddenConversationRefresh()) {
                 refreshToolbarForLiveUpdate('hidden-conversations');
@@ -18704,11 +18733,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         navigateComment(dir);
     }
 
+    function isPullRequestBulkDiffPage(path = location.pathname) {
+        return /\/pull\/\d+\/(?:files|changes)\/?$/.test(path);
+    }
+
     function isDiffReviewPage(path = location.pathname) {
         return (
             isComparePage(path) ||
             isCommitPage(path) ||
-            /\/pull\/\d+\/files\/?$/.test(path) ||
+            isPullRequestBulkDiffPage(path) ||
             /\/pull\/\d+\/(?:changes|commits)\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path)
         );
     }
@@ -27036,7 +27069,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'inject only enables pending review mode when pending changes exist',
         );
 
-        // MutationObserver uses the shared injector runner (root-scoped + doc injectors)
+        // MutationObserver uses the shared injector runner (root-scoped + guarded doc injectors)
         const drainFn = source.slice(
             source.indexOf('function drainDomMutationBatch'),
             source.indexOf('new MutationObserver((mutations)'),
@@ -27046,6 +27079,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'MutationObserver runs root injectors for added subtrees',
         );
         ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors after mutations');
+        ackAssert(
+            drainFn.includes('shouldRunDocInjectorsAfterMutation(ctx)'),
+            'MutationObserver gates document injectors for expensive pages',
+        );
 
         // Pipeline includes key injectors (structural)
         ackAssert(source.includes('fn: addQuickCommentActions'), 'root pipeline includes quick actions');
@@ -27771,6 +27808,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('for (const root of roots)'), 'calls helpers per root');
     });
 
+    ackTest('MutationObserver caps root processing per drain', () => {
+        const source = _ackSource;
+        const drainFn = source.slice(
+            source.indexOf('function drainDomMutationBatch'),
+            source.indexOf('new MutationObserver((mutations)'),
+        );
+        ackAssert(source.includes('const ACK_MUTATION_ROOT_BATCH_SIZE = 16'), 'defines a per-drain root budget');
+        ackAssert(drainFn.includes('processedThisRun'), 'tracks roots handled by one drain');
+        ackAssert(drainFn.includes('ACK_MUTATION_ROOT_BATCH_SIZE'), 'uses the root budget while draining');
+        ackAssert(drainFn.includes("'root-batch-budget'"), 'reschedules when the root budget is exhausted');
+        ackAssert(
+            drainFn.includes('requeueDomMutationBatch(roots, processed, flags, 80,'),
+            'requeues remaining roots after hitting the budget',
+        );
+    });
+
     ackTest('MutationObserver scheduling is lifetime-aware and interaction-aware', () => {
         const source = _ackSource;
         const obsSection = source.slice(
@@ -27797,7 +27850,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fastSection.includes('runRootInjectors(document'), 'fast refresh does not run document injectors');
 
         const childBatch = sourceSection(source, 'function collectDomMutationBatch', 'function drainDomMutationBatch');
-        ackAssert(childBatch.includes('scheduleFastEditorAffordances(n)'), 'added editor/comment roots get fast refresh');
+        ackAssert(
+            childBatch.includes('scheduleFastEditorAffordancesForMutation(n)'),
+            'added editor/comment roots get fast refresh through the mutation gate',
+        );
 
         const attrBatch = sourceSection(source, 'function collectAttrMutationBatch', 'function drainAttrMutationBatch');
         ackAssert(
@@ -27912,7 +27968,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         // Shared injector runner keeps root-scoped mutations consistent
         ackAssert(drainFn.includes('runRootInjectors(root, ctx)'), 'runs root injectors from observer');
-        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'runs doc injectors from observer');
+        ackAssert(drainFn.includes('shouldRunDocInjectorsAfterMutation(ctx)'), 'guards doc injectors from observer');
+        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'can still run doc injectors from observer');
         // addCommitBadges is deferred (IntersectionObserver) and should not be forced eagerly.
         ackAssert(!drainFn.includes('addCommitBadges(root)'), 'addCommitBadges is lazy now');
     });
@@ -30609,6 +30666,56 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const afterLoop = obsBlock.slice(afterLoopStart);
         ackAssert(afterLoop.includes('runDocInjectors(ctx)'), 'doc injectors run after the root loop');
         ackAssert(!insideLoop.includes('runDocInjectors('), 'doc injectors do NOT run inside the root loop');
+    });
+
+    ackTest('bulk PR diff mutations skip document-wide rescans', () => {
+        const source = _ackSource;
+        const helper = source.slice(
+            source.indexOf('function shouldRunDocInjectorsAfterMutation'),
+            source.indexOf('function requeueDomMutationBatch'),
+        );
+        const drainFn = source.slice(
+            source.indexOf('function drainDomMutationBatch'),
+            source.indexOf('new MutationObserver((mutations)'),
+        );
+        ackAssert(helper.includes('ctx.onPR && isPullRequestBulkDiffPage()'), 'bulk PR diff pages are gated');
+        ackAssert(helper.includes('return false'), 'bulk PR diff mutation batches skip doc injectors');
+        ackAssert(
+            drainFn.includes('if (shouldRunDocInjectorsAfterMutation(ctx)) runDocInjectors(ctx)'),
+            'drain consults the doc-injector gate',
+        );
+    });
+
+    ackTest('bulk PR diff mutation collection avoids deep subtree scans', () => {
+        const source = _ackSource;
+        const fastHelper = source.slice(
+            source.indexOf('function scheduleFastEditorAffordancesForMutation'),
+            source.indexOf('function runDocInjectors'),
+        );
+        const hiddenHelper = source.slice(
+            source.indexOf('function mutationRootHasHiddenLoader'),
+            source.indexOf('function collectDomMutationBatch'),
+        );
+        const collectFn = source.slice(
+            source.indexOf('function collectDomMutationBatch'),
+            source.indexOf('function shouldRunDocInjectorsAfterMutation'),
+        );
+        ackAssert(
+            fastHelper.includes('isPullRequestBulkDiffPage() && !attrTargetMayNeedFastEditorAffordances(root)'),
+            'bulk PR diff fast editor check is shallow',
+        );
+        ackAssert(
+            hiddenHelper.includes('if (isPullRequestBulkDiffPage()) return false'),
+            'bulk PR diff hidden-loader check avoids descendant scans',
+        );
+        ackAssert(
+            collectFn.includes('scheduleFastEditorAffordancesForMutation(n)'),
+            'collector uses the shallow fast editor gate',
+        );
+        ackAssert(
+            collectFn.includes('mutationRootHasHiddenLoader(n)'),
+            'collector uses the guarded hidden-loader helper',
+        );
     });
 
     ackTest('escapeHTML and safeHref defined early and used by marked renderer', () => {
@@ -36925,6 +37032,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('diff review helpers detect diff-like review pages', () => {
         ackEq(isDiffReviewPage('/owner/repo/pull/123/files'), true, 'PR files page is a diff review page');
+        ackEq(isDiffReviewPage('/owner/repo/pull/123/changes'), true, 'PR changes page is a diff review page');
         ackEq(
             isDiffReviewPage('/owner/repo/pull/123/changes/abcdef1'),
             true,
@@ -36932,6 +37040,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackEq(isDiffReviewPage('/owner/repo/commit/abcdef1'), true, 'standalone commit page is a diff review page');
         ackEq(isDiffReviewPage('/owner/repo/pull/123'), false, 'conversation page is not a diff review page');
+        ackEq(
+            isPullRequestBulkDiffPage('/owner/repo/pull/123/changes'),
+            true,
+            'PR changes page is a bulk diff page',
+        );
+        ackEq(
+            isPullRequestBulkDiffPage('/owner/repo/pull/123/changes/abcdef1'),
+            false,
+            'single-commit PR changes page is not a bulk diff page',
+        );
     });
 
     ackTest('findFirstUnviewedDiffFile finds unchecked viewed controls', () => {
