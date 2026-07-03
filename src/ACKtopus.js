@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.186
+// @version      1.187
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16473,7 +16473,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    function getCommentMenuRoots(trigger, container) {
+    function menuRootDistanceToTrigger(root, trigger) {
+        const rr = root?.getBoundingClientRect?.();
+        const tr = trigger?.getBoundingClientRect?.();
+        if (!rr || !tr || rr.width <= 0 || rr.height <= 0 || tr.width <= 0 || tr.height <= 0) return Infinity;
+        const dx = rr.right < tr.left ? tr.left - rr.right : tr.right < rr.left ? rr.left - tr.right : 0;
+        const dy = rr.bottom < tr.top ? tr.top - rr.bottom : tr.bottom < rr.top ? rr.top - tr.bottom : 0;
+        return dx * dx + dy * dy;
+    }
+
+    function getNearbyCommentMenuRoots(trigger) {
+        const maxDist2 = 650 * 650;
+        const roots = [];
+        for (const root of qsa(document, COMMENT_MENU_ROOT_SELECTOR)) {
+            if (!isVisible(root)) continue;
+            if (root.contains?.(trigger) || root.closest?.('.js-comment-edit-history, .js-reaction-popover-container, .js-all-reactions-popover')) continue;
+            const d2 = menuRootDistanceToTrigger(root, trigger);
+            if (d2 <= maxDist2) roots.push({ root, d2 });
+        }
+        roots.sort((a, b) => a.d2 - b.d2);
+        return roots.map((item) => item.root);
+    }
+
+    function getCommentMenuRoots(trigger, container, opts = {}) {
+        const { includeDocument = true, includeNearby = false } = opts;
         const roots = [];
         const push = (el) => {
             if (!el || el.nodeType !== 1) return;
@@ -16493,12 +16516,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (menuControlsId) push(document.getElementById(menuControlsId));
         if (popoverTargetId) push(document.getElementById(popoverTargetId));
-        if (triggerId) pushAll(document.querySelectorAll(`[role="menu"][aria-labelledby="${triggerId}"]`));
+        if (triggerId && typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+            const id = CSS.escape(triggerId);
+            pushAll(document.querySelectorAll(`[role="menu"][aria-labelledby="${id}"], [popover][aria-labelledby="${id}"]`));
+        }
 
         pushAll(container?.querySelectorAll?.(COMMENT_MENU_ROOT_SELECTOR) || []);
         pushAll(menuHost?.querySelectorAll?.(COMMENT_MENU_ROOT_SELECTOR) || []);
         push(menuHost);
-        pushAll(qsa(document, COMMENT_MENU_ROOT_SELECTOR));
+        if (includeNearby) pushAll(getNearbyCommentMenuRoots(trigger));
+        if (includeDocument) pushAll(qsa(document, COMMENT_MENU_ROOT_SELECTOR));
 
         return roots;
     }
@@ -17143,7 +17170,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     // the kebab mid-attempt; re-open so Edit can render.
                     const kebabDetails = kebab.closest('details');
                     if (kebabDetails && !kebabDetails.hasAttribute('open')) openMenuTrigger(kebab);
-                    for (const root of getCommentMenuRoots(kebab, container)) {
+                    for (const root of getCommentMenuRoots(kebab, container, {
+                        includeDocument: false,
+                        includeNearby: true,
+                    })) {
                         const direct = root.querySelector?.('button.js-comment-edit-button');
                         if (direct && isVisible(direct)) return direct;
                         for (const item of root.querySelectorAll?.(COMMENT_MENU_ITEM_SELECTOR) || []) {
@@ -17151,34 +17181,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             if (commentMenuItemMatchesAction(item, 'edit')) return item;
                         }
                     }
-
-                    // Last-resort: find visible Edit-like items nearest to the kebab.
-                    // Some ActionMenu variants portal menuitems without stable menu wrappers.
-                    const kr = kebab.getBoundingClientRect?.();
-                    const kx = (kr?.left || 0) + (kr?.width || 0) / 2;
-                    const ky = (kr?.top || 0) + (kr?.height || 0) / 2;
-                    const maxDist2 = 650 * 650;
-                    const candidates = [];
-                    for (const el of document.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
-                        if (!isVisible(el)) continue;
-                        if (!commentMenuItemMatchesAction(el, 'edit')) continue;
-                        if (
-                            !el.closest(
-                                '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]',
-                            )
-                        )
-                            continue;
-                        const r = el.getBoundingClientRect?.();
-                        if (!r) continue;
-                        const cx = r.left + r.width / 2;
-                        const cy = r.top + r.height / 2;
-                        const dx = cx - kx;
-                        const dy = cy - ky;
-                        const d2 = dx * dx + dy * dy;
-                        if (d2 <= maxDist2) candidates.push({ el, d2 });
-                    }
-                    candidates.sort((a, b) => a.d2 - b.d2);
-                    return candidates[0]?.el || null;
+                    return null;
                 },
                 'edit comment button',
                 6,
@@ -17187,7 +17190,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             clickedEdit = ok;
             if (!ok) {
                 try {
-                    const visibleMenus = [...qsa(document, '[role="menu"], .Overlay, .ActionListWrap, details-menu')]
+                    const visibleMenus = getCommentMenuRoots(kebab, container, {
+                        includeDocument: false,
+                        includeNearby: true,
+                    })
                         .filter(isVisible)
                         .slice(0, 3);
                     const items = visibleMenus.flatMap((m) =>
@@ -17263,23 +17269,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             ackSetTimeout(
                 () => {
-                    // Search only menus that are descendants of or adjacent to
-                    // the container — never click items in unrelated menus.
-                    const searchRoots = [
-                        ...container.querySelectorAll('[role="menu"], .Overlay, .ActionListWrap, details-menu'),
-                        ...(menu.querySelectorAll?.('[role="menu"], .Overlay, .ActionListWrap, details-menu') || []),
-                    ];
-                    // Fallback: if nothing found in container, try document-level
-                    // menus, restricted to visible (positioned) ones.
-                    if (searchRoots.length === 0) {
-                        for (const root of document.querySelectorAll(
-                            '[role="menu"], .Overlay, .ActionListWrap, details-menu',
-                        )) {
-                            if (root.offsetParent !== null) searchRoots.push(root);
-                        }
-                    }
+                    const searchRoots = getCommentMenuRoots(kebab, container, {
+                        includeDocument: false,
+                        includeNearby: true,
+                    });
                     for (const root of searchRoots) {
                         for (const item of root.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
+                            if (!isVisible(item)) continue;
                             if (commentMenuItemMatchesAction(item, actionName)) {
                                 menu.style.opacity = origOpacity;
                                 item.click();
@@ -26688,6 +26684,66 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!history.matches(COMMENT_MENU_TRIGGER_SELECTOR), 'history summary does not match menu trigger selector');
         ackAssert(!isCommentActionMenuTrigger(history), 'history summary is rejected defensively');
         ackEq(findCommentMenuTrigger(header, container), actions, 'finds the real action menu after edit history');
+    });
+
+    ackTest('comment menu roots can be scoped to the triggering kebab', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div id="comment-a" class="timeline-comment current-user">
+                <div class="timeline-comment-header">
+                    <button id="kebab-a" aria-label="Open comment actions" aria-controls="menu-a" data-component="IconButton"></button>
+                </div>
+            </div>
+        `;
+        const menuA = document.createElement('div');
+        menuA.id = 'menu-a';
+        menuA.setAttribute('role', 'menu');
+        menuA.innerHTML = '<button type="button" role="menuitem"><span class="ActionListItem-label">Edit</span></button>';
+        const menuB = document.createElement('div');
+        menuB.id = 'menu-b';
+        menuB.setAttribute('role', 'menu');
+        menuB.innerHTML = '<button type="button" role="menuitem"><span class="ActionListItem-label">Edit</span></button>';
+        const box = (left, top, width = 80, height = 40) => ({
+            left,
+            top,
+            width,
+            height,
+            right: left + width,
+            bottom: top + height,
+        });
+        try {
+            document.body.appendChild(host);
+            document.body.appendChild(menuA);
+            document.body.appendChild(menuB);
+            const trigger = host.querySelector('#kebab-a');
+            const container = host.querySelector('#comment-a');
+            trigger.getBoundingClientRect = () => box(100, 100, 20, 20);
+            menuA.getBoundingClientRect = () => box(100, 130);
+            menuB.getBoundingClientRect = () => box(900, 900);
+
+            const broad = getCommentMenuRoots(trigger, container);
+            ackAssert(broad.includes(menuA), 'broad lookup includes the controlled menu');
+            ackAssert(broad.includes(menuB), 'broad lookup still supports document-level menu augmentation');
+
+            const scoped = getCommentMenuRoots(trigger, container, { includeDocument: false });
+            ackAssert(scoped.includes(menuA), 'scoped lookup includes the controlled menu');
+            ackAssert(!scoped.includes(menuB), 'scoped lookup excludes unrelated document menus');
+        } finally {
+            menuA.remove();
+            menuB.remove();
+            host.remove();
+        }
+    });
+
+    ackTest('triggerMenuEdit uses scoped menu roots instead of scanning all document items', () => {
+        const source = _ackSource;
+        const fn = sourceSection(source, 'async function triggerMenuEdit', 'function triggerMenuAction');
+        ackAssert(fn.includes('includeDocument: false'), 'edit lookup does not use broad document menu roots');
+        ackAssert(fn.includes('includeNearby: true'), 'edit lookup still supports nearby portaled GitHub menus');
+        ackAssert(
+            !fn.includes('document.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)'),
+            'edit lookup never scans all document menu items directly',
+        );
     });
 
     ackTest('getEditFormRequest derives review-comment edit_form URL from React r-id containers', () => {
