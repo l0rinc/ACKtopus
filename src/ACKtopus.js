@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.192
+// @version      1.193
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18744,6 +18744,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function gatherCompareFileElements() {
         const entries = [];
         for (const file of document.querySelectorAll('[data-tagsearch-path]')) {
+            if (file.dataset.ackCompareHidden === '1' || file.style.display === 'none') continue;
             if (!isVisible(file)) continue;
             const anchor = file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info') || file;
             if (!isVisible(anchor)) continue;
@@ -30673,6 +30674,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('button.load-diff-button'), 'targets Load diff buttons');
         ackAssert(fn.includes("loadBtn.dataset.ackClicked = '1'"), 'marks clicked buttons to avoid repeats');
         ackAssert(fn.includes('loadBtn.click()'), 'clicks Load diff when navigating to a closed file');
+    });
+
+    ackTest('compare file navigation skips ACK-hidden files before layout checks', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('function gatherCompareFileElements'),
+            source.indexOf('function openCompareFileIfCollapsed'),
+        );
+        ackAssert(
+            fn.includes("file.dataset.ackCompareHidden === '1' || file.style.display === 'none'"),
+            'cheap-skips files hidden by compare filtering',
+        );
+        ackAssert(
+            fn.indexOf("file.dataset.ackCompareHidden === '1'") < fn.indexOf('if (!isVisible(file)) continue'),
+            'hidden-file check runs before layout-forcing visibility check',
+        );
     });
 
     ackTest('autoCollapseCompareFiles cleans up CSS on navigation away', () => {
