@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.190
+// @version      1.191
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3847,18 +3847,32 @@
     // On compare pages, detect which PR the head SHA belongs to,
     // auto-switch to Files changed tab, then collapse files not in the PR.
     let _compareObserver = null;
+    let _compareDebounceTimer = null;
+    let _compareWatchdogTimer = null;
     let _compareActive = false;
     let _comparePath = '';
+
+    function clearCompareWatcher() {
+        if (_compareObserver) {
+            _compareObserver.disconnect();
+            _compareObserver = null;
+        }
+        if (_compareDebounceTimer) {
+            clearTimeout(_compareDebounceTimer);
+            _compareDebounceTimer = null;
+        }
+        if (_compareWatchdogTimer) {
+            clearInterval(_compareWatchdogTimer);
+            _compareWatchdogTimer = null;
+        }
+    }
 
     async function autoCollapseCompareFiles() {
         if (!location.pathname.includes('/compare/')) return;
         const compareLocationKey = `${location.pathname}${location.search}`;
         // Reset if navigated to a different compare page
         if (_comparePath && _comparePath !== compareLocationKey) {
-            if (_compareObserver) {
-                _compareObserver.disconnect();
-                _compareObserver = null;
-            }
+            clearCompareWatcher();
             _compareActive = false;
             const style = document.getElementById('ack-compare-collapse');
             if (style) style.remove();
@@ -4014,6 +4028,14 @@
                 if (f.previous_filename) prFileSet.add(f.previous_filename);
             }
         };
+        const addCompareRangeFiles = (files) => {
+            const paths = new Set();
+            for (const f of files || []) {
+                if (f.filename) paths.add(normalizeComparePath(f.filename));
+                if (f.previous_filename) paths.add(normalizeComparePath(f.previous_filename));
+            }
+            return paths;
+        };
 
         // Source 1: current PR files (paginated for large PRs)
         try {
@@ -4069,6 +4091,20 @@
         const normalizedPrFileSet = new Set([...prFileSet].map(normalizeComparePath).filter(Boolean));
         setCompareStatus(`Compare: filtering to ${normalizedPrFileSet.size} PR file paths...`);
 
+        let compareRangeFileSet = new Set();
+        try {
+            const cmpRange = await gmFetchTimeout(
+                `https://api.github.com/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`,
+                5000,
+            );
+            compareRangeFileSet = addCompareRangeFiles(cmpRange.files);
+            if (compareRangeFileSet.size) {
+                console.log('ACKtopus: compare -- range files:', compareRangeFileSet.size);
+            }
+        } catch (e) {
+            console.warn('ACKtopus: compare -- failed to fetch compare range files', e);
+        }
+
         // Auto-click "Files changed" tab if not already active
         const filesTab =
             document.querySelector('a[href="#files_bucket"]') ||
@@ -4105,6 +4141,11 @@
             });
             styleEl.textContent = rules.join('\n');
         }
+
+        for (const path of compareRangeFileSet) {
+            if (path && !normalizedPrFileSet.has(path)) collapsedPaths.add(path);
+        }
+        updateCollapseCSS();
 
         let lastActivityAt = Date.now();
 
@@ -4200,28 +4241,33 @@
         scrollToFirstKeptFile();
 
         // Keep watching for progressively loaded file diffs. Huge compares
-        // (300+ files) stream in well past any fixed-size window, so use an
-        // idle-based timeout instead of a hard 20-second cap: stop once no
-        // new file has arrived for 10 consecutive seconds, with a 2-minute
-        // absolute ceiling so we don't observe forever on a pathological page.
-        if (_compareObserver) _compareObserver.disconnect();
+        // can stream more file cards minutes later as the user scrolls; keep a
+        // cheap observer alive for the compare page instead of stopping after a
+        // short idle window.
+        clearCompareWatcher();
         console.log('ACKtopus: compare -- watching for progressive file loading...');
-        let debounceTimer = null;
-        let idleCheck = null;
         const startedAt = Date.now();
-        const IDLE_MS = 10000;
-        const HARD_MAX_MS = 120000;
+        const QUIET_STATUS_MS = 10000;
+        const WATCHDOG_MS = 2000;
+        const HARD_MAX_MS = 30 * 60 * 1000;
+        let quietStatusShown = false;
+        const runCompareCollapsePass = () => {
+            const before = processed.size;
+            collapseNewFiles();
+            scrollToFirstKeptFile();
+            if (processed.size > before) quietStatusShown = false;
+        };
         const stopWatching = (reason) => {
             if (!_compareObserver) return;
             _compareObserver.disconnect();
             _compareObserver = null;
-            if (idleCheck) {
-                clearInterval(idleCheck);
-                idleCheck = null;
+            if (_compareWatchdogTimer) {
+                clearInterval(_compareWatchdogTimer);
+                _compareWatchdogTimer = null;
             }
-            if (debounceTimer) {
-                clearTimeout(debounceTimer);
-                debounceTimer = null;
+            if (_compareDebounceTimer) {
+                clearTimeout(_compareDebounceTimer);
+                _compareDebounceTimer = null;
             }
             const elapsedS = Math.round((Date.now() - startedAt) / 1000);
             console.log(
@@ -4233,17 +4279,28 @@
             );
             finishCompareStatus(`Compare: done - kept ${totalKept}, hid ${totalCollapsed}`);
         };
-        idleCheck = setInterval(() => {
+        _compareWatchdogTimer = setInterval(() => {
             const now = Date.now();
             if (now - startedAt >= HARD_MAX_MS) return stopWatching(`${HARD_MAX_MS / 1000}s max`);
-            if (now - lastActivityAt >= IDLE_MS) return stopWatching(`idle ${IDLE_MS / 1000}s`);
-        }, 1000);
+            runCompareCollapsePass();
+            if (!quietStatusShown && now - lastActivityAt >= QUIET_STATUS_MS) {
+                quietStatusShown = true;
+                console.log(
+                    'ACKtopus: compare -- observer quiet, keeping watch for late lazy-loaded files (total:',
+                    totalCollapsed,
+                    'collapsed,',
+                    totalKept,
+                    'kept)',
+                );
+                finishCompareStatus(`Compare: kept ${totalKept}, hid ${totalCollapsed}; still watching lazy-loaded files`);
+            }
+        }, WATCHDOG_MS);
         _compareObserver = new MutationObserver(() => {
             if (_ackTesting) return;
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                collapseNewFiles();
-                scrollToFirstKeptFile();
+            if (_compareDebounceTimer) clearTimeout(_compareDebounceTimer);
+            _compareDebounceTimer = setTimeout(() => {
+                _compareDebounceTimer = null;
+                runCompareCollapsePass();
             }, 200);
         });
         _compareObserver.observe(document.body, { childList: true, subtree: true });
@@ -23080,10 +23137,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const prKey = currentPRKey();
         // Clean up compare observer if we navigated away
         if (!location.pathname.includes('/compare/')) {
-            if (_compareObserver) {
-                _compareObserver.disconnect();
-                _compareObserver = null;
-            }
+            clearCompareWatcher();
             _compareActive = false;
             _comparePath = '';
             const collapseStyle = document.getElementById('ack-compare-collapse');
@@ -30083,7 +30137,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('#files_bucket'), 'uses correct Files changed tab selector');
         ackAssert(fn.includes('processed.has(path)'), 'tracks processed files for progressive loading');
         ackAssert(fn.includes('collapseNewFiles'), 'uses incremental collapse function');
-        ackAssert(fn.includes('debounceTimer'), 'debounces observer for burst loading');
+        ackAssert(fn.includes('_compareDebounceTimer'), 'debounces observer for burst loading');
         ackAssert(fn.includes('ack-compare-collapse'), 'injects CSS style element for collapse');
         ackAssert(fn.includes('showComparePrMissingStatus'), 'shows a visible missing-PR warning');
         ackAssert(fn.includes('Compare: PR not detected'), 'warning title is explicit');
@@ -30118,6 +30172,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('addFiles'), 'uses helper to build union of file sets');
         ackAssert(fn.includes('previous_filename'), 'includes renamed file paths');
         ackAssert(fn.includes('total unique PR file paths'), 'logs total unique paths');
+    });
+
+    ackTest('autoCollapseCompareFiles pre-seeds unrelated compare range CSS', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function autoCollapseCompareFiles'),
+            source.indexOf('// Try immediately'),
+        );
+        ackAssert(fn.includes('addCompareRangeFiles'), 'collects files from the actual compare range');
+        ackAssert(fn.includes('compare/${baseSha}...${headSha}'), 'fetches the opened compare range');
+        ackAssert(fn.includes('compare -- range files'), 'logs range-file discovery');
+        ackAssert(
+            fn.includes('if (path && !normalizedPrFileSet.has(path)) collapsedPaths.add(path)'),
+            'pre-seeds CSS hiding for range files outside the PR file set',
+        );
+        ackAssert(fn.includes('updateCollapseCSS();'), 'applies pre-seeded CSS before lazy DOM cards arrive');
     });
 
     ackTest('fetchCommitPullRequests uses preview accept header and auth fallback', () => {
@@ -30155,6 +30225,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes("file.style.display = 'none'"),
             'hides unmatched file cards immediately before CSS catches up',
         );
+    });
+
+    ackTest('autoCollapseCompareFiles keeps watching late lazy-loaded files', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function autoCollapseCompareFiles'),
+            source.indexOf('// --- LLM Config'),
+        );
+        ackAssert(fn.includes('clearCompareWatcher()'), 'clears any previous compare watcher before starting');
+        ackAssert(fn.includes('const QUIET_STATUS_MS = 10000'), 'keeps the short quiet window only for status');
+        ackAssert(fn.includes('const WATCHDOG_MS = 2000'), 'polls periodically for late file cards');
+        ackAssert(fn.includes('const HARD_MAX_MS = 30 * 60 * 1000'), 'keeps the watcher alive long enough for big compares');
+        ackAssert(fn.includes('runCompareCollapsePass()'), 'reuses collapse pass from observer and watchdog');
+        ackAssert(
+            fn.includes('observer quiet, keeping watch for late lazy-loaded files'),
+            'does not stop merely because the page was briefly idle',
+        );
+        ackAssert(!fn.includes("stopWatching(`idle ${"), 'does not stop on the 10s idle window');
     });
 
     ackTest('config panel shows GitHub Token before AI provider section', () => {
@@ -30583,6 +30671,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.includes("document.getElementById('ack-compare-collapse')"),
             'looks for style element on cleanup',
         );
+        const clearFn = source.slice(
+            source.indexOf('function clearCompareWatcher'),
+            source.indexOf('async function autoCollapseCompareFiles'),
+        );
+        ackAssert(clearFn.includes('_compareDebounceTimer'), 'clears compare debounce timer');
+        ackAssert(clearFn.includes('_compareWatchdogTimer'), 'clears compare watchdog timer');
+        const tryInjectFn = source.slice(source.indexOf('function tryInject()'), source.indexOf('tryInject();'));
+        ackAssert(tryInjectFn.includes('clearCompareWatcher()'), 'navigation away clears compare watcher');
     });
 
     // --- parseCoAuthoredBy ---
