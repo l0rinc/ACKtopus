@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.189
+// @version      1.190
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22354,6 +22354,106 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    const COMMIT_SEARCH_JUMP_KEY = 'ack_commit_search_jump_v1';
+    const COMMIT_SEARCH_JUMP_MAX_AGE_MS = 2 * 60 * 1000;
+    const COMMIT_SEARCH_JUMP_LINE_SELECTOR =
+        'td.blob-code, td.diff-text, td.diff-text-cell, .blob-code-inner, .diff-text-cell, code.diff-text, ' +
+        '[data-testid="diff-line-content"], [class*="blobCode"]';
+    let commitSearchJumpTimer = null;
+
+    function commitSearchJumpPRKey(pr) {
+        return pr ? `${pr.owner}/${pr.repo}/${pr.pr}` : '';
+    }
+
+    function normalizeCommitSearchQuery(query) {
+        return String(query || '')
+            .trim()
+            .toLowerCase();
+    }
+
+    function commitShaMatches(a, b) {
+        if (!a || !b) return false;
+        return a.startsWith(b) || b.startsWith(a);
+    }
+
+    function storeCommitSearchJump(pr, commit, query) {
+        const normalized = normalizeCommitSearchQuery(query);
+        if (!normalized || !commit?.sha) return;
+        try {
+            sessionStorage.setItem(
+                COMMIT_SEARCH_JUMP_KEY,
+                JSON.stringify({
+                    prKey: commitSearchJumpPRKey(pr),
+                    sha: commit.sha,
+                    query: normalized,
+                    ts: Date.now(),
+                }),
+            );
+        } catch (_) {}
+    }
+
+    function readPendingCommitSearchJump(pr = parsePR(), currentSha = pathCommitSha()) {
+        if (!pr || !currentSha) return null;
+        try {
+            const raw = sessionStorage.getItem(COMMIT_SEARCH_JUMP_KEY);
+            if (!raw) return null;
+            const pending = JSON.parse(raw);
+            const stale = !pending?.ts || Date.now() - pending.ts > COMMIT_SEARCH_JUMP_MAX_AGE_MS;
+            const wrongPage =
+                pending?.prKey !== commitSearchJumpPRKey(pr) || !commitShaMatches(String(pending?.sha || ''), currentSha);
+            if (stale || wrongPage || !pending?.query) {
+                sessionStorage.removeItem(COMMIT_SEARCH_JUMP_KEY);
+                return null;
+            }
+            return pending;
+        } catch (_) {
+            try {
+                sessionStorage.removeItem(COMMIT_SEARCH_JUMP_KEY);
+            } catch (_) {}
+            return null;
+        }
+    }
+
+    function findCommitSearchJumpTarget(query) {
+        const normalized = normalizeCommitSearchQuery(query);
+        if (!normalized) return null;
+        for (const el of qsa(document, COMMIT_SEARCH_JUMP_LINE_SELECTOR)) {
+            if (!isVisible(el)) continue;
+            const text = String(el.innerText || el.textContent || '').toLowerCase();
+            if (!text.includes(normalized)) continue;
+            return el.closest?.('tr, [data-testid="diff-line"], [class*="DiffLine"]') || el;
+        }
+        return null;
+    }
+
+    function runPendingCommitSearchJump(reason = 'commit-search-jump', attempt = 0) {
+        const pending = readPendingCommitSearchJump();
+        if (!pending) return;
+        const target = findCommitSearchJumpTarget(pending.query);
+        if (target) {
+            try {
+                sessionStorage.removeItem(COMMIT_SEARCH_JUMP_KEY);
+            } catch (_) {}
+            scrollToAndHighlight(target);
+            ackBackgroundLog('commit search jump matched', { reason, attempt });
+            return;
+        }
+        if (attempt < 32) schedulePendingCommitSearchJump(reason, attempt + 1);
+        else {
+            try {
+                sessionStorage.removeItem(COMMIT_SEARCH_JUMP_KEY);
+            } catch (_) {}
+        }
+    }
+
+    function schedulePendingCommitSearchJump(reason = 'commit-search-jump', attempt = 0) {
+        if (commitSearchJumpTimer) return;
+        commitSearchJumpTimer = ackSetTimeout(() => {
+            commitSearchJumpTimer = null;
+            runPendingCommitSearchJump(reason, attempt);
+        }, attempt ? 250 : 80);
+    }
+
     async function _addFloatingCommitNavInner() {
         const gen = ++commitNavGeneration;
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
@@ -22367,7 +22467,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const shaMatch = location.pathname.match(/\/pull\/\d+\/(?:changes|commits)\/([0-9a-f]+)/);
         const isCommitsList = /\/pull\/\d+\/commits\/?$/.test(location.pathname);
         const isConversation = isPRConversationPage(location.pathname);
-        if (!shaMatch && !isCommitsList && !isConversation) return;
+        const isBulkDiff = isPullRequestBulkDiffPage(location.pathname);
+        if (!shaMatch && !isCommitsList && !isConversation && !isBulkDiff) return;
 
         const currentSha = shaMatch?.[1] || null;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
@@ -22375,13 +22476,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const commits = await fetchCommitList(owner, repo, prNum);
         if (gen !== commitNavGeneration) return;
         if (commits.length === 0) return;
-        const hasJumpMenu = commits.length > 3;
+        const hasJumpMenu = commits.length > 0;
 
         let prevCommit = null,
             nextCommit = null,
             currentIdx = -1;
 
-        if (isCommitsList || isConversation) {
+        if (isCommitsList || isConversation || isBulkDiff) {
             nextCommit = commits[0];
         } else {
             // Match bidirectionally: API returns full SHAs, HTML scrape may return short
@@ -22464,38 +22565,52 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return a;
         };
 
-        // Position indicator
+        const currentCommit = currentIdx >= 0 ? commits[currentIdx] : null;
+        const currentCommitPrefix = currentCommit ? truncMsg(commitLine(currentCommit), 72) : '';
+        const currentLabel = currentCommit
+            ? `${currentIdx + 1}/${commits.length} ${currentCommit.sha.slice(0, 8)} ${currentCommitPrefix}`
+            : `Commits (${commits.length})`;
+        const currentTitle = currentCommit
+            ? `${currentIdx + 1}/${commits.length} ${currentCommit.sha}\n${commitLine(currentCommit)}`
+            : `Jump to any of ${commits.length} commits`;
+
         if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, false));
         if (hasJumpMenu) {
-            const jumpDetails = document.createElement('details');
-            Object.assign(jumpDetails.style, { position: 'relative', flex: '0 0 auto' });
-            const jumpSummary = document.createElement('summary');
-            const currentLabel =
-                currentIdx >= 0
-                    ? `${currentIdx + 1}/${commits.length} ${commits[currentIdx]?.sha?.slice(0, 8) || ''}`
-                    : `Commits (${commits.length})`;
-            jumpSummary.textContent = `${currentLabel} ▾`;
-            jumpSummary.title = 'Jump to any commit';
-            Object.assign(jumpSummary.style, {
-                listStyle: 'none',
+            const jumpWrap = document.createElement('div');
+            Object.assign(jumpWrap.style, {
+                position: 'relative',
+                display: 'flex',
+                gap: '6px',
+                alignItems: 'center',
+                flex: '1 1 520px',
+                minWidth: '0',
+                overflow: 'visible',
+            });
+            const currentPill = document.createElement('span');
+            currentPill.textContent = currentLabel;
+            currentPill.title = currentTitle;
+            Object.assign(currentPill.style, {
                 padding: '4px 10px',
                 fontSize: '11px',
                 color: '#adbac7',
                 background: '#0d1117',
                 border: '1px solid #57606a',
                 borderRadius: '6px',
-                cursor: 'pointer',
                 whiteSpace: 'nowrap',
                 minWidth: '90px',
-                textAlign: 'center',
+                maxWidth: 'min(360px, 42vw)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                textAlign: 'left',
+                flex: '1 1 auto',
             });
-            jumpSummary.addEventListener('mouseenter', () => {
-                jumpSummary.style.background = '#161b22';
-                jumpSummary.style.borderColor = '#8b949e';
+            currentPill.addEventListener('mouseenter', () => {
+                currentPill.style.background = '#161b22';
+                currentPill.style.borderColor = '#8b949e';
             });
-            jumpSummary.addEventListener('mouseleave', () => {
-                jumpSummary.style.background = '#0d1117';
-                jumpSummary.style.borderColor = '#57606a';
+            currentPill.addEventListener('mouseleave', () => {
+                currentPill.style.background = '#0d1117';
+                currentPill.style.borderColor = '#57606a';
             });
             const jumpMenu = document.createElement('div');
             Object.assign(jumpMenu.style, {
@@ -22503,12 +22618,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 left: '50%',
                 bottom: 'calc(100% + 8px)',
                 transform: 'translateX(-50%)',
+                display: 'none',
                 background: '#161b22',
                 border: '1px solid #30363d',
                 borderRadius: '8px',
                 boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
-                minWidth: '360px',
-                maxWidth: 'min(92vw, 560px)',
+                minWidth: '420px',
+                maxWidth: 'min(92vw, 620px)',
                 maxHeight: '320px',
                 overflow: 'auto',
                 padding: '6px',
@@ -22520,9 +22636,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jumpSearch.setAttribute('aria-label', 'Search commits');
             Object.assign(jumpSearch.style, {
                 display: 'block',
-                width: '100%',
+                width: '220px',
+                maxWidth: 'min(280px, 34vw)',
+                minWidth: '130px',
                 boxSizing: 'border-box',
-                margin: '0 0 6px',
                 padding: '6px 8px',
                 fontSize: '12px',
                 color: '#c9d1d9',
@@ -22530,19 +22647,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 border: '1px solid #57606a',
                 borderRadius: '6px',
                 outline: 'none',
-                position: 'sticky',
-                top: '0',
-                zIndex: '1',
+                flex: '0 1 auto',
             });
             const jumpDiffStatus = document.createElement('div');
             Object.assign(jumpDiffStatus.style, {
                 display: 'none',
-                margin: '-2px 0 6px',
+                margin: '0 0 6px',
                 padding: '0 2px',
                 color: '#8b949e',
                 fontSize: '11px',
                 position: 'sticky',
-                top: '34px',
+                top: '0',
                 zIndex: '1',
                 background: '#161b22',
             });
@@ -22640,6 +22755,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     setActiveJumpItem(firstVisible ? Number(firstVisible.dataset.ackIndex || '-1') : -1);
                 }
             };
+            const closeJumpMenu = () => {
+                jumpMenu.style.display = 'none';
+                removeJumpCloseListeners();
+            };
+            const openJumpMenu = ({ select = false } = {}) => {
+                if (jumpMenu.style.display !== 'block') {
+                    jumpMenu.style.display = 'block';
+                    jumpMenu.scrollTop = 0;
+                    document.addEventListener('pointerdown', onJumpOutsidePointer, true);
+                    document.addEventListener('keydown', onJumpKeydown, true);
+                }
+                applyJumpFilter();
+                if (select) jumpSearch.select();
+            };
             const runJumpDiffSearch = async (query, token) => {
                 const pending = commits.filter((commit) => !commitDiffSearchText.has(commit.sha));
                 if (!pending.length) {
@@ -22692,14 +22821,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }, 250);
             };
             const filterJumpItems = () => {
+                openJumpMenu();
                 applyJumpFilter();
                 scheduleJumpDiffSearch();
             };
             jumpSearch.addEventListener('focus', () => {
                 jumpSearch.style.borderColor = '#58a6ff';
+                openJumpMenu({ select: true });
             });
             jumpSearch.addEventListener('blur', () => {
                 jumpSearch.style.borderColor = '#57606a';
+            });
+            jumpSearch.addEventListener('click', () => {
+                openJumpMenu();
             });
             jumpSearch.addEventListener('input', filterJumpItems);
             jumpSearch.addEventListener('keydown', (e) => {
@@ -22712,6 +22846,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } else if (e.key === 'Enter') {
                     e.preventDefault();
                     openActiveJumpItem();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeJumpMenu();
+                    jumpSearch.blur();
                 }
             });
             commits.forEach((commit, idx) => {
@@ -22755,8 +22893,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     paintJumpItem(item);
                 });
                 item.addEventListener('click', (e) => {
-                    jumpDetails.removeAttribute('open');
-                    if (isCommitsList && focusCommitEntry(commit, idx)) {
+                    const query = jumpSearch.value.trim();
+                    if (query) storeCommitSearchJump(pr, commit, query);
+                    closeJumpMenu();
+                    if (query && currentSha && commitShaMatches(commit.sha, currentSha)) {
+                        e.preventDefault();
+                        schedulePendingCommitSearchJump('commit-nav-current-click');
+                        return;
+                    }
+                    if (!query && isCommitsList && focusCommitEntry(commit, idx)) {
                         e.preventDefault();
                     }
                 });
@@ -22764,54 +22909,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 jumpMenu.appendChild(item);
             });
             jumpMenu.setAttribute('role', 'listbox');
-            jumpMenu.prepend(jumpSearch);
-            jumpSearch.insertAdjacentElement('afterend', jumpDiffStatus);
+            jumpMenu.prepend(jumpDiffStatus);
             jumpMenu.appendChild(emptyJumpSearch);
-            const closeJumpMenu = () => {
-                jumpDetails.removeAttribute('open');
-            };
             const onJumpOutsidePointer = (e) => {
-                if (!jumpDetails.contains(e.target)) closeJumpMenu();
+                if (!jumpWrap.contains(e.target)) closeJumpMenu();
             };
             const onJumpKeydown = (e) => {
                 if (e.key !== 'Escape') return;
                 e.preventDefault();
                 e.stopPropagation();
                 closeJumpMenu();
-                jumpSummary.focus();
             };
             const removeJumpCloseListeners = () => {
                 document.removeEventListener('pointerdown', onJumpOutsidePointer, true);
                 document.removeEventListener('keydown', onJumpKeydown, true);
             };
-            jumpDetails.addEventListener('toggle', () => {
-                if (jumpDetails.open) {
-                    window.setTimeout(() => {
-                        if (!jumpDetails.open) return;
-                        jumpMenu.scrollTop = 0;
-                        jumpSearch.focus();
-                        jumpSearch.select();
-                        document.addEventListener('pointerdown', onJumpOutsidePointer, true);
-                        document.addEventListener('keydown', onJumpKeydown, true);
-                    }, 0);
-                } else {
-                    removeJumpCloseListeners();
-                    jumpSearch.value = '';
-                    if (jumpDiffSearchTimer) clearTimeout(jumpDiffSearchTimer);
-                    jumpDiffSearchToken++;
-                    jumpDiffSearchRunning = false;
-                    jumpDiffSearchQuery = '';
-                    activeJumpIdx = currentIdx >= 0 ? currentIdx : 0;
-                    filterJumpItems();
-                }
-            });
             setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0);
-            jumpDetails.appendChild(jumpSummary);
-            jumpDetails.appendChild(jumpMenu);
-            bar.appendChild(jumpDetails);
+            jumpWrap.appendChild(currentPill);
+            jumpWrap.appendChild(jumpSearch);
+            jumpWrap.appendChild(jumpMenu);
+            bar.appendChild(jumpWrap);
         } else {
             const pos = document.createElement('span');
-            pos.textContent = currentIdx >= 0 ? `${currentIdx + 1}/${commits.length}` : `Commits (${commits.length})`;
+            pos.textContent = currentLabel;
+            pos.title = currentTitle;
             Object.assign(pos.style, {
                 fontSize: '11px',
                 color: '#484f58',
@@ -22828,6 +22949,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (existing) existing.remove();
         document.body.appendChild(bar);
         hideNativeCommitNav(true);
+        schedulePendingCommitSearchJump('commit-nav-render');
     }
 
     function isPRPage(path = location.pathname) {
@@ -28748,7 +28870,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('floater commit nav shows [J]/[K] keyboard hints on buttons', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
+        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('const currentCommit ='));
         ackAssert(fn.includes('#1f6feb'), 'hint badge has blue background');
         ackAssert(fn.includes("isNext ? 'K' : 'J'"), 'J for prev, K for next (keyboard order)');
         ackAssert(fn.includes('Ctrl+'), 'tooltip includes Ctrl+ prefix');
@@ -28756,7 +28878,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('floater commit nav HTML-escapes commit messages to prevent innerHTML injection', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
+        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('const currentCommit ='));
         ackAssert(fn.includes('escapeHTML(truncMsg'), 'commit message is HTML-escaped before innerHTML');
     });
 
@@ -37571,6 +37693,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('commitNavTimer = setTimeout'), 'does not use raw setTimeout for nav fetch');
     });
 
+    ackTest('floating commit nav is available on bulk diff pages', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function _addFloatingCommitNavInner'),
+            source.indexOf('function isPRPage'),
+        );
+        ackAssert(fn.includes('const isBulkDiff = isPullRequestBulkDiffPage(location.pathname)'), 'detects bulk diff pages');
+        ackAssert(
+            fn.includes('!shaMatch && !isCommitsList && !isConversation && !isBulkDiff'),
+            'does not return early on bulk diff pages',
+        );
+        ackAssert(
+            fn.includes('isCommitsList || isConversation || isBulkDiff'),
+            'bulk diff pages start navigation at the first commit',
+        );
+    });
+
     ackTest('same-PR route changes keep the commit navigation cache', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -37585,7 +37724,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('floating commit nav has no disabled/null button state', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
+        const fn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('const currentCommit ='));
         ackAssert(!fn.includes("cursor: 'default'"), 'no disabled cursor');
         ackAssert(!fn.includes('if (!commit)'), 'no null commit branch');
     });
@@ -37601,7 +37740,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             navFn.includes("overflow: hasJumpMenu ? 'visible' : 'hidden'"),
             'bar allows dropdown overflow only when jump menu is present',
         );
-        const btnFn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('// Position indicator'));
+        const btnFn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('const currentCommit ='));
         ackAssert(
             btnFn.includes("maxWidth: 'min(300px, calc(50vw - 70px))'"),
             'button width shrinks on narrow viewports',
@@ -37609,31 +37748,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(btnFn.includes("minWidth: '0'"), 'button text can shrink instead of pushing buttons off-screen');
     });
 
-    ackTest('floating commit nav has middle jump dropdown only for larger commit sets', () => {
+    ackTest('floating commit nav always exposes search and current commit label', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function _addFloatingCommitNavInner'),
             source.indexOf('function isPRPage'),
         );
         ackAssert(
-            fn.includes('const hasJumpMenu = commits.length > 3;'),
-            'only enables jump dropdown when more than 3 commits exist',
+            fn.includes('const hasJumpMenu = commits.length > 0;'),
+            'shows jump search for every non-empty commit list',
         );
         ackAssert(
-            fn.indexOf('const commits = await fetchCommitList') < fn.indexOf('const hasJumpMenu = commits.length > 3;'),
+            fn.indexOf('const commits = await fetchCommitList') < fn.indexOf('const hasJumpMenu = commits.length > 0;'),
             'computes hasJumpMenu only after commits are loaded',
         );
-        ackAssert(
-            fn.includes("const jumpDetails = document.createElement('details')"),
-            'creates middle commit jump dropdown',
-        );
-        ackAssert(fn.includes('jumpSummary.textContent'), 'shows clickable middle summary');
+        ackAssert(fn.includes('const currentCommit = currentIdx >= 0'), 'tracks the currently viewed commit');
+        ackAssert(fn.includes('currentCommitPrefix'), 'builds a current commit message prefix');
+        ackAssert(fn.includes('currentPill.textContent = currentLabel'), 'renders the current commit label in the bar');
+        ackAssert(fn.includes('jumpWrap.appendChild(jumpSearch)'), 'renders the search input directly in the bar');
         ackAssert(
             fn.includes('Commits (${commits.length})'),
             'shows commits summary when no current commit is selected',
         );
         ackAssert(fn.includes('commits.forEach((commit, idx) => {'), 'builds dropdown items from all commits');
-        ackAssert(fn.includes('Jump to any commit'), 'middle section is explicitly a commit jump control');
+        ackAssert(fn.includes('Jump to any of ${commits.length} commits'), 'middle section is explicitly a commit jump control');
         ackAssert(
             fn.includes("const pos = document.createElement('span')"),
             'keeps a simple middle indicator when the jump menu is disabled',
@@ -37652,10 +37790,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('Search commits, hashes, or diffs'),
             'search input advertises commit diff search',
         );
-        ackAssert(fn.includes('jumpSearch.focus()'), 'focuses search when chooser opens');
+        ackAssert(fn.includes("jumpSearch.addEventListener('focus'"), 'opens chooser when the visible search is focused');
         ackAssert(fn.includes('filterJumpItems'), 'filters dropdown items');
         ackAssert(fn.includes('item.dataset.ackSearch'), 'stores searchable commit text');
         ackAssert(fn.includes('.toLowerCase()'), 'filters case-insensitively');
+        ackAssert(fn.includes('openJumpMenu'), 'opens the search results menu from the visible search box');
+        ackAssert(fn.includes("jumpMenu.style.display = 'block'"), 'shows the menu without a native details disclosure');
         ackAssert(fn.includes('setActiveJumpItem'), 'tracks active jump item');
         ackAssert(fn.includes('visibleJumpItems'), 'navigates only visible filtered rows');
         ackAssert(fn.includes("e.key === 'ArrowDown'"), 'handles ArrowDown selection');
@@ -37666,8 +37806,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("item.setAttribute('role', 'option')"), 'marks rows as options');
         ackAssert(fn.includes("jumpMenu.setAttribute('role', 'listbox')"), 'marks menu as listbox');
         ackAssert(fn.includes("e.key !== 'Escape'"), 'handles Escape key');
-        ackAssert(fn.includes("jumpDetails.removeAttribute('open')"), 'closes chooser by removing open attribute');
-        ackAssert(fn.includes('!jumpDetails.contains(e.target)'), 'detects outside clicks');
+        ackAssert(fn.includes('closeJumpMenu()'), 'closes chooser through the shared close helper');
+        ackAssert(fn.includes('!jumpWrap.contains(e.target)'), 'detects outside clicks');
         ackAssert(
             fn.includes("document.addEventListener('pointerdown', onJumpOutsidePointer, true)"),
             'closes on outside pointer',
@@ -37692,7 +37832,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('itemDiffMatches(item, query)'), 'matches rows by loaded diff text');
         ackAssert(fn.includes('ack-commit-diff-hit'), 'marks diff-only hits in the chooser');
         ackAssert(fn.includes('Searching diffs'), 'shows async diff search progress');
-        ackAssert(fn.includes("jumpSearch.insertAdjacentElement('afterend', jumpDiffStatus)"), 'renders diff search status');
+        ackAssert(fn.includes('jumpMenu.prepend(jumpDiffStatus)'), 'renders diff search status');
+    });
+
+    ackTest('floating commit nav search results jump to matching diff lines', () => {
+        const source = _ackSource;
+        const helper = source.slice(
+            source.indexOf('const COMMIT_SEARCH_JUMP_KEY'),
+            source.indexOf('async function _addFloatingCommitNavInner'),
+        );
+        const navFn = source.slice(
+            source.indexOf('async function _addFloatingCommitNavInner'),
+            source.indexOf('function isPRPage'),
+        );
+        ackAssert(helper.includes("const COMMIT_SEARCH_JUMP_KEY = 'ack_commit_search_jump_v1'"), 'namespaces jump storage');
+        ackAssert(helper.includes('commitSearchJumpPRKey(pr)'), 'scopes stored jumps to the PR');
+        ackAssert(helper.includes('commitShaMatches'), 'matches short and full commit SHAs');
+        ackAssert(helper.includes('COMMIT_SEARCH_JUMP_LINE_SELECTOR'), 'searches GitHub diff line cells');
+        ackAssert(helper.includes('scrollToAndHighlight(target)'), 'scrolls to the matching line');
+        ackAssert(helper.includes('attempt < 32'), 'retries while streamed diff lines load');
+        ackAssert(navFn.includes('if (query) storeCommitSearchJump(pr, commit, query)'), 'stores searched item clicks');
+        ackAssert(navFn.includes("schedulePendingCommitSearchJump('commit-nav-render')"), 'runs pending jump after nav render');
+        ackAssert(
+            navFn.includes("schedulePendingCommitSearchJump('commit-nav-current-click')"),
+            'runs immediately when the selected commit is already open',
+        );
     });
 
     ackTest('navigateCommit wraps around circularly', () => {
