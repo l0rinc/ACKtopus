@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.191
+// @version      1.192
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22475,9 +22475,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const normalized = normalizeCommitSearchQuery(query);
         if (!normalized) return null;
         for (const el of qsa(document, COMMIT_SEARCH_JUMP_LINE_SELECTOR)) {
-            if (!isVisible(el)) continue;
-            const text = String(el.innerText || el.textContent || '').toLowerCase();
+            // Match text before checking visibility: textContent is layout-free,
+            // while isVisible/innerText force a reflow per cell — repeated over
+            // every diff line on retry scans of a huge streamed diff.
+            const text = String(el.textContent || '').toLowerCase();
             if (!text.includes(normalized)) continue;
+            if (!isVisible(el)) continue;
             return el.closest?.('tr, [data-testid="diff-line"], [class*="DiffLine"]') || el;
         }
         return null;
@@ -22951,11 +22954,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
                 item.addEventListener('click', (e) => {
                     const query = jumpSearch.value.trim();
-                    if (query) storeCommitSearchJump(pr, commit, query);
+                    // Only schedule a diff-line jump when the query can actually
+                    // appear in this commit's diff: a message/SHA-only match would
+                    // make the target page rescan every diff cell 32 times for
+                    // text that is not there.
+                    const patchText = commitDiffSearchText.get(commit.sha);
+                    const jumpable =
+                        !!query && (!patchText || patchText.includes(normalizeCommitSearchQuery(query)));
+                    if (jumpable) storeCommitSearchJump(pr, commit, query);
                     closeJumpMenu();
                     if (query && currentSha && commitShaMatches(commit.sha, currentSha)) {
                         e.preventDefault();
-                        schedulePendingCommitSearchJump('commit-nav-current-click');
+                        if (jumpable) schedulePendingCommitSearchJump('commit-nav-current-click');
                         return;
                     }
                     if (!query && isCommitsList && focusCommitEntry(commit, idx)) {
@@ -37947,7 +37957,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(helper.includes('COMMIT_SEARCH_JUMP_LINE_SELECTOR'), 'searches GitHub diff line cells');
         ackAssert(helper.includes('scrollToAndHighlight(target)'), 'scrolls to the matching line');
         ackAssert(helper.includes('attempt < 32'), 'retries while streamed diff lines load');
-        ackAssert(navFn.includes('if (query) storeCommitSearchJump(pr, commit, query)'), 'stores searched item clicks');
+        ackAssert(!helper.includes('el.innerText'), 'diff-line scan avoids layout-forcing innerText');
+        ackAssert(
+            helper.indexOf('text.includes(normalized)') < helper.indexOf('if (!isVisible(el)) continue'),
+            'cheap text match runs before the layout-forcing visibility check',
+        );
+        ackAssert(
+            navFn.includes('const patchText = commitDiffSearchText.get(commit.sha)'),
+            'consults the loaded commit patch before storing a jump',
+        );
+        ackAssert(
+            navFn.includes('if (jumpable) storeCommitSearchJump(pr, commit, query)'),
+            'stores searched item clicks only when the diff can contain the query',
+        );
         ackAssert(navFn.includes("schedulePendingCommitSearchJump('commit-nav-render')"), 'runs pending jump after nav render');
         ackAssert(
             navFn.includes("schedulePendingCommitSearchJump('commit-nav-current-click')"),
