@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.193
+// @version      1.194
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -7499,6 +7499,16 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         };
     }
 
+    function commentHasOwnPendingReviewMarker(container) {
+        const pendingSelector = '.js-pending-review-comment, .Label--warning, [title="Label: Pending"], [data-testid="pending-badge"]';
+        const markers = qsa(container, pendingSelector).filter((el) => {
+            if (el.classList?.contains('js-pending-review-comment')) return true;
+            const label = `${el.textContent || ''} ${el.getAttribute?.('title') || ''}`.trim();
+            return /pending/i.test(label);
+        });
+        return markers.some((marker) => marker.closest?.(COMMENT_CONTAINER_SELECTOR) === container);
+    }
+
     function formatCommentFlags({ isOutdated, isPending, isResolved } = {}) {
         const flags = [];
         if (isOutdated) flags.push('outdated');
@@ -8123,7 +8133,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             seenBodies.add(body);
             const threadRoot = getCommentThreadRoot(container);
             const flags = getCommentThreadFlags(container, threadRoot);
-            if (!flags.isPending && !container.closest?.('.js-pending-review-comment')) continue;
+            if (!commentHasOwnPendingReviewMarker(container)) continue;
             const markdown = renderBodyMarkdown(body);
             if (!markdown) continue;
             const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
@@ -34074,6 +34084,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(text.includes('bool ok = m_best_block_index != nullptr;'), 'keeps target code context');
         ackAssert(!text.includes('### Visible thread context'), 'does not duplicate a selected-only thread context');
+    });
+
+    ackTest('pending review DOM collection keeps discussion parents as context only', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="js-line-comments" id="discussion_r123">
+                <div class="timeline-comment">
+                    <a class="author" href="/sipa">sipa</a>
+                    <a id="discussion_r123-permalink" href="#discussion_r123">
+                        <relative-time datetime="2026-07-05T21:55:19Z"></relative-time>
+                    </a>
+                    <div class="markdown-body"><p>Parent published comment</p></div>
+                </div>
+                <div class="timeline-comment js-pending-review-comment">
+                    <a class="author" href="/l0rinc">l0rinc</a>
+                    <span title="Label: Pending" class="Label Label--warning">Pending</span>
+                    <div class="markdown-body"><p>Draft reply</p></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const comments = gatherPendingReviewDomComments(host);
+            ackEq(comments.length, 1, 'only the pending reply is copied as a pending comment');
+            ackEq(comments[0].markdown, 'Draft reply', 'keeps the pending draft body');
+            ackAssert(
+                !comments.some((comment) => comment.markdown.includes('Parent published comment')),
+                'does not copy the parent as another pending comment',
+            );
+            ackAssert(
+                comments[0].threadContext.includes('Parent published comment'),
+                'keeps the parent in visible thread context',
+            );
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('pending review comments gather from GraphQL, page data, and DOM without reveal-all', () => {
