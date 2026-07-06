@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.194
+// @version      1.195
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22657,9 +22657,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 minWidth: '0',
                 overflow: 'visible',
             });
-            const currentPill = document.createElement('span');
+            const currentPill = document.createElement('button');
+            currentPill.type = 'button';
             currentPill.textContent = currentLabel;
-            currentPill.title = currentTitle;
+            currentPill.title = `${currentTitle}\nClick to search and jump to any commit`;
+            currentPill.setAttribute('aria-haspopup', 'listbox');
+            currentPill.setAttribute('aria-expanded', 'false');
             Object.assign(currentPill.style, {
                 padding: '4px 10px',
                 fontSize: '11px',
@@ -22667,6 +22670,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 background: '#0d1117',
                 border: '1px solid #57606a',
                 borderRadius: '6px',
+                cursor: 'pointer',
                 whiteSpace: 'nowrap',
                 minWidth: '90px',
                 maxWidth: 'min(360px, 42vw)',
@@ -22701,15 +22705,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 padding: '6px',
                 zIndex: '99999',
             });
+            const jumpHeader = document.createElement('div');
+            Object.assign(jumpHeader.style, {
+                position: 'sticky',
+                top: '0',
+                zIndex: '2',
+                background: '#161b22',
+                padding: '0 0 6px',
+            });
             const jumpSearch = document.createElement('input');
             jumpSearch.type = 'search';
             jumpSearch.placeholder = 'Search commits, hashes, or diffs...';
             jumpSearch.setAttribute('aria-label', 'Search commits');
             Object.assign(jumpSearch.style, {
                 display: 'block',
-                width: '220px',
-                maxWidth: 'min(280px, 34vw)',
-                minWidth: '130px',
+                width: '100%',
+                maxWidth: 'none',
+                minWidth: '0',
                 boxSizing: 'border-box',
                 padding: '6px 8px',
                 fontSize: '12px',
@@ -22718,18 +22730,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 border: '1px solid #57606a',
                 borderRadius: '6px',
                 outline: 'none',
-                flex: '0 1 auto',
             });
             const jumpDiffStatus = document.createElement('div');
             Object.assign(jumpDiffStatus.style, {
                 display: 'none',
-                margin: '0 0 6px',
+                margin: '6px 0 0',
                 padding: '0 2px',
                 color: '#8b949e',
                 fontSize: '11px',
-                position: 'sticky',
-                top: '0',
-                zIndex: '1',
                 background: '#161b22',
             });
             const emptyJumpSearch = document.createElement('div');
@@ -22828,16 +22836,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             const closeJumpMenu = () => {
                 jumpMenu.style.display = 'none';
+                currentPill.setAttribute('aria-expanded', 'false');
                 removeJumpCloseListeners();
             };
-            const openJumpMenu = ({ select = false } = {}) => {
+            const openJumpMenu = ({ clear = false, focusSearch = false, select = false } = {}) => {
+                if (clear) jumpSearch.value = '';
                 if (jumpMenu.style.display !== 'block') {
                     jumpMenu.style.display = 'block';
                     jumpMenu.scrollTop = 0;
+                    currentPill.setAttribute('aria-expanded', 'true');
                     document.addEventListener('pointerdown', onJumpOutsidePointer, true);
                     document.addEventListener('keydown', onJumpKeydown, true);
                 }
                 applyJumpFilter();
+                if (focusSearch) jumpSearch.focus();
                 if (select) jumpSearch.select();
             };
             const runJumpDiffSearch = async (query, token) => {
@@ -22905,6 +22917,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             jumpSearch.addEventListener('click', () => {
                 openJumpMenu();
+            });
+            currentPill.addEventListener('click', () => {
+                openJumpMenu({ clear: true, focusSearch: true, select: true });
+                setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0, { scroll: currentIdx >= 0 });
             });
             jumpSearch.addEventListener('input', filterJumpItems);
             jumpSearch.addEventListener('keydown', (e) => {
@@ -22987,7 +23003,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 jumpMenu.appendChild(item);
             });
             jumpMenu.setAttribute('role', 'listbox');
-            jumpMenu.prepend(jumpDiffStatus);
+            jumpHeader.appendChild(jumpSearch);
+            jumpHeader.appendChild(jumpDiffStatus);
+            jumpMenu.prepend(jumpHeader);
             jumpMenu.appendChild(emptyJumpSearch);
             const onJumpOutsidePointer = (e) => {
                 if (!jumpWrap.contains(e.target)) closeJumpMenu();
@@ -23004,7 +23022,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0);
             jumpWrap.appendChild(currentPill);
-            jumpWrap.appendChild(jumpSearch);
             jumpWrap.appendChild(jumpMenu);
             bar.appendChild(jumpWrap);
         } else {
@@ -37917,7 +37934,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(btnFn.includes("minWidth: '0'"), 'button text can shrink instead of pushing buttons off-screen');
     });
 
-    ackTest('floating commit nav always exposes search and current commit label', () => {
+    ackTest('floating commit nav merges current commit and search chooser', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function _addFloatingCommitNavInner'),
@@ -37934,7 +37951,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('const currentCommit = currentIdx >= 0'), 'tracks the currently viewed commit');
         ackAssert(fn.includes('currentCommitPrefix'), 'builds a current commit message prefix');
         ackAssert(fn.includes('currentPill.textContent = currentLabel'), 'renders the current commit label in the bar');
-        ackAssert(fn.includes('jumpWrap.appendChild(jumpSearch)'), 'renders the search input directly in the bar');
+        ackAssert(fn.includes("const currentPill = document.createElement('button')"), 'current label is the jump trigger');
+        ackAssert(fn.includes("currentPill.addEventListener('click'"), 'clicking the current label opens the chooser');
+        ackAssert(
+            fn.includes('openJumpMenu({ clear: true, focusSearch: true, select: true })'),
+            'current-label click opens an unfiltered searchable chooser',
+        );
+        ackAssert(fn.includes('jumpHeader.appendChild(jumpSearch)'), 'renders search at the top of the chooser');
+        ackAssert(!fn.includes('jumpWrap.appendChild(jumpSearch)'), 'does not keep a separate search box in the bar');
         ackAssert(
             fn.includes('Commits (${commits.length})'),
             'shows commits summary when no current commit is selected',
@@ -37959,11 +37983,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('Search commits, hashes, or diffs'),
             'search input advertises commit diff search',
         );
-        ackAssert(fn.includes("jumpSearch.addEventListener('focus'"), 'opens chooser when the visible search is focused');
+        ackAssert(fn.includes('jumpHeader.appendChild(jumpSearch)'), 'places the search input in the chooser header');
+        ackAssert(fn.includes("position: 'sticky'"), 'keeps the chooser header at the top while scrolling');
+        ackAssert(fn.includes("jumpSearch.addEventListener('focus'"), 'keeps chooser open when the menu search is focused');
         ackAssert(fn.includes('filterJumpItems'), 'filters dropdown items');
         ackAssert(fn.includes('item.dataset.ackSearch'), 'stores searchable commit text');
         ackAssert(fn.includes('.toLowerCase()'), 'filters case-insensitively');
-        ackAssert(fn.includes('openJumpMenu'), 'opens the search results menu from the visible search box');
+        ackAssert(fn.includes('openJumpMenu'), 'opens the search results menu from the merged jump control');
         ackAssert(fn.includes("jumpMenu.style.display = 'block'"), 'shows the menu without a native details disclosure');
         ackAssert(fn.includes('setActiveJumpItem'), 'tracks active jump item');
         ackAssert(fn.includes('visibleJumpItems'), 'navigates only visible filtered rows');
