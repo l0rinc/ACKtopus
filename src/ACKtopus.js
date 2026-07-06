@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.195
+// @version      1.196
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -30731,7 +30731,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(clearFn.includes('_compareDebounceTimer'), 'clears compare debounce timer');
         ackAssert(clearFn.includes('_compareWatchdogTimer'), 'clears compare watchdog timer');
-        const tryInjectFn = source.slice(source.indexOf('function tryInject()'), source.indexOf('tryInject();'));
+        const tryInjectFn = sourceSection(source, 'function tryInject()', '\n    tryInject();');
         ackAssert(tryInjectFn.includes('clearCompareWatcher()'), 'navigation away clears compare watcher');
     });
 
@@ -38027,7 +38027,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('itemDiffMatches(item, query)'), 'matches rows by loaded diff text');
         ackAssert(fn.includes('ack-commit-diff-hit'), 'marks diff-only hits in the chooser');
         ackAssert(fn.includes('Searching diffs'), 'shows async diff search progress');
-        ackAssert(fn.includes('jumpMenu.prepend(jumpDiffStatus)'), 'renders diff search status');
+        ackAssert(fn.includes('jumpHeader.appendChild(jumpDiffStatus)'), 'renders diff search status');
     });
 
     ackTest('floating commit nav search results jump to matching diff lines', () => {
