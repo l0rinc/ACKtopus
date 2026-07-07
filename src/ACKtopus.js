@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.197
+// @version      1.198
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2292,15 +2292,23 @@
     // This prevents a misconfigured/expired PAT from breaking everything.
     // =========================================================================
 
+    function githubPatValue() {
+        return String(GM_getValue('github_pat', '') || '').trim();
+    }
+
     function ghApiHeaders() {
         const headers = { Accept: 'application/vnd.github+json' };
-        const pat = GM_getValue('github_pat', '');
-        if (pat) headers.Authorization = pat.startsWith('ghp_') ? `token ${pat}` : `Bearer ${pat}`;
+        const pat = githubPatValue();
+        if (pat && pat !== _githubBadPat) headers.Authorization = pat.startsWith('ghp_') ? `token ${pat}` : `Bearer ${pat}`;
         return headers;
     }
 
     let _rateLimitWarned = false;
-    let _patInvalidWarned = false;
+    let _patInvalidWarned = '';
+    let _githubBadPat = '';
+    let _githubAuthBucketPat = '';
+    let _githubAuthBucketId = 0;
+    const _githubRateLimitedUntil = new Map();
 
     function githubResponseSnippet(response) {
         return String(response?.responseText || '').slice(0, 120);
@@ -2315,7 +2323,80 @@
     }
 
     function githubHttpError(response, url) {
-        return new Error(`HTTP ${response.status} for ${url}: ${githubResponseSnippet(response)}`);
+        const err = new Error(`HTTP ${response.status} for ${url}: ${githubResponseSnippet(response)}`);
+        err.status = response?.status;
+        if (isGithubRateLimitResponse(response)) err.githubRateLimited = true;
+        return err;
+    }
+
+    function githubResponseHeader(response, name) {
+        const wanted = String(name || '').toLowerCase();
+        return (
+            String(response?.responseHeaders || '')
+                .split(/\r?\n/)
+                .map((line) => line.match(/^([^:]+):\s*(.*)$/))
+                .find((m) => m && m[1].toLowerCase() === wanted)?.[2]
+                ?.trim() || ''
+        );
+    }
+
+    function isGithubRateLimitResponse(response) {
+        return (response?.status === 403 || response?.status === 429) && /rate limit/i.test(response?.responseText || '');
+    }
+
+    function isGithubRateLimitedError(err) {
+        return !!err?.githubRateLimited;
+    }
+
+    function githubAuthBucket(headers = {}) {
+        if (!headers.Authorization) return 'anonymous';
+        const pat = githubPatValue();
+        if (pat !== _githubAuthBucketPat) {
+            _githubAuthBucketPat = pat;
+            _githubAuthBucketId++;
+        }
+        return `auth:${_githubAuthBucketId}`;
+    }
+
+    function githubRateLimitUntil(response) {
+        const resetSeconds = Number(githubResponseHeader(response, 'x-ratelimit-reset'));
+        const resetMs = Number.isFinite(resetSeconds) && resetSeconds > 0 ? resetSeconds * 1000 + 1000 : 0;
+        return Math.max(Date.now() + 5 * 60 * 1000, resetMs);
+    }
+
+    function rememberGithubRateLimit(response, headers) {
+        if (!isGithubRateLimitResponse(response)) return;
+        const bucket = githubAuthBucket(headers);
+        _githubRateLimitedUntil.set(bucket, Math.max(_githubRateLimitedUntil.get(bucket) || 0, githubRateLimitUntil(response)));
+        if (!_rateLimitWarned) {
+            _rateLimitWarned = true;
+            console.warn(
+                'ACKtopus: GitHub API rate limit hit. Add or fix the Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
+            );
+        }
+    }
+
+    function githubRateLimitPreflightError(url, headers) {
+        const until = _githubRateLimitedUntil.get(githubAuthBucket(headers)) || 0;
+        if (until <= Date.now()) return null;
+        const err = new Error(`GitHub API rate limit already hit, skipping ${url} until ${new Date(until).toISOString()}`);
+        err.githubRateLimited = true;
+        return err;
+    }
+
+    function rememberGithubBadPat(response) {
+        if (!response || isGithubRateLimitResponse(response)) return;
+        const pat = githubPatValue();
+        if (!pat) return;
+        _githubBadPat = pat;
+        if (_patInvalidWarned !== pat) {
+            _patInvalidWarned = pat;
+            console.warn(
+                'ACKtopus: PAT returned ' +
+                    response.status +
+                    ', disabling it for this page session. Check your token permissions in ACKtopus settings.',
+            );
+        }
     }
 
     function githubTransportError(url, label, event) {
@@ -2332,10 +2413,16 @@
 
     function gmFetch(url) {
         return new Promise((resolve, reject) => {
+            const headers = ghApiHeaders();
+            const preflight = githubRateLimitPreflightError(url, headers);
+            if (preflight) {
+                reject(preflight);
+                return;
+            }
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
-                headers: ghApiHeaders(),
+                headers,
                 onload: (r) => {
                     if (r.status >= 200 && r.status < 300) {
                         try {
@@ -2343,31 +2430,25 @@
                         } catch (e) {
                             reject(e);
                         }
-                    } else if ((r.status === 401 || r.status === 403) && ghApiHeaders().Authorization) {
+                    } else if ((r.status === 401 || r.status === 403) && headers.Authorization) {
                         // PAT may be invalid/expired/wrong-scope. Retry without
                         // auth — public repos still work at 60 req/hr unauthenticated.
-                        if (!_patInvalidWarned && !/rate limit/i.test(r.responseText)) {
-                            _patInvalidWarned = true;
-                            console.warn(
-                                'ACKtopus: PAT returned ' +
-                                    r.status +
-                                    ', retrying without auth. Check your token permissions in ACKtopus settings.',
-                            );
-                        }
-                        if (r.status === 403 && /rate limit/i.test(r.responseText)) {
-                            if (!_rateLimitWarned) {
-                                _rateLimitWarned = true;
-                                console.warn(
-                                    'ACKtopus: GitHub API rate limit hit. Add a Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
-                                );
-                            }
+                        if (isGithubRateLimitResponse(r)) {
+                            rememberGithubRateLimit(r, headers);
                             reject(githubHttpError(r, url));
+                            return;
+                        }
+                        rememberGithubBadPat(r);
+                        const fallbackHeaders = { Accept: 'application/vnd.github+json' };
+                        const fallbackPreflight = githubRateLimitPreflightError(url, fallbackHeaders);
+                        if (fallbackPreflight) {
+                            reject(fallbackPreflight);
                             return;
                         }
                         GM_xmlhttpRequest({
                             method: 'GET',
                             url,
-                            headers: { Accept: 'application/vnd.github+json' },
+                            headers: fallbackHeaders,
                             onload: (r2) => {
                                 if (r2.status >= 200 && r2.status < 300) {
                                     try {
@@ -2376,18 +2457,14 @@
                                         reject(e);
                                     }
                                 } else {
+                                    rememberGithubRateLimit(r2, fallbackHeaders);
                                     reject(githubHttpError(r2, url));
                                 }
                             },
                             ...githubGetTransportHandlers(url, reject),
                         });
                     } else {
-                        if (r.status === 403 && /rate limit/i.test(r.responseText) && !_rateLimitWarned) {
-                            _rateLimitWarned = true;
-                            console.warn(
-                                'ACKtopus: GitHub API rate limit hit. Add a Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
-                            );
-                        }
+                        rememberGithubRateLimit(r, headers);
                         reject(githubHttpError(r, url));
                     }
                 },
@@ -2431,13 +2508,16 @@
 
     function fetchCommitPullRequests(owner, repo, sha) {
         const url = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls`;
-        const tryHeaders = [
-            { ...ghApiHeaders(), Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' },
-            { Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' },
-        ];
+        const authHeaders = { ...ghApiHeaders(), Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' };
+        const tryHeaders = [authHeaders, { Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' }];
         return new Promise((resolve, reject) => {
             let attempt = 0;
             const run = () => {
+                const preflight = githubRateLimitPreflightError(url, tryHeaders[attempt]);
+                if (preflight) {
+                    reject(preflight);
+                    return;
+                }
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url,
@@ -2451,7 +2531,13 @@
                             }
                             return;
                         }
-                        if ((r.status === 401 || r.status === 403) && attempt === 0 && ghApiHeaders().Authorization) {
+                        if (isGithubRateLimitResponse(r)) {
+                            rememberGithubRateLimit(r, tryHeaders[attempt]);
+                            reject(githubHttpError(r, url));
+                            return;
+                        }
+                        if ((r.status === 401 || r.status === 403) && attempt === 0 && tryHeaders[attempt].Authorization) {
+                            rememberGithubBadPat(r);
                             run(++attempt);
                             return;
                         }
@@ -2501,7 +2587,7 @@
                 if (comments.length < 100) break; // last page
             }
         } catch (e) {
-            console.warn('ACKtopus: API fetch failed', e);
+            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: API fetch failed', e);
         }
         return [];
     }
@@ -2926,7 +3012,8 @@
                     );
                 } catch (e) {
                     fetchFailed = true;
-                    console.warn('ACKtopus: fetchRepoMembers - org public_members failed:', e.message || e);
+                    if (!isGithubRateLimitedError(e))
+                        console.warn('ACKtopus: fetchRepoMembers - org public_members failed:', e.message || e);
                 }
                 // Don't cache failed/partial fetches: a transient error would otherwise pin an
                 // empty/incomplete member set for the whole 24h ORG_TTL.
@@ -2955,7 +3042,8 @@
                     `ACKtopus: fetchRepoMembers - PR reviews: +${members.size - beforeReviews} new (${reviews.length} checked, associations: ${[...new Set(reviews.map((r) => r.author_association))].join(',')})`,
                 );
             } catch (e) {
-                console.warn('ACKtopus: fetchRepoMembers - PR reviews failed:', e.message || e);
+                if (!isGithubRateLimitedError(e))
+                    console.warn('ACKtopus: fetchRepoMembers - PR reviews failed:', e.message || e);
             }
 
             const beforeIssue = members.size;
@@ -2973,7 +3061,8 @@
                     `ACKtopus: fetchRepoMembers - issue comments: +${members.size - beforeIssue} new (${comments.length} checked)`,
                 );
             } catch (e) {
-                console.warn('ACKtopus: fetchRepoMembers - issue comments failed:', e.message || e);
+                if (!isGithubRateLimitedError(e))
+                    console.warn('ACKtopus: fetchRepoMembers - issue comments failed:', e.message || e);
             }
 
             // Source: inline review comments (code comments on diff lines)
@@ -2992,7 +3081,8 @@
                     `ACKtopus: fetchRepoMembers - inline review comments: +${members.size - beforeInline} new (${inline.length} checked)`,
                 );
             } catch (e) {
-                console.warn('ACKtopus: fetchRepoMembers - inline review comments failed:', e.message || e);
+                if (!isGithubRateLimitedError(e))
+                    console.warn('ACKtopus: fetchRepoMembers - inline review comments failed:', e.message || e);
             }
         }
 
@@ -3047,7 +3137,7 @@
             }
             console.log(`ACKtopus: fetchReviewCommentCommits - ${Object.keys(map).length} comments mapped to commits`);
         } catch (e) {
-            console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
+            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
         }
         _reviewCommitMap = { prKey, map };
         return map;
@@ -3310,7 +3400,7 @@
             }
             return pushes;
         } catch (e) {
-            console.warn('ACKtopus: timeline fetch failed', e);
+            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: timeline fetch failed', e);
         }
         return [];
     }
@@ -3656,7 +3746,8 @@
                 return branch;
             })
             .catch((e) => {
-                if (!_ackTesting) console.warn(`ACKtopus: failed to fetch default branch for ${repoKey}`, e);
+                if (!_ackTesting && !isGithubRateLimitedError(e))
+                    console.warn(`ACKtopus: failed to fetch default branch for ${repoKey}`, e);
                 return '';
             })
             .finally(() => {
@@ -22362,10 +22453,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (let pageNum = 1; pageNum <= 20; pageNum++) {
             const batch = await new Promise((resolve) => {
                 const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100&page=${pageNum}`;
+                const headers = ghApiHeaders();
+                const preflight = githubRateLimitPreflightError(url, headers);
+                if (preflight) {
+                    resolve(null);
+                    return;
+                }
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url,
-                    headers: ghApiHeaders(),
+                    headers,
                     onload: (r) => {
                         if (r.status >= 200 && r.status < 300) {
                             try {
@@ -22373,7 +22470,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 return;
                             } catch {}
                         }
-                        console.warn(`ACKtopus: commits API returned ${r.status}, falling back to HTML scrape`);
+                        if (isGithubRateLimitResponse(r)) rememberGithubRateLimit(r, headers);
+                        else if (headers.Authorization && (r.status === 401 || r.status === 403)) rememberGithubBadPat(r);
+                        else console.warn(`ACKtopus: commits API returned ${r.status}, falling back to HTML scrape`);
                         resolve(null);
                     },
                     onerror: () => {
@@ -30239,7 +30338,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('application/vnd.github.groot-preview+json'),
             'uses pulls-for-commit preview accept header',
         );
-        ackAssert(fn.includes('ghApiHeaders().Authorization'), 'retries without auth when PAT-auth request fails');
+        ackAssert(fn.includes('tryHeaders[attempt].Authorization'), 'retries without auth when PAT-auth request fails');
         ackAssert(fn.includes('/commits/${sha}/pulls'), 'queries the commits/{sha}/pulls endpoint');
     });
 
@@ -31022,10 +31121,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
         ackAssert(fn.includes('r.status === 401'), 'detects 401');
-        ackAssert(fn.includes('ghApiHeaders().Authorization'), 'only retries if PAT was set');
+        ackAssert(fn.includes('headers.Authorization'), 'only retries if PAT was set');
         ackAssert(fn.includes("Accept: 'application/vnd.github+json'"), 'retries with accept header only (no auth)');
         ackAssert(fn.includes('_patInvalidWarned'), 'warns once about invalid PAT');
         ackAssert(fn.includes('rate limit'), 'does NOT retry on rate limit (that needs auth, not less auth)');
+    });
+
+    ackTest('GitHub API helpers remember bad PATs and rate limits', () => {
+        const source = _ackSource;
+        const helpers = sourceSection(source, 'function githubPatValue', 'function githubTransportError');
+        ackAssert(helpers.includes('pat !== _githubBadPat'), 'bad PAT is disabled for later requests');
+        ackAssert(helpers.includes('_githubRateLimitedUntil'), 'tracks rate-limited auth buckets');
+        ackAssert(helpers.includes('x-ratelimit-reset'), 'uses GitHub reset header when available');
+        ackAssert(helpers.includes('err.githubRateLimited = true'), 'marks rate-limit HTTP errors');
+        ackAssert(helpers.includes('function isGithubRateLimitedError'), 'has rate-limit error predicate');
+        ackAssert(helpers.includes('githubRateLimitPreflightError'), 'has preflight skip helper');
+        ackAssert(helpers.includes('rememberGithubBadPat'), 'has bad-PAT memoization helper');
+        ackAssert(helpers.includes('rememberGithubRateLimit'), 'has rate-limit memoization helper');
+        ackAssert(!helpers.includes('auth:${headers.Authorization}'), 'does not store Authorization header in rate-limit bucket key');
+    });
+
+    ackTest('gmFetch fails fast after known rate limits and disables bad PATs', () => {
+        const source = _ackSource;
+        const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
+        ackAssert(fn.includes('const headers = ghApiHeaders()'), 'captures request headers once');
+        ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips known rate-limited auth bucket');
+        ackAssert(fn.includes('rememberGithubBadPat(r)'), 'memoizes invalid PAT before retrying anonymously');
+        ackAssert(fn.includes('fallbackPreflight'), 'checks anonymous rate limit before fallback request');
+        ackAssert(fn.includes('rememberGithubRateLimit(r2, fallbackHeaders)'), 'memoizes anonymous fallback rate limit');
+    });
+
+    ackTest('optional GitHub API callers stay quiet after shared rate-limit warning', () => {
+        const source = _ackSource;
+        const acks = sourceSection(source, 'async function parseAcksFromAPI', 'function navigateToFragment');
+        ackAssert(acks.includes('!isGithubRateLimitedError(e)'), 'ACK API fallback does not log known rate-limit skips');
+        const members = sourceSection(source, 'async function fetchRepoMembers', '// Map review comment ID');
+        ackAssert(members.includes('!isGithubRateLimitedError(e)'), 'member supplement fetches do not log known rate-limit skips');
+        const reviewCommits = sourceSection(source, 'async function fetchReviewCommentCommits', '// Hardcoded maintainer list');
+        ackAssert(reviewCommits.includes('!isGithubRateLimitedError(e)'), 'review-comment map does not log known rate-limit skips');
+        const forcePushes = sourceSection(source, 'async function parseForcePushesFromAPI', 'function forcePushRangeEndpoint');
+        ackAssert(forcePushes.includes('!isGithubRateLimitedError(e)'), 'force-push timeline fetch does not log known rate-limit skips');
+        const defaultBranch = sourceSection(source, 'async function fetchGitHubRepoDefaultBranch', 'function rewriteLocalRepoCompareLinks');
+        ackAssert(defaultBranch.includes('!isGithubRateLimitedError(e)'), 'default-branch lookup does not log known rate-limit skips');
     });
 
     ackTest('gmFetch warns once on rate limit with PAT instructions', () => {
@@ -31035,6 +31172,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('rate limit'), 'detects rate limit in response');
         ackAssert(fn.includes('Personal Access Token'), 'mentions PAT in warning');
         ackAssert(fn.includes('5000'), 'mentions authenticated rate limit');
+    });
+
+    ackTest('fetchCommitList shares bad-PAT and rate-limit guards', () => {
+        const source = _ackSource;
+        const fn = sourceSection(source, 'async function fetchCommitList', 'const COMMIT_SEARCH_JUMP_KEY');
+        ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips API page when auth bucket is rate-limited');
+        ackAssert(fn.includes('rememberGithubRateLimit(r, headers)'), 'records API rate-limit responses');
+        ackAssert(fn.includes('rememberGithubBadPat(r)'), 'records invalid PAT responses');
+        ackAssert(fn.includes('falling back to HTML scrape'), 'still keeps the HTML scrape fallback');
     });
 
     ackTest('config panel has GitHub PAT field and saves it', () => {
