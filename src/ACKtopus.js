@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.196
+// @version      1.197
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22595,15 +22595,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const hintKey = isNext ? 'K' : 'J';
             const href = commitHref(commit);
             const msg = escapeHTML(truncMsg(commitLine(commit)));
-            const hint = `<span class="ack-shortcut-hint" style="background:#1f6feb;color:#fff;font-size:9px;font-weight:bold;padding:0 3px;border-radius:2px;margin:0 2px;display:none">${hintKey}</span>`;
+            const msgStyle =
+                'font-size:11px;color:#adbac7;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            const arrowStyle = 'font-weight:700;color:#58a6ff;flex:0 0 auto';
+            const hint = `<span class="ack-shortcut-hint" style="background:#1f6feb;color:#fff;font-size:9px;font-weight:bold;padding:0 3px;border-radius:2px;margin:0 2px;flex:0 0 auto;display:none">${hintKey}</span>`;
             const a = document.createElement('a');
             a.href = href;
             a.title = `${commitLine(commit) || ''} [Ctrl+${hintKey}]`;
             a.setAttribute('aria-label', `${isNext ? 'Next' : 'Previous'} commit [Ctrl+${hintKey}]`);
             a.innerHTML = isNext
-                ? `<span style="font-size:11px;color:#adbac7">${msg}</span> ${hint} <span style="font-weight:700;color:#58a6ff">▶</span>`
-                : `<span style="font-weight:700;color:#58a6ff">◀</span> ${hint} <span style="font-size:11px;color:#adbac7">${msg}</span>`;
+                ? `<span style="${msgStyle}">${msg}</span> ${hint} <span style="${arrowStyle}">▶</span>`
+                : `<span style="${arrowStyle}">◀</span> ${hint} <span style="${msgStyle}">${msg}</span>`;
             Object.assign(a.style, {
+                boxSizing: 'border-box',
                 padding: '4px 12px',
                 fontSize: '12px',
                 color: '#c9d1d9',
@@ -22653,7 +22657,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 display: 'flex',
                 gap: '6px',
                 alignItems: 'center',
-                flex: '1 1 520px',
+                flex: '0 1 auto',
                 minWidth: '0',
                 overflow: 'visible',
             });
@@ -22677,7 +22681,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 textAlign: 'left',
-                flex: '1 1 auto',
+                flex: '0 1 auto',
             });
             currentPill.addEventListener('mouseenter', () => {
                 currentPill.style.background = '#161b22';
@@ -37931,7 +37935,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btnFn.includes("maxWidth: 'min(300px, calc(50vw - 70px))'"),
             'button width shrinks on narrow viewports',
         );
+        ackAssert(btnFn.includes("boxSizing: 'border-box'"), 'button padding counts inside its viewport cap');
         ackAssert(btnFn.includes("minWidth: '0'"), 'button text can shrink instead of pushing buttons off-screen');
+        ackAssert(btnFn.includes('text-overflow:ellipsis'), 'button labels ellipsize before navigation arrows clip');
+        ackAssert(btnFn.includes('flex:0 0 auto'), 'button arrows and shortcut hints do not shrink away');
     });
 
     ackTest('floating commit nav merges current commit and search chooser', () => {
@@ -37953,6 +37960,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('currentPill.textContent = currentLabel'), 'renders the current commit label in the bar');
         ackAssert(fn.includes("const currentPill = document.createElement('button')"), 'current label is the jump trigger');
         ackAssert(fn.includes("currentPill.addEventListener('click'"), 'clicking the current label opens the chooser');
+        const jumpWrapSection = fn.slice(fn.indexOf('const jumpWrap'), fn.indexOf('const currentPill'));
+        ackAssert(jumpWrapSection.includes("flex: '0 1 auto'"), 'chooser sizes to the visible current-label button');
+        ackAssert(!jumpWrapSection.includes('520px'), 'chooser no longer reserves space for the old inline search box');
+        const currentPillSection = fn.slice(fn.indexOf('const currentPill'), fn.indexOf('const jumpMenu'));
+        ackAssert(currentPillSection.includes("flex: '0 1 auto'"), 'current label does not stretch into empty space');
         ackAssert(
             fn.includes('openJumpMenu({ clear: true, focusSearch: true, select: true })'),
             'current-label click opens an unfiltered searchable chooser',
