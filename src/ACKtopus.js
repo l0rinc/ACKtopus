@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.200
+// @version      1.201
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4988,6 +4988,8 @@ Keep the original sentence structure unless separating clauses clearly improves 
 If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages, or thread context, fix it minimally. Only correct objective errors, not opinions.
 Make the reply make sense in light of the commit messages, current thread, and surrounding text (if any). If the surrounding thread or nearby text has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
 Remove accidental duplication: repeated words, repeated phrases or sentences, and repeated points that nearby text or thread context already covers.
+Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose into a natural line unless the break is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or an intentional hard break.
+When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token.
 Keep replies friendly and professional without making them more verbose or less direct.
 Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it by rephrasing as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
@@ -5000,7 +5002,7 @@ Use simple punctuation: prefer commas, semicolons, parentheses, or sentence brea
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), replace it with a short, specific summary when the content clearly supports one. Preserve the <details><summary> and </summary> tags; change only the summary text. For benchmark or test output, prefer a result-based summary such as "aarch64 RPi5 SSD: 1024 MiB 1.5% faster".
 For fenced code blocks, check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.
-Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.
+Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.
 Return only the corrected text. If nothing needs fixing, return the original text unchanged.`,
     };
 
@@ -11827,13 +11829,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     '- Heading compaction is a required proofreading style change, not optional cleanup. For GitHub comments and PR descriptions, replace Markdown headings (any line that starts with one or more # characters) or standalone label lines with compact inline bold prefixes whenever the result remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. Do not leave a Markdown heading unchanged merely because its words are grammatical. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. If several paragraphs or later bullets follow, fold only the first normal prose block onto the prefix line and keep the rest below. Later block content does not prevent compaction. If the first following content is a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line. Never leave a bold prefix alone on a line when normal prose follows.';
                 const fenceLanguageRule =
                     '- For fenced code blocks: check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.';
+                const lineWrappingRule =
+                    '- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose into a natural line unless the break is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token.';
                 const fenceFormattingRule =
-                    '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
+                    '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
                 const prDescriptionRule = isPRBody
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, or removing duplicated wording. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. Join prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -20829,7 +20833,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, blank lines, and indentation. Preserve the blank line between a Markdown blockquote (`> ...`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
+                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (`> ...`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -25596,6 +25600,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('abstract reviewer-speak'), 'mentions avoiding jargon');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental duplication'), 'removes duplication');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('surrounding text'), 'uses surrounding text');
+    });
+
+    ackTest('proofread instructions remove accidental wrapping and prose indentation', () => {
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental manual wrapping and leading indentation'),
+            'asks the proofreader to remove accidental prose wrapping',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('GitHub comments do not need 72-column-style hard wrapping'),
+            'does not preserve old fixed-width prose wrapping',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('When joining wrapped prose, insert one normal space'),
+            'joins prose-wrapped lines with one space',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('join it without adding a space inside that token'),
+            'joins split code-like expressions without adding spaces',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('shell assignment'),
+            'calls out split shell assignments explicitly',
+        );
     });
 
     ackTest('proofread instructions preserve quoted text', () => {
@@ -31971,6 +31998,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('simple, plain language'), 'selection proofread prefers plain language');
         ackAssert(fn.includes('accidental duplicate'), 'selection proofread removes duplicate wording');
+        ackAssert(fn.includes('Remove accidental manual wrapping'), 'selection proofread removes accidental prose wrapping');
+        ackAssert(fn.includes('Join wrapped prose with one normal space'), 'selection proofread joins prose with one space');
+        ackAssert(
+            fn.includes('without adding a space inside that token'),
+            'selection proofread joins split code-like tokens without spaces',
+        );
         ackAssert(fn.includes('bare double-hyphen punctuation'), 'selection proofread avoids double-hyphen punctuation');
         ackAssert(
             fn.includes('following reply so GitHub does not render the reply as part of the quote'),
@@ -31987,6 +32020,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             fn.includes('Long single-line shell commands should usually be split'),
             'selection proofread asks to reflow ugly long shell commands',
+        );
+        ackAssert(
+            fn.includes('joining the split token without adding a space'),
+            'selection proofread repairs split shell tokens',
         );
         ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
         ackAssert(
@@ -33085,6 +33122,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes('Long single-line shell commands should usually be split'),
             'DEFAULT_INSTRUCTIONS.proofread asks to reflow ugly long shell commands',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('joining the split token without adding a space'),
+            'DEFAULT_INSTRUCTIONS.proofread asks to repair split code-like tokens',
+        );
+        ackAssert(
+            makePromptSection.includes('lineWrappingRule'),
+            'inline proofread rules include prose wrapping guidance',
+        );
+        ackAssert(
+            makePromptSection.includes('fixing accidental wrapping'),
+            'inline proofread rules allow small growth for line-wrap fixes',
         );
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes('Do not change tokens'),
@@ -36263,6 +36312,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const input = '#### Notes\nKeep this as returned by the model.';
         const out = postProcessProofreadMarkdown(input);
         ackEq(out, input);
+    });
+
+    ackTest('postProcessProofreadMarkdown leaves line-joining decisions to the LLM', () => {
+        const input = [
+            '    Redownloading a pruned candidate changed `nSequenceId` while',
+            '    the block was still in `setBlockIndexCandidates`, whose ordering uses that field.',
+            '',
+            '```bash',
+            'COMMITS="ab233255d444ccf6ffe4a45cb02bfc3e5fb71bdb 8cdc5dd73b73',
+            'f60113b4b87ac8a1af5de6bc2ea4"; \\',
+            '```',
+        ].join('\n');
+        const out = postProcessProofreadMarkdown(input);
+        ackEq(out, input, 'postprocessing does not guess prose or shell-token line joins');
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('join it without adding a space inside that token'),
+            'line-join repair is requested in the proofread prompt',
+        );
+        ackAssert(
+            !_ackSource.includes('function normalizeProofreadLineWrapping'),
+            'no deterministic line-wrapping normalizer',
+        );
     });
 
     ackTest('postProcessProofreadMarkdown normalizes details spacing without rewriting summaries', () => {
