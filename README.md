@@ -117,7 +117,7 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Copying PR, issue, commit, patch, comment, and visible discussion context to the clipboard
 - Revealing hidden conversations, issue timeline items, resolved threads, minimized comments, outdated sections, and deferred diffs in bulk
 - Navigating long PRs by comment, file, and commit, with optional timeline noise filtering
-- Reviewing diffs with quick whitespace-ignore and first-unviewed-file helpers
+- Reviewing diffs with GitHub-side whitespace and comment-minimizing checkboxes
 - Reviewing with LLM chat, local reproducer prompts, maintainer summaries, commit lightbulbs, selection helpers, and cached PR/commit infographics
 - Proofreading comments, PR descriptions, and selected prose with a diff preview before applying changes
 - Starting pending GitHub reviews and opening the review dialog from the Conversation tab
@@ -160,11 +160,11 @@ Jumps between comments by date on PR pages, and between visible files on compare
 
 ### 🧹 Timeline filter
 
-On PR conversations and issues, cycles the timeline between **All**, **Comments**, and **Unresolved**. The choice is stored per path for the current browser session and reapplied after GitHub updates the page. Direct permalink targets stay visible even when the active filter would normally hide their timeline item.
+On PR conversations and issues, the GitHub-side **Minimize comments** checkbox hides non-comment timeline noise. The choice is stored per path for the current browser session and reapplied after GitHub updates the page. Direct permalink targets stay visible even when the active filter would normally hide their timeline item.
 
-### ␠ Diff review tools
+### Diff review tools
 
-On Files, Changes, compare, and commit diff pages, the toolbar adds **Ignore WS / Show WS** for toggling GitHub's `?w=1` whitespace mode, plus **Unviewed** to jump to the first visible file that is not marked viewed. Clicking a non-interactive part of a diff file header also toggles that file through GitHub's native collapse/expand control.
+On Files, Changes, compare, and commit diff pages, ACKtopus adds GitHub-side checkboxes for **Hide whitespace-only** and **Minimize comments** near the native review controls when those options apply. Clicking a non-interactive part of a diff file header also toggles that file through GitHub's native collapse/expand control.
 
 ### 📎 Context copy
 

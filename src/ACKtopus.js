@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.198
+// @version      1.199
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -648,11 +648,6 @@
         '[popover], anchored-position[popover], [class*="Dialog-module__"], [class*="Overlay-module__"], .prc-Dialog-Dialog';
     const TIMELINE_FILTER_STORAGE_PREFIX = 'ack_timeline_filter:';
     const TIMELINE_FILTER_MODES = Object.freeze(['all', 'comments', 'unresolved']);
-    const TIMELINE_FILTER_LABELS = Object.freeze({
-        all: 'All',
-        comments: 'Comments',
-        unresolved: 'Unresolved',
-    });
     // React "Files changed" views use hashed CSS-module classes (see the
     // saved DOMs): container [class*="Diff-module__diff__"], header
     // [class*="DiffFileHeader-module__"]; classic selectors kept as fallback.
@@ -13778,12 +13773,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return safeMode;
     }
 
-    function nextTimelineFilterMode(mode, dir = 1) {
-        const idx = TIMELINE_FILTER_MODES.indexOf(mode);
-        const start = idx >= 0 ? idx : 0;
-        return TIMELINE_FILTER_MODES[(start + dir + TIMELINE_FILTER_MODES.length) % TIMELINE_FILTER_MODES.length];
-    }
-
     function timelineFilterItemInfo(item) {
         const hasComment =
             !!item?.matches?.(
@@ -13842,26 +13831,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
-    function renderTimelineFilterButton(btn, hiddenCount = null) {
-        const mode = getTimelineFilterMode();
-        const compact = GM_getValue('compactToolbar', false);
-        const label = TIMELINE_FILTER_LABELS[mode] || TIMELINE_FILTER_LABELS.all;
-        const countText = hiddenCount && mode !== 'all' ? ` (${hiddenCount})` : '';
-        btn.textContent = compact ? `🧹${countText}` : `🧹 ${label}${countText}`;
-        btn.title = `Timeline filter: ${label}\nClick to cycle All, Comments, and Unresolved.\nShift+click: cycle backward.`;
-        btn.dataset.ackTimelineFilterMode = mode;
-    }
-
-    function updateTimelineFilterButtons(hiddenCount = null) {
-        for (const btn of document.querySelectorAll('.ack-timeline-filter-btn')) {
-            renderTimelineFilterButton(btn, hiddenCount);
-        }
-    }
-
     function applyTimelineFilter(root = document) {
         if (!isTimelineFilterPage()) {
             restoreTimelineFilterItems(document);
-            updateTimelineFilterButtons(0);
+            updateGithubReviewOptions();
             return 0;
         }
         const mode = getTimelineFilterMode();
@@ -13876,21 +13849,181 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 hidden++;
             }
         }
-        updateTimelineFilterButtons(hidden);
+        updateGithubReviewOptions();
         return hidden;
     }
 
-    function buildTimelineFilterButton() {
-        const btn = createBtn('', (e) => {
-            const dir = eventUsesShiftAlternate(e) ? -1 : 1;
-            const mode = nextTimelineFilterMode(getTimelineFilterMode(), dir);
-            setTimelineFilterMode(mode);
-            applyTimelineFilter(document);
+    function timelineCommentsMinimized() {
+        return getTimelineFilterMode() !== 'all';
+    }
+
+    function setTimelineCommentsMinimized(minimized) {
+        setTimelineFilterMode(minimized ? 'comments' : 'all');
+        applyTimelineFilter(document);
+    }
+
+    function whitespaceOnlyHidden() {
+        return new URL(location.href).searchParams.get('w') === '1';
+    }
+
+    function setWhitespaceOnlyHidden(hidden) {
+        const url = new URL(location.href);
+        if (hidden) url.searchParams.set('w', '1');
+        else url.searchParams.delete('w');
+        if (url.href !== location.href) location.assign(url.href);
+    }
+
+    function reviewOptionLabelText(el) {
+        return [
+            el?.getAttribute?.('aria-label'),
+            el?.getAttribute?.('title'),
+            el?.getAttribute?.('data-testid'),
+            el?.textContent,
+        ]
+            .map((v) => String(v || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join(' ');
+    }
+
+    function isUnrelatedGithubGear(el) {
+        return !!el?.closest?.(
+            [
+                `#${BUTTON_CONTAINER_ID}`,
+                '#acktopus-analysis',
+                '.ack-config-overlay',
+                'header[role="banner"]',
+                '.GlobalNav',
+                '[data-testid^="top-nav"]',
+                '#partial-discussion-sidebar',
+                '#pr-conversation-sidebar',
+                '.discussion-sidebar-item',
+                'nav[aria-label="Repository"]',
+            ].join(', '),
+        );
+    }
+
+    function findGithubReviewOptionsAnchor(root = document) {
+        const candidates = qsa(root, 'button, summary, [role="button"]').filter((el) => {
+            if (!isVisible(el) || isUnrelatedGithubGear(el)) return false;
+            const hasGear = !!el.querySelector?.('.octicon-gear, svg[class*="octicon-gear"]');
+            const label = reviewOptionLabelText(el);
+            if (/reviewers|assignees|labels|milestone|projects|development/i.test(label)) return false;
+            const reviewSettingsLabel = /(diff|file|whitespace).*(settings|options)|(settings|options).*(diff|file|whitespace)/i.test(
+                label,
+            );
+            if (!hasGear && !reviewSettingsLabel) return false;
+            if (reviewSettingsLabel) return true;
+            return hasGear && !!el.closest?.('#files, #files_bucket, .file-navigation, .diffbar, [data-testid*="diff" i], [class*="Diff"]');
         });
-        btn.classList.add('ack-timeline-filter-btn');
-        btn.style.padding = GM_getValue('compactToolbar', false) ? '4px 8px' : '4px 10px';
-        renderTimelineFilterButton(btn, 0);
-        return btn;
+        return candidates[0] || null;
+    }
+
+    function findGithubReviewOptionsContainer() {
+        return (
+            findGithubReviewOptionsAnchor(document)?.parentElement ||
+            document.querySelector(
+                '#files_bucket .file-navigation, #files .file-navigation, .file-navigation, #files_bucket, #files, [data-testid*="diff" i]',
+            ) ||
+            document.querySelector(
+                '[data-component="PH_Actions"], .prc-PageHeader-Actions-wawWm, .gh-header-actions, .prc-PageHeader-Navigation--uLav, .tabnav, main',
+            )
+        );
+    }
+
+    function makeGithubReviewOption({ label, checked, onChange }) {
+        const wrap = document.createElement('label');
+        wrap.className = 'ack-github-review-option';
+        Object.assign(wrap.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '4px',
+            margin: '0',
+            whiteSpace: 'nowrap',
+            fontSize: '12px',
+            color: 'var(--fgColor-muted, #57606a)',
+            cursor: 'pointer',
+        });
+
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!checked;
+        input.setAttribute('aria-label', label);
+        input.style.margin = '0';
+        input.addEventListener('change', (e) => onChange(e.currentTarget.checked));
+
+        const text = document.createElement('span');
+        text.textContent = label;
+        wrap.append(input, text);
+        return wrap;
+    }
+
+    function renderGithubReviewOptions(host) {
+        const showWhitespace = isDiffReviewPage();
+        const showComments = isTimelineFilterPage();
+        const state = `${location.pathname}${location.search}|${showWhitespace}:${whitespaceOnlyHidden()}|${showComments}:${timelineCommentsMinimized()}`;
+        if (host.dataset.ackState === state) return;
+        host.dataset.ackState = state;
+        host.replaceChildren();
+        if (showWhitespace) {
+            host.appendChild(
+                makeGithubReviewOption({
+                    label: 'Hide whitespace-only',
+                    checked: whitespaceOnlyHidden(),
+                    onChange: setWhitespaceOnlyHidden,
+                }),
+            );
+        }
+        if (showComments) {
+            host.appendChild(
+                makeGithubReviewOption({
+                    label: 'Minimize comments',
+                    checked: timelineCommentsMinimized(),
+                    onChange: setTimelineCommentsMinimized,
+                }),
+            );
+        }
+    }
+
+    function removeGithubReviewOptions() {
+        document.querySelectorAll('.ack-github-review-options').forEach((el) => el.remove());
+    }
+
+    function updateGithubReviewOptions() {
+        document.querySelectorAll('.ack-github-review-options').forEach(renderGithubReviewOptions);
+    }
+
+    function installGithubReviewOptions() {
+        const showWhitespace = isDiffReviewPage();
+        const showComments = isTimelineFilterPage();
+        if (!showWhitespace && !showComments) {
+            removeGithubReviewOptions();
+            return;
+        }
+
+        const container = findGithubReviewOptionsContainer();
+        if (!container || isAckOwnedOverlay(container)) return;
+
+        let host = document.querySelector('.ack-github-review-options');
+        if (!host) {
+            host = document.createElement('div');
+            host.className = 'ack-github-review-options';
+            Object.assign(host.style, {
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '8px',
+                marginLeft: '8px',
+                verticalAlign: 'middle',
+            });
+        }
+
+        const anchor = findGithubReviewOptionsAnchor(document);
+        if (anchor?.parentElement) {
+            const insertionPoint = anchor.closest?.('details') || anchor;
+            insertionPoint.after(host);
+        } else if (!host.isConnected || host.parentElement !== container) {
+            container.appendChild(host);
+        }
+        renderGithubReviewOptions(host);
     }
 
     function gatherCommentContext(container) {
@@ -14426,6 +14559,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             name: 'timelineFilter',
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
             fn: () => applyTimelineFilter(document),
+        },
+        {
+            name: 'githubReviewOptions',
+            when: (ctx) => ctx.onToolbar,
+            fn: installGithubReviewOptions,
         },
         { name: 'diffHeaderToggle', when: (ctx) => ctx.onToolbar, fn: installDiffHeaderToggle },
         { name: 'outOfViewMenuCloser', when: (ctx) => ctx.onToolbar, fn: installOutOfViewMenuCloser },
@@ -18913,55 +19051,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
-    function diffFileViewedState(file) {
-        const control = [
-            ...file.querySelectorAll(
-                'input.js-reviewed-checkbox, input[type="checkbox"][aria-label*="viewed" i], ' +
-                    'button[aria-label*="viewed" i], button[aria-pressed][data-testid*="viewed" i]',
-            ),
-        ].find((el) => isVisible(el) || el.matches?.('input[type="checkbox"]'));
-        if (!control) return null;
-        if (control.matches?.('input[type="checkbox"]')) return !!control.checked;
-        const pressed = control.getAttribute('aria-pressed') || control.getAttribute('aria-checked');
-        if (pressed) return pressed === 'true';
-        return /\bviewed\b/i.test(control.textContent || '') ? true : false;
-    }
-
-    function findFirstUnviewedDiffFile(root = document) {
-        for (const file of gatherDiffFiles(root)) {
-            if (diffFileViewedState(file) === false) return file;
-        }
-        return null;
-    }
-
-    function jumpToFirstUnviewedDiffFile(btn = null) {
-        const file = findFirstUnviewedDiffFile(document);
-        if (file) {
-            const header = file.querySelector(DIFF_FILE_HEADER_SELECTOR) || file;
-            scrollToAndHighlight(header);
-            return true;
-        }
-        const popup = makeStatusPopup('No unviewed files found');
-        if (btn) {
-            const orig = btn.textContent;
-            btn.textContent = '✅';
-            ackSetTimeout(() => {
-                if (btn.isConnected) btn.textContent = orig;
-                popup.remove();
-            }, 1200);
-        } else {
-            ackSetTimeout(() => popup.remove(), 1200);
-        }
-        return false;
-    }
-
-    function toggleWhitespaceQueryParam() {
-        const url = new URL(location.href);
-        if (url.searchParams.get('w') === '1') url.searchParams.delete('w');
-        else url.searchParams.set('w', '1');
-        location.assign(url.href);
-    }
-
     function findDiffFileToggle(file, header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR)) {
         if (!file || !header) return null;
         const candidates = [
@@ -19008,36 +19097,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             e.stopPropagation();
             toggle.click();
         });
-    }
-
-    function buildDiffReviewToolsGroup() {
-        const compact = GM_getValue('compactToolbar', false);
-        const group = document.createElement('div');
-        Object.assign(group.style, { display: 'flex', gap: compact ? '2px' : '4px' });
-
-        const whitespaceOn = new URL(location.href).searchParams.get('w') === '1';
-        const whitespaceBtn = createBtn(
-            compact ? '␠' : whitespaceOn ? '␠ Show WS' : '␠ Ignore WS',
-            toggleWhitespaceQueryParam,
-            whitespaceOn ? 'Show whitespace-sensitive diff (remove ?w=1)' : 'Hide whitespace-only diff noise (add ?w=1)',
-        );
-        whitespaceBtn.classList.add('ack-diff-whitespace-btn');
-        whitespaceBtn.style.padding = compact ? '4px 8px' : '4px 10px';
-        group.appendChild(whitespaceBtn);
-
-        const unviewedBtn = createBtn(
-            compact ? '⇥' : '⇥ Unviewed',
-            (e) => {
-                e.preventDefault();
-                jumpToFirstUnviewedDiffFile(unviewedBtn);
-            },
-            'Jump to the first visible file that is not marked viewed',
-        );
-        unviewedBtn.classList.add('ack-first-unviewed-btn');
-        unviewedBtn.style.padding = compact ? '4px 8px' : '4px 10px';
-        group.appendChild(unviewedBtn);
-
-        return group;
     }
 
     function isAckOwnedOverlay(el) {
@@ -22197,10 +22256,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         registerShiftAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
-
-        if (isDiffReviewPage()) toolbar.appendChild(buildDiffReviewToolsGroup());
-
-        if (isTimelineFilterPage()) toolbar.appendChild(buildTimelineFilterButton());
 
         _ackPendingReviewActive = onPR ? detectPendingReview() && hasPendingReviewChanges() : false;
 
@@ -37466,26 +37521,44 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(timelineFilterShouldShowItem(event, 'comments', true), true, 'hash-pinned items stay visible');
     });
 
-    ackTest('timeline filter cycles and stores the mode per path', () => {
+    ackTest('timeline filter stores the mode per path', () => {
         const path = '/owner/repo/pull/123';
         setTimelineFilterMode('all', path);
         ackEq(getTimelineFilterMode(path), 'all', 'all is default');
-        ackEq(nextTimelineFilterMode('all'), 'comments', 'all cycles to comments');
-        ackEq(nextTimelineFilterMode('comments'), 'unresolved', 'comments cycles to unresolved');
-        ackEq(nextTimelineFilterMode('all', -1), 'unresolved', 'shift cycle wraps backward');
         setTimelineFilterMode('comments', path);
         ackEq(getTimelineFilterMode(path), 'comments', 'stores comments mode');
         setTimelineFilterMode('all', path);
         ackEq(getTimelineFilterMode(path), 'all', 'all clears stored override');
     });
 
-    ackTest('timeline filter is wired into toolbar and DOM refresh', () => {
+    ackTest('timeline filter is wired into GitHub review options and DOM refresh', () => {
         const source = _ackSource;
-        ackAssert(source.includes('function buildTimelineFilterButton'), 'has toolbar button');
-        ackAssert(source.includes("toolbar.appendChild(buildTimelineFilterButton())"), 'adds button to toolbar');
+        const timeline = sourceSection(source, 'function timelineFilterStorageKey', 'function gatherCommentContext');
+        const toolbar = sourceSection(source, 'async function loadAsyncPRData', 'function isToolbarPage');
+        ackAssert(!timeline.includes('function buildTimelineFilterButton'), 'has no ACK toolbar button');
+        ackAssert(!toolbar.includes('buildTimelineFilterButton'), 'does not add button to toolbar');
         ackAssert(source.includes("name: 'timelineFilter'"), 'has document injector');
+        ackAssert(source.includes("name: 'githubReviewOptions'"), 'has GitHub-side options injector');
         ackAssert(source.includes('fn: () => applyTimelineFilter(document)'), 'injector reapplies filter');
-        ackAssert(source.includes('sessionStorage.setItem(timelineFilterStorageKey(path), safeMode)'), 'persists mode');
+        ackAssert(timeline.includes('sessionStorage.setItem(timelineFilterStorageKey(path), safeMode)'), 'persists mode');
+        ackAssert(timeline.includes('setTimelineCommentsMinimized'), 'has checkbox setter for comment minimization');
+    });
+
+    ackTest('GitHub review options render checkbox state', () => {
+        let changed = null;
+        const option = makeGithubReviewOption({
+            label: 'Example option',
+            checked: true,
+            onChange: (value) => {
+                changed = value;
+            },
+        });
+        const input = option.querySelector('input');
+        ackEq(input?.type, 'checkbox', 'renders a checkbox');
+        ackEq(input?.checked, true, 'reflects checked state');
+        input.checked = false;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        ackEq(changed, false, 'reports changed state');
     });
 
     ackTest('diff review helpers detect diff-like review pages', () => {
@@ -37510,40 +37583,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('findFirstUnviewedDiffFile finds unchecked viewed controls', () => {
-        const host = document.createElement('div');
-        host.innerHTML = `
-          <div class="js-file" id="viewed-file">
-            <div class="file-header">viewed</div>
-            <input class="js-reviewed-checkbox" type="checkbox" checked aria-label="Viewed">
-          </div>
-          <div class="js-file" id="unviewed-file">
-            <div class="file-header">unviewed</div>
-            <input class="js-reviewed-checkbox" type="checkbox" aria-label="Viewed">
-          </div>
-          <div class="Diff-module__diff__rx9XH" id="react-unviewed-file">
-            <div class="DiffFileHeader-module__diff-file-header__UuNN4">react header</div>
-            <input type="checkbox" aria-label="Viewed">
-          </div>
-        `;
-        document.body.appendChild(host);
-        host.querySelectorAll('*').forEach((el) => {
-            el.getBoundingClientRect = () => ({ width: 120, height: 20, top: 0, left: 0, right: 120, bottom: 20 });
-        });
-        try {
-            ackEq(findFirstUnviewedDiffFile(host)?.id, 'unviewed-file', 'returns the first unchecked viewed control');
-            ackEq(gatherDiffFiles(host).length, 3, 'React CSS-module diff containers are recognized too');
-            host.querySelector('#unviewed-file').remove();
-            ackEq(
-                findFirstUnviewedDiffFile(host)?.id,
-                'react-unviewed-file',
-                'finds unviewed files in the React diff DOM',
-            );
-        } finally {
-            host.remove();
-        }
-    });
-
     ackTest('findDiffFileToggle prefers native diff toggle controls', () => {
         const file = document.createElement('div');
         file.className = 'js-file';
@@ -37565,13 +37604,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('diff review helpers are wired into toolbar and DOM refresh', () => {
+    ackTest('diff review helpers are wired into GitHub review options and DOM refresh', () => {
         const source = _ackSource;
-        ackAssert(source.includes('function buildDiffReviewToolsGroup'), 'has toolbar group');
-        ackAssert(source.includes("toolbar.appendChild(buildDiffReviewToolsGroup())"), 'adds group to toolbar');
+        const reviewOptions = sourceSection(source, 'function timelineFilterStorageKey', 'function gatherCommentContext');
+        const diff = sourceSection(source, 'function isPullRequestBulkDiffPage', 'function isAckOwnedOverlay');
+        const toolbar = sourceSection(source, 'async function loadAsyncPRData', 'function isToolbarPage');
+        ackAssert(!diff.includes('function buildDiffReviewToolsGroup'), 'has no ACK toolbar group');
+        ackAssert(!toolbar.includes('buildDiffReviewToolsGroup'), 'does not add group to toolbar');
         ackAssert(source.includes("name: 'diffHeaderToggle'"), 'has header-toggle injector');
-        ackAssert(source.includes('toggleWhitespaceQueryParam'), 'has whitespace query toggle');
-        ackAssert(source.includes('jumpToFirstUnviewedDiffFile'), 'has first-unviewed jump');
+        ackAssert(reviewOptions.includes('setWhitespaceOnlyHidden'), 'has whitespace checkbox setter');
+        ackAssert(reviewOptions.includes('Hide whitespace-only'), 'adds GitHub-side whitespace option');
+        ackAssert(reviewOptions.includes("input.type = 'checkbox'"), 'uses checkbox state in GitHub-side options');
+        ackAssert(!diff.includes('ack-first-unviewed-btn'), 'does not add viewed-checkbox navigation');
     });
 
     ackTest('isElementOutsideViewport detects only fully out-of-view elements', () => {
