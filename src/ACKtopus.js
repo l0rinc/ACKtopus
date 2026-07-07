@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.199
+// @version      1.200
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3695,12 +3695,124 @@
         return '';
     }
 
+    const embeddedRepoInfoCache = new WeakMap();
+    const embeddedDataScriptSelector =
+        'script[type="application/json"][data-target="react-app.embeddedData"], ' +
+        'script[type="application/json"][data-target="react-partial.embeddedData"], ' +
+        'react-app script[type="application/json"][data-target="react-app.embeddedData"]';
+
+    function embeddedDataScripts(root = document) {
+        const doc = root?.ownerDocument || document;
+        const roots = root === doc ? [doc] : [root, doc];
+        const scripts = [];
+        for (const queryRoot of roots) {
+            if (!queryRoot?.querySelectorAll) continue;
+            for (const script of qsa(queryRoot, embeddedDataScriptSelector)) {
+                if (script?.textContent && !scripts.includes(script)) scripts.push(script);
+            }
+        }
+        return scripts;
+    }
+
+    function repoOwnerLogin(value) {
+        return typeof value === 'object' && value
+            ? value.login || value.name || value.displayLogin || value.username || ''
+            : value;
+    }
+
+    function addEmbeddedRepoInfo(infos, rawRepo) {
+        if (!rawRepo || typeof rawRepo !== 'object') return;
+        let owner = repoOwnerLogin(
+            rawRepo.ownerLogin ||
+                rawRepo.owner ||
+                rawRepo.ownerName ||
+                rawRepo.owner_login ||
+                rawRepo.repositoryOwner,
+        );
+        let repo = rawRepo.name || rawRepo.repo || rawRepo.repositoryName || rawRepo.repoName || '';
+        const nwo = rawRepo.nameWithOwner || rawRepo.repositoryNwo || rawRepo.repository_nwo || rawRepo.nwo || '';
+        const nwoMatch = String(nwo || '').match(/^([^/\s]+)\/([^/\s]+)$/);
+        if ((!owner || !repo) && nwoMatch) {
+            owner = owner || nwoMatch[1];
+            repo = repo || nwoMatch[2];
+        }
+        owner = String(owner || '').trim();
+        repo = String(repo || '').trim();
+        if (!/^[^/\s]+$/.test(owner) || !/^[^/\s]+$/.test(repo)) return;
+        const defaultBranch = normalizeBranchName(
+            rawRepo.defaultBranch ||
+                rawRepo.default_branch ||
+                rawRepo.defaultBranchName ||
+                rawRepo.default_branch_name ||
+                rawRepo.defaultBranchRef?.name ||
+                '',
+        );
+        const repoKey = `${owner}/${repo}`;
+        if (infos.some((info) => info.repoKey === repoKey && info.defaultBranch === defaultBranch)) return;
+        infos.push({ owner, repo, repoKey, defaultBranch });
+    }
+
+    function collectLikelyEmbeddedRepoInfos(data, infos) {
+        const payload = data?.payload || {};
+        [
+            data?.repository,
+            data?.currentRepository,
+            data?.props?.repository,
+            data?.props?.initialPayload?.repository,
+            payload.repository,
+            payload.currentRepository,
+            payload.repo,
+            payload.repositoryOwner?.repository,
+            payload.pullRequestsLayoutRoute?.repository,
+            payload.pullRequestsChangesRoute?.repository,
+        ].forEach((repo) => addEmbeddedRepoInfo(infos, repo));
+    }
+
+    function collectEmbeddedRepoInfos(value, infos, seen = new Set(), stats = { nodes: 0 }) {
+        if (!value || typeof value !== 'object' || seen.has(value) || stats.nodes > 1500 || infos.length > 20) return;
+        seen.add(value);
+        stats.nodes++;
+        addEmbeddedRepoInfo(infos, value);
+        addEmbeddedRepoInfo(infos, value.repository);
+        for (const child of Object.values(value)) {
+            if (child && typeof child === 'object') collectEmbeddedRepoInfos(child, infos, seen, stats);
+        }
+    }
+
+    function embeddedRepoInfosFromScript(script) {
+        const text = script?.textContent || '';
+        const cached = embeddedRepoInfoCache.get(script);
+        if (cached?.text === text) return cached.infos;
+        const infos = [];
+        try {
+            const data = JSON.parse(text);
+            collectLikelyEmbeddedRepoInfos(data, infos);
+            collectEmbeddedRepoInfos(data, infos);
+        } catch (_) {}
+        embeddedRepoInfoCache.set(script, { text, infos });
+        return infos;
+    }
+
+    function readEmbeddedGitHubRepoInfo(root = document, path = location.pathname) {
+        const pathRepo = parseGitHubRepoPath(path);
+        let fallback = null;
+        for (const script of embeddedDataScripts(root)) {
+            for (const info of embeddedRepoInfosFromScript(script)) {
+                if (pathRepo && info.repoKey === pathRepo.repoKey) return info;
+                if (!fallback) fallback = info;
+            }
+        }
+        return pathRepo ? null : fallback;
+    }
+
     function currentGitHubRepo(root = document, path = location.pathname) {
         const metaRepo =
             repositoryMetaValue('octolytics-dimension-repository_nwo', root) ||
             repositoryMetaValue('repository_nwo', root);
         const m = String(metaRepo || '').match(/^([^/\s]+)\/([^/\s]+)$/);
         if (m) return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
+        const embeddedRepo = readEmbeddedGitHubRepoInfo(root, path);
+        if (embeddedRepo) return { owner: embeddedRepo.owner, repo: embeddedRepo.repo, repoKey: embeddedRepo.repoKey };
         return parseGitHubRepoPath(path);
     }
 
@@ -3708,13 +3820,15 @@
         return String(value || '').replace(/\s+/g, ' ').trim();
     }
 
-    function currentGitHubRepoBaseBranch(root = document) {
+    function currentGitHubRepoBaseBranch(root = document, path = location.pathname) {
         const metaBranch =
             repositoryMetaValue('octolytics-dimension-repository_default_branch', root) ||
             repositoryMetaValue('repository_default_branch', root) ||
             repositoryMetaValue('default_branch', root);
         const normalizedMetaBranch = normalizeBranchName(metaBranch);
         if (normalizedMetaBranch) return normalizedMetaBranch;
+        const embeddedBranch = normalizeBranchName(readEmbeddedGitHubRepoInfo(root, path)?.defaultBranch || '');
+        if (embeddedBranch) return embeddedBranch;
 
         const doc = root?.ownerDocument || document;
         const branchEl = doc.querySelector(
@@ -3733,6 +3847,11 @@
         const repoKey = repo?.repoKey || (repo?.owner && repo?.repo ? `${repo.owner}/${repo.repo}` : '');
         if (!repoKey) return '';
         if (repoDefaultBranchCache.has(repoKey)) return repoDefaultBranchCache.get(repoKey) || '';
+        const embedded = repo?.owner && repo?.repo ? readEmbeddedGitHubRepoInfo(document, `/${repo.owner}/${repo.repo}`) : null;
+        if (embedded?.defaultBranch) {
+            repoDefaultBranchCache.set(repoKey, embedded.defaultBranch);
+            return embedded.defaultBranch;
+        }
         if (repoDefaultBranchRequests.has(repoKey)) return repoDefaultBranchRequests.get(repoKey);
         const request = gmFetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`)
             .then((data) => {
@@ -3791,17 +3910,6 @@
         return sameOriginPath(url);
     }
 
-    function ensurePullsRecentlyUpdatedSort(opts = {}) {
-        const path = opts.path || location.pathname;
-        const href = opts.href || location.href;
-        if (_ackTesting || !isPullRequestListPage(path)) return false;
-        const next = pullsListUrlWithQuery({ path, href });
-        const current = sameOriginPath(new URL(href, location.origin));
-        if (!next || next === current) return false;
-        location.replace(next);
-        return true;
-    }
-
     function findPullsAuthorFilterControl(root = document) {
         const controls = qsa(root, 'summary, button, a, [role="button"]').filter(isVisible);
         const labelOf = (el) =>
@@ -3815,7 +3923,6 @@
         const path = opts.path || location.pathname;
         const href = opts.href || location.href;
         if (!isPullRequestListPage(path)) return;
-        ensurePullsRecentlyUpdatedSort({ path, href });
         const login = getCurrentGitHubLogin(root);
         if (!login) return;
         const doc = root?.ownerDocument || document;
@@ -3877,7 +3984,7 @@
         const [, owner, repo, headBranch, hash = ''] = match;
         const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
         if (!currentRepo || currentRepo.repoKey !== `${owner}/${repo}`) return null;
-        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document));
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document, opts.path || location.pathname));
         if (!baseBranch) return null;
         if (!headBranch || headBranch.includes('..')) return null;
         return {
@@ -3900,8 +4007,9 @@
 
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
         let rewritten = 0;
-        const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
-        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document));
+        const scanRoot = opts.root || root || document;
+        const currentRepo = opts.currentRepo || currentGitHubRepo(scanRoot, opts.path || location.pathname);
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, opts.path || location.pathname));
         if (!currentRepo) return rewritten;
         if (!baseBranch) {
             if (opts.allowAsync !== false) queueLocalRepoCompareRewrite(root, currentRepo);
@@ -3913,7 +4021,8 @@
             const rewrite = rewriteLocalRepoCompareHref(link.getAttribute('href') || '', {
                 currentRepo,
                 baseBranch,
-                root: opts.root || document,
+                root: scanRoot,
+                path: opts.path || location.pathname,
             });
             if (!rewrite) continue;
             link.setAttribute('href', rewrite.href);
@@ -30124,6 +30233,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(currentGitHubRepoBaseBranch(host), 'trunk');
     });
 
+    ackTest('local repo compare rewrite reads embedded GitHub repository metadata', () => {
+        const host = document.createElement('div');
+        host.innerHTML = [
+            '<script type="application/json" data-target="react-app.embeddedData">',
+            '{"payload":{"repository":{"ownerLogin":"octo","name":"demo","defaultBranch":"develop"}}}',
+            '</script>',
+            '<a href="/octo/demo/compare/topic/remove-foo?expand=1" class="btn btn-primary">Compare & pull request</a>',
+        ].join('');
+        ackDeepEq(currentGitHubRepo(host, '/octo/demo/pulls'), { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' });
+        ackEq(currentGitHubRepoBaseBranch(host, '/octo/demo/pulls'), 'develop');
+        ackEq(rewriteLocalRepoCompareLinks(host, { path: '/octo/demo/pulls' }), 1);
+        ackEq(
+            host.querySelector('a').getAttribute('href'),
+            '/octo/demo/compare/develop...topic/remove-foo?quick_pull=1',
+        );
+    });
+
     ackTest('pull request list URLs use recently-updated sort and current-user author filter', () => {
         ackEq(isPullRequestListPage('/octo/demo/pulls'), true);
         ackEq(isPullRequestListPage('/octo/demo/pull/123'), false);
@@ -30147,6 +30273,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             location.origin,
         );
         ackEq(mine.searchParams.get('q'), 'is:pr is:open author:l0rinc sort:updated-desc');
+    });
+
+    ackTest('pull request list enhancer does not reload to enforce sorting', () => {
+        const fn = sourceSection(_ackSource, 'function enhancePullRequestListPage', 'function isComparePullRequestButton');
+        ackAssert(!fn.includes('location.replace'), 'enhancer does not replace the current pulls URL');
+        ackAssert(!fn.includes('ensurePullsRecentlyUpdatedSort'), 'enhancer does not call the old reload helper');
     });
 
     ackTest('pull request list injects Mine button beside Author filter', () => {

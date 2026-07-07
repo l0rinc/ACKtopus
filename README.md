@@ -286,13 +286,13 @@ ACKtopus scans visible comment details blocks for cleartext PGP signatures, fetc
 
 ### Pull request lists
 
-On a repository's `/pulls` page, ACKtopus normalizes the list to recently-updated order (`sort:updated-desc`) and adds a **Mine 👤** button next to GitHub's Author filter that shows your own PRs with the same sorting.
+On a repository's `/pulls` page, ACKtopus adds a **Mine 👤** button next to GitHub's Author filter that shows your own PRs in recently-updated order (`sort:updated-desc`) without reloading the current list.
 
 ### Focused compare/diff views
 
 On compare-style views, ACKtopus can collapse files that are unrelated to the PR so the diff stays focused on what you’re reviewing. Force-push compare links are marked with 🔍 and get a `?pr=1234` parameter so the compare page keeps its PR context even if you edit the compared hashes manually. If ACKtopus cannot detect a PR for a compare range, it leaves an obvious warning popup and tells you to add `?pr=1234` to the URL.
 After collapsing unrelated files, it also scrolls to the first remaining open file.
-On repository pages, ACKtopus marks recent-push compare buttons with 🏠 and rewrites one-sided compare links so new PRs target the current repository’s base branch instead of GitHub’s upstream-parent default. If the page does not expose the base branch in the DOM, ACKtopus fetches and caches the repository default branch before rewriting the button.
+On repository pages, ACKtopus marks recent-push compare buttons with 🏠 and rewrites one-sided compare links so new PRs target the current repository’s base branch instead of GitHub’s upstream-parent default. It reads the base branch from GitHub’s page metadata when available, and falls back to fetching and caching the repository default branch.
 
 ## Development checks
 
