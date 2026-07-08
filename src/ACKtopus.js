@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.201
+// @version      1.207
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -106,7 +106,8 @@
     }
 
     // Post-proofread processing is intentionally limited to mechanical URL
-    // preservation and details spacing. Prose/style changes belong in the LLM prompt.
+    // preservation, Markdown spacing, and trailing whitespace. Prose/style
+    // changes belong in the LLM prompt.
 
     const GITHUB_COMMIT_DIFF_LINE_URL_RE =
         /\bhttps:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-fA-F]{40})(#diff-[A-Za-z0-9]+L\d+-L\d+)\b/g;
@@ -164,6 +165,35 @@
         return normalized;
     }
 
+    function normalizeProofreadBlockquoteSpacing(text) {
+        const lines = String(text || '').split('\n');
+        const out = [];
+        let inFence = false;
+        let fenceMarker = '';
+        const isFenceLine = (line) => line.trimStart().match(/^(`{3,}|~{3,})/);
+        const isBlockquoteLine = (line) => /^\s{0,3}>/.test(line);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            out.push(line);
+            const fenceMatch = isFenceLine(line);
+            if (inFence) {
+                if (fenceMatch?.[1] === fenceMarker && line.trimStart().slice(fenceMarker.length).trim() === '') {
+                    inFence = false;
+                    fenceMarker = '';
+                }
+                continue;
+            }
+            if (fenceMatch) {
+                inFence = true;
+                fenceMarker = fenceMatch[1];
+                continue;
+            }
+            const next = lines[i + 1];
+            if (isBlockquoteLine(line) && next !== undefined && next.trim() !== '' && !isBlockquoteLine(next)) out.push('');
+        }
+        return out.join('\n');
+    }
+
     function trimProofreadTrailingWhitespace(text) {
         const lines = String(text || '').split('\n');
         let inFence = false;
@@ -195,7 +225,9 @@
 
     function postProcessProofreadMarkdown(text) {
         return trimProofreadTrailingWhitespace(
-            normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls(String(text || '')).text),
+            normalizeProofreadBlockquoteSpacing(
+                normalizeProofreadDetailsSpacing(rewriteProofreadCommitDiffUrls(String(text || '')).text),
+            ),
         );
     }
 
@@ -2343,6 +2375,18 @@
         return !!err?.githubRateLimited;
     }
 
+    function githubApiAuthLabel(headers = {}) {
+        if (headers.Authorization) return 'authenticated';
+        const pat = githubPatValue();
+        if (pat && pat === _githubBadPat) return 'anonymous, configured PAT disabled after 401/403';
+        if (pat) return 'anonymous fallback';
+        return 'anonymous, no GitHub PAT configured';
+    }
+
+    function shouldWarnOptionalGitHubApiError(err) {
+        return !_ackTesting && !isGithubRateLimitedError(err);
+    }
+
     function githubAuthBucket(headers = {}) {
         if (!headers.Authorization) return 'anonymous';
         const pat = githubPatValue();
@@ -2365,8 +2409,12 @@
         _githubRateLimitedUntil.set(bucket, Math.max(_githubRateLimitedUntil.get(bucket) || 0, githubRateLimitUntil(response)));
         if (!_rateLimitWarned) {
             _rateLimitWarned = true;
+            const authLabel = githubApiAuthLabel(headers);
+            const guidance = headers?.Authorization
+                ? 'Authenticated requests are rate-limited too; wait for GitHub reset or reduce API use.'
+                : 'Add or fix the GitHub Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.';
             console.warn(
-                'ACKtopus: GitHub API rate limit hit. Add or fix the Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.',
+                `ACKtopus: GitHub API rate limit hit (${authLabel}). ${guidance}`,
             );
         }
     }
@@ -2374,8 +2422,11 @@
     function githubRateLimitPreflightError(url, headers) {
         const until = _githubRateLimitedUntil.get(githubAuthBucket(headers)) || 0;
         if (until <= Date.now()) return null;
-        const err = new Error(`GitHub API rate limit already hit, skipping ${url} until ${new Date(until).toISOString()}`);
+        const err = new Error(
+            `GitHub API rate limit already hit (${githubApiAuthLabel(headers)}), skipping ${url} until ${new Date(until).toISOString()}`,
+        );
         err.githubRateLimited = true;
+        err.githubAuthLabel = githubApiAuthLabel(headers);
         return err;
     }
 
@@ -2582,7 +2633,7 @@
                 if (comments.length < 100) break; // last page
             }
         } catch (e) {
-            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: API fetch failed', e);
+            if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: API fetch failed', e);
         }
         return [];
     }
@@ -3007,7 +3058,7 @@
                     );
                 } catch (e) {
                     fetchFailed = true;
-                    if (!isGithubRateLimitedError(e))
+                    if (shouldWarnOptionalGitHubApiError(e))
                         console.warn('ACKtopus: fetchRepoMembers - org public_members failed:', e.message || e);
                 }
                 // Don't cache failed/partial fetches: a transient error would otherwise pin an
@@ -3037,7 +3088,7 @@
                     `ACKtopus: fetchRepoMembers - PR reviews: +${members.size - beforeReviews} new (${reviews.length} checked, associations: ${[...new Set(reviews.map((r) => r.author_association))].join(',')})`,
                 );
             } catch (e) {
-                if (!isGithubRateLimitedError(e))
+                if (shouldWarnOptionalGitHubApiError(e))
                     console.warn('ACKtopus: fetchRepoMembers - PR reviews failed:', e.message || e);
             }
 
@@ -3056,7 +3107,7 @@
                     `ACKtopus: fetchRepoMembers - issue comments: +${members.size - beforeIssue} new (${comments.length} checked)`,
                 );
             } catch (e) {
-                if (!isGithubRateLimitedError(e))
+                if (shouldWarnOptionalGitHubApiError(e))
                     console.warn('ACKtopus: fetchRepoMembers - issue comments failed:', e.message || e);
             }
 
@@ -3076,7 +3127,7 @@
                     `ACKtopus: fetchRepoMembers - inline review comments: +${members.size - beforeInline} new (${inline.length} checked)`,
                 );
             } catch (e) {
-                if (!isGithubRateLimitedError(e))
+                if (shouldWarnOptionalGitHubApiError(e))
                     console.warn('ACKtopus: fetchRepoMembers - inline review comments failed:', e.message || e);
             }
         }
@@ -3132,7 +3183,7 @@
             }
             console.log(`ACKtopus: fetchReviewCommentCommits - ${Object.keys(map).length} comments mapped to commits`);
         } catch (e) {
-            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
+            if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
         }
         _reviewCommitMap = { prKey, map };
         return map;
@@ -3395,7 +3446,7 @@
             }
             return pushes;
         } catch (e) {
-            if (!isGithubRateLimitedError(e)) console.warn('ACKtopus: timeline fetch failed', e);
+            if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: timeline fetch failed', e);
         }
         return [];
     }
@@ -3676,9 +3727,17 @@
         window.open(url, '_blank', 'noopener');
     }
 
-    function repositoryMetaValue(name, root = document) {
+    function repositoryMetaValue(name, root = document, opts = {}) {
         const doc = root?.ownerDocument || document;
-        const roots = root === doc ? [doc] : [root, doc];
+        const includeDocument = opts.includeDocument !== false;
+        const roots =
+            root === doc
+                ? includeDocument
+                    ? [doc]
+                    : []
+                : root?.isConnected === false || !includeDocument
+                  ? [root]
+                  : [root, doc];
         const dataName = name.replace(/_/g, '-');
         for (const queryRoot of roots) {
             const el = queryRoot?.querySelector?.(
@@ -3703,7 +3762,7 @@
 
     function embeddedDataScripts(root = document) {
         const doc = root?.ownerDocument || document;
-        const roots = root === doc ? [doc] : [root, doc];
+        const roots = root === doc ? [doc] : root?.isConnected === false ? [root] : [root, doc];
         const scripts = [];
         for (const queryRoot of roots) {
             if (!queryRoot?.querySelectorAll) continue;
@@ -3821,17 +3880,21 @@
     }
 
     function currentGitHubRepoBaseBranch(root = document, path = location.pathname) {
+        const doc = root?.ownerDocument || document;
+        const pathRepo = parseGitHubRepoPath(path);
+        const liveRepo = parseGitHubRepoPath(location.pathname);
+        const sameLiveRepo = !pathRepo || !liveRepo || pathRepo.repoKey === liveRepo.repoKey;
         const metaBranch =
-            repositoryMetaValue('octolytics-dimension-repository_default_branch', root) ||
-            repositoryMetaValue('repository_default_branch', root) ||
-            repositoryMetaValue('default_branch', root);
+            repositoryMetaValue('octolytics-dimension-repository_default_branch', root, { includeDocument: sameLiveRepo }) ||
+            repositoryMetaValue('repository_default_branch', root, { includeDocument: sameLiveRepo }) ||
+            repositoryMetaValue('default_branch', root, { includeDocument: sameLiveRepo });
         const normalizedMetaBranch = normalizeBranchName(metaBranch);
         if (normalizedMetaBranch) return normalizedMetaBranch;
         const embeddedBranch = normalizeBranchName(readEmbeddedGitHubRepoInfo(root, path)?.defaultBranch || '');
         if (embeddedBranch) return embeddedBranch;
 
-        const doc = root?.ownerDocument || document;
-        const branchEl = doc.querySelector(
+        const branchRoot = sameLiveRepo ? doc : root !== doc ? root : null;
+        const branchEl = branchRoot?.querySelector?.(
             '#branch-picker-repos-header-ref-selector [data-menu-button], ' +
                 '[data-testid="anchor-button"] [data-menu-button], ' +
                 '.js-branch-name, ' +
@@ -3860,7 +3923,7 @@
                 return branch;
             })
             .catch((e) => {
-                if (!_ackTesting && !isGithubRateLimitedError(e))
+                if (shouldWarnOptionalGitHubApiError(e))
                     console.warn(`ACKtopus: failed to fetch default branch for ${repoKey}`, e);
                 return '';
             })
@@ -3984,7 +4047,8 @@
         const [, owner, repo, headBranch, hash = ''] = match;
         const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
         if (!currentRepo || currentRepo.repoKey !== `${owner}/${repo}`) return null;
-        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document, opts.path || location.pathname));
+        const branchPath = opts.path || (opts.currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : location.pathname);
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document, branchPath));
         if (!baseBranch) return null;
         if (!headBranch || headBranch.includes('..')) return null;
         return {
@@ -4008,8 +4072,10 @@
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
         let rewritten = 0;
         const scanRoot = opts.root || root || document;
-        const currentRepo = opts.currentRepo || currentGitHubRepo(scanRoot, opts.path || location.pathname);
-        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, opts.path || location.pathname));
+        const pagePath = opts.path || location.pathname;
+        const currentRepo = opts.currentRepo || currentGitHubRepo(scanRoot, pagePath);
+        const branchPath = opts.path || (opts.currentRepo && currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : pagePath);
+        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, branchPath));
         if (!currentRepo) return rewritten;
         if (!baseBranch) {
             if (opts.allowAsync !== false) queueLocalRepoCompareRewrite(root, currentRepo);
@@ -4175,7 +4241,8 @@
                         );
                     }
                 } catch (e) {
-                    console.warn('ACKtopus: compare -- commits/pulls failed for', sha.slice(0, 8) + ':', e.message);
+                    if (shouldWarnOptionalGitHubApiError(e))
+                        console.warn('ACKtopus: compare -- commits/pulls failed for', sha.slice(0, 8) + ':', e.message);
                 }
             }
         }
@@ -4231,6 +4298,28 @@
             }
             return paths;
         };
+        let compareApiRateLimited = false;
+        let currentPrFilesIncomplete = false;
+        const noteCompareApiError = (label, error) => {
+            if (isGithubRateLimitedError(error)) {
+                compareApiRateLimited = true;
+                setCompareStatus('Compare: REST API rate-limited; trying page patch fallback...');
+                return;
+            }
+            if (shouldWarnOptionalGitHubApiError(error)) console.warn(label, error);
+        };
+        let triedPatchFileFallback = false;
+        const addPRPatchFallbackFiles = async () => {
+            if (triedPatchFileFallback) return;
+            triedPatchFileFallback = true;
+            try {
+                const patchPaths = await fetchPRPatchFilePaths({ owner, repo, pr: prNum });
+                for (const filename of patchPaths) prFileSet.add(filename);
+                if (patchPaths.length) console.log('ACKtopus: compare -- PR files from patch fallback:', patchPaths.length);
+            } catch (e) {
+                if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: compare -- failed to fetch PR patch fallback', e);
+            }
+        };
 
         // Source 1: current PR files (paginated for large PRs)
         try {
@@ -4245,7 +4334,8 @@
             } while (batch.length === 100 && page <= 30); // up to 3000 files
             console.log('ACKtopus: compare -- current PR files:', prFileSet.size);
         } catch (e) {
-            console.warn('ACKtopus: compare -- failed to fetch current PR files', e);
+            currentPrFilesIncomplete = true;
+            noteCompareApiError('ACKtopus: compare -- failed to fetch current PR files', e);
         }
 
         // Source 2: PR files at the specific headSha (handles refactored PRs)
@@ -4273,12 +4363,17 @@
                 } catch (_) {}
             }
         } catch (e) {
-            console.warn('ACKtopus: compare -- failed to fetch PR files at commit', e);
+            noteCompareApiError('ACKtopus: compare -- failed to fetch PR files at commit', e);
         }
 
+        if (currentPrFilesIncomplete || prFileSet.size === 0) await addPRPatchFallbackFiles();
         if (prFileSet.size === 0) {
-            console.warn('ACKtopus: compare -- no PR files found, aborting');
-            finishCompareStatus(`Compare: PR #${prNum} has no file list`);
+            if (!compareApiRateLimited) console.warn('ACKtopus: compare -- no PR files found, aborting');
+            finishCompareStatus(
+                compareApiRateLimited
+                    ? 'Compare: REST API rate-limited and patch fallback had no files'
+                    : `Compare: PR #${prNum} has no file list`,
+            );
             _compareActive = false;
             return;
         }
@@ -4297,7 +4392,7 @@
                 console.log('ACKtopus: compare -- range files:', compareRangeFileSet.size);
             }
         } catch (e) {
-            console.warn('ACKtopus: compare -- failed to fetch compare range files', e);
+            noteCompareApiError('ACKtopus: compare -- failed to fetch compare range files', e);
         }
 
         // Auto-click "Files changed" tab if not already active
@@ -6739,6 +6834,31 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         return gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`).then(
             stripDeletedFileBodiesFromPatch,
         );
+    }
+
+    function extractPatchFilePaths(patchText) {
+        const paths = new Set();
+        for (const line of String(patchText || '').split(/\r?\n/)) {
+            const diff = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+            if (diff) {
+                paths.add(diff[1]);
+                paths.add(diff[2]);
+                continue;
+            }
+            const rename = line.match(/^rename (?:from|to) (.+)$/);
+            if (rename) {
+                paths.add(rename[1]);
+                continue;
+            }
+            const marker = line.match(/^(?:---|\+\+\+) (?:a|b)\/(.+)$/);
+            if (marker) paths.add(marker[1]);
+        }
+        paths.delete('/dev/null');
+        return [...paths].filter(Boolean);
+    }
+
+    async function fetchPRPatchFilePaths(pr) {
+        return extractPatchFilePaths(await fetchPatch(pr));
     }
 
     function comparePatchUrl(path = location.pathname) {
@@ -30524,6 +30644,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('base?.ref'), 'extracts base branch from PR data');
         ackAssert(fn.includes('compare/${baseBranch}...${headSha}'), 'fetches PR files at head SHA via compare API');
         ackAssert(fn.includes('compare/${baseBranch}...${baseSha}'), 'fetches PR files at base SHA too');
+        ackAssert(fn.includes('fetchPRPatchFilePaths'), 'falls back to the same-origin PR patch when REST API is unavailable');
+        ackAssert(fn.includes('PR files from patch fallback'), 'logs patch fallback path count');
+        ackAssert(fn.includes('noteCompareApiError'), 'keeps optional compare API failures quiet when rate-limited');
+        ackAssert(fn.includes('currentPrFilesIncomplete'), 'patch fallback supplements partial REST file lists');
         ackAssert(fn.includes('addFiles'), 'uses helper to build union of file sets');
         ackAssert(fn.includes('previous_filename'), 'includes renamed file paths');
         ackAssert(fn.includes('total unique PR file paths'), 'logs total unique paths');
@@ -31334,11 +31458,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('gmFetch retries without auth on 401/403 (bad PAT fallback)', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
+        const helpers = sourceSection(source, 'function githubPatValue', 'function githubTransportError');
         ackAssert(fn.includes('r.status === 401'), 'detects 401');
         ackAssert(fn.includes('headers.Authorization'), 'only retries if PAT was set');
         ackAssert(fn.includes("Accept: 'application/vnd.github+json'"), 'retries with accept header only (no auth)');
-        ackAssert(fn.includes('_patInvalidWarned'), 'warns once about invalid PAT');
-        ackAssert(fn.includes('rate limit'), 'does NOT retry on rate limit (that needs auth, not less auth)');
+        ackAssert(helpers.includes('_patInvalidWarned'), 'warns once about invalid PAT');
+        ackAssert(fn.includes('isGithubRateLimitResponse(r)'), 'does NOT retry on rate limit (that needs auth, not less auth)');
     });
 
     ackTest('GitHub API helpers remember bad PATs and rate limits', () => {
@@ -31348,6 +31473,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(helpers.includes('_githubRateLimitedUntil'), 'tracks rate-limited auth buckets');
         ackAssert(helpers.includes('x-ratelimit-reset'), 'uses GitHub reset header when available');
         ackAssert(helpers.includes('err.githubRateLimited = true'), 'marks rate-limit HTTP errors');
+        ackAssert(helpers.includes('githubApiAuthLabel(headers)'), 'rate-limit errors include auth state');
         ackAssert(helpers.includes('function isGithubRateLimitedError'), 'has rate-limit error predicate');
         ackAssert(helpers.includes('githubRateLimitPreflightError'), 'has preflight skip helper');
         ackAssert(helpers.includes('rememberGithubBadPat'), 'has bad-PAT memoization helper');
@@ -31367,25 +31493,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('optional GitHub API callers stay quiet after shared rate-limit warning', () => {
         const source = _ackSource;
+        const helper = sourceSection(source, 'function shouldWarnOptionalGitHubApiError', 'function githubAuthBucket');
+        ackAssert(helper.includes('!_ackTesting'), 'optional API failures stay quiet during browser self-tests');
+        ackAssert(helper.includes('!isGithubRateLimitedError(err)'), 'optional API failures stay quiet after shared rate-limit warning');
         const acks = sourceSection(source, 'async function parseAcksFromAPI', 'function navigateToFragment');
-        ackAssert(acks.includes('!isGithubRateLimitedError(e)'), 'ACK API fallback does not log known rate-limit skips');
+        ackAssert(acks.includes('shouldWarnOptionalGitHubApiError(e)'), 'ACK API fallback uses shared optional warning guard');
         const members = sourceSection(source, 'async function fetchRepoMembers', '// Map review comment ID');
-        ackAssert(members.includes('!isGithubRateLimitedError(e)'), 'member supplement fetches do not log known rate-limit skips');
+        ackAssert(members.includes('shouldWarnOptionalGitHubApiError(e)'), 'member supplement fetches use shared optional warning guard');
         const reviewCommits = sourceSection(source, 'async function fetchReviewCommentCommits', '// Hardcoded maintainer list');
-        ackAssert(reviewCommits.includes('!isGithubRateLimitedError(e)'), 'review-comment map does not log known rate-limit skips');
+        ackAssert(reviewCommits.includes('shouldWarnOptionalGitHubApiError(e)'), 'review-comment map uses shared optional warning guard');
         const forcePushes = sourceSection(source, 'async function parseForcePushesFromAPI', 'function forcePushRangeEndpoint');
-        ackAssert(forcePushes.includes('!isGithubRateLimitedError(e)'), 'force-push timeline fetch does not log known rate-limit skips');
+        ackAssert(forcePushes.includes('shouldWarnOptionalGitHubApiError(e)'), 'force-push timeline fetch uses shared optional warning guard');
         const defaultBranch = sourceSection(source, 'async function fetchGitHubRepoDefaultBranch', 'function rewriteLocalRepoCompareLinks');
-        ackAssert(defaultBranch.includes('!isGithubRateLimitedError(e)'), 'default-branch lookup does not log known rate-limit skips');
+        ackAssert(defaultBranch.includes('shouldWarnOptionalGitHubApiError(e)'), 'default-branch lookup uses shared optional warning guard');
     });
 
     ackTest('gmFetch warns once on rate limit with PAT instructions', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gmFetch('), source.indexOf('function gmFetchText('));
-        ackAssert(fn.includes('_rateLimitWarned'), 'uses flag to warn only once');
-        ackAssert(fn.includes('rate limit'), 'detects rate limit in response');
-        ackAssert(fn.includes('Personal Access Token'), 'mentions PAT in warning');
-        ackAssert(fn.includes('5000'), 'mentions authenticated rate limit');
+        const helpers = sourceSection(source, 'function githubPatValue', 'function githubTransportError');
+        ackAssert(helpers.includes('_rateLimitWarned'), 'uses flag to warn only once');
+        ackAssert(fn.includes('isGithubRateLimitResponse(r)'), 'detects rate limit in response');
+        ackAssert(helpers.includes('Personal Access Token'), 'mentions PAT in warning');
+        ackAssert(helpers.includes('5000'), 'mentions authenticated rate limit');
     });
 
     ackTest('fetchCommitList shares bad-PAT and rate-limit guards', () => {
@@ -32426,6 +32556,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('extractPatchFilePaths reads current, renamed, and deleted patch paths', () => {
+        const paths = extractPatchFilePaths(
+            [
+                'diff --git a/src/old.cpp b/src/new.cpp',
+                'similarity index 90%',
+                'rename from src/old.cpp',
+                'rename to src/new.cpp',
+                '--- a/src/old.cpp',
+                '+++ b/src/new.cpp',
+                'diff --git a/doc/remove.md b/doc/remove.md',
+                'deleted file mode 100644',
+                '--- a/doc/remove.md',
+                '+++ /dev/null',
+            ].join('\n'),
+        );
+        ackDeepEq(paths.sort(), ['doc/remove.md', 'src/new.cpp', 'src/old.cpp']);
+    });
+
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
         const source = _ackSource;
         ackAssert(source.includes('function gmFetchText(url)'), 'gmFetchText defined');
@@ -32566,7 +32714,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let helpState = '';
         try {
             GM_xmlhttpRequest = (opts) => {
-                const model = JSON.parse(opts.data).model;
+                let model = '';
+                try {
+                    model = opts?.data ? JSON.parse(opts.data).model : '';
+                } catch (_) {}
+                if (!model) {
+                    opts.onload?.({ status: 404, responseText: '{}' });
+                    return;
+                }
                 if (model === LLM_MODELS.claude) {
                     opts.onload?.({ status: 200, responseText: '{}' });
                 } else if (model === LLM_MODELS.claude_high_context) {
@@ -32594,7 +32749,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let helpState = '';
         try {
             GM_xmlhttpRequest = (opts) => {
-                const model = JSON.parse(opts.data).model;
+                let model = '';
+                try {
+                    model = opts?.data ? JSON.parse(opts.data).model : '';
+                } catch (_) {}
+                if (!model) {
+                    opts.onload?.({ status: 404, responseText: '{}' });
+                    return;
+                }
                 if (model === LLM_MODELS.claude) {
                     opts.onload?.({ status: 401, responseText: 'invalid key' });
                 } else {
@@ -33687,6 +33849,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const targetUrl = `${location.origin}/bitcoin/bitcoin/pull/1/review_comment/333/edit_form?textarea_id=discussion_r333-body&comment_context=discussion`;
         GM_xmlhttpRequest = (opts) => {
             if (opts?.url === targetUrl) gmCalls++;
+            opts?.onload?.({ status: 404, responseText: '' });
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
@@ -33739,13 +33902,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let gmCalls = 0;
         const targetUrl = new URL(fakeFrag.getAttribute('src'), location.origin).href;
         GM_xmlhttpRequest = (opts) => {
-            if (opts?.url === targetUrl) gmCalls++;
-            opts.onload({
-                status: 200,
-                responseText:
-                    '<textarea name="issue[body]" style="width:200px;height:60px">native</textarea>' +
-                    '<button type="button">Cancel</button><button type="submit">Update comment</button>',
-            });
+            if (opts?.url === targetUrl) {
+                gmCalls++;
+                opts.onload({
+                    status: 200,
+                    responseText:
+                        '<textarea name="issue[body]" style="width:200px;height:60px">native</textarea>' +
+                        '<button type="button">Cancel</button><button type="submit">Update comment</button>',
+                });
+            } else {
+                opts?.onload?.({ status: 404, responseText: '' });
+            }
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
@@ -33796,13 +33963,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const origGM = GM_xmlhttpRequest;
         const origGetEditFormRequest = getEditFormRequest;
         let gmCalls = 0;
+        const targetUrl = new URL(fakeFrag.getAttribute('src'), location.origin).href;
         GM_xmlhttpRequest = (opts) => {
-            gmCalls++;
-            opts.onload({ status: 404, responseText: '' });
+            if (opts?.url === targetUrl) gmCalls++;
+            opts?.onload?.({ status: 404, responseText: '' });
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
-            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            url: targetUrl,
             roots: [container],
         });
         try {
@@ -33846,17 +34014,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const origGM = GM_xmlhttpRequest;
         const origGetEditFormRequest = getEditFormRequest;
         let gmCalls = 0;
+        const targetUrl = new URL(fakeFrag.getAttribute('src'), location.origin).href;
         GM_xmlhttpRequest = (opts) => {
-            gmCalls++;
-            fakeFrag.insertAdjacentHTML(
-                'beforebegin',
-                '<textarea style="width:200px;height:60px">native after failure</textarea>',
-            );
-            opts.onload({ status: 404, responseText: '' });
+            if (opts?.url === targetUrl) {
+                gmCalls++;
+                fakeFrag.insertAdjacentHTML(
+                    'beforebegin',
+                    '<textarea style="width:200px;height:60px">native after failure</textarea>',
+                );
+            }
+            opts?.onload?.({ status: 404, responseText: '' });
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
-            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            url: targetUrl,
             roots: [container],
         });
         try {
@@ -33900,13 +34071,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const origGM = GM_xmlhttpRequest;
         const origGetEditFormRequest = getEditFormRequest;
         let gmCalls = 0;
+        const targetUrl = new URL(fakeFrag.getAttribute('src'), location.origin).href;
         GM_xmlhttpRequest = (opts) => {
-            gmCalls++;
-            opts.onload({ status: 404, responseText: '' });
+            if (opts?.url === targetUrl) gmCalls++;
+            opts?.onload?.({ status: 404, responseText: '' });
         };
         getEditFormRequest = () => ({
             frag: fakeFrag,
-            url: new URL(fakeFrag.getAttribute('src'), location.origin).href,
+            url: targetUrl,
             roots: [container],
         });
         try {
@@ -36306,6 +36478,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'The follow-up paragraph',
             'removes only ACKtopus wrapper newlines around normal section content',
         );
+    });
+
+    ackTest('postProcessProofreadMarkdown restores blank line after blockquote replies', () => {
+        const input = [
+            "> it lets us delete a line that doesn't really gain us much",
+            "Not sure I follow. The reserve is needed to avoid copying the data.",
+        ].join('\n');
+        const out = postProcessProofreadMarkdown(input);
+        ackEq(
+            out,
+            [
+                "> it lets us delete a line that doesn't really gain us much",
+                '',
+                'Not sure I follow. The reserve is needed to avoid copying the data.',
+            ].join('\n'),
+        );
+    });
+
+    ackTest('postProcessProofreadMarkdown does not rewrite blockquote-like fenced code', () => {
+        const input = ['```', '> quoted-looking fixture', 'reply-looking fixture', '```'].join('\n');
+        const out = postProcessProofreadMarkdown(input);
+        ackEq(out, input);
     });
 
     ackTest('postProcessProofreadMarkdown leaves markdown headings unchanged', () => {
