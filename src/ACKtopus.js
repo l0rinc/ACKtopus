@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.207
+// @version      1.208
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2319,14 +2319,27 @@
     // This prevents a misconfigured/expired PAT from breaking everything.
     // =========================================================================
 
+    function normalizeGithubPatInput(value) {
+        return String(value || '')
+            .trim()
+            .replace(/^authorization:\s*/i, '')
+            .replace(/^(?:bearer|token)\s+/i, '')
+            .trim();
+    }
+
     function githubPatValue() {
-        return String(GM_getValue('github_pat', '') || '').trim();
+        return normalizeGithubPatInput(GM_getValue('github_pat', ''));
+    }
+
+    function githubAuthHeaderValue(value = githubPatValue()) {
+        const pat = normalizeGithubPatInput(value);
+        return pat ? `Bearer ${pat}` : '';
     }
 
     function ghApiHeaders() {
         const headers = { Accept: 'application/vnd.github+json' };
         const pat = githubPatValue();
-        if (pat && pat !== _githubBadPat) headers.Authorization = pat.startsWith('ghp_') ? `token ${pat}` : `Bearer ${pat}`;
+        if (pat && pat !== _githubBadPat) headers.Authorization = githubAuthHeaderValue(pat);
         return headers;
     }
 
@@ -2440,7 +2453,7 @@
             console.warn(
                 'ACKtopus: PAT returned ' +
                     response.status +
-                    ', disabling it for this page session. Check your token permissions in ACKtopus settings.',
+                    ', disabling it for this page session. Paste only the token value in ACKtopus settings, or check the token permissions.',
             );
         }
     }
@@ -5601,8 +5614,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         Object.assign(ghRow.style, { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' });
         const ghInput = document.createElement('input');
         ghInput.type = 'password';
-        ghInput.value = GM_getValue('github_pat', '');
-        ghInput.placeholder = 'ghp_... or github_pat_...';
+        ghInput.value = githubPatValue();
+        ghInput.placeholder = 'github_pat_... or ghp_...';
         ghInput.id = 'ack-github-pat';
         Object.assign(ghInput.style, {
             flex: '1',
@@ -5632,6 +5645,15 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             marginBottom: '4px',
         });
         panel.appendChild(ghHelp);
+        const ghFormatHelp = document.createElement('div');
+        ghFormatHelp.textContent = 'Paste only the token. ACKtopus will strip Authorization, Bearer, or token if pasted.';
+        Object.assign(ghFormatHelp.style, {
+            fontSize: '11px',
+            color: '#8b949e',
+            textAlign: 'right',
+            marginBottom: '4px',
+        });
+        panel.appendChild(ghFormatHelp);
 
         // --- Maintainer list ---
         const maintRow = document.createElement('div');
@@ -6136,7 +6158,11 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                 GM_setValue(`llm_${el.dataset.optKey}`, el.checked);
             });
             const ghPat = document.getElementById('ack-github-pat');
-            if (ghPat) GM_setValue('github_pat', ghPat.value);
+            if (ghPat) {
+                const normalizedPat = normalizeGithubPatInput(ghPat.value);
+                if (normalizedPat) GM_setValue('github_pat', normalizedPat);
+                else GM_deleteValue('github_pat');
+            }
             const maintEl = document.getElementById('ack-maintainer-logins');
             if (maintEl) GM_setValue('maintainer_logins', maintEl.value);
             const mirrorEl = document.getElementById('ack-repo-mirrors');
@@ -12514,9 +12540,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // PAT-based GraphQL helpers used by review-thread search and chat context.
 
     function patAuthHeaderValue() {
-        const pat = GM_getValue('github_pat', '').trim();
-        if (!pat) return '';
-        return pat.startsWith('ghp_') ? `token ${pat}` : `Bearer ${pat}`;
+        return githubAuthHeaderValue();
     }
 
     // GitHub GraphQL API via PAT (no cookies/CSRF required).
@@ -17383,9 +17407,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const src = frag?.getAttribute?.('src') || '';
             return src ? new URL(src, location.origin).href : '';
         };
+        const existingFragmentRequest = () => {
+            const item =
+                targetEditFragments.length === 1
+                    ? targetEditFragments[0]
+                    : localEditFragments.length === 1
+                      ? localEditFragments[0]
+                      : null;
+            return item ? { frag: item.frag, url: fragmentHref(item.frag), roots } : { frag: null, url: '', roots };
+        };
 
         const ctx = parsePageContext();
-        if (!ctx) return { frag: null, url: '', roots };
+        if (!ctx) return existingFragmentRequest();
 
         const ids = new Set();
         const hrefs = new Set();
@@ -17513,16 +17546,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return { frag: src ? frag : null, url, roots };
         }
 
-        if (localEditFragments.length === 1) {
-            const { frag } = localEditFragments[0];
-            return { frag, url: fragmentHref(frag), roots };
-        }
-        if (targetEditFragments.length === 1) {
-            const { frag } = targetEditFragments[0];
-            return { frag, url: fragmentHref(frag), roots };
-        }
-
-        return { frag: null, url: '', roots };
+        return existingFragmentRequest();
     }
 
     function activateEditFormForFragment(frag, container) {
@@ -31445,14 +31469,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("Accept: 'application/vnd.github+json'"), 'uses vnd.github+json header');
     });
 
-    ackTest('ghApiHeaders uses correct auth scheme based on PAT type', () => {
+    ackTest('ghApiHeaders normalizes pasted GitHub token auth', () => {
         const source = _ackSource;
+        const helpers = sourceSection(source, 'function normalizeGithubPatInput', 'function githubTransportError');
         ackAssert(source.includes('function ghApiHeaders'), 'ghApiHeaders helper exists');
         ackAssert(source.includes("GM_getValue('github_pat'"), 'reads github_pat from storage');
         ackAssert(source.includes('Authorization'), 'sets Authorization header');
-        ackAssert(source.includes('ghp_'), 'checks for classic PAT prefix');
-        ackAssert(source.includes('token ${pat}'), 'uses token prefix for classic PATs');
-        ackAssert(source.includes('Bearer ${pat}'), 'uses Bearer prefix for fine-grained PATs');
+        ackAssert(helpers.includes('function normalizeGithubPatInput'), 'normalizes stored/pasted token text');
+        ackAssert(helpers.includes('authorization:'), 'strips pasted Authorization header labels');
+        ackAssert(helpers.includes('bearer|token'), 'strips pasted Bearer/token auth schemes');
+        ackAssert(helpers.includes('function githubAuthHeaderValue'), 'has shared auth-header formatter');
+        ackAssert(helpers.includes('Bearer ${pat}'), 'uses GitHub documented Bearer auth format');
     });
 
     ackTest('gmFetch retries without auth on 401/403 (bad PAT fallback)', () => {
@@ -31535,6 +31562,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(configFn.includes('ack-github-pat'), 'PAT input field exists');
         ackAssert(configFn.includes('github_pat'), 'saves to github_pat key');
         ackAssert(configFn.includes('ghp_'), 'placeholder mentions ghp_ format');
+        ackAssert(configFn.includes('normalizeGithubPatInput(ghPat.value)'), 'normalizes pasted auth header before saving');
+        ackAssert(configFn.includes("GM_deleteValue('github_pat')"), 'clears stored PAT when field is empty');
         ackAssert(configFn.includes('settings/tokens'), 'links to GitHub token page');
     });
 
@@ -33807,6 +33836,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('getEditFormRequest prefers local edit fragment over unrelated earlier one', () => {
         const host = document.createElement('div');
+        const origParsePageContext = parsePageContext;
         host.innerHTML = `
             <div id="first" class="timeline-comment">
                 <include-fragment class="js-comment-edit-form-deferred-include-fragment"
@@ -33820,11 +33850,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             </div>
         `;
         try {
+            parsePageContext = () => null;
             const second = host.querySelector('#second');
             const req = getEditFormRequest(second);
             ackAssert(req.url.includes('/review_comment/222/edit_form'), 'uses local edit fragment URL');
             ackEq(req.frag, second.querySelector('include-fragment'), 'returns local fragment element');
         } finally {
+            parsePageContext = origParsePageContext;
             host.textContent = '';
         }
     });
@@ -39290,7 +39322,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('function patAuthHeaderValue'),
             _ackSource.indexOf('async function patGraphQL'),
         );
-        ackAssert(authFn.includes('ghp_'), 'handles classic PAT prefix');
+        ackAssert(authFn.includes('githubAuthHeaderValue()'), 'uses shared normalized PAT auth helper');
     });
 
     ackTest('config panel text mentions GitHub PAT write permission', () => {
