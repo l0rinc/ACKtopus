@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.209
+// @version      1.210
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -7015,6 +7015,55 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         };
     }
 
+    function mergeFileCategories(...categories) {
+        const merged = { benchFiles: [], bench: [], test: [], fuzz: [], functional: [], cpp: [] };
+        for (const cats of categories) {
+            if (!cats) continue;
+            for (const key of Object.keys(merged)) {
+                merged[key].push(...(cats[key] || []));
+            }
+        }
+        for (const key of Object.keys(merged)) {
+            merged[key] = [...new Set(merged[key])].sort();
+        }
+        return merged;
+    }
+
+    function readDiffFilePath(file) {
+        const direct =
+            file?.getAttribute?.('data-path') ||
+            file?.getAttribute?.('data-file-name') ||
+            file?.getAttribute?.('data-tagsearch-path') ||
+            '';
+        if (direct) return direct.trim();
+        const header = file?.querySelector?.('.file-header, [data-testid="diff-file-header"], .file-info');
+        const named = header?.querySelector?.('[title], [data-path], [aria-label], [data-testid="file-name"], a');
+        return (
+            named?.getAttribute?.('data-path') ||
+            named?.getAttribute?.('title') ||
+            named?.getAttribute?.('aria-label') ||
+            named?.textContent?.trim() ||
+            ''
+        ).trim();
+    }
+
+    function visibleDiffFilePaths(root = document) {
+        const paths = [];
+        root.querySelectorAll?.(DIFF_FILE_SELECTOR)?.forEach((file) => {
+            const path = readDiffFilePath(file);
+            if (path && path.includes('/')) paths.push(path);
+        });
+        return [...new Set(paths)];
+    }
+
+    function visibleDiffFileCategories(root = document) {
+        const paths = visibleDiffFilePaths(root);
+        if (paths.length === 0) return null;
+        const cats = categorizePRFiles(paths);
+        delete cats.benchFiles;
+        return cats;
+    }
+
     function extractBenchmarkNames(source) {
         const names = [];
         for (const m of source.matchAll(/\bBENCHMARK\s*\(\s*([A-Za-z_]\w*)/g)) {
@@ -7028,25 +7077,20 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     async function fetchPRFileCategories(pr) {
+        const visibleCats = visibleDiffFileCategories();
         try {
             const files = [];
             let page = 1;
             let batch;
             do {
-                const resp = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=100&page=${page}`,
-                        headers: ghApiHeaders(),
-                        onload: (r) => resolve(r),
-                        onerror: reject,
-                    });
-                });
-                batch = JSON.parse(resp.responseText);
+                batch = await gmFetch(
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=100&page=${page}`,
+                );
+                if (!Array.isArray(batch)) throw new Error('GitHub files response was not an array');
                 files.push(...batch);
                 page++;
             } while (batch.length === 100 && page <= 30); // up to 3000 files (GitHub API listing cap)
-            const cats = categorizePRFiles(files.map((f) => f.filename));
+            const cats = mergeFileCategories(categorizePRFiles(files.map((f) => f.filename)), visibleCats);
 
             // For bench files, fetch raw content to extract BENCHMARK() names
             if (cats.benchFiles.length > 0) {
@@ -7063,7 +7107,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
             delete cats.benchFiles;
             return cats;
         } catch {
-            return null;
+            return visibleCats;
         }
     }
 
@@ -22346,12 +22390,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function loadAsyncPRData(wrapper, toolbar) {
         const pr = parsePR();
         const ackToggleBtn = toolbar.querySelector('button[title*="ACK panel"]');
-        let fileCategoriesApplied = false;
         const applyFileCategories = (cats) => {
-            if (fileCategoriesApplied) return;
+            if (!cats) return;
             if (!wrapper.isConnected) return;
-            fileCategoriesApplied = true;
-            prFileCategories = cats;
+            prFileCategories = mergeFileCategories(prFileCategories, cats);
+            delete prFileCategories.benchFiles;
             if (prFileCategories) {
                 console.log('ACKtopus: file categories:', JSON.stringify(prFileCategories));
                 for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
@@ -22365,6 +22408,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);
         fileCategoriesPromise.then(applyFileCategories).catch(() => {});
+        const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories());
+        ackSetTimeout(applyVisibleFileCategories, 1000);
+        ackSetTimeout(applyVisibleFileCategories, 3000);
         let acks = parseAcksFromPage();
         console.log('ACKtopus: DOM ACKs found:', acks.length);
         if (acks.length === 0) {
@@ -24998,6 +25044,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('categorizePRFiles detects fuzz targets', () => {
         const c = categorizePRFiles(['src/test/fuzz/coins_view.cpp', 'src/test/fuzz/deserialize.cpp']);
         ackDeepEq(c.fuzz, ['coins_view', 'deserialize']);
+    });
+
+    ackTest('visibleDiffFileCategories detects fuzz targets from GitHub file headers', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="js-file" data-path="src/test/fuzz/crypto.cpp">
+                <div class="file-header"><span title="src/test/fuzz/crypto.cpp">src/test/fuzz/crypto.cpp</span></div>
+            </div>
+            <div data-testid="diff-file">
+                <div data-testid="diff-file-header">
+                    <a title="src/test/fuzz/eval_script.cpp">src/test/fuzz/eval_script.cpp</a>
+                </div>
+            </div>
+        `;
+        try {
+            const c = visibleDiffFileCategories(host);
+            ackDeepEq(c.fuzz, ['crypto', 'eval_script']);
+            ackDeepEq(c.cpp, ['src/test/fuzz/crypto.cpp', 'src/test/fuzz/eval_script.cpp']);
+        } finally {
+            host.textContent = '';
+        }
     });
 
     ackTest('categorizePRFiles detects nested fuzz targets such as wallet fuzzers', () => {
@@ -35006,7 +35073,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('^(ACK|'), 'uses anchored regex to exclude NACK');
     });
 
-    ackTest('fetchCommitList and fetchPRFileCategories use ghApiHeaders', () => {
+    ackTest('fetchCommitList and fetchPRFileCategories use shared GitHub API helpers', () => {
         const source = _ackSource;
         const commitListFn = source.slice(
             source.indexOf('async function fetchCommitList'),
@@ -35018,9 +35085,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(commitListFn.includes('apiResult.push(...batch)'), 'fetchCommitList appends each API page');
         const fileCatFn = source.slice(
             source.indexOf('async function fetchPRFileCategories'),
-            source.indexOf('async function fetchPRFileCategories') + 600,
+            source.indexOf('async function fetchPRFileCategories') + 900,
         );
-        ackAssert(fileCatFn.includes('ghApiHeaders()'), 'fetchPRFileCategories uses ghApiHeaders');
+        ackAssert(fileCatFn.includes('gmFetch('), 'fetchPRFileCategories uses shared gmFetch auth/rate-limit handling');
+        ackAssert(fileCatFn.includes('visibleDiffFileCategories()'), 'fetchPRFileCategories falls back to visible file headers');
     });
 
     ackTest('callLLM guards JSON.parse with try/catch', () => {
@@ -39960,6 +40028,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('fileCategoriesPromise.then(applyFileCategories)'),
             'applies file categories as soon as they resolve',
         );
+        ackAssert(
+            fn.includes('const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories())'),
+            'uses visible diff files as a fallback when the API is unavailable',
+        );
+        ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 1000)'), 'retries visible file detection after hydration');
+        ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 3000)'), 'keeps watching for lazy-loaded file headers');
     });
 
     // --- copyPRContext structural test ---
