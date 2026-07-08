@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.208
+// @version      1.209
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1811,6 +1811,7 @@
         const dropBtn = document.createElement('button');
         dropBtn.textContent = '▾';
         dropBtn.title = 'Change copy format';
+        dropBtn.dataset.ackToolbarDropdownTrigger = 'sha-format';
         Object.assign(dropBtn.style, {
             padding: '4px 6px',
             fontSize: '12px',
@@ -1825,6 +1826,8 @@
         dropBtn.addEventListener('mouseleave', () => (dropBtn.style.background = '#21262d'));
 
         const menu = document.createElement('div');
+        menu.dataset.ackToolbarDropdown = 'hide';
+        menu.dataset.ackToolbarDropdownId = 'sha-format';
         Object.assign(menu.style, {
             display: 'none',
             position: 'absolute',
@@ -21908,6 +21911,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    function closeAckToolbarDropdowns({ except = null, root = document } = {}) {
+        let closed = 0;
+        root.querySelectorAll?.('[data-ack-toolbar-dropdown]')?.forEach((dropdown) => {
+            if (dropdown === except) return;
+            if (root === document && dropdown.id === ACK_PANEL_ID) GM_setValue('ackPanelVisible', false);
+            if (dropdown.dataset.ackToolbarDropdown === 'remove') {
+                dropdown.remove();
+                closed++;
+            } else if (dropdown.style.display !== 'none') {
+                dropdown.style.display = 'none';
+                closed++;
+            }
+        });
+        return closed;
+    }
+
+    function findAckToolbarDropdownById(id, root = document) {
+        if (!id) return null;
+        for (const dropdown of root.querySelectorAll?.('[data-ack-toolbar-dropdown-id]') || []) {
+            if (dropdown.dataset.ackToolbarDropdownId === id) return dropdown;
+        }
+        return null;
+    }
+
+    function installAckToolbarDropdownCloser(toolbar) {
+        toolbar.addEventListener(
+            'pointerdown',
+            (e) => {
+                if (e.target.closest?.('[data-ack-toolbar-dropdown]')) return;
+                const trigger = e.target.closest?.('[data-ack-toolbar-dropdown-trigger]');
+                const except = findAckToolbarDropdownById(trigger?.dataset.ackToolbarDropdownTrigger);
+                closeAckToolbarDropdowns({ except });
+            },
+            true,
+        );
+    }
+
     function buildContextCopyGroup() {
         const compact = GM_getValue('compactToolbar', false);
         const group = document.createElement('div');
@@ -22029,6 +22069,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const dropBtn = document.createElement('button');
         dropBtn.textContent = '▾';
         dropBtn.title = 'Choose context copy format';
+        dropBtn.dataset.ackToolbarDropdownTrigger = 'context-copy';
         Object.assign(dropBtn.style, {
             padding: '4px 6px',
             fontSize: '12px',
@@ -22041,6 +22082,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
 
         const menu = document.createElement('div');
+        menu.dataset.ackToolbarDropdown = 'hide';
+        menu.dataset.ackToolbarDropdownId = 'context-copy';
         Object.assign(menu.style, {
             display: 'none',
             position: 'absolute',
@@ -22194,6 +22237,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const dropBtn = document.createElement('button');
         dropBtn.textContent = '▾';
         dropBtn.title = 'Choose robot recipe';
+        dropBtn.dataset.ackToolbarDropdownTrigger = 'robot-recipe';
         Object.assign(dropBtn.style, {
             padding: '4px 6px',
             fontSize: '12px',
@@ -22206,6 +22250,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
 
         const menu = document.createElement('div');
+        menu.dataset.ackToolbarDropdown = 'hide';
+        menu.dataset.ackToolbarDropdownId = 'robot-recipe';
         Object.assign(menu.style, {
             display: 'none',
             position: 'absolute',
@@ -22458,6 +22504,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             alignItems: 'center',
             width: 'max-content',
         });
+        installAckToolbarDropdownCloser(toolbar);
         wrapper.appendChild(toolbar);
         document.body.appendChild(wrapper);
 
@@ -22474,6 +22521,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 },
                 'Toggle ACK panel [Ctrl+Q]',
             );
+            ackToggleBtn.dataset.ackToolbarDropdownTrigger = 'ack-panel';
             ackToggleBtn.style.padding = '4px 6px';
             ackToggleBtn.disabled = true;
             Object.assign(ackToggleBtn.style, { opacity: '0.35', cursor: 'default' });
@@ -22555,6 +22603,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             const dd = document.createElement('div');
             dd.className = 'ack-prov-dd';
+            dd.dataset.ackToolbarDropdown = 'remove';
+            dd.dataset.ackToolbarDropdownId = 'provider';
             Object.assign(dd.style, {
                 position: 'absolute',
                 top: '100%',
@@ -22607,6 +22657,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             setTimeout(() => document.addEventListener('click', close), 0);
         });
+        providerBtn.dataset.ackToolbarDropdownTrigger = 'provider';
 
         const settingsBtn = document.createElement('button');
         settingsBtn.type = 'button';
@@ -22677,6 +22728,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (existingAckPanel) existingAckPanel.remove();
             const placeholder = document.createElement('div');
             placeholder.id = ACK_PANEL_ID;
+            placeholder.dataset.ackToolbarDropdown = 'hide';
+            placeholder.dataset.ackToolbarDropdownId = 'ack-panel';
             placeholder.style.display = GM_getValue('ackPanelVisible', false) ? '' : 'none';
             wrapper.appendChild(placeholder);
 
@@ -34489,6 +34542,49 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(commentIdx < robotIdx, '💬 before 🤖 group');
         ackAssert(robotIdx < settingsIdx, '🤖 group before Settings');
         ackAssert(settingsIdx < queueIdx, 'Settings before ☑️');
+    });
+
+    ackTest('toolbar dropdown closer hides old menus before opening another', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="context-copy" style="display:block"></div>
+            <div data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="robot-recipe" style="display:block"></div>
+            <div data-ack-toolbar-dropdown="remove" data-ack-toolbar-dropdown-id="provider"></div>
+            <div id="${ACK_PANEL_ID}" data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="ack-panel" style="display:block"></div>
+        `;
+        try {
+            const contextMenu = host.querySelector('[data-ack-toolbar-dropdown-id="context-copy"]');
+            const robotMenu = host.querySelector('[data-ack-toolbar-dropdown-id="robot-recipe"]');
+            const closed = closeAckToolbarDropdowns({ except: contextMenu, root: host });
+            ackEq(closed, 3, 'closes every other open dropdown');
+            ackEq(contextMenu.style.display, 'block', 'leaves the owned dropdown alone');
+            ackEq(robotMenu.style.display, 'none', 'hides sibling menu');
+            ackEq(host.querySelector('[data-ack-toolbar-dropdown-id="provider"]'), null, 'removes provider dropdown');
+            ackEq(host.querySelector('#' + ACK_PANEL_ID).style.display, 'none', 'hides ACK panel');
+        } finally {
+            host.textContent = '';
+        }
+    });
+
+    ackTest('toolbar dropdown triggers share one close path', () => {
+        const source = _ackSource;
+        const inject = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
+        const sha = sourceSection(source, 'function buildSHAGroup', 'async function fetchPRContext');
+        const context = sourceSection(source, 'function buildContextCopyGroup', 'function buildRobotRecipeGroup');
+        const robot = sourceSection(source, 'function buildRobotRecipeGroup', 'async function copyCommentContext');
+        ackAssert(source.includes('function closeAckToolbarDropdowns'), 'has shared closer');
+        ackAssert(source.includes('function installAckToolbarDropdownCloser'), 'has toolbar capture listener');
+        ackAssert(inject.includes('installAckToolbarDropdownCloser(toolbar)'), 'installs shared closer on toolbar');
+        ackAssert(sha.includes("dropBtn.dataset.ackToolbarDropdownTrigger = 'sha-format'"), 'SHA dropdown trigger is registered');
+        ackAssert(sha.includes("menu.dataset.ackToolbarDropdownId = 'sha-format'"), 'SHA menu is managed');
+        ackAssert(inject.includes("ackToggleBtn.dataset.ackToolbarDropdownTrigger = 'ack-panel'"), 'ACK panel trigger is registered');
+        ackAssert(inject.includes("placeholder.dataset.ackToolbarDropdownId = 'ack-panel'"), 'ACK panel is a managed dropdown');
+        ackAssert(inject.includes("providerBtn.dataset.ackToolbarDropdownTrigger = 'provider'"), 'provider trigger is registered');
+        ackAssert(inject.includes("dd.dataset.ackToolbarDropdown = 'remove'"), 'provider dropdown is managed');
+        ackAssert(context.includes("dropBtn.dataset.ackToolbarDropdownTrigger = 'context-copy'"), 'context trigger is registered');
+        ackAssert(context.includes("menu.dataset.ackToolbarDropdownId = 'context-copy'"), 'context menu is managed');
+        ackAssert(robot.includes("dropBtn.dataset.ackToolbarDropdownTrigger = 'robot-recipe'"), 'robot trigger is registered');
+        ackAssert(robot.includes("menu.dataset.ackToolbarDropdownId = 'robot-recipe'"), 'robot menu is managed');
     });
 
     ackTest('commit-message proofread is not wired into the fixed toolbar', () => {
