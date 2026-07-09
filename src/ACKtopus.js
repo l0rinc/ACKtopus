@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.210
+// @version      1.211
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1885,8 +1885,6 @@
             e.stopPropagation();
             menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
         });
-        document.addEventListener('click', () => (menu.style.display = 'none'), { signal });
-
         // Keyboard shortcuts: Ctrl+letter triggers the associated format.
         // Shortcuts only arm after Ctrl is held for 500ms to avoid breaking
         // standard shortcuts (Ctrl+C=copy, Ctrl+A=select-all, etc.).
@@ -1899,6 +1897,7 @@
         const showHotkeyHints = () => {
             hotkeyArmed = true;
             document.documentElement.classList.add('ack-ctrl-armed');
+            closeAckToolbarDropdowns({ except: menu });
             for (const item of menu.children) {
                 const hk = item.dataset?.ackHotkey;
                 if (hk && !item.dataset.ackOrigLabel) {
@@ -21979,17 +21978,40 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    function installAckToolbarDropdownCloser(toolbar) {
+    function installAckToolbarDropdownCloser(toolbar, root = document) {
+        const ac = new AbortController();
+        if (root === document) {
+            installAckToolbarDropdownCloser._ac?.abort();
+            installAckToolbarDropdownCloser._ac = ac;
+            const lifetimeSignal = ensureAckLifetime('toolbar-dropdowns').signal;
+            const abortWithLifetime = () => ac.abort();
+            lifetimeSignal.addEventListener('abort', abortWithLifetime, { once: true });
+            ac.signal.addEventListener('abort', () => lifetimeSignal.removeEventListener('abort', abortWithLifetime), {
+                once: true,
+            });
+        }
         toolbar.addEventListener(
-            'pointerdown',
+            'click',
             (e) => {
                 if (e.target.closest?.('[data-ack-toolbar-dropdown]')) return;
                 const trigger = e.target.closest?.('[data-ack-toolbar-dropdown-trigger]');
-                const except = findAckToolbarDropdownById(trigger?.dataset.ackToolbarDropdownTrigger);
-                closeAckToolbarDropdowns({ except });
+                const except = trigger && toolbar.contains(trigger)
+                    ? findAckToolbarDropdownById(trigger.dataset.ackToolbarDropdownTrigger, root)
+                    : null;
+                closeAckToolbarDropdowns({ except, root });
             },
-            true,
+            { capture: true, signal: ac.signal },
         );
+        root.addEventListener(
+            'click',
+            (e) => {
+                if (toolbar.contains(e.target) || e.target.closest?.('[data-ack-toolbar-dropdown]')) return;
+                const ackPanel = findAckToolbarDropdownById('ack-panel', root);
+                closeAckToolbarDropdowns({ except: ackPanel, root });
+            },
+            { capture: true, signal: ac.signal },
+        );
+        return ac;
     }
 
     function buildContextCopyGroup() {
@@ -22218,8 +22240,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             renderRevealItem();
             menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
         });
-        document.addEventListener('click', () => (menu.style.display = 'none'));
-
         group.appendChild(mainBtn);
         group.appendChild(dropBtn);
         group.appendChild(menu);
@@ -22345,8 +22365,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             e.stopPropagation();
             menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
         });
-        document.addEventListener('click', () => (menu.style.display = 'none'));
-
         group.appendChild(mainBtn);
         group.appendChild(dropBtn);
         group.appendChild(menu);
@@ -22695,13 +22713,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 dd.appendChild(item);
             }
             settingsGroup.appendChild(dd);
-            const close = (e) => {
-                if (!settingsGroup.contains(e.target)) {
-                    dd.remove();
-                    document.removeEventListener('click', close);
-                }
-            };
-            setTimeout(() => document.addEventListener('click', close), 0);
         });
         providerBtn.dataset.ackToolbarDropdownTrigger = 'provider';
 
@@ -31462,18 +31473,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- ChatGPT review fixes ---
 
-    ackTest('buildSHAGroup document click handler uses AbortController signal', () => {
+    ackTest('toolbar dropdown document click handler is shared and abortable', () => {
         const source = _ackSource;
-        const fn = source.slice(source.indexOf('function buildSHAGroup'), source.indexOf('function getHiddenCount'));
-        // Find all lines with document.addEventListener('click' and verify they include signal
-        const lines = fn.split('\n').filter((l) => l.includes("document.addEventListener('click'"));
-        ackAssert(lines.length > 0, 'has at least one document click handler');
-        for (const line of lines) {
-            ackAssert(
-                line.includes('signal'),
-                'document click handler must use { signal } to prevent leak: ' + line.trim(),
-            );
-        }
+        const manager = sourceSection(source, 'function installAckToolbarDropdownCloser', 'function buildContextCopyGroup');
+        const context = sourceSection(source, 'function buildContextCopyGroup', 'function buildRobotRecipeGroup');
+        const robot = sourceSection(source, 'function buildRobotRecipeGroup', 'async function copyCommentContext');
+        ackAssert(manager.includes("root.addEventListener(\n            'click'"), 'has one shared outside-click handler');
+        ackAssert(manager.includes('signal: ac.signal'), 'shared handlers use an AbortController signal');
+        ackAssert(manager.includes('installAckToolbarDropdownCloser._ac?.abort()'), 're-injection aborts the old handler');
+        ackAssert(manager.includes("removeEventListener('abort', abortWithLifetime)"), 're-injection removes its lifetime hook');
+        ackAssert(!context.includes("document.addEventListener('click'"), 'context dropdown has no leaked document handler');
+        ackAssert(!robot.includes("document.addEventListener('click'"), 'robot dropdown has no leaked document handler');
     });
 
     ackTest('queue filter guards against undefined title', () => {
@@ -34633,6 +34643,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('toolbar dropdown manager handles click-only activation and outside clicks', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div data-outside="true"></div>
+            <div data-toolbar="true">
+                <button data-ack-toolbar-dropdown-trigger="context-copy">open context</button>
+                <div data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="sha-format" style="display:block"></div>
+                <div data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="context-copy" style="display:block"></div>
+            </div>
+            <div id="${ACK_PANEL_ID}" data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="ack-panel" style="display:block"></div>
+        `;
+        const toolbar = host.querySelector('[data-toolbar]');
+        const shaMenu = host.querySelector('[data-ack-toolbar-dropdown-id="sha-format"]');
+        const contextMenu = host.querySelector('[data-ack-toolbar-dropdown-id="context-copy"]');
+        const ackPanel = host.querySelector('#' + ACK_PANEL_ID);
+        const ac = installAckToolbarDropdownCloser(toolbar, host);
+        try {
+            toolbar.querySelector('button').click();
+            ackEq(shaMenu.style.display, 'none', 'click-only activation closes the previous dropdown');
+            ackEq(contextMenu.style.display, 'block', 'click-only activation preserves the triggered dropdown');
+
+            shaMenu.style.display = 'block';
+            host.querySelector('[data-outside]').click();
+            ackEq(shaMenu.style.display, 'none', 'outside click closes transient dropdowns');
+            ackEq(contextMenu.style.display, 'none', 'outside click closes the active transient dropdown');
+            ackEq(ackPanel.style.display, 'block', 'outside click leaves the persistent ACK panel open');
+        } finally {
+            ac.abort();
+            host.textContent = '';
+        }
+    });
+
     ackTest('toolbar dropdown triggers share one close path', () => {
         const source = _ackSource;
         const inject = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
@@ -34644,6 +34686,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(inject.includes('installAckToolbarDropdownCloser(toolbar)'), 'installs shared closer on toolbar');
         ackAssert(sha.includes("dropBtn.dataset.ackToolbarDropdownTrigger = 'sha-format'"), 'SHA dropdown trigger is registered');
         ackAssert(sha.includes("menu.dataset.ackToolbarDropdownId = 'sha-format'"), 'SHA menu is managed');
+        ackAssert(sha.includes('closeAckToolbarDropdowns({ except: menu })'), 'Ctrl-held SHA chooser closes sibling menus');
         ackAssert(inject.includes("ackToggleBtn.dataset.ackToolbarDropdownTrigger = 'ack-panel'"), 'ACK panel trigger is registered');
         ackAssert(inject.includes("placeholder.dataset.ackToolbarDropdownId = 'ack-panel'"), 'ACK panel is a managed dropdown');
         ackAssert(inject.includes("providerBtn.dataset.ackToolbarDropdownTrigger = 'provider'"), 'provider trigger is registered');
