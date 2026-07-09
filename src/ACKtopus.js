@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.211
+// @version      1.212
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -7029,21 +7029,33 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     }
 
     function readDiffFilePath(file) {
+        const normalize = (value) =>
+            String(value || '')
+                .trim()
+                .replace(/^Diff for:\s*/i, '');
         const direct =
             file?.getAttribute?.('data-path') ||
             file?.getAttribute?.('data-file-name') ||
             file?.getAttribute?.('data-tagsearch-path') ||
             '';
-        if (direct) return direct.trim();
-        const header = file?.querySelector?.('.file-header, [data-testid="diff-file-header"], .file-info');
-        const named = header?.querySelector?.('[title], [data-path], [aria-label], [data-testid="file-name"], a');
-        return (
+        if (direct) return normalize(direct);
+        const tableLabel = file
+            ?.querySelector?.('table[aria-label^="Diff for:"]')
+            ?.getAttribute?.('aria-label');
+        if (tableLabel) return normalize(tableLabel);
+        const header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR);
+        const named =
+            header?.querySelector?.(
+                '[data-testid="file-name"], [class*="DiffFileHeader-module__file-name"], .file-info a',
+            ) || header?.querySelector?.('a[title], [data-path]');
+        return normalize(
+            header?.getAttribute?.('data-path') ||
             named?.getAttribute?.('data-path') ||
             named?.getAttribute?.('title') ||
             named?.getAttribute?.('aria-label') ||
             named?.textContent?.trim() ||
-            ''
-        ).trim();
+            '',
+        );
     }
 
     function visibleDiffFilePaths(root = document) {
@@ -22523,8 +22535,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
 
-        applyFileCategories(await fileCategoriesPromise);
-
         if (pr) {
             await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
             scheduleAckBackgroundWork('commit-badges-after-api', () => addCommitBadges(document), {
@@ -25067,6 +25077,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 <div data-testid="diff-file-header">
                     <a title="src/test/fuzz/eval_script.cpp">src/test/fuzz/eval_script.cpp</a>
                 </div>
+            </div>
+        `;
+        try {
+            const c = visibleDiffFileCategories(host);
+            ackDeepEq(c.fuzz, ['crypto', 'eval_script']);
+            ackDeepEq(c.cpp, ['src/test/fuzz/crypto.cpp', 'src/test/fuzz/eval_script.cpp']);
+        } finally {
+            host.textContent = '';
+        }
+    });
+
+    ackTest('visibleDiffFileCategories reads current React diff paths', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="Diff-module__diffTargetable__pirZi Diff-module__diff__rx9XH">
+                <div class="DiffFileHeader-module__diff-file-header__UuNN4">
+                    <h3 class="DiffFileHeader-module__file-name__VVXpg">src/test/fuzz/crypto.cpp</h3>
+                </div>
+            </div>
+            <div class="Diff-module__diffTargetable__pirZi Diff-module__diff__rx9XH">
+                <table aria-label="Diff for: src/test/fuzz/eval_script.cpp" data-diff-anchor="diff-deadbeef"></table>
             </div>
         `;
         try {
@@ -31020,7 +31051,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const injectSection = sourceSection(
             source,
             'force-pushes found:',
-            'applyFileCategories(await fileCategoriesPromise)',
+            'await fetchReviewCommentCommits(pr.owner',
         );
         ackAssert(injectSection.includes('invalidatePRContext'), 'invalidated on force push detection');
         ackAssert(injectSection.includes('commitListCache.clear()'), 'commitListCache cleared on force push');
@@ -40070,6 +40101,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             fn.includes('fileCategoriesPromise.then(applyFileCategories)'),
             'applies file categories as soon as they resolve',
+        );
+        ackAssert(
+            !fn.includes('applyFileCategories(await fileCategoriesPromise)'),
+            'does not apply the same API categories again after ACK loading',
         );
         ackAssert(
             fn.includes('const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories())'),
