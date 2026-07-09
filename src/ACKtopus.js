@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.212
+// @version      1.213
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4842,6 +4842,9 @@
         commit: 'commit', // /pull/N/commits/{sha}
     };
 
+    const PROOFREAD_MECHANICAL_RULE =
+        'Inspect every word and character before deciding the text is correct. Fix obvious typos and accidental whitespace in prose. Collapse repeated spaces or tabs between words to one space, remove spaces before punctuation, and use normal spacing after punctuation. These are required corrections; never return the original text unchanged while any remain.';
+
     const DEFAULT_INSTRUCTIONS = {
         chat: `Answer questions about the current page directly and concisely.
 Prefer concrete conclusions over brainstorming.
@@ -5092,6 +5095,7 @@ Output only these markdown sections:
 
 Under each section, keep bullets short and high signal.`,
         proofread: `Use American English.
+${PROOFREAD_MECHANICAL_RULE}
 Fix grammar, spelling, and clarity with minimal edits. Preserve the author's tone and intent.
 Prefer simple, plain language. Do not add jargon, abstract reviewer-speak, or more formal wording unless the original technical meaning requires it.
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
@@ -5115,6 +5119,14 @@ For fenced code blocks, check whether the language hint gives useful GitHub high
 Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.
 Return only the corrected text. If nothing needs fixing, return the original text unchanged.`,
     };
+
+    function getProofreadInstructions(configured) {
+        const custom = String(configured || '').trim();
+        const instructions = custom || DEFAULT_INSTRUCTIONS.proofread;
+        return instructions.includes(PROOFREAD_MECHANICAL_RULE)
+            ? instructions
+            : `${PROOFREAD_MECHANICAL_RULE}\n${instructions}`;
+    }
 
     const CONFIG_INSTRUCTION_DEFS = Object.freeze([
         { key: 'chat', label: '🤖 Chat' },
@@ -11115,7 +11127,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function wordDiff(oldText, newText) {
         // Uses jsdiff's Myers O(ND) algorithm (linear in edits, not O(N*M))
-        return Diff.diffWords(oldText, newText).map((d) => ({
+        return Diff.diffWordsWithSpace(oldText, newText).map((d) => ({
             type: d.added ? 'add' : d.removed ? 'del' : 'same',
             text: d.value,
         }));
@@ -11761,7 +11773,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const provider = active;
         const config = getLLMConfig();
-        const extra = config.instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
+        const extra = getProofreadInstructions(config.instructions.proofread);
 
         // Start spinner IMMEDIATELY so user sees feedback before API calls
         const origHTML = commentEl.innerHTML;
@@ -12041,7 +12053,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. Join prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- ${PROOFREAD_MECHANICAL_RULE}\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. Join prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -12238,7 +12250,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             provider,
                             mutableSegments: parsed.mutableCount,
                         });
-                        const llmRaw = await callLLM(provider, system, user);
+                        const llmRaw = await callLLM(provider, system, user, { skipCache: true });
                         const llmClean = cleanResult(llmRaw);
                         const tagCount = (llmClean.match(/<s\d+>/gi) || []).length;
                         console.log('ACKtopus: proofread: LLM xml tags', { tagCount, expected: parsed.mutableCount });
@@ -12256,7 +12268,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 const strictSystem =
                                     system +
                                     '\n\nMANDATORY OUTPUT FORMAT: return exactly one <output> block containing every required <sN> section.';
-                                const retryRaw = await callLLM(provider, strictSystem, user);
+                                const retryRaw = await callLLM(provider, strictSystem, user, { skipCache: true });
                                 const retryClean = cleanResult(retryRaw);
                                 const retryTagCount = (retryClean.match(/<s\d+>/gi) || []).length;
                                 console.log('ACKtopus: proofread: LLM xml tags (retry)', {
@@ -12469,7 +12481,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return;
             }
             const commitMessages = await fetchFullCommitMessagesForProofread(pr, ctx.commitMessages);
-            const extra = getLLMConfig().instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
+            const extra = getProofreadInstructions(getLLMConfig().instructions.proofread);
             const context = buildReadOnlyProofreadContext({
                 title: ctx.title || getPRTitleText(),
                 commitMessages,
@@ -12554,7 +12566,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (stopSpin) stopSpin('∅');
                 return;
             }
-            const extra = getLLMConfig().instructions.proofread || DEFAULT_INSTRUCTIONS.proofread;
+            const extra = getProofreadInstructions(getLLMConfig().instructions.proofread);
             const context = buildReadOnlyProofreadContext({
                 title: ctx.title || getPRTitleText(),
                 description: ctx.description,
@@ -16617,7 +16629,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const system = generateTitle
                 ? `You are drafting a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
-                : `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
+                : `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
             const user = generateTitle
                 ? `PR title is empty. Propose a concise title from the context below.${ctxBlock}`
                 : `Original title:\n${original}${ctxBlock}`;
@@ -21035,7 +21047,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    'Proofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as `--connect`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (`> ...`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).';
+                    `${PROOFREAD_MECHANICAL_RULE}\nProofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as \`--connect\`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).`;
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -21084,7 +21096,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     .join('\n\n');
             }
 
-            const result = await callLLM(provider, system, user);
+            const result = await callLLM(provider, system, user, { skipCache: mode === 'proofread' });
             stopSpin();
             if (reqId !== _diffSelectionActionReqId) return;
             if (!outEl.isConnected) return;
@@ -25580,6 +25592,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('wordDiff detects repeated prose whitespace corrections', () => {
+        const original =
+            'Rebased on current master, adapted the stack to the upstream size_t to uint64_t cache changes, folded the final type-cleanup commit into the earlier commits, and applied the remaining nits. The   stack now has 9 commits.';
+        const corrected = original.replace('The   stack', 'The stack');
+        const d = wordDiff(original, corrected);
+        ackAssert(d.some((x) => x.type !== 'same' && /^\s+$/.test(x.text)), 'detects changed whitespace');
+        ackEq(
+            d.filter((x) => x.type !== 'add').map((x) => x.text).join(''),
+            original,
+            'non-added tokens reconstruct the original text',
+        );
+        ackEq(
+            d.filter((x) => x.type !== 'del').map((x) => x.text).join(''),
+            corrected,
+            'non-deleted tokens reconstruct the corrected text',
+        );
+    });
+
     ackTest('wordDiff handles markdown link changes', () => {
         const d = wordDiff('See [link](http://old.com)', 'See [link](http://new.com)');
         ackAssert(
@@ -25886,6 +25916,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('spelling'), 'mentions spelling');
     });
 
+    ackTest('proofread instructions require typo and accidental whitespace fixes', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Inspect every word and character'), 'requires a full check');
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Fix obvious typos'), 'requires typo fixes');
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Collapse repeated spaces or tabs between words to one space'),
+            'requires repeated whitespace fixes',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('never return the original text unchanged while any remain'),
+            'does not allow a false no-op result',
+        );
+    });
+
+    ackTest('custom proofread instructions retain required mechanical checks', () => {
+        const instructions = getProofreadInstructions('Keep domain-specific wording.');
+        ackAssert(instructions.includes(PROOFREAD_MECHANICAL_RULE), 'adds required mechanical rule');
+        ackAssert(instructions.includes('Keep domain-specific wording.'), 'keeps custom instructions');
+        ackEq(
+            getProofreadInstructions(DEFAULT_INSTRUCTIONS.proofread),
+            DEFAULT_INSTRUCTIONS.proofread,
+            'does not duplicate the required rule in defaults',
+        );
+    });
+
     ackTest('proofread instructions say to change minimally', () => {
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('minimal edits'), 'mentions minimal edits');
     });
@@ -26118,11 +26172,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackDeepEq(result, { action: 'unchanged', text: 'same text' }, 'identical text = no dialog, returns unchanged');
     });
 
-    ackTest('showDiffDialog returns unchanged for whitespace-only difference in same words', async () => {
-        // jsdiff diffWords ignores whitespace when computing the diff --
-        // whitespace-only changes = no dialog (double space is load-bearing below)
-        const result = await showDiffDialog('hello  world', 'hello world');
-        ackDeepEq(result, { action: 'unchanged', text: 'hello world' }, 'same words = no changes');
+    ackTest('showDiffDialog shows and accepts whitespace-only corrections', async () => {
+        const original = 'The   stack now has 9 commits.';
+        const corrected = 'The stack now has 9 commits.';
+        const promise = showDiffDialog(original, corrected, { showDuringSelfTests: true });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const overlay = document.querySelector('.ack-diff-dialog-overlay');
+        try {
+            ackAssert(overlay, 'whitespace correction opens the diff dialog');
+            const changedText = [...overlay.querySelectorAll('[data-ack-diff-nav-target="1"]')]
+                .map((el) => el.textContent)
+                .filter((text) => /^\s+$/.test(text));
+            ackAssert(changedText.length > 0, 'shows the changed whitespace');
+            const acceptBtn = [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Accept');
+            ackAssert(acceptBtn, 'whitespace correction can be accepted');
+            acceptBtn.click();
+            const result = await promise;
+            ackDeepEq(result, { action: 'edit', text: corrected }, 'accepts the whitespace-only correction');
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+        }
     });
 
     ackTest('showDiffDialog source has accept/reject buttons and readability modes', () => {
@@ -26336,6 +26405,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('wordDiff(original, corrected)'), 'uses proofread diff for inline rendering');
         ackAssert(fn.includes('Diff'), 'includes inline diff heading');
         ackAssert(fn.includes('Result'), 'includes inline result heading');
+    });
+
+    ackTest('renderInlineProofreadResult keeps whitespace-only corrections', () => {
+        const corrected = renderInlineProofreadResult('The   stack now has 9 commits.', 'The stack now has 9 commits.');
+        ackAssert(corrected.hasChanges, 'reports repeated-space cleanup as a change');
+        ackEq(corrected.text, 'The stack now has 9 commits.', 'keeps the corrected result');
+        ackAssert(corrected.html.includes('Diff'), 'renders the whitespace correction as a diff');
     });
 
     ackTest('showDiffDialog returns unchanged when no changes detected', () => {
@@ -31463,7 +31539,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('wordDiff uses jsdiff library (Myers O(ND) algorithm)', () => {
         const source = _ackSource;
-        ackAssert(source.includes('Diff.diffWords'), 'delegates to jsdiff diffWords');
+        ackAssert(source.includes('Diff.diffWordsWithSpace'), 'delegates to whitespace-sensitive jsdiff word diff');
         ackAssert(/@require\s+https:\S+diff@\d/.test(source), '@require includes jsdiff');
         // No custom LCS implementation
         ackAssert(!source.includes('Uint16Array(m + 1)'), 'no custom DP matrix');
@@ -32346,6 +32422,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'selection proofread repairs split shell tokens',
         );
         ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
+        ackAssert(fn.includes('${PROOFREAD_MECHANICAL_RULE}'), 'selection proofread includes required mechanical checks');
+        ackAssert(
+            fn.includes("{ skipCache: mode === 'proofread' }"),
+            'selection proofreading bypasses the general prompt cache',
+        );
         ackAssert(
             !fn.includes('showDiffDialog(ctx.text, out)'),
             'selection proofread no longer opens modal diff dialog',
@@ -33511,6 +33592,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Strips GitHub metadata before proofreading
         ackAssert(source.includes('stripGitHubMeta'), 'strips GitHub metadata footer');
         ackAssert(source.includes('_Originally posted by'), 'matches cross-post footer');
+    });
+
+    ackTest('editable proofreading bypasses the general prompt cache', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function runProofreadOnComment'),
+            source.indexOf('async function runReadOnlyPRDescriptionProofread'),
+        );
+        ackAssert(
+            fn.includes('callLLM(provider, system, user, { skipCache: true })'),
+            'initial proofreading request bypasses cache',
+        );
+        ackAssert(
+            fn.includes('callLLM(provider, strictSystem, user, { skipCache: true })'),
+            'strict-format retry bypasses cache',
+        );
     });
 
     ackTest('showDiffDialog auto-closes when all changes reverted', () => {
