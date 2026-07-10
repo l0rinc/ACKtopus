@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.213
+// @version      1.214
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2352,6 +2352,32 @@
     let _githubAuthBucketId = 0;
     const _githubRateLimitedUntil = new Map();
 
+    function updateGithubPatStatus(input, status) {
+        if (!input || !status) return;
+        const pat = normalizeGithubPatInput(input.value);
+        const invalid = !!pat && pat === _githubBadPat;
+        const title = invalid
+            ? 'GitHub rejected this token. It may be expired, invalid, or missing required permissions.'
+            : pat
+              ? 'Token configured. ACKtopus will warn here if GitHub rejects it.'
+              : '';
+        status.textContent = invalid ? '⚠️' : pat ? '✅' : '';
+        status.style.color = invalid ? '#d29922' : pat ? '#3fb950' : '';
+        status.title = title;
+        if (title) status.setAttribute('aria-label', title);
+        else status.removeAttribute('aria-label');
+        if (invalid) input.setAttribute('aria-invalid', 'true');
+        else input.removeAttribute('aria-invalid');
+        input.style.borderColor = invalid ? '#d29922' : '#30363d';
+    }
+
+    function refreshGithubPatStatus() {
+        updateGithubPatStatus(
+            document.getElementById('ack-github-pat'),
+            document.getElementById('ack-github-pat-status'),
+        );
+    }
+
     function githubResponseSnippet(response) {
         return String(response?.responseText || '').slice(0, 120);
     }
@@ -2450,6 +2476,7 @@
         const pat = githubPatValue();
         if (!pat) return;
         _githubBadPat = pat;
+        refreshGithubPatStatus();
         if (_patInvalidWarned !== pat) {
             _patInvalidWarned = pat;
             console.warn(
@@ -5643,8 +5670,10 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         });
         ghRow.appendChild(ghInput);
         const ghStatus = document.createElement('span');
+        ghStatus.id = 'ack-github-pat-status';
         Object.assign(ghStatus.style, { fontSize: '13px', minWidth: '18px', textAlign: 'center' });
-        if (ghInput.value) ghStatus.textContent = '\u2705';
+        updateGithubPatStatus(ghInput, ghStatus);
+        ghInput.addEventListener('input', () => updateGithubPatStatus(ghInput, ghStatus));
         ghRow.appendChild(ghStatus);
         panel.appendChild(ghRow);
         const ghHelp = document.createElement('a');
@@ -31741,8 +31770,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(helpers.includes('function isGithubRateLimitedError'), 'has rate-limit error predicate');
         ackAssert(helpers.includes('githubRateLimitPreflightError'), 'has preflight skip helper');
         ackAssert(helpers.includes('rememberGithubBadPat'), 'has bad-PAT memoization helper');
+        ackAssert(helpers.includes('refreshGithubPatStatus();'), 'refreshes an open settings panel after PAT rejection');
         ackAssert(helpers.includes('rememberGithubRateLimit'), 'has rate-limit memoization helper');
         ackAssert(!helpers.includes('auth:${headers.Authorization}'), 'does not store Authorization header in rate-limit bucket key');
+    });
+
+    ackTest('GitHub PAT status warns for the rejected token and recovers for a replacement', () => {
+        const input = document.createElement('input');
+        const status = document.createElement('span');
+        const previousBadPat = _githubBadPat;
+        try {
+            _githubBadPat = 'expired-token';
+            input.value = 'expired-token';
+            updateGithubPatStatus(input, status);
+            ackEq(status.textContent, '⚠️', 'known rejected token shows a warning');
+            ackAssert(status.title.includes('GitHub rejected this token'), 'warning explains the rejection');
+            ackEq(input.getAttribute('aria-invalid'), 'true', 'marks the rejected token invalid');
+            ackEq(input.style.borderColor, 'rgb(210, 153, 34)', 'highlights the rejected token field');
+
+            input.value = 'replacement-token';
+            updateGithubPatStatus(input, status);
+            ackEq(status.textContent, '✅', 'replacement token is no longer marked as the rejected value');
+            ackEq(input.hasAttribute('aria-invalid'), false, 'clears invalid state for the replacement');
+            ackEq(input.style.borderColor, 'rgb(48, 54, 61)', 'restores the normal field border');
+
+            input.value = '';
+            updateGithubPatStatus(input, status);
+            ackEq(status.textContent, '', 'empty optional token has no status icon');
+        } finally {
+            _githubBadPat = previousBadPat;
+        }
     });
 
     ackTest('gmFetch fails fast after known rate limits and disables bad PATs', () => {
@@ -31797,9 +31854,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const end = source.indexOf('function openConfigForProvider');
         const configFn = source.slice(start, end);
         ackAssert(configFn.includes('ack-github-pat'), 'PAT input field exists');
+        ackAssert(configFn.includes('ack-github-pat-status'), 'PAT status field exists');
         ackAssert(configFn.includes('github_pat'), 'saves to github_pat key');
         ackAssert(configFn.includes('ghp_'), 'placeholder mentions ghp_ format');
         ackAssert(configFn.includes('normalizeGithubPatInput(ghPat.value)'), 'normalizes pasted auth header before saving');
+        ackAssert(configFn.includes('updateGithubPatStatus(ghInput, ghStatus)'), 'renders known PAT validity state');
+        ackAssert(configFn.includes("ghInput.addEventListener('input'"), 'updates PAT state as a replacement is typed');
         ackAssert(configFn.includes("GM_deleteValue('github_pat')"), 'clears stored PAT when field is empty');
         ackAssert(configFn.includes('settings/tokens'), 'links to GitHub token page');
     });
@@ -40677,6 +40737,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             userAckSha,
             prFileCategories,
             selectedFormat,
+            rateLimitWarned: _rateLimitWarned,
+            patInvalidWarned: _patInvalidWarned,
+            githubBadPat: _githubBadPat,
+            githubAuthBucketPat: _githubAuthBucketPat,
+            githubAuthBucketId: _githubAuthBucketId,
+            githubRateLimitedUntil: new Map(_githubRateLimitedUntil),
         };
 
         // Try to sandbox Greasemonkey/Tampermonkey storage so tests are deterministic
@@ -40748,6 +40814,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             userAckSha = null;
             prFileCategories = null;
             selectedFormat = 'ack';
+            _rateLimitWarned = false;
+            _patInvalidWarned = '';
+            _githubBadPat = '';
+            _githubAuthBucketPat = '';
+            _githubAuthBucketId = 0;
+            _githubRateLimitedUntil.clear();
             if (gmMode === 'stub') {
                 gmMem.clear();
             } else if (gmMode === 'snapshot' && gmOrig.deleteValue && gmOrig.listValues) {
@@ -40806,6 +40878,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             userAckSha = stateSnapshot.userAckSha;
             prFileCategories = stateSnapshot.prFileCategories;
             selectedFormat = stateSnapshot.selectedFormat;
+            _rateLimitWarned = stateSnapshot.rateLimitWarned;
+            _patInvalidWarned = stateSnapshot.patInvalidWarned;
+            _githubBadPat = stateSnapshot.githubBadPat;
+            _githubAuthBucketPat = stateSnapshot.githubAuthBucketPat;
+            _githubAuthBucketId = stateSnapshot.githubAuthBucketId;
+            _githubRateLimitedUntil.clear();
+            for (const [bucket, until] of stateSnapshot.githubRateLimitedUntil) {
+                _githubRateLimitedUntil.set(bucket, until);
+            }
+            refreshGithubPatStatus();
 
             // Restore Greasemonkey/Tampermonkey storage.
             try {
@@ -40842,6 +40924,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = String(runACKtopusTests);
         ackAssert(fn.includes('resyncAfterSelfTests'), 'triggers a post-test re-sync');
         ackAssert(fn.includes('setTimeout('), 're-sync is deferred until testing flag clears');
+    });
+
+    ackTest('runACKtopusTests restores GitHub authentication state after auto-tests', () => {
+        const fn = String(runACKtopusTests);
+        ackAssert(fn.includes('githubBadPat: _githubBadPat'), 'snapshots the rejected PAT marker');
+        ackAssert(fn.includes("_githubBadPat = ''"), 'clears rejected PAT state between tests');
+        ackAssert(fn.includes('_githubBadPat = stateSnapshot.githubBadPat'), 'restores the live rejected PAT marker');
+        ackAssert(fn.includes('githubRateLimitedUntil: new Map'), 'snapshots rate-limit buckets');
+        ackAssert(fn.includes('refreshGithubPatStatus()'), 'refreshes the settings warning after restoration');
     });
 
     ackTest('runACKtopusTests blocks real form submissions from fixture clicks', () => {
