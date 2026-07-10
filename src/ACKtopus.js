@@ -31794,7 +31794,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('config panel has GitHub PAT field and saves it', () => {
         const source = _ackSource;
         const start = source.indexOf('function buildConfigPanel');
-        const end = source.indexOf('function addUsage');
+        const end = source.indexOf('function openConfigForProvider');
         const configFn = source.slice(start, end);
         ackAssert(configFn.includes('ack-github-pat'), 'PAT input field exists');
         ackAssert(configFn.includes('github_pat'), 'saves to github_pat key');
@@ -32410,8 +32410,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('the hint does not have to be the exact real language'),
             'selection proofread optimizes fence hints for useful coloring',
         );
-        ackAssert(fn.includes('Do not choose boring ```text'), 'selection proofread avoids text for runnable shell');
-        ackAssert(fn.includes('keep or choose ```bash or ```sh'), 'selection proofread prefers shell fence hints');
+        ackAssert(
+            fn.includes('Do not choose boring') && fn.includes('text for runnable shell scripts'),
+            'selection proofread avoids text for runnable shell',
+        );
+        ackAssert(
+            fn.includes('keep or choose') && fn.includes('bash or') && fn.includes('sh even when'),
+            'selection proofread prefers shell fence hints',
+        );
         ackAssert(fn.includes('whitespace-only edits'), 'selection proofread allows whitespace-only fenced code formatting');
         ackAssert(
             fn.includes('Long single-line shell commands should usually be split'),
@@ -34791,8 +34797,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             toolbar.querySelector('button').click();
             ackEq(shaMenu.style.display, 'none', 'click-only activation closes the previous dropdown');
             ackEq(contextMenu.style.display, 'block', 'click-only activation preserves the triggered dropdown');
+            ackEq(ackPanel.style.display, 'none', 'opening a transient dropdown closes the ACK panel');
 
             shaMenu.style.display = 'block';
+            ackPanel.style.display = 'block';
             host.querySelector('[data-outside]').click();
             ackEq(shaMenu.style.display, 'none', 'outside click closes transient dropdowns');
             ackEq(contextMenu.style.display, 'none', 'outside click closes the active transient dropdown');
