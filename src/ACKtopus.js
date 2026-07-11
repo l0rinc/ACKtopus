@@ -4848,7 +4848,39 @@
     };
 
     const PROOFREAD_MECHANICAL_RULE =
-        'Inspect every word and character before deciding the text is correct. Fix obvious typos and accidental whitespace in prose. Collapse repeated spaces or tabs between words to one space, remove spaces before punctuation, and use normal spacing after punctuation. These are required corrections; never return the original text unchanged while any remain.';
+        'Inspect every word and character before deciding the text is correct. Fix obvious typos and accidental whitespace in prose. Collapse repeated spaces or tabs between words to one space, remove spaces before punctuation, and use normal spacing after punctuation. Remove trailing spaces or tabs before every newline, including inside fenced code blocks. These are required corrections; never return the original text unchanged while any remain.';
+
+    const BITCOIN_CORE_REVIEW_PROSE_RULES = `Bitcoin Core prose preferences:
+- Use concise, plain, concrete language. Keep only details that change reviewer understanding.
+- Lead with the reviewer-visible behavior, problem, or reason before implementation details.
+- Keep related context and consequences together. Do not make concise prose choppy.
+- Avoid formulaic contrasts such as "not X, but Y". State the positive claim directly and mention a non-goal only when it matters.
+- Avoid abstract words such as "boundary", "invariant", "hardening", or "contract" unless the text names the concrete API, lifetime, call path, or behavior.
+- When writing a PR description or commit message, keep each complete sentence on one physical line when practical. Do not hard-wrap inside a sentence or add blank lines between related sentences.
+- Use \`backticks\` for code symbols, paths, commands, options, and other code-like names.
+- Ground factual claims in the supplied diff, comments, tests, logs, or links. State what evidence is missing instead of guessing.`;
+
+    const BITCOIN_CORE_PR_DESCRIPTION_RULES = `Bitcoin Core PR-description rules:
+- Put the concrete problem before the fix and optimize for deletion before adding prose.
+- Use compact inline prefixes such as \`**Problem:** Text\` and \`**Fix:** Text\` when that structure already exists or clearly helps. Do not put those labels on their own lines and do not use Markdown headings for PR-body structure.
+- Do not invent sections only to impose a template. Omit routine testing or verification sections unless the command or result is useful review evidence.
+- Use short references such as \`#123\` for the same repository. Use the full owner/repository form only for cross-repository references.
+- Do not use short commit hashes as reviewer-facing evidence. Prefer a GitHub link or a full 40-character hash.
+- Recheck file names, symbols, behavior claims, and commit counts against the supplied patch and commit list.
+- Return only the PR body. The title has a separate proofreading control.`;
+
+    const BITCOIN_CORE_COMMIT_MESSAGE_RULES = `Bitcoin Core commit-message rules:
+- Use a subject in the form \`component: lowercase imperative summary\` unless the first word must be a proper noun, acronym, option, RPC, or code identifier.
+- Explain the current problem or reviewer-facing reason before the implementation. Keep the body higher-level than the diff.
+- Prefer one to three short paragraphs without artificial Problem, Approach, Risk, or Tests headings.
+- Mention tests only when the commit changes tests or the result itself matters to review. Do not add a routine tests-run footer.
+- Use short references such as \`#123\` for the same repository and a GitHub link or full 40-character hash for commit evidence.
+- Preserve valid trailers. Never add AI tool or model attribution.`;
+
+    const BITCOIN_CORE_PR_TITLE_RULES = `Bitcoin Core PR-title rules:
+- Prefer \`component: specific summary\` when the component is clear.
+- Keep the component prefix lowercase. Start the text after the prefix with lowercase unless it begins with a proper noun, acronym, option, RPC, or code identifier.
+- Name the concrete change or old pattern being removed. Avoid vague wording.`;
 
     const DEFAULT_INSTRUCTIONS = {
         chat: `Answer questions about the current page directly and concisely.
@@ -4862,21 +4894,21 @@ Add context, implications, and the minimum necessary technical detail.`,
 Then write "Worthwhile:" with whether the change seems desirable and worth the complexity/maintenance cost. Mention simpler alternatives and opportunity cost. If unclear, ask 2 specific questions.
 Then write "Assessment:" with a TENTATIVE view of whether it looks safe to merge and the top risk areas. Do not give a final verdict or write a review comment.
 Then write "Findings:" where each finding is tagged [BLOCKING], [SHOULD-FIX], or [NIT]:
-- [BLOCKING]: security, correctness, consensus — must fix before merge
+- [BLOCKING]: security, correctness, or consensus issue that must be fixed before merge
 - [SHOULD-FIX]: bugs, significant issues, strong recommendations
 - [NIT]: style, minor preference, optional
 Each finding starts with the tag and \`file:line\` when applicable, then "Issue:", and when possible "Fix:" with the smallest safe change.
 Call out anything that could affect consensus behavior, determinism, validation, mempool policy, or P2P behavior.
 Check for: integer overflows, input validation gaps, DoS vectors (unbounded memory/CPU), lock ordering vs annotations, incorrect \`AssertLockHeld\`, missing \`EXCLUSIVE_LOCKS_REQUIRED\`.
 If performance or complexity could regress, state the worst-case and what input triggers it.
-Then write "Dev-notes:" Flag any violations of Bitcoin Core developer-notes conventions: naming (snake_case vars, m_ members, PascalCase functions), no \`using namespace\`, no \`std::map::operator[]\` for reads, \`Mutex\` over \`RecursiveMutex\`, proper assertion types (\`Assert\` vs \`CHECK_NONFATAL\` vs \`Assume\`), logging levels (\`LogDebug\` vs \`LogInfo\`). Skip if nothing to flag.
+Then write "Dev-notes:" Flag any violations of Bitcoin Core developer-notes conventions: naming (snake_case variables, m_ members, UpperCamelCase functions), no \`using namespace\`, no \`std::map::operator[]\` for reads, \`Mutex\` over \`RecursiveMutex\`, proper assertion types (\`Assert\` vs \`CHECK_NONFATAL\` vs \`Assume\`), logging levels (\`LogDebug\` vs \`LogInfo\`). Skip if nothing to flag.
 Then write "Design:" stepping back from line-by-line to analyze the approach:
 - Threat model: what problem or attack does this address? What is the residual risk with and without the change?
-- Robustness: walk through failure modes. What assumptions does the approach rely on — are they guaranteed or conventional? Could upstream dependency changes (Tor, OS, libs) break it?
-- Alternatives: is there a simpler or more robust way? If the current approach is best, say why alternatives are worse. Be specific — name scenarios, not vague "could go wrong."
+- Failure modes: what assumptions does the approach rely on, and are they guaranteed or only conventional? Could upstream dependency changes (Tor, the OS, or libraries) break it?
+- Alternatives: is there a simpler approach? If the current approach is best, explain the concrete tradeoff. Name specific scenarios instead of saying something "could go wrong."
 - Precedent: does this establish a pattern future PRs will follow? Is that a pattern we want?
 Then write "Tests:" with concrete tests or assertions to add (unit, functional, fuzz, sanitizer, or log/assumption checks) and mention gaps in coverage.
-Then write "Questions:" with 3 to 7 high-leverage questions to quiz a human reviewer while they step through commits. Focus on areas where targeted human attention would find things generic analysis misses.
+Then write "Questions:" with up to 5 high-value questions for a human reviewer. Skip this section when no grounded question would improve the review.
 Avoid false positives: every finding must name a specific scenario, input, or code path. Do not flag hypothetical concerns you cannot ground in the actual diff.
 If you propose code, do not output a diff. Show a minimal self-contained snippet or a full function. Keep changes minimal.`,
         commits: `For each commit, output one line in this format:
@@ -4889,15 +4921,15 @@ Mention test implications when relevant.`,
 Use the format "Line N: ..." for each note.
 For each note, state what is wrong or surprising, the impact, and the smallest safe fix.
 Be aggressive about flagging UB, lifetime and ownership, alignment, integer overflow, signedness, endianness, locking, atomic ordering, and error-handling issues.
-If something is correct but subtle, state the invariant it relies on and what would break it.
+If something is correct but subtle, state the concrete condition, object lifetime, or call path it relies on and what would break it.
 For scripted-diffs, also check overlapping patterns (longer token first) and GNU-only \`sed\` features.
 For benchmarks, also flag work too small relative to fixture setup and prefer representative larger inputs.
 Do not output a diff. If code is needed, show a minimal snippet or a full function.`,
         pseudocode: `For each commit, produce a structured review aid as a JSON object with these fields:
-"summary": One sentence, outside-in: first name the subsystem/area being changed, then what the commit does and why. Use \`backticks\` for every symbol name. Do NOT repeat the commit message -- add context the message omits.
+"summary": One sentence, outside-in: first name the subsystem/area being changed, then what the commit does and why. Use \`backticks\` for every symbol name. Do NOT repeat the commit message; add context the message omits.
 "context": Brief background a reviewer needs BEFORE reading the diff. Explain every abbreviation, protocol concept, or subsystem name that is not universally known (e.g. what IBD is, what the UTXO set is, what CCoinsView does). One short sentence per concept. Skip if the commit is trivial.
 "files_overview": For each modified file, one sentence explaining what role it plays in Bitcoin Core and what this commit changes in it. Format: "\`path/to/file.cpp\`: <role in the project>. <what changed here>." Use {{annotations||...}} for subsystem names. Skip test files unless the test logic itself is interesting. Skip if only 1 file changed.
-"why_care": 2 to 4 sentences, written for a reviewer at elevator-pitch level. Explain the pain or friction the author is likely trying to remove, how that pain shows up in practice, and why reviewing this well makes later work or maintenance easier. Stay top-down: no file lists, no line-level mechanics, no implementation details. Mention symbols only if unavoidable.
+"why_care": 2 to 4 sentences explaining why the change matters to a reviewer before implementation details. Explain the concrete problem the author is likely trying to remove, how it appears in practice, and why careful review matters. Stay top-down: no file lists, no line-level mechanics, no implementation details. Mention symbols only if unavoidable.
 "pseudocode": Very high-level Python-like pseudocode that conveys only the concept/gist (not line-by-line). Show only the new behavior and the main data flow. Omit glue. Omit implementation details: helper structure, condition-by-condition logic, error plumbing, logging, includes, boilerplate, and trivial iteration. Collapse details aggressively into a good abstraction. Keep original identifiers only when they matter (with \`backticks\`). Use # comments for WHY, not WHAT. If purely mechanical, say "# mechanical: rename/move/format" in one line.
 "verify_repro": Optional. The simplest practical way to verify or reproduce the commit. Prefer minimal commands, test names, or 2 to 4 short manual steps. If nothing obvious exists, use an empty string. Do not invent heavy setups.
 "performance_simplifications": Short notes on performance and simplification opportunities. Mention any obvious perf regressions/improvements (extra copies/allocations, complexity changes) and any clear simplifications (reuse existing helpers/types, better data structure choice, remove duplication). Empty string if none.
@@ -4905,7 +4937,10 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 "message_check": "OK" if commit message matches the diff. Otherwise, one sentence describing the mismatch.
 "depends": One sentence with \`backticks\` for symbols: what prior commit this builds on and what it enables next. "standalone" if independent.
 
-INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate technical terms and jargon that a competent C++ developer reviewing Bitcoin Core might need a quick refresher on. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}} or {{CCoinsViewCache||in-memory write-through cache over the UTXO database}}. Annotate liberally: class names, protocol terms, acronyms, subsystem names, non-obvious flags. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.`,
+INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate only unfamiliar terms that a competent C++ developer needs to understand the review. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}}. Do not annotate ordinary class names, symbols, or project terms that the surrounding text already explains. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.
+
+Use these rules when evaluating message_check:
+${BITCOIN_CORE_COMMIT_MESSAGE_RULES}`,
         reimplementation: `Write the actual self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
 Internal generation rule: answer with the ready-to-paste target-agent prompt itself. Keep generation-only checks out of the prompt you output, including checks about whether the text is a prompt.
@@ -4929,6 +4964,7 @@ Produce a local reproducer prompt whose only target artifact is useful independe
 - Commit-by-commit target jobs may use commit ordinals and short high-level titles inferred from the source, but they must be written as exact technical outcomes to rediscover, not as copied commit messages or a line-by-line patch recipe.
 - Leave room for the local agent to discover a different valid design.
 - Require grounded claims. The local agent uses its chosen no-peek base tree, tests, build errors, logs, and project documentation as evidence, and marks missing evidence instead of guessing.
+- Preserve unrelated user work, keep each implementation change as small as the target outcome allows, and verify the live branch before making stack-shape claims.
 - Do not tell the local agent to push. Keep history changes local and ask before destructive or remote-affecting operations.
 
 Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
@@ -4947,6 +4983,9 @@ Start by stating the exact or inferred number of local commits to create from th
 
 ## Local Commit Expectations
 How to keep the local branch reviewable: create exactly the stated number of implementation commits when the commit metadata is complete, tests that document existing behavior before a refactor should come first, real reproducers should live with fixes, each commit should compile or clearly explain why it cannot, and commit messages should explain the problem and result. After the implementation is correct and finished, add a deliberately excessive test phase as new local commits on top: unit tests, functional tests, fuzz targets or fuzz harness extensions, regression tests, boundary cases, failure modes, weird inputs, and every relevant corner case the project can reasonably support. Run those tests, fix any failures in additional local commits on top, and keep going until the feature is already ridiculously well tested rather than merely adequately covered.
+
+Carry these commit-message preferences into the generated prompt:
+${BITCOIN_CORE_COMMIT_MESSAGE_RULES}
 
 ## Verification And Evidence
 The checks, tests, logs, benchmarks, or manual validation the target agent should produce, plus how to report missing evidence without guessing. Require exact commands and results for the implementation checks and for the excessive test phase, including which unit, functional, fuzz, sanitizer, or manual edge-case runs passed, failed, were fixed, or could not run.
@@ -4976,6 +5015,7 @@ Produce a prompt for the step after the no-peek local reproducer exists and the 
 - Every difference between the compared or replayed local implementation and the actual PR — including nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations — becomes its own small suggestion commit. The bar is "the local version is a plausible alternative", not "the local version is clearly better"; the user filters the stack downstream.
 - Beyond local-vs-PR divergences, the generated prompt must ask the target agent to read the new code introduced by the PR with a code-reviewer's eye and propose a separate small commit for every plausible improvement: inverting contrived \`if\` conditions, replacing a custom helper with an existing simpler method, fixing typos in new code or in new commit messages, choosing a more idiomatic C++ or Python construct, deduplicating repetitive blocks in newly added code, tightening naming, and adding test coverage for newly introduced code paths.
 - Strongly prefer over-suggesting to under-suggesting. Coming up with a new commit costs the user far more than skipping a proposed one, so when in doubt, propose. The only commits the prompt must avoid are forced/empty/invalid ones, ones not grounded in the actual PR code, and ones whose entire content is "the PR is better" (those are reported in prose, not committed).
+- Verify every suggestion against the live PR, comments, tests, and branch shape before committing it. If evidence undercuts the premise, drop the suggestion instead of defending it or preserving a stack count.
 - The generated prompt should tell the target agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading. Encourage the agent to cover every angle a proofreader might check (correctness, safety, idiom, repetition, naming, typos, commit-message accuracy, test coverage, edge cases) rather than self-filtering to what it personally considers most important.
 - One commit equals one issue equals one PR comment. Each suggestion commit covers a single concrete point the agent would write as one inline review comment, and its patch is the smallest possible change that satisfies that single point. If the agent finds two issues, even in the same hunk, that becomes two commits — never bundle.
 - Suggestion commit messages must be phrased like actual PR code review comments: concrete problem first, why it matters, smallest suggested change, and exact GitHub code/review URLs proving the claim.
@@ -4986,6 +5026,7 @@ Produce a prompt for the step after the no-peek local reproducer exists and the 
 - One commit per issue, always. Each suggestion commit reflects a single PR comment the agent would have written. Prefer many small commits over one combined commit, even when two suggestions touch the same file or hunk. Do not let "is it worth a commit?" reasoning suppress nits or stylistic deltas — those still get their own commits.
 - Do not hide uncertainty behind confident prose. Separate evidence from inference.
 - Do not claim the PR is wrong unless the local diff, tests, logs, comments, or GitHub URLs support that claim.
+- Preserve unrelated user work and keep the smallest effective patch for each suggestion.
 - Ask before destructive or remote-affecting operations.
 
 Output exactly one prompt, ready to paste into a local coding agent. The prompt must contain these sections:
@@ -5107,8 +5148,8 @@ Keep the original sentence structure unless separating clauses clearly improves 
 If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages, or thread context, fix it minimally. Only correct objective errors, not opinions.
 Make the reply make sense in light of the commit messages, current thread, and surrounding text (if any). If the surrounding thread or nearby text has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
 Remove accidental duplication: repeated words, repeated phrases or sentences, and repeated points that nearby text or thread context already covers.
-Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose into a natural line unless the break is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or an intentional hard break.
-When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token.
+Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or an intentional hard break.
+When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.
 Keep replies friendly and professional without making them more verbose or less direct.
 Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it by rephrasing as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
@@ -5203,14 +5244,15 @@ Scripted-diff commits (mechanical renames) should be verifiable independently an
 For benchmarks and performance changes, note when inputs may not be representative or when harness overhead can dominate measurement. Prefer deterministic, reproducible setups. When benchmark input data changes intentionally, expect and explain baseline impact.
 Commit messages should describe the problem first, then the change. Prefer short narrative prose over lists. Use backticks around symbol and command names. Avoid forward references to future commits.
 Track scope carefully: mechanical renames should not be mixed with behavior changes, benchmark input changes should be separate from API changes, build-system fixes should be coupled with the functional change they unblock.
-Bitcoin Core developer-notes conventions to watch for: snake_case variables, m_ member prefix, g_ global prefix, PascalCase functions, no using namespace, no std::map::operator[] for reads (use .find()), Mutex over RecursiveMutex, explicit constructors, std::optional over sentinels, named boolean args (Foo(/*flag=*/true)).
+	Bitcoin Core developer-notes conventions to watch for: snake_case variables, m_ member prefix, g_ global prefix, UpperCamelCase functions, no using namespace, no std::map::operator[] for reads (use .find()), Mutex over RecursiveMutex, explicit constructors, std::optional over sentinels, named boolean args (Foo(/*flag=*/true)).
 Prefer small, local fixes over refactors. Avoid speculative redesigns.
 When there is a tradeoff, give the best argument for and against, then ask the single most important follow-up question.
 Do not self-censor minor issues. Label them as minor if needed, but still report them.
-Always present problems before solutions, questions before answers. Explain outside-in: start at the highest level, briefly introduce any new concept or term before using it, then progressively zoom into the problem until it is clear. Only after the problem is understood, explain why it matters. Only then present the solution.
-Use \`backticks\` for every symbol, function, type, variable, file, and class name (e.g. "Guards \`SetStdinEcho\` with \`StdinTerminal()\` early return"). Explain every abbreviation and domain-specific term on first use.
+Present concrete problems before solutions. Ask a question only when evidence is missing or a reviewer decision is needed. Explain outside-in: start at the highest level, introduce a new concept only when it is needed, and then move into the relevant code.
+Use \`backticks\` for every symbol, function, type, variable, file, and class name (e.g. "Guards \`SetStdinEcho\` with \`StdinTerminal()\` early return"). Briefly define an unfamiliar abbreviation or domain term when the explanation needs it.
 When your output appears next to the original text (commit message, PR description, or user comment), do NOT repeat what the original already says. Add what is missing: context, implications, risks, or background the reader needs.
 Task-specific instructions and requested output schemas override these default style rules.
+${BITCOIN_CORE_REVIEW_PROSE_RULES}
 Ground factual claims in the provided page context, diff, comments, or clearly labeled inference. If evidence is missing, say what is missing instead of guessing.
 Before finalizing, check correctness, grounding, and formatting against the requested output contract.
 Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em dashes. Use bullets or numbered lists only when the task's output contract asks for them or they materially improve scanability.`;
@@ -12053,14 +12095,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const fenceLanguageRule =
                     '- For fenced code blocks: check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.';
                 const lineWrappingRule =
-                    '- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose into a natural line unless the break is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token.';
+                    '- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.';
                 const fenceFormattingRule =
                     '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
                 const prDescriptionRule = isPRBody
-                    ? '- For PR descriptions: match concise Bitcoin Core contributor style. Pay special attention to renamed files, changed variable/function names, removed code, incorrect behavior descriptions, outdated file paths, wrong commit counts.'
+                    ? BITCOIN_CORE_PR_DESCRIPTION_RULES
                     : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- ${PROOFREAD_MECHANICAL_RULE}\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. Join prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -12494,7 +12536,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 commitMessages,
                 diff: ctx.diff,
             });
-            const system = `${SYSTEM_BASE}\n\nYou are proofreading another author's GitHub PR description in read-only mode. ${extra}\n\nRULES:\n- Return only the corrected PR description. No preamble, no explanation, no markdown fence.\n- Make the smallest useful edits so the description matches the actual change.\n- Use the PR patch and all commit messages to fix objective inaccuracies, outdated names, stale file paths, wrong behavior claims, and duplicated points.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not invent new sections, review advice, risk lists, tests, or claims not supported by the patch.\n- Preserve markdown structure unless a small wording or heading change is needed for clarity.\n- If the description is already accurate and clear, return it unchanged.`;
+            const system = `${SYSTEM_BASE}\n\nYou are proofreading another author's GitHub PR description in read-only mode. ${extra}\n\n${BITCOIN_CORE_PR_DESCRIPTION_RULES}\n\nRULES:\n- Return only the corrected PR description. No preamble, no explanation, no markdown fence.\n- Make the smallest useful edits so the description matches the actual change.\n- Use the PR patch and all commit messages to fix objective inaccuracies, outdated names, stale file paths, wrong behavior claims, and duplicated points.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not invent new sections, review advice, risk lists, tests, or claims not supported by the patch.\n- Preserve markdown structure unless a small wording or heading change is needed for clarity.\n- If the description is already accurate and clear, return it unchanged.`;
             const user = [
                 wrapPromptBlock('ORIGINAL PR DESCRIPTION', original),
                 context ? `Read-only grounding context:\n\n${context}` : '',
@@ -12581,7 +12623,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 diff: commitPatch || ctx.diff,
                 diffLabel: commitPatch ? 'CURRENT COMMIT PATCH' : 'FULL PR PATCH',
             });
-            const system = `${SYSTEM_BASE}\n\nYou are proofreading GitHub PR commit-message text in read-only mode. ${extra}\n\nRULES:\n- Return the full corrected commit-message text only. No preamble, no explanation, no markdown fence.\n- Preserve commit order, separators, and every \`COMMIT <sha>\` label exactly.\n- Make the smallest useful edits so each message reflects the code it describes and the PR patch as a whole.\n- Fix grammar, spelling, duplicated wording, outdated names, stale file paths, and objective claims contradicted by the patch.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not rewrite the commit history, add new commits, or invent details not supported by the patch.\n- If the messages are already accurate and clear, return them unchanged.`;
+            const system = `${SYSTEM_BASE}\n\nYou are proofreading GitHub PR commit-message text in read-only mode. ${extra}\n\n${BITCOIN_CORE_COMMIT_MESSAGE_RULES}\n\nRULES:\n- Return the full corrected commit-message text only. No preamble, no explanation, no markdown fence.\n- Preserve commit order, separators, and every \`COMMIT <sha>\` label exactly.\n- Make the smallest useful edits so each message reflects the code it describes and the PR patch as a whole.\n- Fix grammar, spelling, duplicated wording, outdated names, stale file paths, and objective claims contradicted by the patch.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not rewrite the commit history, add new commits, or invent details not supported by the patch.\n- If the messages are already accurate and clear, return them unchanged.`;
             const user = [
                 wrapPromptBlock('ORIGINAL COMMIT MESSAGES', original),
                 context ? `Read-only grounding context:\n\n${context}` : '',
@@ -16635,8 +16677,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 : '';
 
             const system = generateTitle
-                ? `You are drafting a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
-                : `You are proofreading a GitHub Pull Request title.\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If the title has a component prefix like \"node:\", keep it unchanged.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
+                ? `You are drafting a GitHub Pull Request title.\n\n${BITCOIN_CORE_PR_TITLE_RULES}\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
+                : `You are proofreading a GitHub Pull Request title.\n\n${BITCOIN_CORE_PR_TITLE_RULES}\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, and filenames.\n- Preserve the component choice and colon, but correct the component prefix to lowercase.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
             const user = generateTitle
                 ? `PR title is empty. Propose a concise title from the context below.${ctxBlock}`
                 : `Original title:\n${original}${ctxBlock}`;
@@ -21060,7 +21102,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
             }
 
-            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}\n\nReturn a concise markdown answer only.`;
+            const artifactRules = mode === 'proofread' && ctx.isPRDescription
+                ? `\n\n${BITCOIN_CORE_PR_DESCRIPTION_RULES}`
+                : '';
+            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}${artifactRules}\n\nReturn a concise markdown answer only.`;
             let user = '';
             if (mode === 'factcheck') {
                 const diff = prCtx?.diff || '';
@@ -25934,6 +25979,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             DEFAULT_INSTRUCTIONS.proofread.includes('never return the original text unchanged while any remain'),
             'does not allow a false no-op result',
         );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('Remove trailing spaces or tabs before every newline'),
+            'requires trailing whitespace removal',
+        );
     });
 
     ackTest('custom proofread instructions retain required mechanical checks', () => {
@@ -25990,6 +26039,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             DEFAULT_INSTRUCTIONS.proofread.includes('shell assignment'),
             'calls out split shell assignments explicitly',
         );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('keep each complete sentence on one physical line'),
+            'keeps complete prose sentences on physical lines',
+        );
+    });
+
+    ackTest('Bitcoin Core prose rules stay concrete and artifact-specific', () => {
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('reviewer-visible behavior'), 'leads with behavior');
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('Do not hard-wrap inside a sentence'), 'avoids hard wraps');
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('not X, but Y'), 'rejects formulaic contrasts');
+        ackAssert(BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('**Problem:** Text'), 'uses inline Problem prefix');
+        ackAssert(BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('Omit routine testing'), 'omits routine PR testing');
+        ackAssert(BITCOIN_CORE_COMMIT_MESSAGE_RULES.includes('lowercase imperative summary'), 'checks subjects');
+        ackAssert(BITCOIN_CORE_COMMIT_MESSAGE_RULES.includes('routine tests-run footer'), 'omits test footers');
+        ackAssert(BITCOIN_CORE_PR_TITLE_RULES.includes('prefix lowercase'), 'checks title prefix case');
     });
 
     ackTest('proofread instructions preserve quoted text', () => {
@@ -26703,6 +26767,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(!runFn.includes('fetchComparePatchForDraftPR'), 'does not fetch compare patches for title generation');
         ackAssert(!runFn.includes('Draft PR title is empty'), 'does not expose compare-page draft title prompting');
+    });
+
+    ackTest('PR title drafting and proofreading use Bitcoin Core title rules', () => {
+        const runFn = _ackSource.slice(
+            _ackSource.indexOf('async function runProofreadOnPRTitle'),
+            _ackSource.indexOf('function addQuickCommentActions'),
+        );
+        ackEq(
+            (runFn.match(/\$\{BITCOIN_CORE_PR_TITLE_RULES\}/g) || []).length,
+            2,
+            'applies title rules to generated and existing titles',
+        );
     });
 
     ackTest('parseCommitsFromPage falls back to SSR commits on compare pages', () => {
@@ -31028,6 +31104,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('FULL PR PATCH'), 'includes PR patch context');
         ackAssert(fn.includes('Make the smallest useful edits'), 'prompt asks for minimal edits');
         ackAssert(fn.includes('simple, plain language'), 'prompt prefers simple language');
+        ackAssert(
+            fn.includes('${BITCOIN_CORE_PR_DESCRIPTION_RULES}'),
+            'applies Bitcoin Core PR-description rules',
+        );
         ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
 
@@ -31045,6 +31125,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("diffLabel: commitPatch ? 'CURRENT COMMIT PATCH'"), 'uses current commit patch as context');
         ackAssert(fn.includes('reflects the code it describes'), 'checks messages against changes');
         ackAssert(fn.includes('Preserve commit order'), 'preserves commit order');
+        ackAssert(
+            fn.includes('${BITCOIN_CORE_COMMIT_MESSAGE_RULES}'),
+            'applies Bitcoin Core commit-message rules',
+        );
         ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
 
@@ -31354,8 +31438,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'keeps block content below heading-style prefixes',
         );
         ackAssert(
-            makePromptSection.includes('concise Bitcoin Core contributor style'),
-            'PR descriptions still get Bitcoin Core style guidance',
+            makePromptSection.includes('BITCOIN_CORE_PR_DESCRIPTION_RULES') &&
+                BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('optimize for deletion'),
+            'PR descriptions get shared Bitcoin Core style guidance',
         );
         ackAssert(
             makePromptSection.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
@@ -32467,6 +32552,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
         ackAssert(fn.includes('${PROOFREAD_MECHANICAL_RULE}'), 'selection proofread includes required mechanical checks');
+        ackAssert(
+            fn.includes("mode === 'proofread' && ctx.isPRDescription") &&
+                fn.includes('${BITCOIN_CORE_PR_DESCRIPTION_RULES}'),
+            'selected PR-description prose uses Bitcoin Core PR rules',
+        );
         ackAssert(
             fn.includes("{ skipCache: mode === 'proofread' }"),
             'selection proofreading bypasses the general prompt cache',
@@ -37184,7 +37274,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(prompt.includes('{{term||short explanation}}'), 'documents annotation syntax');
         ackAssert(prompt.includes('INLINE ANNOTATIONS'), 'has annotation section');
         ackAssert(prompt.includes('{{IBD||'), 'gives IBD example');
-        ackAssert(prompt.includes('{{CCoinsViewCache||'), 'gives CCoinsViewCache example');
+        ackAssert(prompt.includes('annotate only unfamiliar terms'), 'limits annotations to terms that need them');
+        ackAssert(prompt.includes('Do not annotate ordinary class names'), 'does not over-annotate symbols');
         ackAssert(
             prompt.includes('Do NOT annotate in the pseudocode field'),
             'excludes pseudocode field from annotations',
@@ -37546,6 +37637,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(prompt.includes('unit tests, functional tests, fuzz targets'), 'asks for unit, functional, and fuzz coverage');
         ackAssert(prompt.includes('ridiculously well tested'), 'sets the requested high test-coverage bar');
         ackAssert(prompt.includes('additional local commits on top'), 'keeps test fixes as follow-up commits');
+        ackAssert(prompt.includes('Bitcoin Core commit-message rules'), 'carries commit-message preferences');
+        ackAssert(prompt.includes('Preserve unrelated user work'), 'preserves unrelated live work');
         ackAssert(prompt.includes('Follow-Up Handoff Notes'), 'mentions follow-up handoff shape');
         ackAssert(prompt.includes('context window'), 'handles context-window overflow');
         ackAssert(prompt.includes('treat the supplied source as an index of the problem'), 'treats truncated context as problem index');
@@ -37729,6 +37822,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'lowers inclusion bar to plausible alternatives',
         );
         ackAssert(prompt.includes('Do not tell the local agent to push'), 'keeps changes local');
+        ackAssert(prompt.includes('If evidence undercuts the premise, drop the suggestion'), 'drops weak suggestions');
+        ackAssert(prompt.includes('Preserve unrelated user work'), 'preserves unrelated work');
         ackAssert(prompt.includes('## Step 1 - Inspect And Split The Actual PR'), 'has actual PR split step');
         ackAssert(prompt.includes('## Step 2 - Rebase The Local Reproducer'), 'has rebase step');
         ackAssert(prompt.includes('## Step 3 - Add Suggestion Commits'), 'has suggestion step');
@@ -37755,6 +37850,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             prompt.includes('over-suggesting to under-suggesting'),
             'tells agent to err on the side of over-suggesting',
+        );
+        ackAssert(
+            prompt.includes('Verify every suggestion against the live PR'),
+            'verifies suggestions before committing them',
         );
         ackAssert(
             prompt.includes('another capable LLM for proofreading'),
