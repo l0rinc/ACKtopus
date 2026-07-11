@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.215
+// @version      1.216
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22616,10 +22616,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    function shouldRefreshExistingConversationEnhancements(path = location.pathname) {
+        return isPRConversationPage(path) || isIssuePage(path);
+    }
+
+    function refreshExistingConversationEnhancements() {
+        if (!shouldRefreshExistingConversationEnhancements()) return;
+        const ctx = currentInjectContext();
+        runRootInjectors(document, ctx);
+        runDocInjectors(ctx);
+    }
+
     // --- Inject ---
 
     function inject() {
-        if (document.getElementById(BUTTON_CONTAINER_ID)) return;
+        if (document.getElementById(BUTTON_CONTAINER_ID)) {
+            // popstate can update the URL before Turbo restores the conversation DOM.
+            // The later render/load events must still process that restored content.
+            refreshExistingConversationEnhancements();
+            return;
+        }
         const onPR = isPRPage();
         const onCompare = isComparePage();
         const ctx = { onPR, onCompare, onToolbar: isToolbarPage() };
@@ -29700,6 +29716,37 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(block.includes('lastInjectedPath = null'), 'clears injected path cache before reinject');
         ackAssert(block.includes('tryInject()'), 'forces fresh reinject on pageshow');
         ackAssert(block.includes('addFloatingCommitNav({ immediate: true })'), 'rebuilds floating commit nav immediately on pageshow');
+    });
+
+    ackTest('existing toolbar refreshes conversation enhancements after Turbo restore', () => {
+        ackEq(shouldRefreshExistingConversationEnhancements('/owner/repo/pull/123'), true, 'refreshes PR conversation');
+        ackEq(shouldRefreshExistingConversationEnhancements('/owner/repo/issues/123'), true, 'refreshes issue conversation');
+        ackEq(
+            shouldRefreshExistingConversationEnhancements('/owner/repo/pull/123/changes'),
+            false,
+            'does not rescan bulk PR diff',
+        );
+        ackEq(
+            shouldRefreshExistingConversationEnhancements('/owner/repo/pull/123/commits'),
+            false,
+            'does not rescan commit list',
+        );
+
+        const source = _ackSource;
+        const refreshFn = sourceSection(
+            source,
+            'function refreshExistingConversationEnhancements',
+            '// --- Inject ---',
+        );
+        ackAssert(refreshFn.includes('runRootInjectors(document, ctx)'), 'reruns root injectors on restored DOM');
+        ackAssert(refreshFn.includes('runDocInjectors(ctx)'), 'reruns document injectors on restored DOM');
+
+        const injectStart = source.indexOf('function inject()');
+        const injectSetup = source.slice(injectStart, source.indexOf('const onPR = isPRPage()', injectStart));
+        ackAssert(
+            injectSetup.includes('refreshExistingConversationEnhancements()'),
+            'existing-toolbar path refreshes page enhancements before returning',
+        );
     });
 
     ackTest('floating commit nav matches conversation, /changes/SHA and /commits routes', () => {
