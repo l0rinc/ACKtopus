@@ -436,7 +436,7 @@
             fmt: () => {
                 const b = prFileCategories?.bench;
                 return b?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j -t bench_bitcoin && build/bin/bench_bitcoin --filter='${b.join('|')}' -min-time=1000`
+                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter='${b.join('|')}' -min-time=1000`
                     : null;
             },
         },
@@ -450,7 +450,7 @@
             fmt: () => {
                 const t = prFileCategories?.test;
                 return t?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j -t test_bitcoin && build/bin/test_bitcoin --run_test=${t.join(',')}`
+                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j --target test_bitcoin && build/bin/test_bitcoin --run_test=${shellQuote(t.join(','))}`
                     : null;
             },
         },
@@ -465,8 +465,8 @@
                 const f = prFileCategories?.fuzz;
                 if (!f?.length) return null;
                 const build = 'cmake --preset=libfuzzer && cmake --build build_fuzz --target fuzz -j1';
-                if (f.length === 1) return `${build} && FUZZ=${f[0]} build_fuzz/bin/fuzz -runs=10000`;
-                return `${build} && for f in ${f.join(' ')}; do FUZZ=$f build_fuzz/bin/fuzz -runs=10000; done`;
+                if (f.length === 1) return `${build} && FUZZ=${shellQuote(f[0])} build_fuzz/bin/fuzz -runs=10000`;
+                return `${build} && for f in ${f.map(shellQuote).join(' ')}; do FUZZ="$f" build_fuzz/bin/fuzz -runs=10000; done`;
             },
         },
         {
@@ -479,7 +479,7 @@
             fmt: () => {
                 const f = prFileCategories?.functional;
                 return f?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j && build/test/functional/test_runner.py ${f.join(' ')}`
+                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j && build/test/functional/test_runner.py ${f.map(shellQuote).join(' ')}`
                     : null;
             },
         },
@@ -508,7 +508,7 @@
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
                 const upstreamBase = shellQuote(`upstream/${getReviewBaseBranch()}`);
-                return `TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | "$TIDY_DIFF" -p1 -path build -j $(nproc)`;
+                return `TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | "$TIDY_DIFF" -p1 -path build -j "$(getconf _NPROCESSORS_ONLN)"`;
             },
         },
         {
@@ -24982,7 +24982,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(cmd.includes('CMAKE_CXX_COMPILER=clang++'), 'configures clang++ for tooling');
         ackAssert(cmd.includes('-p1'), 'uses -p1 (strip a/ prefix)');
         ackAssert(cmd.includes('-path build'), 'uses build path');
-        ackAssert(cmd.includes('$(nproc)'), 'uses local nproc');
+        ackAssert(cmd.includes('$(getconf _NPROCESSORS_ONLN)'), 'uses portable local CPU count');
+        ackAssert(!cmd.includes('$(nproc)'), 'does not require Linux-only nproc');
         ackAssert(cmd.includes('src/node/txdownload.cpp'), 'includes exact changed file path');
     });
 
@@ -25045,8 +25046,51 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fuzzFmt.includes('f.length === 1'), 'single fuzzer avoids loop');
         ackAssert(fuzzFmt.includes('-runs=10000'), 'fuzz has run limit for termination');
         ackAssert(fuzzFmt.includes('for f in'), 'loop uses f variable (not t)');
-        ackAssert(fuzzFmt.includes('FUZZ=$f'), 'loop body uses $f');
+        ackAssert(fuzzFmt.includes('FUZZ="$f"'), 'loop body quotes $f');
         ackAssert(!fuzzFmt.includes('./build_fuzz'), 'no ./ prefix on fuzz binary (consistency)');
+    });
+
+    ackTest('generated test commands quote PR-controlled names', () => {
+        const previous = prFileCategories;
+        try {
+            prFileCategories = {
+                test: ["odd'name_tests"],
+                fuzz: ['target;printf unsafe'],
+                functional: ['rpc test.py'],
+            };
+            const unit = SHA_FORMATS.find((f) => f.key === 'test').fmt();
+            const fuzz = SHA_FORMATS.find((f) => f.key === 'fuzz').fmt();
+            const functional = SHA_FORMATS.find((f) => f.key === 'functional').fmt();
+            ackAssert(unit.includes("--run_test='odd'\"'\"'name_tests'"), 'quotes unit suite list');
+            ackAssert(fuzz.includes("FUZZ='target;printf unsafe'"), 'quotes a single fuzz target');
+            ackAssert(functional.endsWith("'rpc test.py'"), 'quotes functional test names');
+            prFileCategories.fuzz = ['first target', 'second;target'];
+            const fuzzLoop = SHA_FORMATS.find((f) => f.key === 'fuzz').fmt();
+            ackAssert(
+                fuzzLoop.includes("for f in 'first target' 'second;target'"),
+                'quotes every fuzz target in a loop',
+            );
+            ackAssert(fuzzLoop.includes('FUZZ="$f"'), 'quotes the loop variable');
+        } finally {
+            prFileCategories = previous;
+        }
+    });
+
+    ackTest('generated CMake commands use explicit target option', () => {
+        const previous = prFileCategories;
+        try {
+            prFileCategories = { bench: ['Block'], test: ['block_tests'] };
+            ackAssert(
+                SHA_FORMATS.find((f) => f.key === 'bench').fmt().includes('--target bench_bitcoin'),
+                'benchmark build names its target',
+            );
+            ackAssert(
+                SHA_FORMATS.find((f) => f.key === 'test').fmt().includes('--target test_bitcoin'),
+                'unit-test build names its target',
+            );
+        } finally {
+            prFileCategories = previous;
+        }
     });
 
     ackTest('build commands consistently omit ./ prefix', () => {
