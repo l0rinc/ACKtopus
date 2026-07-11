@@ -195,31 +195,9 @@
     }
 
     function trimProofreadTrailingWhitespace(text) {
-        const lines = String(text || '').split('\n');
-        let inFence = false;
-        let fenceMarker = '';
-        return lines
-            .map((line, idx) => {
-                const trimmedStart = line.trimStart();
-                if (inFence) {
-                    if (trimmedStart.startsWith(fenceMarker) && trimmedStart.slice(fenceMarker.length).trim() === '') {
-                        inFence = false;
-                        fenceMarker = '';
-                    }
-                    return line; // fenced code content is never reformatted
-                }
-                const fenceMatch = trimmedStart.match(/^(`{3,}|~{3,})/);
-                if (fenceMatch) {
-                    inFence = true;
-                    fenceMarker = fenceMatch[1];
-                    return line;
-                }
-                // Two or more trailing spaces before a non-blank line are a
-                // Markdown hard break: normalize to exactly two instead of
-                // stripping, so proofreading cannot merge separated lines.
-                const isHardBreak = / {2,}$/.test(line) && line.trim() !== '' && (lines[idx + 1] || '').trim() !== '';
-                return isHardBreak ? line.replace(/[ \t]+$/, '  ') : line.replace(/[ \t]+$/, '');
-            })
+        return String(text || '')
+            .split('\n')
+            .map((line) => line.replace(/[ \t]+(\r?)$/, '$1'))
             .join('\n');
     }
 
@@ -36979,13 +36957,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(out.includes('<summary>Benchmark setup</summary>'), 'does not replace already specific summary');
     });
 
-    ackTest('postProcessProofreadMarkdown trims trailing whitespace but keeps fences and hard breaks', () => {
+    ackTest('postProcessProofreadMarkdown trims all trailing whitespace', () => {
         const input =
-            'Hard break  \nnext line\nnoise \nmessy break    \nlast line\n```bash\nprintf x \t\n```\n<details><summary>Details</summary> \n\nbody\t\n\n\n</details>   ';
+            'Former hard break  \r\nnext line\nnoise \nmessy break    \nlast line\n```bash\nprintf x \t\n```\n<details><summary>Details</summary> \n\nbody\t\n\n\n</details>   ';
         const out = postProcessProofreadMarkdown(input);
         ackEq(
             out,
-            'Hard break  \nnext line\nnoise\nmessy break  \nlast line\n```bash\nprintf x \t\n```\n<details><summary>Details</summary>\n\nbody\n</details>',
+            'Former hard break\r\nnext line\nnoise\nmessy break\nlast line\n```bash\nprintf x\n```\n<details><summary>Details</summary>\n\nbody\n</details>',
         );
     });
 
