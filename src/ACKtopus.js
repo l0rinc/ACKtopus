@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.216
+// @version      1.217
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3962,6 +3962,193 @@
         return /^\/[^/?#]+\/[^/?#]+\/pulls\/?$/.test(String(path || ''));
     }
 
+    // GitHub's list response omits diff stats. Fetch visible PRs gradually while
+    // idle, then reuse the result across list visits and full PR-context loads.
+    const PULL_REQUEST_SIZE_CACHE_TTL_MS = 30 * 60 * 1000;
+    const PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 2;
+    const pullRequestSizeQueue = [];
+    const pendingPullRequestSizes = new Map();
+    let activePullRequestSizeRequests = 0;
+    let pullRequestSizeFailureWarned = false;
+
+    function pullRequestSizeIdentity(pr) {
+        if (!pr?.owner || !pr?.repo || !/^[1-9]\d*$/.test(String(pr.pr || ''))) return '';
+        return `${pr.owner}/${pr.repo}#${pr.pr}`;
+    }
+
+    function pullRequestSizeCacheKey(pr) {
+        const identity = pullRequestSizeIdentity(pr);
+        return identity ? `ack_pr_size:${identity}` : '';
+    }
+
+    function normalizePullRequestSize(value) {
+        const additions = Number(value?.additions);
+        const deletions = Number(value?.deletions);
+        if (!Number.isSafeInteger(additions) || additions < 0) return null;
+        if (!Number.isSafeInteger(deletions) || deletions < 0) return null;
+        return { additions, deletions };
+    }
+
+    function readPullRequestSize(pr, now = Date.now()) {
+        const key = pullRequestSizeCacheKey(pr);
+        if (!key) return null;
+        const cached = GM_getValue(key, null);
+        const stats = normalizePullRequestSize(cached);
+        const ts = Number(cached?.ts);
+        if (!stats || !Number.isFinite(ts) || ts > now + 60_000 || now - ts > PULL_REQUEST_SIZE_CACHE_TTL_MS) {
+            if (cached !== null && cached !== undefined) GM_deleteValue(key);
+            return null;
+        }
+        return stats;
+    }
+
+    function rememberPullRequestSize(pr, value, now = Date.now()) {
+        const key = pullRequestSizeCacheKey(pr);
+        const stats = normalizePullRequestSize(value);
+        if (!key || !stats) return null;
+        GM_setValue(key, { ...stats, ts: now });
+        return stats;
+    }
+
+    function findPullRequestListEntries(root = document, repo = currentGitHubRepo(root)) {
+        if (!repo) return [];
+        const entries = [];
+        const seen = new Set();
+        for (const link of qsa(
+            root,
+            'a[data-hovercard-type="pull_request"][href], a[data-hovercard-url*="/pull/"][href], a[id^="issue_"][href*="/pull/"]',
+        )) {
+            let url;
+            try {
+                url = new URL(link.getAttribute('href') || '', location.origin);
+            } catch (_) {
+                continue;
+            }
+            const match = url.pathname.match(/^\/([^/?#]+)\/([^/?#]+)\/pull\/([1-9]\d*)\/?$/);
+            if (!match || `${match[1]}/${match[2]}` !== repo.repoKey) continue;
+            const pr = { owner: match[1], repo: match[2], pr: match[3] };
+            const identity = pullRequestSizeIdentity(pr);
+            if (seen.has(identity)) continue;
+            const row = link.closest(
+                '.js-issue-row, [data-testid="issue-row"], [data-testid="pull-request-row"], [role="listitem"], .Box-row',
+            );
+            if (!row) continue;
+            seen.add(identity);
+            entries.push({ identity, link, row, pr });
+        }
+        return entries;
+    }
+
+    function ensurePullRequestSizeMarker(entry) {
+        let marker = entry.row.querySelector('.ack-pr-size');
+        if (marker && marker.dataset.ackPrSizeIdentity !== entry.identity) {
+            marker.remove();
+            marker = null;
+        }
+        if (marker) return marker;
+        marker = document.createElement('span');
+        marker.className = 'ack-pr-size';
+        marker.dataset.ackPrSizeIdentity = entry.identity;
+        marker.style.display = 'none';
+        Object.assign(marker.style, {
+            gap: '5px',
+            marginLeft: '8px',
+            fontSize: '12px',
+            fontWeight: '600',
+            whiteSpace: 'nowrap',
+            verticalAlign: 'middle',
+        });
+        const metadata = entry.row.querySelector('.opened-by')?.closest('div');
+        if (metadata?.parentElement === entry.link.parentElement) metadata.insertAdjacentElement('beforebegin', marker);
+        else entry.link.insertAdjacentElement('afterend', marker);
+        return marker;
+    }
+
+    function renderPullRequestSize(marker, stats) {
+        if (!marker?.isConnected && !_ackTesting) return;
+        const normalized = normalizePullRequestSize(stats);
+        if (!normalized) return;
+        const additions = document.createElement('span');
+        additions.style.color = 'var(--fgColor-open, #3fb950)';
+        additions.textContent = `+${normalized.additions.toLocaleString('en-US')}`;
+        const deletions = document.createElement('span');
+        deletions.style.color = 'var(--fgColor-danger, #f85149)';
+        deletions.textContent = `-${normalized.deletions.toLocaleString('en-US')}`;
+        marker.replaceChildren(additions, deletions);
+        marker.style.display = 'inline-flex';
+        marker.dataset.ackPrSizeLoaded = 'true';
+        marker.title = `${normalized.additions.toLocaleString('en-US')} additions, ${normalized.deletions.toLocaleString('en-US')} deletions`;
+        marker.setAttribute('aria-label', marker.title);
+    }
+
+    function schedulePullRequestSizeQueue() {
+        if (!pullRequestSizeQueue.length) return;
+        scheduleAckBackgroundWork('pull-list-sizes', drainPullRequestSizeQueue, {
+            delayMs: 250,
+            timeoutMs: 2500,
+            reason: 'pull-list-sizes',
+        });
+    }
+
+    function drainPullRequestSizeQueue() {
+        while (
+            activePullRequestSizeRequests < PULL_REQUEST_SIZE_FETCH_CONCURRENCY &&
+            pullRequestSizeQueue.length
+        ) {
+            const item = pullRequestSizeQueue.shift();
+            if (![...item.markers].some((marker) => marker.isConnected)) {
+                pendingPullRequestSizes.delete(item.identity);
+                continue;
+            }
+            activePullRequestSizeRequests++;
+            const url = `https://api.github.com/repos/${item.pr.owner}/${item.pr.repo}/pulls/${item.pr.pr}`;
+            gmFetch(url)
+                .then((data) => rememberPullRequestSize(item.pr, data))
+                .then((stats) => {
+                    if (!stats) return;
+                    for (const marker of item.markers) renderPullRequestSize(marker, stats);
+                })
+                .catch((e) => {
+                    if (!pullRequestSizeFailureWarned && shouldWarnOptionalGitHubApiError(e)) {
+                        pullRequestSizeFailureWarned = true;
+                        console.warn('ACKtopus: failed to fetch pull request sizes:', e?.message || e);
+                    }
+                    return null;
+                })
+                .finally(() => {
+                    activePullRequestSizeRequests--;
+                    pendingPullRequestSizes.delete(item.identity);
+                    schedulePullRequestSizeQueue();
+                });
+        }
+    }
+
+    function queuePullRequestSize(entry, marker) {
+        if (marker.dataset.ackPrSizeLoaded === 'true' || marker.dataset.ackPrSizeAttempted === 'true') return;
+        marker.dataset.ackPrSizeAttempted = 'true';
+        const pending = pendingPullRequestSizes.get(entry.identity);
+        if (pending) {
+            pending.markers.add(marker);
+            return;
+        }
+        const item = { identity: entry.identity, pr: entry.pr, markers: new Set([marker]) };
+        pendingPullRequestSizes.set(entry.identity, item);
+        pullRequestSizeQueue.push(item);
+        schedulePullRequestSizeQueue();
+    }
+
+    function addPullRequestListSizes(root = document, opts = {}) {
+        const path = opts.path || location.pathname;
+        if (!isPullRequestListPage(path)) return;
+        const repo = opts.repo || parseGitHubRepoPath(path) || currentGitHubRepo(root, path);
+        for (const entry of findPullRequestListEntries(root, repo)) {
+            const marker = ensurePullRequestSizeMarker(entry);
+            const cached = readPullRequestSize(entry.pr);
+            if (cached) renderPullRequestSize(marker, cached);
+            else queuePullRequestSize(entry, marker);
+        }
+    }
+
     function normalizePullsListQuery(query, opts = {}) {
         const tokens = String(query || '')
             .trim()
@@ -4006,6 +4193,7 @@
         const path = opts.path || location.pathname;
         const href = opts.href || location.href;
         if (!isPullRequestListPage(path)) return;
+        addPullRequestListSizes(root, opts);
         const login = getCurrentGitHubLogin(root);
         if (!login) return;
         const doc = root?.ownerDocument || document;
@@ -7017,6 +7205,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
                     .join('\n');
             }
             if (prResp.status === 'fulfilled') {
+                rememberPullRequestSize(pr, prResp.value);
                 ctx.description = prResp.value.body || '';
                 ctx.title = prResp.value.title || '';
                 ctx.headSha = prResp.value.head?.sha || '';
@@ -23913,7 +24102,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         document
             .querySelectorAll(
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
-                    '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, ' +
+                    '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, ' +
                     '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
@@ -29692,6 +29881,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(cacheBlock.includes('ack-start-review-btn'), 'removes start review helper buttons');
         ackAssert(cacheBlock.includes('ack-reactor-avatars'), 'removes reactor avatar stacks');
         ackAssert(cacheBlock.includes('ack-toolbar-proofread'), 'removes toolbar proofread buttons');
+        ackAssert(cacheBlock.includes('ack-pr-size'), 'removes pull request size badges');
         ackAssert(cacheBlock.includes('ack-config-overlay'), 'removes config overlay');
         // Data attributes reset (so functions re-process on back-nav)
         ackAssert(cacheBlock.includes('data-ack-reaction-hover'), 'resets reaction hover flags');
@@ -30931,6 +31121,70 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             created.forEach((m) => m.remove());
             host.remove();
         }
+    });
+
+    ackTest('pull request list finds each PR once and renders additions and deletions', () => {
+        const host = document.createElement('div');
+        host.innerHTML = [
+            '<div id="issue_12" class="Box-row js-issue-row">',
+            '<a data-hovercard-type="pull_request" href="/octo/demo/pull/12">First PR</a>',
+            '<a class="IssueLabel">bug</a>',
+            '<div class="metadata"><span class="opened-by">#12 opened today</span></div>',
+            '<a class="mobile-overlay" href="/octo/demo/pull/12">First PR mobile link</a>',
+            '</div>',
+            '<div id="issue_13" class="Box-row js-issue-row">',
+            '<a data-hovercard-url="/octo/demo/pull/13/hovercard" href="/octo/demo/pull/13">Second PR</a>',
+            '</div>',
+            '<div class="Box-row js-issue-row">',
+            '<a data-hovercard-type="pull_request" href="/other/repo/pull/99">Other repo</a>',
+            '</div>',
+        ].join('');
+        const repo = { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' };
+        const entries = findPullRequestListEntries(host, repo);
+        ackEq(entries.length, 2, 'finds two unique PR rows');
+        ackEq(entries[0].pr.pr, '12', 'parses first PR number');
+        ackEq(entries[1].pr.pr, '13', 'parses hovercard URL variant');
+
+        const marker = ensurePullRequestSizeMarker(entries[0]);
+        renderPullRequestSize(marker, { additions: 123, deletions: 45 });
+        ackEq(marker.textContent, '+123-45', 'renders compact size counts');
+        ackEq(marker.style.display, 'inline-flex', 'shows loaded size marker');
+        ackAssert(marker.title.includes('123 additions'), 'describes additions in tooltip');
+        ackAssert(marker.previousElementSibling?.classList.contains('IssueLabel'), 'places size after title labels');
+        ackAssert(marker.nextElementSibling?.classList.contains('metadata'), 'places size before PR metadata line');
+    });
+
+    ackTest('pull request size cache expires and rejects invalid counts', () => {
+        const pr = { owner: 'octo', repo: 'demo', pr: '12' };
+        const key = pullRequestSizeCacheKey(pr);
+        const old = GM_getValue(key, null);
+        try {
+            ackEq(rememberPullRequestSize(pr, { additions: 7, deletions: 3 }, 10_000)?.additions, 7);
+            ackDeepEq(readPullRequestSize(pr, 10_001), { additions: 7, deletions: 3 });
+            ackEq(readPullRequestSize(pr, 10_000 + PULL_REQUEST_SIZE_CACHE_TTL_MS + 1), null, 'expires stale size');
+            ackEq(rememberPullRequestSize(pr, { additions: -1, deletions: 3 }), null, 'rejects negative count');
+            ackEq(rememberPullRequestSize(pr, { additions: 1.5, deletions: 3 }), null, 'rejects fractional count');
+        } finally {
+            if (old === null || old === undefined) GM_deleteValue(key);
+            else GM_setValue(key, old);
+        }
+    });
+
+    ackTest('pull request sizes load through a bounded idle queue before Mine-filter requirements', () => {
+        const source = _ackSource;
+        const queueSection = sourceSection(
+            source,
+            'const PULL_REQUEST_SIZE_CACHE_TTL_MS',
+            'function normalizePullsListQuery',
+        );
+        ackAssert(queueSection.includes('PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 2'), 'limits requests to two at a time');
+        ackAssert(queueSection.includes("scheduleAckBackgroundWork('pull-list-sizes'"), 'uses idle background scheduler');
+        ackAssert(queueSection.includes('readPullRequestSize(entry.pr)'), 'uses persistent cache before fetching');
+        const enhancer = sourceSection(_ackSource, 'function enhancePullRequestListPage', 'function isComparePullRequestButton');
+        ackAssert(
+            enhancer.indexOf('addPullRequestListSizes(root, opts)') < enhancer.indexOf('const login = getCurrentGitHubLogin(root)'),
+            'queues sizes without waiting for current-user or filter controls',
+        );
     });
 
     ackTest('repo mirror config maps current GitHub paths and heavy PR links', () => {
