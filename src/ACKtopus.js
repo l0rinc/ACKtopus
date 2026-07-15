@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.217
+// @version      1.218
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -403,17 +403,17 @@
             label: 'rebase + diff',
             tip: 'Rebase both versions on the base branch and diff (cleanest comparison)',
             fmt: (sha) => {
-                const base = getReviewBaseBranch();
-                const upstreamBase = shellQuote(`upstream/${base}`);
-                const fetchBase = shellQuote(base);
+                const base = shellQuoteIfNeeded(getReviewBaseBranch());
+                const command = (before, after) =>
+                    `B=${before} A=${after} && ${preferredRemoteCommand()} && git fetch "$REMOTE" ${base} $B $A && (W=$(mktemp -d) && trap 'git worktree remove -f "$W" >/dev/null 2>&1 || rmdir "$W"' EXIT && git worktree add --detach "$W" $B && cd "$W" && git rebase "$REMOTE"/${base} && OLD=$(git rev-parse HEAD) && git switch --detach $A && git rebase "$REMOTE"/${base} && git diff "$OLD")`;
                 if (userAckSha && sha) {
-                    return `B=${userAckSha} A=${sha} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
+                    return command(userAckSha, sha);
                 }
                 const range = lastForcePushRange || lastForcePush;
                 if (!range) return null;
                 const f = range.fromFull || range.from;
                 const t = range.toFull || range.to;
-                return `B=${f} A=${t} && git fetch upstream ${fetchBase} $B $A && git checkout --detach $B && git rebase ${upstreamBase} && OLD=$(git rev-parse HEAD) && git checkout --detach $A && git rebase ${upstreamBase} && git diff $OLD`;
+                return command(f, t);
             },
         },
         {
@@ -25145,7 +25145,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('rebasediff command rebases against the review base branch', () => {
+    ackTest('rebasediff command uses an isolated worktree and the preferred remote', () => {
         const f = SHA_FORMATS.find((f) => f.key === 'rebasediff');
         const origBase = getReviewBaseBranch;
         const origAck = userAckSha;
@@ -25153,8 +25153,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             getReviewBaseBranch = () => 'main';
             userAckSha = 'abc123';
             const cmd = f.fmt('def456');
-            ackAssert(cmd.includes("git fetch upstream 'main' $B $A"), 'fetches the dynamic base branch');
-            ackAssert(cmd.includes("git rebase 'upstream/main'"), 'rebases against the dynamic base branch');
+            ackAssert(
+                cmd.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'),
+                'uses upstream/origin remote fallback',
+            );
+            ackAssert(cmd.includes('git fetch "$REMOTE" main $B $A'), 'fetches both commits and the base branch');
+            ackAssert(cmd.includes('git worktree add --detach "$W" $B'), 'checks out the old commit in a worktree');
+            ackAssert(cmd.includes('cd "$W"'), 'enters the temporary worktree once');
+            ackEq((cmd.match(/git rebase "\$REMOTE"\/main/g) || []).length, 2, 'rebases both commits');
+            ackAssert(cmd.includes('git switch --detach $A'), 'switches only the temporary worktree');
+            ackAssert(cmd.includes('git diff "$OLD"'), 'diffs the rebased commits in the worktree');
+            ackAssert(cmd.includes('trap \'git worktree remove -f "$W"'), 'removes the temporary worktree');
+            ackAssert(!cmd.includes('git checkout'), 'does not change the active checkout');
+            ackAssert(cmd.indexOf('git rebase') > cmd.indexOf('cd "$W"'), 'rebases only after entering the worktree');
+            ackAssert(!cmd.includes('git -C "$W"'), 'does not repeat the temporary path for every command');
         } finally {
             getReviewBaseBranch = origBase;
             userAckSha = origAck;
