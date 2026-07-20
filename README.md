@@ -1,6 +1,6 @@
 <h1><img src="screenshots/acktopus-logo.svg" alt="ACKtopus" width="28" height="28"> ACKtopus</h1>
 
-ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a floating review toolbar, context-copy tools, LLM review recipes, proofreading, pending-review helpers, and queue/navigation shortcuts on GitHub pull requests and issues (optimized for Bitcoin Core-style review).
+ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a floating review toolbar, context-copy tools, LLM review recipes, proofreading, pending-review helpers, and queue/navigation shortcuts on GitHub pull requests and issues (optimized for Bitcoin Core and libsecp256k1 review).
 
 ## Highlights
 

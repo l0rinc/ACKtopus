@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.220
-// @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
+// @version      1.221
+// @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @match        https://github.com/*
@@ -34,6 +34,7 @@
     let _ackTesting = false;
 
     const BUTTON_CONTAINER_ID = 'acktopus-buttons';
+    const SECP256K1_REPO_KEYS = new Set(['bitcoin-core/secp256k1', 'l0rinc/secp256k1']);
 
     // Hide scrollbar on ACK panel body + sticky edit toolbar
     const style = document.createElement('style');
@@ -433,11 +434,17 @@
             label: 'Run benchmarks',
             tip: 'Build and run changed benchmarks (Release)',
             cond: 'bench',
-            fmt: () => {
+            fmt: (_sha, pr) => {
                 const b = prFileCategories?.bench;
-                return b?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter=${shellQuote(b.join('|'))} -min-time=1000`
-                    : null;
+                if (!b?.length) return null;
+                if (pr && isSecp256k1Repo(pr)) {
+                    const targets = b.filter((target) => ['bench', 'bench_internal', 'bench_ecmult'].includes(target));
+                    if (!targets.length) return null;
+                    const targetArgs = targets.map(shellQuoteIfNeeded).join(' ');
+                    const runs = targets.map((target) => `build/bin/${target}`).join(' && ');
+                    return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DSECP256K1_BUILD_BENCHMARK=ON && cmake --build build -j --target ${targetArgs} && ${runs}`;
+                }
+                return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter=${shellQuote(b.join('|'))} -min-time=1000`;
             },
         },
         {
@@ -447,11 +454,20 @@
             label: 'Run tests',
             tip: 'Build and run changed unit test suites (Debug)',
             cond: 'test',
-            fmt: () => {
+            fmt: (_sha, pr) => {
                 const t = prFileCategories?.test;
-                return t?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j --target test_bitcoin && build/bin/test_bitcoin --run_test=${shellQuote(t.join(','))}`
-                    : null;
+                if (!t?.length) return null;
+                if (pr && isSecp256k1Repo(pr)) {
+                    const ctime = t.includes('ctime_tests');
+                    const ctimeConfig = ctime
+                        ? ' -DSECP256K1_VALGRIND=ON -DSECP256K1_BUILD_CTIME_TESTS=ON'
+                        : ' -DSECP256K1_BUILD_CTIME_TESTS=OFF';
+                    const ctimeRun = ctime
+                        ? ' && command -v valgrind >/dev/null && valgrind --error-exitcode=42 build/bin/ctime_tests'
+                        : '';
+                    return `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_TESTS=ON -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=ON${ctimeConfig} && cmake --build build -j && ctest --test-dir build --output-on-failure${ctimeRun}`;
+                }
+                return `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j --target test_bitcoin && build/bin/test_bitcoin --run_test=${shellQuote(t.join(','))}`;
             },
         },
         {
@@ -3621,6 +3637,15 @@
         return { owner: m[1], repo: m[2], repoKey: `${m[1]}/${m[2]}` };
     }
 
+    function isSecp256k1Repo(context = location.pathname) {
+        const repo =
+            context && typeof context === 'object'
+                ? context
+                : parseGitHubRepoPath(context);
+        if (!repo?.owner || !repo?.repo) return false;
+        return SECP256K1_REPO_KEYS.has(`${repo.owner}/${repo.repo}`.toLowerCase());
+    }
+
     function getCurrentGitHubLogin(root = document) {
         const doc = root?.ownerDocument || document;
         return (
@@ -5130,7 +5155,7 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
         pseudocode: `For each commit, produce a structured review aid as a JSON object with these fields:
 "summary": One sentence, outside-in: first name the subsystem/area being changed, then what the commit does and why. Use \`backticks\` for every symbol name. Do NOT repeat the commit message; add context the message omits.
 "context": Brief background a reviewer needs BEFORE reading the diff. Explain every abbreviation, protocol concept, or subsystem name that is not universally known (e.g. what IBD is, what the UTXO set is, what CCoinsView does). One short sentence per concept. Skip if the commit is trivial.
-"files_overview": For each modified file, one sentence explaining what role it plays in Bitcoin Core and what this commit changes in it. Format: "\`path/to/file.cpp\`: <role in the project>. <what changed here>." Use {{annotations||...}} for subsystem names. Skip test files unless the test logic itself is interesting. Skip if only 1 file changed.
+"files_overview": For each modified file, one sentence explaining what role it plays in the current project and what this commit changes in it. Format: "\`path/to/file.cpp\`: <role in the project>. <what changed here>." Use {{annotations||...}} for subsystem names. Skip test files unless the test logic itself is interesting. Skip if only 1 file changed.
 "why_care": 2 to 4 sentences explaining why the change matters to a reviewer before implementation details. Explain the concrete problem the author is likely trying to remove, how it appears in practice, and why careful review matters. Stay top-down: no file lists, no line-level mechanics, no implementation details. Mention symbols only if unavoidable.
 "pseudocode": Very high-level Python-like pseudocode that conveys only the concept/gist (not line-by-line). Show only the new behavior and the main data flow. Omit glue. Omit implementation details: helper structure, condition-by-condition logic, error plumbing, logging, includes, boilerplate, and trivial iteration. Collapse details aggressively into a good abstraction. Keep original identifiers only when they matter (with \`backticks\`). Use # comments for WHY, not WHAT. If purely mechanical, say "# mechanical: rename/move/format" in one line.
 "verify_repro": Optional. The simplest practical way to verify or reproduce the commit. Prefer minimal commands, test names, or 2 to 4 short manual steps. If nothing obvious exists, use an empty string. Do not invent heavy setups.
@@ -5142,7 +5167,7 @@ Do not output a diff. If code is needed, show a minimal snippet or a full functi
 INLINE ANNOTATIONS: In the summary, context, files_overview, why_care, performance_simplifications, concerns, message_check, and depends fields, annotate only unfamiliar terms that a competent C++ developer needs to understand the review. Use the syntax {{term||short explanation}} - e.g. {{IBD||Initial Block Download: syncing the full chain from genesis}}. Do not annotate ordinary class names, symbols, or project terms that the surrounding text already explains. Do NOT annotate in the pseudocode field (use # comments there instead). Keep explanations under 100 chars.
 
 Use these rules when evaluating message_check:
-${BITCOIN_CORE_COMMIT_MESSAGE_RULES}`,
+${getReviewCommitMessageRules()}`,
         reimplementation: `Write the actual self-contained, outcome-focused no-peek reproducer prompt for a coding agent.
 
 Internal generation rule: answer with the ready-to-paste target-agent prompt itself. Keep generation-only checks out of the prompt you output, including checks about whether the text is a prompt.
@@ -5187,7 +5212,7 @@ Start by stating the exact or inferred number of local commits to create from th
 How to keep the local branch reviewable: create exactly the stated number of implementation commits when the commit metadata is complete, tests that document existing behavior before a refactor should come first, real reproducers should live with fixes, each commit should compile or clearly explain why it cannot, and commit messages should explain the problem and result. After the implementation is correct and finished, add a deliberately excessive test phase as new local commits on top: unit tests, functional tests, fuzz targets or fuzz harness extensions, regression tests, boundary cases, failure modes, weird inputs, and every relevant corner case the project can reasonably support. Run those tests, fix any failures in additional local commits on top, and keep going until the feature is already ridiculously well tested rather than merely adequately covered.
 
 Carry these commit-message preferences into the generated prompt:
-${BITCOIN_CORE_COMMIT_MESSAGE_RULES}
+${getReviewCommitMessageRules()}
 
 ## Verification And Evidence
 The checks, tests, logs, benchmarks, or manual validation the target agent should produce, plus how to report missing evidence without guessing. Require exact commands and results for the implementation checks and for the excessive test phase, including which unit, functional, fuzz, sanitizer, or manual edge-case runs passed, failed, were fixed, or could not run.
@@ -5466,6 +5491,52 @@ Task-specific instructions and requested output schemas override these default s
 ${BITCOIN_CORE_REVIEW_PROSE_RULES}
 Before finalizing, check correctness, grounding, and formatting against the requested output contract.
 Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em dashes. Use bullets or numbered lists only when the task's output contract asks for them or they materially improve scanability.`;
+
+    const SECP256K1_SYSTEM_BASE = `You are an expert libsecp256k1 reviewer (portable C and related build, test, and tooling).
+Search carefully for subtle bugs, but report only concerns grounded in the supplied code or evidence.
+Prioritize cryptographic correctness, constant-time behavior for secret data, side-channel resistance, API safety, and portability across supported compilers and 32-bit and 64-bit platforms.
+Judge whether the change solves a concrete problem and whether its complexity, performance, and maintenance cost are justified.
+This output is a private review aid. Do NOT draft a PR review comment and do NOT propose posting anything. Avoid "LGTM/approve" style conclusions.
+Ask a focused question only when evidence is missing or a reviewer decision is needed.
+Look for undefined behavior, lifetime and ownership bugs, memory alignment pitfalls, signedness and integer overflow, endianness, boundary conditions, secret-dependent branches or memory access, and API misuse.
+Check scalar and field arithmetic bounds, normalization and magnitude assumptions, exhaustive-test behavior, module interactions, context capabilities, declassification, and VERIFY-only behavior where relevant.
+Check for inconsistencies between code, comments, naming, tests, and behavior. Review public API changes for compatibility and misuse resistance.
+Each commit in a stacked PR should be self-contained: it should compile, preserve coherent behavior, and justify the transition it introduces. Mechanical changes should be independently verifiable and should not hide behavioral changes.
+For benchmarks and performance changes, check that inputs are representative, the measured operation matches the claim, and the setup is deterministic and reproducible.
+Prefer small, local fixes over refactors. Avoid speculative redesigns.
+Present concrete problems before solutions. Ask a question only when evidence is missing or a reviewer decision is needed. Explain outside-in: start at the highest level, introduce a new concept only when it is needed, and then move into the relevant code.
+Use \`backticks\` for every symbol, function, type, variable, file, and macro. Briefly define an unfamiliar abbreviation or domain term when the explanation needs it.
+When your output appears next to the original text, do NOT repeat what the original already says. Add only missing context, implications, risks, or background.
+Task-specific instructions and requested output schemas override these default style rules.
+${BITCOIN_CORE_REVIEW_PROSE_RULES.replace('Bitcoin Core prose preferences:', 'Review prose preferences:')}
+Before finalizing, check correctness, grounding, and formatting against the requested output contract.
+Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em dashes. Use bullets or numbered lists only when the task's output contract asks for them or they materially improve scanability.`;
+
+    function getReviewSystemBase(context = location.pathname) {
+        return isSecp256k1Repo(context) ? SECP256K1_SYSTEM_BASE : SYSTEM_BASE;
+    }
+
+    function getReviewProjectName(context = location.pathname) {
+        return isSecp256k1Repo(context) ? 'libsecp256k1' : 'Bitcoin Core';
+    }
+
+    function getReviewPRDescriptionRules(context = location.pathname) {
+        return isSecp256k1Repo(context)
+            ? BITCOIN_CORE_PR_DESCRIPTION_RULES.replace('Bitcoin Core PR-description rules:', 'libsecp256k1 PR-description rules:')
+            : BITCOIN_CORE_PR_DESCRIPTION_RULES;
+    }
+
+    function getReviewCommitMessageRules(context = location.pathname) {
+        return isSecp256k1Repo(context)
+            ? BITCOIN_CORE_COMMIT_MESSAGE_RULES.replace('Bitcoin Core commit-message rules:', 'libsecp256k1 commit-message rules:')
+            : BITCOIN_CORE_COMMIT_MESSAGE_RULES;
+    }
+
+    function getReviewPRTitleRules(context = location.pathname) {
+        return isSecp256k1Repo(context)
+            ? BITCOIN_CORE_PR_TITLE_RULES.replace('Bitcoin Core PR-title rules:', 'libsecp256k1 PR-title rules:')
+            : BITCOIN_CORE_PR_TITLE_RULES;
+    }
 
     function getAnalysisMode(path = location.pathname) {
         if (/\/pull\/\d+\/commits\/[0-9a-f]+/.test(path)) return ANALYSIS_MODES.commit;
@@ -7264,10 +7335,30 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return parts.length ? '\n\n' + parts.join('\n\n') : '';
     }
 
-    function categorizePRFiles(filenames) {
+    function categorizePRFiles(filenames, context = null) {
         const base = (f) => f.match(/\/([^/]+)\.cpp$/)?.[1];
         const pyBase = (f) => f.match(/\/([^/]+\.py)$/)?.[1];
         const isCppLike = (f) => /\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/i.test(f);
+        if (isSecp256k1Repo(context)) {
+            const bench = new Set();
+            const test = new Set();
+            for (const file of filenames) {
+                if (file === 'src/bench.c' || /^src\/modules\/[^/]+\/bench_impl\.h$/.test(file)) bench.add('bench');
+                if (file === 'src/bench_internal.c') bench.add('bench_internal');
+                if (file === 'src/bench_ecmult.c') bench.add('bench_ecmult');
+                if (file === 'src/bench.h') ['bench', 'bench_internal', 'bench_ecmult'].forEach((target) => bench.add(target));
+                if (/^(?:src|include)\/.*\.[ch]$/.test(file)) test.add('secp256k1');
+                if (file === 'src/ctime_tests.c' || file === 'src/checkmem.h') test.add('ctime_tests');
+            }
+            return {
+                benchFiles: [],
+                bench: [...bench].sort(),
+                test: [...test].sort(),
+                fuzz: [],
+                functional: [],
+                cpp: [],
+            };
+        }
         return {
             benchFiles: filenames.filter((f) => /^src\/bench\/.*\.cpp$/.test(f)),
             bench: [],
@@ -7341,10 +7432,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return [...new Set(paths)];
     }
 
-    function visibleDiffFileCategories(root = document) {
+    function visibleDiffFileCategories(root = document, context = null) {
         const paths = visibleDiffFilePaths(root);
         if (paths.length === 0) return null;
-        const cats = categorizePRFiles(paths);
+        const cats = categorizePRFiles(paths, context);
         delete cats.benchFiles;
         return cats;
     }
@@ -7362,7 +7453,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     async function fetchPRFileCategories(pr) {
-        const visibleCats = visibleDiffFileCategories();
+        const visibleCats = visibleDiffFileCategories(document, pr);
         try {
             const files = [];
             let page = 1;
@@ -7375,7 +7466,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 files.push(...batch);
                 page++;
             } while (batch.length === 100 && page <= 30); // up to 3000 files (GitHub API listing cap)
-            const cats = mergeFileCategories(categorizePRFiles(files.map((f) => f.filename)), visibleCats);
+            const cats = mergeFileCategories(categorizePRFiles(files.map((f) => f.filename), pr), visibleCats);
 
             // For bench files, fetch raw content to extract BENCHMARK() names
             if (cats.benchFiles.length > 0) {
@@ -9868,7 +9959,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function getRecipeSystemPrompt(recipe, extraInstr, citationInstructions) {
         if (isPromptRecipe(recipe)) return extraInstr;
-        return `${SYSTEM_BASE}\n\n${extraInstr}${citationInstructions}`;
+        return `${getReviewSystemBase()}\n\n${extraInstr}${citationInstructions}`;
     }
 
     function scrollToAndHighlight(el) {
@@ -10678,7 +10769,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const source = chunk
                         .map((item, i) => findSearchItemForLLM(item, i, viewerLogin))
                         .join('\n\n---\n\n');
-                    const system = `${SYSTEM_BASE}\n\nYou are a GitHub PR navigation assistant. Read the supplied comments and code excerpts, then decide which items answer the user's find request.\n\nRules:\n- Read the text and metadata for each item; do not use keyword matching as a substitute for understanding.\n- Respect author and ownership constraints. The current viewer login is ${viewerLogin ? `\`${viewerLogin}\`` : 'unknown'}.\n- If the user says "my", "mine", "by me", "from me", "I said", "I wrote", "I asked", "I suggested", or similar first-person wording, that refers to the current viewer login when it is known.\n- Use metadata such as author, date, direct comment vs reply, review summary vs inline comment, file path, line, commit, state, and permalink when relevant.\n- Return ONLY JSON: [{"index": number, "summary": "short factual summary", "reason": "why this answers the request"}].\n- Use each item's REF as the index. Return at most 12 results for this batch, ordered by relevance. Return [] if no item in the batch is relevant.\n- If the request asks where something was said, include the closest actual comment or reply, not just surrounding discussion.`;
+                    const system = `${getReviewSystemBase()}\n\nYou are a GitHub PR navigation assistant. Read the supplied comments and code excerpts, then decide which items answer the user's find request.\n\nRules:\n- Read the text and metadata for each item; do not use keyword matching as a substitute for understanding.\n- Respect author and ownership constraints. The current viewer login is ${viewerLogin ? `\`${viewerLogin}\`` : 'unknown'}.\n- If the user says "my", "mine", "by me", "from me", "I said", "I wrote", "I asked", "I suggested", or similar first-person wording, that refers to the current viewer login when it is known.\n- Use metadata such as author, date, direct comment vs reply, review summary vs inline comment, file path, line, commit, state, and permalink when relevant.\n- Return ONLY JSON: [{"index": number, "summary": "short factual summary", "reason": "why this answers the request"}].\n- Use each item's REF as the index. Return at most 12 results for this batch, ordered by relevance. Return [] if no item in the batch is relevant.\n- If the request asks where something was said, include the closest actual comment or reply, not just surrounding discussion.`;
                     const user = `Find request: ${cleanAllCommentSearchQuery(query)}\n\nItems (${label}):\n${source}`;
                     let matches = [];
                     try {
@@ -10868,7 +10959,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         ? `\n\nIMPORTANT: When a question is about a specific comment or code from the page, cite it using [ref:N] markers (e.g. [ref:3]) that match the "Visible review comments" reference numbers, so the user can navigate.`
                         : '';
                     const focus = text.replace(/^\/quiz\s*/i, '').trim();
-                    const quizSystem = `${SYSTEM_BASE}\n\nYou are a review coach. Your job is to ask high-leverage questions that help a human reviewer validate correctness, test coverage, and whether the change is worthwhile.\n\nRULES:\n- Output questions ONLY. Do not answer.\n- Each question must be on its own line and start with \"Q:\".\n- Ask 5 to 10 questions.\n${citationInstructions}\n\n${context}${diffBlock}`;
+                    const quizSystem = `${getReviewSystemBase()}\n\nYou are a review coach. Your job is to ask high-leverage questions that help a human reviewer validate correctness, test coverage, and whether the change is worthwhile.\n\nRULES:\n- Output questions ONLY. Do not answer.\n- Each question must be on its own line and start with \"Q:\".\n- Ask 5 to 10 questions.\n${citationInstructions}\n\n${context}${diffBlock}`;
                     const quizUser = focus ? `Focus: ${focus}` : 'Generate questions to guide my review.';
                     const result = await callLLM(provider, quizSystem, quizUser);
                     stopSpin();
@@ -11011,7 +11102,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         ? `\n\nIMPORTANT: When your answer references specific comments or code from the page, cite the source using [ref:N] markers (e.g. [ref:3]) matching the reference numbers in the "Visible review comments" section. Always cite sources so the user can navigate to them. Use multiple [ref:N] markers when synthesizing from multiple sources.`
                         : '';
                     const extra = getLLMConfig().instructions.chat || DEFAULT_INSTRUCTIONS.chat;
-                    const system = `${SYSTEM_BASE}\n\n${extra}${citationInstructions}\n\n${context}${diffBlock}`;
+                    const system = `${getReviewSystemBase()}\n\n${extra}${citationInstructions}\n\n${context}${diffBlock}`;
 
                     const historyText = history
                         .map((m) => (m.role === 'user' ? `User: ${m.content}` : `Assistant: ${m.content}`))
@@ -12445,11 +12536,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     `- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. ${PROOFREAD_SENTENCE_PER_LINE_RULE}`;
                 const fenceFormattingRule =
                     '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
-                const prDescriptionRule = isPRBody
-                    ? BITCOIN_CORE_PR_DESCRIPTION_RULES
-                    : '';
+                const prDescriptionRule = isPRBody ? getReviewPRDescriptionRules() : '';
                 return {
-                    system: `${SYSTEM_BASE}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
+                    system: `${getReviewSystemBase()}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
                     stripped: text !== cleaned ? text : null,
@@ -12875,7 +12964,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 commitMessages,
                 diff: ctx.diff,
             });
-            const system = `${SYSTEM_BASE}\n\nYou are proofreading another author's GitHub PR description in read-only mode. ${extra}\n\n${BITCOIN_CORE_PR_DESCRIPTION_RULES}\n\nRULES:\n- Return only the corrected PR description. No preamble, no explanation, no markdown fence.\n- Make the smallest useful edits so the description matches the actual change.\n- Use the PR patch and all commit messages to fix objective inaccuracies, outdated names, stale file paths, wrong behavior claims, and duplicated points.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not invent new sections, review advice, risk lists, tests, or claims not supported by the patch.\n- Preserve markdown structure unless a small wording or heading change is needed for clarity.\n- If the description is already accurate and clear, return it unchanged.`;
+            const system = `${getReviewSystemBase()}\n\nYou are proofreading another author's GitHub PR description in read-only mode. ${extra}\n\n${getReviewPRDescriptionRules()}\n\nRULES:\n- Return only the corrected PR description. No preamble, no explanation, no markdown fence.\n- Make the smallest useful edits so the description matches the actual change.\n- Use the PR patch and all commit messages to fix objective inaccuracies, outdated names, stale file paths, wrong behavior claims, and duplicated points.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not invent new sections, review advice, risk lists, tests, or claims not supported by the patch.\n- Preserve markdown structure unless a small wording or heading change is needed for clarity.\n- If the description is already accurate and clear, return it unchanged.`;
             const user = [
                 wrapPromptBlock('ORIGINAL PR DESCRIPTION', original),
                 context ? `Read-only grounding context:\n\n${context}` : '',
@@ -12962,7 +13051,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 diff: commitPatch || ctx.diff,
                 diffLabel: commitPatch ? 'CURRENT COMMIT PATCH' : 'FULL PR PATCH',
             });
-            const system = `${SYSTEM_BASE}\n\nYou are proofreading GitHub PR commit-message text in read-only mode. ${extra}\n\n${BITCOIN_CORE_COMMIT_MESSAGE_RULES}\n\nRULES:\n- Return the full corrected commit-message text only. No preamble, no explanation, no markdown fence.\n- Preserve commit order, separators, and every \`COMMIT <sha>\` label exactly.\n- Make the smallest useful edits so each message reflects the code it describes and the PR patch as a whole.\n- Fix grammar, spelling, duplicated wording, outdated names, stale file paths, and objective claims contradicted by the patch.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not rewrite the commit history, add new commits, or invent details not supported by the patch.\n- If the messages are already accurate and clear, return them unchanged.`;
+            const system = `${getReviewSystemBase()}\n\nYou are proofreading GitHub PR commit-message text in read-only mode. ${extra}\n\n${getReviewCommitMessageRules()}\n\nRULES:\n- Return the full corrected commit-message text only. No preamble, no explanation, no markdown fence.\n- Preserve commit order, separators, and every \`COMMIT <sha>\` label exactly.\n- Make the smallest useful edits so each message reflects the code it describes and the PR patch as a whole.\n- Fix grammar, spelling, duplicated wording, outdated names, stale file paths, and objective claims contradicted by the patch.\n- Prefer simple, plain language. Do not add jargon or more formal wording.\n- Do not rewrite the commit history, add new commits, or invent details not supported by the patch.\n- If the messages are already accurate and clear, return them unchanged.`;
             const user = [
                 wrapPromptBlock('ORIGINAL COMMIT MESSAGES', original),
                 context ? `Read-only grounding context:\n\n${context}` : '',
@@ -15991,7 +16080,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const prTitle =
                     normalizeInlineWhitespace(ctx.title) || normalizeInlineWhitespace(getPRTitleText()) || '';
 
-                system = `${SYSTEM_BASE}\n\nYou are helping a Bitcoin Core reviewer understand a PR before starting their review. Structure your response outside-in:\n1. First, briefly explain the subsystem/area being changed (what it does in the project, why it exists)\n2. Then the problem being addressed (why change is needed)\n3. Then the approach taken (how the solution works)\n4. Finally, areas needing careful review (consensus, memory safety, thread safety, etc)\n\nBe concise: 4-8 sentences, then optionally a brief list of key files changed.`;
+                system = `${getReviewSystemBase()}\n\nYou are helping a ${getReviewProjectName()} reviewer understand a PR before starting their review. Structure your response outside-in:\n1. First, briefly explain the subsystem/area being changed (what it does in the project, why it exists)\n2. Then the problem being addressed (why change is needed)\n3. Then the approach taken (how the solution works)\n4. Finally, areas needing careful review (consensus, memory safety, thread safety, etc)\n\nBe concise: 4-8 sentences, then optionally a brief list of key files changed.`;
                 const parts = [];
                 if (prTitle) parts.push(`PR: "${prTitle}"`);
                 parts.push(wrapPromptBlock('PR DESCRIPTION', `by ${author}\n${commentText}`));
@@ -16092,7 +16181,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const prContext = buildContextBlock(ctx, { maxDiff: 120000, maxCommits: 12000, maxDesc: 5000 });
 
                 if (isInline) {
-                    system = `${SYSTEM_BASE}\n\nYou are explaining an inline code review comment on a GitHub PR. The comment is attached to a SPECIFIC line of code (marked with <<<). Structure your response outside-in:\n1. First, briefly explain what this code area does (the function/class/subsystem context)\n2. Then what the reviewer is pointing out about THAT specific line\n3. Then what concern or improvement they are suggesting, and why it matters\n4. What action the PR author should take\n\nBe concise (3-5 sentences).`;
+                    system = `${getReviewSystemBase()}\n\nYou are explaining an inline code review comment on a GitHub PR. The comment is attached to a SPECIFIC line of code (marked with <<<). Structure your response outside-in:\n1. First, briefly explain what this code area does (the function/class/subsystem context)\n2. Then what the reviewer is pointing out about THAT specific line\n3. Then what concern or improvement they are suggesting, and why it matters\n4. What action the PR author should take\n\nBe concise (3-5 sentences).`;
 
                     const parts = [`COMMENT by ${author}:\n"${commentText}"`];
                     if (targetLine) {
@@ -16112,7 +16201,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (prContext) parts.push(prContext);
                     user = parts.join('\n\n');
                 } else {
-                    system = `${SYSTEM_BASE}\n\nYou are explaining a GitHub PR comment to help the PR author understand what the reviewer means. Structure your response outside-in:\n1. First, briefly explain the relevant concept/subsystem the comment touches on\n2. Then the reviewer's concern - WHY it matters for correctness, performance, or safety\n3. Then what action (if any) the author should take\n\nBe concise (3-5 sentences).`;
+                    system = `${getReviewSystemBase()}\n\nYou are explaining a GitHub PR comment to help the PR author understand what the reviewer means. Structure your response outside-in:\n1. First, briefly explain the relevant concept/subsystem the comment touches on\n2. Then the reviewer's concern - WHY it matters for correctness, performance, or safety\n3. Then what action (if any) the author should take\n\nBe concise (3-5 sentences).`;
 
                     const parts = [`COMMENT by ${author}:\n"${commentText}"`];
                     if (threadContext) {
@@ -17034,8 +17123,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 : '';
 
             const system = generateTitle
-                ? `You are drafting a GitHub Pull Request title.\n\n${BITCOIN_CORE_PR_TITLE_RULES}\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
-                : `You are proofreading a GitHub Pull Request title.\n\n${BITCOIN_CORE_PR_TITLE_RULES}\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, and filenames.\n- Preserve the component choice and colon, but correct the component prefix to lowercase.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
+                ? `You are drafting a GitHub Pull Request title.\n\n${getReviewPRTitleRules()}\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
+                : `You are proofreading a GitHub Pull Request title.\n\n${getReviewPRTitleRules()}\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, and filenames.\n- Preserve the component choice and colon, but correct the component prefix to lowercase.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
             const user = generateTitle
                 ? `PR title is empty. Propose a concise title from the context below.${ctxBlock}`
                 : `Original title:\n${original}${ctxBlock}`;
@@ -19242,7 +19331,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .filter(Boolean)
                 .join('\n\n');
 
-            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer sanity-check a pending GitHub comment by estimating how the PR author would respond.\n\nReturn ONLY valid JSON with this schema:\n{"verdict":"accurate|change|unclear","feedback":"...","reply":"..."}\n\nRULES:\n- \`verdict\` means whether the pending comment looks accurate enough to post as-is, should be changed before posting, or is unclear from context.\n- \`feedback\` is the important part. Keep it short, blunt, and factual. Say what is factually wrong, missing, or already correct.\n- If \`verdict\` is \`accurate\`, start \`feedback\` with a brief acknowledgment that this is a real catch.\n- If \`verdict\` is \`change\`, start \`feedback\` with a blunt corrective sentence that makes clear the premise is wrong.\n- \`reply\` is a short potential author response. Do not restate the pending comment. Do not repeat the question unless needed for clarity.\n- Keep \`reply\` shorter than \`feedback\` whenever possible.\n- Answer from the PR author's perspective.\n- If the pending comment contains an incorrect factual assumption, point that out in \`feedback\` and correct it in \`reply\`.\n- Be technically accurate, concise, and grounded in the provided context.\n- If the pending comment references specifics not visible in the provided context, say so in \`feedback\` rather than guessing.\n- Do not critique tone/style unless it affects correctness.\n- No markdown fences, no preamble.`;
+            const system = `${getReviewSystemBase()}\n\nYou are helping a reviewer sanity-check a pending GitHub comment by estimating how the PR author would respond.\n\nReturn ONLY valid JSON with this schema:\n{"verdict":"accurate|change|unclear","feedback":"...","reply":"..."}\n\nRULES:\n- \`verdict\` means whether the pending comment looks accurate enough to post as-is, should be changed before posting, or is unclear from context.\n- \`feedback\` is the important part. Keep it short, blunt, and factual. Say what is factually wrong, missing, or already correct.\n- If \`verdict\` is \`accurate\`, start \`feedback\` with a brief acknowledgment that this is a real catch.\n- If \`verdict\` is \`change\`, start \`feedback\` with a blunt corrective sentence that makes clear the premise is wrong.\n- \`reply\` is a short potential author response. Do not restate the pending comment. Do not repeat the question unless needed for clarity.\n- Keep \`reply\` shorter than \`feedback\` whenever possible.\n- Answer from the PR author's perspective.\n- If the pending comment contains an incorrect factual assumption, point that out in \`feedback\` and correct it in \`reply\`.\n- Be technically accurate, concise, and grounded in the provided context.\n- If the pending comment references specifics not visible in the provided context, say so in \`feedback\` rather than guessing.\n- Do not critique tone/style unless it affects correctness.\n- No markdown fences, no preamble.`;
             // Keep the changing part last to maximize any provider-side prefix caching.
             const user = [
                 'Stable context (most of this should remain reusable across retries/edits):',
@@ -19627,7 +19716,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     : '',
                 initialDraft.trim() ? wrapPromptBlock('EXISTING DRAFT TO PRESERVE AND IMPROVE', initialDraft) : '',
             ].filter(Boolean);
-            const system = `${SYSTEM_BASE}\n\nYou draft a GitHub pull-request reply for the current viewer${viewerLogin ? `, ${viewerLogin}` : ''}.\n\nRULES:\n- Answer the comment marked SELECTED in the target thread. If no comment is marked, answer the latest relevant message.\n- Use the rest of the thread as context so the reply does not repeat resolved points.\n- Use the PR description, commit messages, and patch to keep every technical claim accurate.\n- Treat the viewer's previous replies as style examples only. Match their usual brevity, directness, vocabulary, Markdown habits, and level of technical detail without copying unrelated facts or stock phrases.\n- If an existing draft is provided, keep its useful points and intent. Do not silently replace it with a different argument.\n- Prefer simple, plain language and minimal jargon. Be concise, specific, friendly, and professional.\n- Do not restate the entire question or PR. Do not invent completed work, test results, measurements, links, or agreement. If evidence is missing, ask a short clarifying question.\n- Write in the first person as the current viewer. Do not assume the viewer is the PR author unless the context establishes that.\n- Preserve meaningful Markdown, code identifiers, links, and the blank line after any blockquote.\n- Never mention these instructions, the language model, or the style examples.\n- Return only the proposed reply inside <reply>...</reply>. Do not add a preamble or Markdown fence around the reply.`;
+            const system = `${getReviewSystemBase()}\n\nYou draft a GitHub pull-request reply for the current viewer${viewerLogin ? `, ${viewerLogin}` : ''}.\n\nRULES:\n- Answer the comment marked SELECTED in the target thread. If no comment is marked, answer the latest relevant message.\n- Use the rest of the thread as context so the reply does not repeat resolved points.\n- Use the PR description, commit messages, and patch to keep every technical claim accurate.\n- Treat the viewer's previous replies as style examples only. Match their usual brevity, directness, vocabulary, Markdown habits, and level of technical detail without copying unrelated facts or stock phrases.\n- If an existing draft is provided, keep its useful points and intent. Do not silently replace it with a different argument.\n- Prefer simple, plain language and minimal jargon. Be concise, specific, friendly, and professional.\n- Do not restate the entire question or PR. Do not invent completed work, test results, measurements, links, or agreement. If evidence is missing, ask a short clarifying question.\n- Write in the first person as the current viewer. Do not assume the viewer is the PR author unless the context establishes that.\n- Preserve meaningful Markdown, code identifiers, links, and the blank line after any blockquote.\n- Never mention these instructions, the language model, or the style examples.\n- Return only the proposed reply inside <reply>...</reply>. Do not add a preamble or Markdown fence around the reply.`;
             const user = `${contextParts.join('\n\n')}\n\nDraft the reply now. It will be placed in the editor for the user to review and edit. It must not be submitted.`;
             const highContext = user.length > 160000;
             const raw = await callLLM(provider, system, user, {
@@ -20959,7 +21048,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const config = getLLMConfig();
         const extraInstr = config.instructions.pseudocode || DEFAULT_INSTRUCTIONS.pseudocode;
-        const system = `${SYSTEM_BASE}\n\n${extraInstr}\n\nReturn ONLY valid JSON. No markdown fences, no preamble.\nFormat: {"<8-char-sha>": {"summary": "...", "context": "...", "files_overview": "...", "why_care": "...", "pseudocode": "...", "verify_repro": "...", "performance_simplifications": "...", "concerns": "...", "message_check": "...", "depends": "..."}}`;
+        const system = `${getReviewSystemBase()}\n\n${extraInstr}\n\nReturn ONLY valid JSON. No markdown fences, no preamble.\nFormat: {"<8-char-sha>": {"summary": "...", "context": "...", "files_overview": "...", "why_care": "...", "pseudocode": "...", "verify_repro": "...", "performance_simplifications": "...", "concerns": "...", "message_check": "...", "depends": "..."}}`;
         const contextBlock = extraContext
             ? `\n\nComprehensive PR context (description, commits, responses, and patch where available):\n${extraContext}`
             : '';
@@ -20993,7 +21082,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const config = getLLMConfig();
         const extra = config.instructions.commits || DEFAULT_INSTRUCTIONS.commits;
-        const system = `${SYSTEM_BASE}\n\n${extra}\n\nReturn ONLY valid JSON. No markdown fences, no preamble. Format: {"<8-char-sha>": "1-2 sentence explanation of how this commit fits into the PR"}`;
+        const system = `${getReviewSystemBase()}\n\n${extra}\n\nReturn ONLY valid JSON. No markdown fences, no preamble. Format: {"<8-char-sha>": "1-2 sentence explanation of how this commit fits into the PR"}`;
         const extraContextBlock = extraContext
             ? `\n\nAdditional PR context (description, commits, and responses):\n${extraContext}`
             : '';
@@ -21908,13 +21997,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             const artifactRules = mode === 'proofread' && ctx.isPRDescription
-                ? `\n\n${BITCOIN_CORE_PR_DESCRIPTION_RULES}`
+                ? `\n\n${getReviewPRDescriptionRules()}`
                 : '';
             const outputRule =
                 mode === 'proofread'
                     ? 'Return only the corrected text with no commentary or code fence.'
                     : 'Return a concise markdown answer only.';
-            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}${artifactRules}\n\n${outputRule}`;
+            const system = `${getReviewSystemBase()}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}${artifactRules}\n\n${outputRule}`;
             let user = '';
             if (mode === 'factcheck') {
                 const diff = prCtx?.diff || '';
@@ -23328,7 +23417,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);
         fileCategoriesPromise.then(applyFileCategories).catch(() => {});
-        const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories());
+        const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories(document, pr));
         ackSetTimeout(applyVisibleFileCategories, 1000);
         ackSetTimeout(applyVisibleFileCategories, 3000);
         let acks = parseAcksFromPage();
@@ -24928,7 +25017,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
 // @version      ${ver}
-// @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
+// @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @match        https://github.com/*
 // @grant        GM_setClipboard
 // @grant        GM_getValue
@@ -24989,6 +25078,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('parses standard PR URL', () => {
         const r = parsePR('/bitcoin/bitcoin/pull/12345');
         ackDeepEq(r, { owner: 'bitcoin', repo: 'bitcoin', pr: '12345' });
+    });
+
+    ackTest('parses upstream and fork secp256k1 PR URLs', () => {
+        ackDeepEq(parsePR('/bitcoin-core/secp256k1/pull/123/files'), {
+            owner: 'bitcoin-core',
+            repo: 'secp256k1',
+            pr: '123',
+        });
+        ackDeepEq(parsePR('/l0rinc/secp256k1/pull/456/commits'), {
+            owner: 'l0rinc',
+            repo: 'secp256k1',
+            pr: '456',
+        });
     });
 
     ackTest('parses PR files URL', () => {
@@ -25757,6 +25859,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('secp256k1 benchmark and test formats use repository targets for upstream and fork PRs', () => {
+        const previous = prFileCategories;
+        try {
+            for (const owner of ['bitcoin-core', 'l0rinc']) {
+                const pr = { owner, repo: 'secp256k1', pr: '1' };
+                prFileCategories = {
+                    bench: ['bench', 'bench_ecmult', 'bench_internal'],
+                    test: ['secp256k1'],
+                };
+                const bench = SHA_FORMATS.find((format) => format.key === 'bench').fmt('', pr);
+                const test = SHA_FORMATS.find((format) => format.key === 'test').fmt('', pr);
+                ackAssert(bench.includes('-DSECP256K1_BUILD_BENCHMARK=ON'), `${owner} enables secp benchmarks`);
+                ackAssert(bench.includes('--target bench bench_ecmult bench_internal'), `${owner} builds secp targets`);
+                ackAssert(bench.endsWith('build/bin/bench && build/bin/bench_ecmult && build/bin/bench_internal'), `${owner} runs secp benchmarks`);
+                ackAssert(test.includes('-DSECP256K1_BUILD_TESTS=ON'), `${owner} enables secp tests`);
+                ackAssert(test.includes('-DSECP256K1_BUILD_EXHAUSTIVE_TESTS=ON'), `${owner} enables exhaustive tests`);
+                ackAssert(test.includes('-DSECP256K1_BUILD_BENCHMARK=OFF'), `${owner} skips benchmark builds`);
+                ackAssert(test.includes('ctest --test-dir build --output-on-failure'), `${owner} runs ctest`);
+                ackAssert(!test.includes('test_bitcoin'), `${owner} does not use Bitcoin Core test target`);
+            }
+        } finally {
+            prFileCategories = previous;
+        }
+    });
+
+    ackTest('secp256k1 constant-time test format requires Valgrind', () => {
+        const previous = prFileCategories;
+        try {
+            prFileCategories = { test: ['ctime_tests'] };
+            const command = SHA_FORMATS.find((format) => format.key === 'test').fmt('', {
+                owner: 'bitcoin-core',
+                repo: 'secp256k1',
+            });
+            ackAssert(command.includes('-DSECP256K1_VALGRIND=ON'), 'enables Valgrind instrumentation');
+            ackAssert(command.includes('-DSECP256K1_BUILD_CTIME_TESTS=ON'), 'builds ctime_tests');
+            ackAssert(command.includes('valgrind --error-exitcode=42 build/bin/ctime_tests'), 'runs ctime_tests in Valgrind');
+        } finally {
+            prFileCategories = previous;
+        }
+    });
+
     ackTest('formatdiff/tidydiff/iwyu formats are conditional on C/C++ changes (cond=cpp)', () => {
         for (const key of ['formatdiff', 'tidydiff', 'iwyu']) {
             const f = SHA_FORMATS.find((f) => f.key === key);
@@ -26161,6 +26304,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackDeepEq(c.test, []);
         ackDeepEq(c.fuzz, []);
         ackDeepEq(c.functional, []);
+    });
+
+    ackTest('categorizePRFiles maps secp256k1 benchmark and test files to repository targets', () => {
+        for (const owner of ['bitcoin-core', 'l0rinc']) {
+            const c = categorizePRFiles(
+                [
+                    'src/bench.c',
+                    'src/bench_internal.c',
+                    'src/bench_ecmult.c',
+                    'src/modules/musig/bench_impl.h',
+                    'src/tests.c',
+                    'src/tests_exhaustive.c',
+                    'src/modules/schnorrsig/tests_impl.h',
+                    'src/ctime_tests.c',
+                    'src/secp256k1.c',
+                ],
+                { owner, repo: 'secp256k1' },
+            );
+            ackDeepEq(c.bench, ['bench', 'bench_ecmult', 'bench_internal']);
+            ackDeepEq(c.test, ['ctime_tests', 'secp256k1']);
+            ackDeepEq(c.benchFiles, []);
+            ackDeepEq(c.fuzz, []);
+            ackDeepEq(c.functional, []);
+            ackDeepEq(c.cpp, [], 'hides Bitcoin Core-only clang helpers');
+            ackDeepEq(
+                categorizePRFiles(['include/secp256k1.h'], { owner, repo: 'secp256k1' }).test,
+                ['secp256k1'],
+                'runs the secp256k1 suite for library-only changes',
+            );
+        }
     });
 
     // --- extractBenchmarkNames ---
@@ -27170,6 +27343,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('secp256k1 review profile covers cryptographic C review for upstream and fork URLs', () => {
+        for (const owner of ['bitcoin-core', 'l0rinc']) {
+            const path = `/${owner}/secp256k1/pull/123`;
+            const prompt = getReviewSystemBase(path);
+            ackAssert(isSecp256k1Repo(path), `${owner} is a supported secp256k1 repository`);
+            ackAssert(prompt.includes('expert libsecp256k1 reviewer'), `${owner} selects libsecp256k1 prompt`);
+            ackAssert(prompt.includes('portable C'), `${owner} uses C review guidance`);
+            ackAssert(prompt.includes('constant-time behavior for secret data'), `${owner} checks constant time`);
+            ackAssert(prompt.includes('scalar and field arithmetic bounds'), `${owner} checks arithmetic bounds`);
+            ackAssert(prompt.includes('exhaustive-test behavior'), `${owner} checks exhaustive tests`);
+            ackAssert(!prompt.includes('C++20'), `${owner} does not inherit Bitcoin Core C++ guidance`);
+            ackAssert(getReviewPRDescriptionRules(path).startsWith('libsecp256k1'), `${owner} uses secp PR rules`);
+            ackAssert(getReviewCommitMessageRules(path).startsWith('libsecp256k1'), `${owner} uses secp commit rules`);
+            ackAssert(getReviewPRTitleRules(path).startsWith('libsecp256k1'), `${owner} uses secp title rules`);
+        }
+        ackEq(getReviewSystemBase('/bitcoin/bitcoin/pull/123'), SYSTEM_BASE, 'keeps Bitcoin Core prompt');
+        ackEq(isSecp256k1Repo('/someone/secp256k1/pull/123'), false, 'does not opt in unrelated forks');
+    });
+
     // ============================================================================
     // BRAILLE spinner
     // ============================================================================
@@ -27744,13 +27936,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!runFn.includes('Draft PR title is empty'), 'does not expose compare-page draft title prompting');
     });
 
-    ackTest('PR title drafting and proofreading use Bitcoin Core title rules', () => {
+    ackTest('PR title drafting and proofreading use repository-aware title rules', () => {
         const runFn = _ackSource.slice(
             _ackSource.indexOf('async function runProofreadOnPRTitle'),
             _ackSource.indexOf('function addQuickCommentActions'),
         );
         ackEq(
-            (runFn.match(/\$\{BITCOIN_CORE_PR_TITLE_RULES\}/g) || []).length,
+            (runFn.match(/\$\{getReviewPRTitleRules\(\)\}/g) || []).length,
             2,
             'applies title rules to generated and existing titles',
         );
@@ -31576,7 +31768,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('explainComment: all prompts use outside-in approach and inherit SYSTEM_BASE rules', () => {
+    ackTest('explainComment: all prompts use outside-in approach and repository review rules', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function explainComment'),
@@ -31584,8 +31776,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         // All three paths should mention outside-in structure
         ackAssert(fn.includes('outside-in'), 'PR body prompt uses outside-in approach');
-        // All three variants use SYSTEM_BASE which provides backtick, abbreviation, and non-repetition rules
-        ackAssert((fn.match(/SYSTEM_BASE/g) || []).length >= 3, 'all three explain variants use SYSTEM_BASE');
+        // All three variants use the repository profile, which provides backtick, abbreviation, and non-repetition rules.
+        ackAssert(
+            (fn.match(/getReviewSystemBase/g) || []).length >= 3,
+            'all three explain variants use repository review rules',
+        );
     });
 
     ackTest('explainComment: inline system prompt focuses on specific line, general explains context', () => {
@@ -32436,8 +32631,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('Make the smallest useful edits'), 'prompt asks for minimal edits');
         ackAssert(fn.includes('simple, plain language'), 'prompt prefers simple language');
         ackAssert(
-            fn.includes('${BITCOIN_CORE_PR_DESCRIPTION_RULES}'),
-            'applies Bitcoin Core PR-description rules',
+            fn.includes('${getReviewPRDescriptionRules()}'),
+            'applies repository PR-description rules',
         );
         ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
@@ -32457,8 +32652,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('reflects the code it describes'), 'checks messages against changes');
         ackAssert(fn.includes('Preserve commit order'), 'preserves commit order');
         ackAssert(
-            fn.includes('${BITCOIN_CORE_COMMIT_MESSAGE_RULES}'),
-            'applies Bitcoin Core commit-message rules',
+            fn.includes('${getReviewCommitMessageRules()}'),
+            'applies repository commit-message rules',
         );
         ackAssert(fn.includes('readOnly: true'), 'shows read-only diff dialog');
     });
@@ -32759,9 +32954,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'preserves block content below a compact prefix',
         );
         ackAssert(
-            makePromptSection.includes('BITCOIN_CORE_PR_DESCRIPTION_RULES') &&
+            makePromptSection.includes('getReviewPRDescriptionRules') &&
                 BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('optimize for deletion'),
-            'PR descriptions get shared Bitcoin Core style guidance',
+            'PR descriptions get shared repository style guidance',
         );
         ackAssert(
             makePromptSection.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
@@ -33893,8 +34088,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(
             fn.includes("mode === 'proofread' && ctx.isPRDescription") &&
-                fn.includes('${BITCOIN_CORE_PR_DESCRIPTION_RULES}'),
-            'selected PR-description prose uses Bitcoin Core PR rules',
+                fn.includes('${getReviewPRDescriptionRules()}'),
+            'selected PR-description prose uses repository PR rules',
         );
         ackAssert(
             fn.includes("{ skipCache: mode === 'proofread' }"),
@@ -34845,6 +35040,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(isToolbarPage('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin'), false);
         ackEq(isToolbarPage('/bitcoin/bitcoin/pulls'), false);
+    });
+
+    ackTest('toolbar routes cover upstream and fork secp256k1 pages', () => {
+        const sha = 'a3f596f269324d110031f97c3bc4373516ca9e8c';
+        for (const owner of ['bitcoin-core', 'l0rinc']) {
+            const repo = `/${owner}/secp256k1`;
+            ackEq(isToolbarPage(`${repo}/pull/123`), true, `${owner} PR`);
+            ackEq(isToolbarPage(`${repo}/pull/123/files`), true, `${owner} PR files`);
+            ackEq(isToolbarPage(`${repo}/issues/123`), true, `${owner} issue`);
+            ackEq(isToolbarPage(`${repo}/compare/master...topic`), true, `${owner} compare`);
+            ackEq(isToolbarPage(`${repo}/commit/${sha}`), true, `${owner} commit`);
+        }
     });
 
     ackTest('isPRCreationPage detects compare page with PR creation form', () => {
@@ -36848,7 +37055,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function fetchPRFileCategories') + 900,
         );
         ackAssert(fileCatFn.includes('gmFetch('), 'fetchPRFileCategories uses shared gmFetch auth/rate-limit handling');
-        ackAssert(fileCatFn.includes('visibleDiffFileCategories()'), 'fetchPRFileCategories falls back to visible file headers');
+        ackAssert(
+            fileCatFn.includes('visibleDiffFileCategories(document, pr)'),
+            'fetchPRFileCategories falls back to repository-aware visible file headers',
+        );
     });
 
     ackTest('callLLM guards JSON.parse with try/catch', () => {
@@ -38792,7 +39002,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const prompt = source.slice(source.indexOf('pseudocode: `'), source.indexOf('proofread: `'));
         ackAssert(prompt.includes('"files_overview"'), 'prompt defines files_overview field');
-        ackAssert(prompt.includes('role it plays in Bitcoin Core'), 'files_overview explains file role');
+        ackAssert(prompt.includes('role it plays in the current project'), 'files_overview explains file role');
         ackAssert(prompt.includes('Skip if only 1 file changed'), 'skip for single-file commits');
         ackAssert(prompt.includes('"why_care"'), 'prompt defines why_care field');
         ackAssert(
@@ -39156,7 +39366,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'reproducer prompt preview excludes the generic review system prompt',
         );
         ackAssert(
-            recipeSystem.includes('return `${SYSTEM_BASE}\\n\\n${extraInstr}${citationInstructions}`'),
+            recipeSystem.includes('return `${getReviewSystemBase()}\\n\\n${extraInstr}${citationInstructions}`'),
             'non-prompt recipes keep the generic review system prompt',
         );
         ackAssert(
@@ -41838,8 +42048,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'does not apply the same API categories again after ACK loading',
         );
         ackAssert(
-            fn.includes('const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories())'),
-            'uses visible diff files as a fallback when the API is unavailable',
+            fn.includes(
+                'const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories(document, pr))',
+            ),
+            'uses repository-aware visible diff files as a fallback when the API is unavailable',
         );
         ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 1000)'), 'retries visible file detection after hydration');
         ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 3000)'), 'keeps watching for lazy-loaded file headers');
@@ -42578,6 +42790,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // --- Test Exports ---
     const _testExports = {
         parsePR,
+        isSecp256k1Repo,
         getAnalysisMode,
         isPRPage,
         isIssuePage,
@@ -42605,6 +42818,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         TYPE_META,
         DEFAULT_INSTRUCTIONS,
         SYSTEM_BASE,
+        SECP256K1_SYSTEM_BASE,
+        getReviewSystemBase,
+        getReviewPRDescriptionRules,
+        getReviewCommitMessageRules,
+        getReviewPRTitleRules,
         BRAILLE_ROWS,
         BRAILLE_COLS,
         BRAILLE_PHASES,
