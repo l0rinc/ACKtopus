@@ -5876,7 +5876,7 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
         panel.appendChild(ghTitle);
         const ghDesc = document.createElement('div');
         ghDesc.textContent =
-            'Personal Access Token for authenticated API requests (5000/hr vs 60/hr). No scopes needed for read-only on public repos. Pending review mode requires "Pull requests: Read and write" permission.';
+            'Personal Access Token for authenticated API reads (5000/hr vs 60/hr). Public repositories do not need repository permissions. ACKtopus uses your GitHub page session for edits, replies, and reviews, so the token does not need write access.';
         Object.assign(ghDesc.style, { fontSize: '11px', color: '#8b949e', marginBottom: '6px' });
         panel.appendChild(ghDesc);
         const ghRow = document.createElement('div');
@@ -40914,8 +40914,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(authFn.includes('githubAuthHeaderValue()'), 'uses shared normalized PAT auth helper');
     });
 
-    ackTest('config panel text mentions GitHub PAT write permission', () => {
-        ackAssert(_ackSource.includes('Read and write'), 'mentions Read and write permission');
+    ackTest('config panel documents read-only GitHub PAT use', () => {
+        ackAssert(_ackSource.includes('authenticated API reads'), 'limits the PAT to API reads');
+        ackAssert(_ackSource.includes('does not need write access'), 'does not request write access');
     });
 
     ackTest('design principle: DOM-first for writes documented at all key sites', () => {
