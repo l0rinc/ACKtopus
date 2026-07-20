@@ -644,6 +644,8 @@
     const WIDE_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_SELECTOR + ', .js-discussion, .timeline-comment-group, .js-timeline-item, [id^="issue-"]';
     const MARKDOWN_BODY_SELECTOR = '.markdown-body, .comment-body, .js-comment-body, [data-testid="markdown-body"]';
+    const PENDING_REVIEW_MARKER_SELECTOR =
+        '.js-pending-review-comment, .Label--warning, [title*="Pending" i], [aria-label*="Pending" i], [data-testid*="pending" i]';
     const COMMENT_THREAD_SELECTOR =
         '.js-line-comments, [data-testid="review-thread"], .review-thread-component, .inline-comments, details[data-resolved], .js-resolvable-timeline-thread-container';
     const COMMENT_MENU_TRIGGER_SELECTOR =
@@ -8172,14 +8174,42 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         };
     }
 
-    function commentHasOwnPendingReviewMarker(container) {
-        const pendingSelector = '.js-pending-review-comment, .Label--warning, [title="Label: Pending"], [data-testid="pending-badge"]';
-        const markers = qsa(container, pendingSelector).filter((el) => {
-            if (el.classList?.contains('js-pending-review-comment')) return true;
-            const label = `${el.textContent || ''} ${el.getAttribute?.('title') || ''}`.trim();
-            return /pending/i.test(label);
-        });
-        return markers.some((marker) => marker.closest?.(COMMENT_CONTAINER_SELECTOR) === container);
+    function isPendingReviewMarker(el) {
+        if (el?.classList?.contains('js-pending-review-comment')) return true;
+        if (el?.closest?.('[id^="pullrequestreview-"]') && !el.closest('.js-pending-review-comment')) return false;
+        const label = [
+            el?.textContent,
+            el?.getAttribute?.('title'),
+            el?.getAttribute?.('aria-label'),
+            el?.getAttribute?.('data-testid'),
+        ]
+            .filter(Boolean)
+            .join(' ');
+        return /pending/i.test(label);
+    }
+
+    function findPendingReviewCommentContainer(marker, root = document) {
+        for (let el = marker; el && el !== root.parentElement; el = el.parentElement) {
+            const looksLikeComment =
+                el.matches?.(COMMENT_CONTAINER_SELECTOR) ||
+                el.matches?.(
+                    '.js-comment, [id^="discussion_r"], [id^="pullrequestreviewcomment-"], ' +
+                        '[data-testid*="comment" i], [class*="Comment"], [class*="comment"]',
+                );
+            if (looksLikeComment && el.querySelectorAll?.(MARKDOWN_BODY_SELECTOR).length === 1) return el;
+            if (el === root) break;
+        }
+        return null;
+    }
+
+    function commentHasOwnPendingReviewMarker(container, root = document) {
+        const markers = [
+            ...(container?.matches?.(PENDING_REVIEW_MARKER_SELECTOR) ? [container] : []),
+            ...qsa(container, PENDING_REVIEW_MARKER_SELECTOR),
+        ];
+        return markers
+            .filter(isPendingReviewMarker)
+            .some((marker) => findPendingReviewCommentContainer(marker, root) === container);
     }
 
     function formatCommentFlags({ isOutdated, isPending, isResolved } = {}) {
@@ -8797,16 +8827,25 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return mergePendingReviewComments(out);
     }
 
-    function gatherPendingReviewDomComments(root = document) {
+    function gatherPendingReviewDomComments(root = document, diagnostics = null) {
         const comments = [];
         const seenBodies = new Set();
-        for (const container of root.querySelectorAll?.(COMMENT_CONTAINER_SELECTOR) || []) {
+        const knownContainers = qsa(root, COMMENT_CONTAINER_SELECTOR);
+        const markers = qsa(root, PENDING_REVIEW_MARKER_SELECTOR).filter(isPendingReviewMarker);
+        const markerContainers = markers.map((marker) => findPendingReviewCommentContainer(marker, root)).filter(Boolean);
+        const containers = [...new Set([...knownContainers, ...markerContainers])];
+        if (diagnostics) {
+            diagnostics.knownContainers = knownContainers.length;
+            diagnostics.markers = markers.length;
+            diagnostics.markerContainers = new Set(markerContainers).size;
+        }
+        for (const container of containers) {
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!body || seenBodies.has(body)) continue;
-            seenBodies.add(body);
             const threadRoot = getCommentThreadRoot(container);
             const flags = getCommentThreadFlags(container, threadRoot);
-            if (!commentHasOwnPendingReviewMarker(container)) continue;
+            if (!commentHasOwnPendingReviewMarker(container, root)) continue;
+            seenBodies.add(body);
             const markdown = renderBodyMarkdown(body);
             if (!markdown) continue;
             const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
@@ -8829,6 +8868,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             };
             comments.push(comment);
         }
+        if (diagnostics) diagnostics.comments = comments.length;
         return mergePendingReviewComments(comments);
     }
 
@@ -8865,6 +8905,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         let cursor = null;
         for (let page = 1; page <= 20; page++) {
             onProgress(`Fetching pending review comments, page ${page}...`);
+            console.log(`ACKtopus: pending review context: GraphQL page ${page} requested`);
             const data = await patGraphQL(query, {
                 owner: pr.owner,
                 repo: pr.repo,
@@ -8872,6 +8913,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 cursor,
             });
             const review = data?.data?.repository?.pullRequest?.viewerLatestReview;
+            console.log('ACKtopus: pending review context: GraphQL page result', {
+                page,
+                reviewState: review?.state || 'none',
+                comments: review?.comments?.nodes?.length || 0,
+                hasNextPage: !!review?.comments?.pageInfo?.hasNextPage,
+            });
             if (review?.state && review.state !== 'PENDING') break;
             const connection = review?.comments;
             const nodes = connection?.nodes || [];
@@ -8882,6 +8929,42 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             if (!connection?.pageInfo?.hasNextPage) break;
             cursor = connection.pageInfo.endCursor || null;
             if (!cursor) break;
+        }
+        return mergePendingReviewComments(comments);
+    }
+
+    async function fetchViewerPendingReviewCommentsRest(pr, onProgress = () => {}) {
+        if (!patAuthHeaderValue()) return [];
+        const base = `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`;
+        onProgress('Fetching pending reviews...');
+        const reviews = await fetchPagedGithubRows((page) => `${base}/reviews?per_page=100&page=${page}`);
+        const login = getCurrentGitHubLogin().toLowerCase();
+        const pendingReviews = reviews.filter((review) => {
+            if (String(review?.state || '').toUpperCase() !== 'PENDING') return false;
+            const author = String(review?.user?.login || '').toLowerCase();
+            return !login || !author || author === login;
+        });
+        console.log('ACKtopus: pending review context: REST reviews result', {
+            reviews: reviews.length,
+            pendingReviews: pendingReviews.length,
+            viewerKnown: !!login,
+        });
+
+        const comments = [];
+        for (const [index, review] of pendingReviews.entries()) {
+            if (!review?.id) continue;
+            onProgress(`Fetching pending review ${index + 1}/${pendingReviews.length} comments...`);
+            const rows = await fetchPagedGithubRows(
+                (page) => `${base}/reviews/${review.id}/comments?per_page=100&page=${page}`,
+            );
+            console.log('ACKtopus: pending review context: REST review comments result', {
+                review: index + 1,
+                comments: rows.length,
+            });
+            for (const row of rows) {
+                const normalized = normalizePendingReviewComment(row, 'REST pending review');
+                if (normalized) comments.push(normalized);
+            }
         }
         return mergePendingReviewComments(comments);
     }
@@ -8911,17 +8994,70 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     async function gatherPendingReviewCommentsContext(onProgress = () => {}) {
         const pr = parsePR();
-        if (!pr) return '';
+        if (!pr) {
+            console.warn('ACKtopus: pending review context: not on a pull request page', {
+                pathname: location.pathname,
+            });
+            return '';
+        }
+        const startedAt = Date.now();
         const pageUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
-        const comments = mergePendingReviewComments(
-            await fetchViewerPendingReviewComments(pr, onProgress).catch((e) => {
+        const auth = {
+            configured: !!githubPatValue(),
+            usable: !!patAuthHeaderValue(),
+        };
+        console.log('ACKtopus: pending review context: started', {
+            pullRequest: `${pr.owner}/${pr.repo}#${pr.pr}`,
+            pathname: location.pathname,
+            patConfigured: auth.configured,
+            patUsable: auth.usable,
+            viewer: getCurrentGitHubLogin() || 'unknown',
+            pendingDetected: detectPendingReview(),
+            pendingChangesDetected: hasPendingReviewChanges(),
+        });
+
+        let graphQLComments = [];
+        let restComments = [];
+        if (auth.usable) {
+            try {
+                graphQLComments = await fetchViewerPendingReviewComments(pr, onProgress);
+            } catch (e) {
                 onProgress(`Could not fetch pending comments through GraphQL: ${e.message || e}`);
-                return [];
-            }),
-            extractPendingReviewCommentsFromObject(readViewerPendingReviewFromSSR(), 'embedded page data'),
-            gatherPendingReviewDomComments(document),
-        );
-        if (!comments.length) return '';
+                console.warn('ACKtopus: pending review context: GraphQL failed', e);
+            }
+            if (!graphQLComments.length && patAuthHeaderValue()) {
+                try {
+                    restComments = await fetchViewerPendingReviewCommentsRest(pr, onProgress);
+                } catch (e) {
+                    onProgress(`Could not fetch pending comments through REST: ${e.message || e}`);
+                    console.warn('ACKtopus: pending review context: REST failed', e);
+                }
+            }
+        } else {
+            console.warn('ACKtopus: pending review context: authenticated sources skipped', auth);
+        }
+
+        const embeddedDiagnostics = {};
+        const embeddedReview = readViewerPendingReviewFromSSR(embeddedDiagnostics);
+        const embeddedComments = extractPendingReviewCommentsFromObject(embeddedReview, 'embedded page data');
+        const domDiagnostics = {};
+        const domComments = gatherPendingReviewDomComments(document, domDiagnostics);
+        const comments = mergePendingReviewComments(graphQLComments, restComments, embeddedComments, domComments);
+        console.log('ACKtopus: pending review context: source summary', {
+            graphQL: graphQLComments.length,
+            rest: restComments.length,
+            embeddedReviewFound: !!embeddedReview,
+            embedded: embeddedComments.length,
+            embeddedDiagnostics,
+            dom: domComments.length,
+            domDiagnostics,
+            merged: comments.length,
+            elapsedMs: Date.now() - startedAt,
+        });
+        if (!comments.length) {
+            onProgress('No pending comments found; see console logs for source details');
+            return '';
+        }
         const parts = [
             `# Pending review comments for ${pageUrl}`,
             `Pending comments: ${comments.length}`,
@@ -12862,34 +12998,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // PAT-based GraphQL helpers used by review-thread search and chat context.
 
     function patAuthHeaderValue() {
-        return githubAuthHeaderValue();
+        return ghApiHeaders().Authorization || '';
     }
 
     // GitHub GraphQL API via PAT (no cookies/CSRF required).
     async function patGraphQL(query, variables) {
         const auth = patAuthHeaderValue();
         if (!auth) throw new Error('no PAT configured');
+        const url = 'https://api.github.com/graphql';
+        const headers = {
+            'Content-Type': 'application/json',
+            Authorization: auth,
+        };
+        const preflight = githubRateLimitPreflightError(url, headers);
+        if (preflight) throw preflight;
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
-                url: 'https://api.github.com/graphql',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: auth,
-                },
+                url,
+                headers,
                 data: JSON.stringify({ query, variables }),
                 onload(resp) {
+                    if (resp.status < 200 || resp.status >= 300) {
+                        if (isGithubRateLimitResponse(resp)) rememberGithubRateLimit(resp, headers);
+                        else if (resp.status === 401 || resp.status === 403) rememberGithubBadPat(resp);
+                        reject(githubHttpError(resp, url));
+                        return;
+                    }
                     try {
-                        const json = JSON.parse(resp.responseText);
+                        const json = parseGithubJson(resp, url);
                         if (json.errors?.length) return reject(new Error(json.errors.map((e) => e.message).join('; ')));
                         resolve(json);
                     } catch (e) {
                         reject(e);
                     }
                 },
-                onerror(e) {
-                    reject(new Error(e?.error || 'network error'));
-                },
+                ...githubGetTransportHandlers(url, reject),
             });
         });
     }
@@ -13317,13 +13461,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // When true, reply Comment buttons show ⏳ instead of "Start a review".
     let _ackPendingReviewActive = false;
 
-    function readViewerPendingReviewFromSSR() {
+    function readViewerPendingReviewFromSSR(diagnostics = null) {
         try {
             const scriptEl = document.querySelector(
                 'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]',
             );
+            if (diagnostics) diagnostics.scriptFound = !!scriptEl?.textContent;
             if (!scriptEl?.textContent) return null;
             const data = JSON.parse(scriptEl.textContent);
+            if (diagnostics) diagnostics.parsed = true;
             const stack = [data];
             const seen = new Set();
             while (stack.length) {
@@ -13331,13 +13477,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
                 seen.add(cur);
                 if (cur.viewerPendingReview && typeof cur.viewerPendingReview === 'object') {
+                    if (diagnostics) diagnostics.field = 'viewerPendingReview';
                     return cur.viewerPendingReview;
+                }
+                if (
+                    cur.viewerLatestReview &&
+                    typeof cur.viewerLatestReview === 'object' &&
+                    String(cur.viewerLatestReview.state || '').toUpperCase() === 'PENDING'
+                ) {
+                    if (diagnostics) diagnostics.field = 'viewerLatestReview';
+                    return cur.viewerLatestReview;
                 }
                 for (const v of Object.values(cur)) {
                     if (v && typeof v === 'object') stack.push(v);
                 }
             }
-        } catch (_) {}
+        } catch (e) {
+            if (diagnostics) diagnostics.error = e?.message || String(e);
+        }
         return null;
     }
 
@@ -22471,14 +22628,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- Inject helpers ---
 
-    async function copyContextWith(btn, { gather, initialStatus, successLabel, errorLabel = 'copy context' } = {}) {
+    async function copyContextWith(
+        btn,
+        { gather, initialStatus, successLabel, emptyLabel = 'No context found', errorLabel = 'copy context' } = {},
+    ) {
         if (btn._running) return;
         btn._running = true;
+        const startedAt = Date.now();
         const origText = btn.textContent;
         const stopSpin = startBrailleAnimation((frame) => {
             btn.textContent = frame;
         });
         const popup = makeStatusPopup(initialStatus);
+        console.log(`ACKtopus: ${errorLabel}: started`, {
+            pathname: location.pathname,
+            page: pageKind(),
+        });
 
         try {
             const context = await gather((msg) => {
@@ -22488,9 +22653,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 GM_setClipboard(context);
                 btn.textContent = '✅';
                 popup.textContent = `✅ ${successLabel} ${(context.length / 1024).toFixed(0)}KB to clipboard`;
+                console.log(`ACKtopus: ${errorLabel}: copied`, {
+                    characters: context.length,
+                    elapsedMs: Date.now() - startedAt,
+                });
             } else {
                 btn.textContent = '❌';
-                popup.textContent = '❌ No context found';
+                popup.textContent = `❌ ${emptyLabel}`;
+                console.warn(`ACKtopus: ${errorLabel}: no context found`, {
+                    pathname: location.pathname,
+                    elapsedMs: Date.now() - startedAt,
+                });
             }
         } catch (e) {
             btn.textContent = '❌';
@@ -22551,6 +22724,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             gather: gatherPendingReviewCommentsContext,
             initialStatus: 'Gathering pending review comments...',
             successLabel: 'Copied pending comments',
+            emptyLabel: 'No pending comments found; see console logs',
             errorLabel: 'copy pending review comments context',
         });
     }
@@ -32985,6 +33159,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!helpers.includes('auth:${headers.Authorization}'), 'does not store Authorization header in rate-limit bucket key');
     });
 
+    ackTest('PAT GraphQL auth stops using a token rejected earlier in the page session', () => {
+        GM_setValue('github_pat', 'rejected-test-token');
+        _githubBadPat = '';
+        ackAssert(!!patAuthHeaderValue(), 'uses a configured token before GitHub rejects it');
+        _githubBadPat = 'rejected-test-token';
+        ackEq(patAuthHeaderValue(), '', 'does not reuse the rejected token for GraphQL requests');
+    });
+
     ackTest('GitHub PAT status warns for the rejected token and recovers for a replacement', () => {
         const input = document.createElement('input');
         const status = document.createElement('span');
@@ -36208,6 +36390,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!helper.includes('navigator.clipboard'), 'does not use navigator.clipboard API');
         ackAssert(helper.includes('startBrailleAnimation'), 'shows loading spinner');
         ackAssert(helper.includes('popup.textContent'), 'updates progress popup');
+        ackAssert(helper.includes(': started'), 'logs the start of each copy operation');
+        ackAssert(helper.includes(': copied'), 'logs successful copy sizes and durations');
+        ackAssert(helper.includes(': no context found'), 'logs empty copy results');
 
         const copyHelper = source.slice(
             source.indexOf('function waitForNextPaint'),
@@ -36372,6 +36557,97 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('pending review DOM collection finds new comment containers through accessible pending labels', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="NewReviewThread">
+                <div class="NewReviewComment">
+                    <span aria-label="Pending review comment">Pending</span>
+                    <div data-testid="markdown-body"><p>Draft from new React markup</p></div>
+                </div>
+            </div>
+        `;
+        const diagnostics = {};
+        const comments = gatherPendingReviewDomComments(host, diagnostics);
+        ackEq(comments.length, 1, 'copies a pending comment without a known GitHub container class');
+        ackEq(comments[0].markdown, 'Draft from new React markup', 'keeps the draft body');
+        ackEq(diagnostics.markers, 1, 'reports the accessible pending marker');
+        ackEq(diagnostics.markerContainers, 1, 'reports the marker-derived comment container');
+    });
+
+    ackTest('pending review DOM collection does not assign a thread-level marker to a parent comment', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="NewReviewThread">
+                <span aria-label="Pending review">Pending</span>
+                <div class="NewReviewComment"><div data-testid="markdown-body">Published parent</div></div>
+                <div class="NewReviewComment"><div data-testid="markdown-body">Draft reply</div></div>
+            </div>
+        `;
+        const comments = gatherPendingReviewDomComments(host);
+        ackEq(comments.length, 0, 'a marker around multiple comment bodies is not treated as one pending comment');
+    });
+
+    ackTest('pending review DOM collection ignores page-level pending controls', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <button aria-label="Submit pending review">Submit review</button>
+            <div id="issue-body"><div data-testid="markdown-body">PR description</div></div>
+        `;
+        const comments = gatherPendingReviewDomComments(host);
+        ackEq(comments.length, 0, 'a page-level pending control does not turn the PR body into a pending comment');
+    });
+
+    ackTest('pending review DOM collection ignores pending review timeline summaries', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div id="pullrequestreview-123" class="timeline-comment">
+                <span title="Label: Pending" class="Label--warning">Pending</span>
+                <div class="markdown-body">Review summary, not a pending inline comment</div>
+            </div>
+        `;
+        const comments = gatherPendingReviewDomComments(host);
+        ackEq(comments.length, 0, 'does not copy a pending review summary as a pending inline comment');
+    });
+
+    ackTest('pending review REST fallback fetches the viewer pending review comments', async () => {
+        const originalFetchPagedGithubRows = fetchPagedGithubRows;
+        const originalGetCurrentGitHubLogin = getCurrentGitHubLogin;
+        const calls = [];
+        GM_setValue('github_pat', 'test-token');
+        _githubBadPat = '';
+        try {
+            getCurrentGitHubLogin = () => 'current-viewer';
+            fetchPagedGithubRows = async (urlForPage) => {
+                const url = urlForPage(1);
+                calls.push(url);
+                if (/\/reviews\?/.test(url)) {
+                    return [
+                        { id: 7, state: 'PENDING', user: { login: 'current-viewer' } },
+                        { id: 8, state: 'PENDING', user: { login: 'someone-else' } },
+                        { id: 9, state: 'APPROVED', user: { login: 'current-viewer' } },
+                    ];
+                }
+                return [
+                    {
+                        id: 9,
+                        body: 'Pending REST draft',
+                        path: 'src/foo.cpp',
+                        line: 42,
+                    },
+                ];
+            };
+            const comments = await fetchViewerPendingReviewCommentsRest({ owner: 'octo', repo: 'demo', pr: '12' });
+            ackEq(comments.length, 1, 'returns the pending review comment');
+            ackEq(comments[0].markdown, 'Pending REST draft', 'normalizes the pending body');
+            ackEq(calls.length, 2, 'fetches reviews and only the pending review comments');
+            ackAssert(calls[1].includes('/reviews/7/comments'), 'uses the review comments endpoint');
+        } finally {
+            fetchPagedGithubRows = originalFetchPagedGithubRows;
+            getCurrentGitHubLogin = originalGetCurrentGitHubLogin;
+        }
+    });
+
     ackTest('pending review comments gather from GraphQL, page data, and DOM without reveal-all', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -36379,9 +36655,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('// --- Visible Comments Scraper'),
         );
         ackAssert(fn.includes('fetchViewerPendingReviewComments'), 'uses GraphQL pending review comments');
+        ackAssert(fn.includes('fetchViewerPendingReviewCommentsRest'), 'falls back to REST pending review comments');
         ackAssert(fn.includes('readViewerPendingReviewFromSSR'), 'uses embedded page pending review data');
         ackAssert(fn.includes('gatherPendingReviewDomComments'), 'uses DOM pending comments as fallback/enrichment');
         ackAssert(fn.includes('mergePendingReviewComments'), 'deduplicates across sources');
+        ackAssert(fn.includes('source summary'), 'logs per-source counts for failed copy reports');
+        ackAssert(fn.includes('embeddedDiagnostics'), 'logs embedded page-data discovery and parse details');
+        ackAssert(fn.includes('domDiagnostics'), 'logs pending marker and container counts');
         ackAssert(!fn.includes('revealAllContext'), 'does not visually open hidden GitHub content');
         const graphQL = source.slice(
             source.indexOf('async function fetchViewerPendingReviewComments'),
@@ -40979,12 +41259,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(patFn.includes('api.github.com/graphql'), 'uses official GraphQL API');
         ackAssert(patFn.includes('GM_xmlhttpRequest'), 'uses GM_xmlhttpRequest (bypasses CORS)');
         ackAssert(patFn.includes('Authorization'), 'sends Authorization header');
+        ackAssert(patFn.includes('resp.status < 200 || resp.status >= 300'), 'rejects non-success HTTP responses');
+        ackAssert(patFn.includes('rememberGithubBadPat(resp)'), 'disables a rejected PAT');
+        ackAssert(patFn.includes('rememberGithubRateLimit(resp, headers)'), 'records GraphQL rate limits');
+        ackAssert(patFn.includes('githubHttpError(resp, url)'), 'reports HTTP status and response context');
 
         const authFn = _ackSource.slice(
             _ackSource.indexOf('function patAuthHeaderValue'),
             _ackSource.indexOf('async function patGraphQL'),
         );
-        ackAssert(authFn.includes('githubAuthHeaderValue()'), 'uses shared normalized PAT auth helper');
+        ackAssert(authFn.includes('ghApiHeaders().Authorization'), 'shares bad-PAT handling with REST requests');
+    });
+
+    ackTest('patGraphQL rejects HTTP failures and disables a rejected PAT', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        GM_setValue('github_pat', 'graphql-test-token');
+        _patInvalidWarned = 'graphql-test-token';
+        try {
+            GM_xmlhttpRequest = ({ onload }) => {
+                onload?.({ status: 401, responseText: '{"message":"Bad credentials"}' });
+            };
+            let error = null;
+            try {
+                await patGraphQL('query { viewer { login } }', {});
+            } catch (e) {
+                error = e;
+            }
+            ackEq(error?.status, 401, 'returns the GraphQL HTTP status to the caller');
+            ackEq(_githubBadPat, 'graphql-test-token', 'disables the rejected token for later requests');
+            ackEq(patAuthHeaderValue(), '', 'subsequent GraphQL calls do not reuse the token');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+        }
     });
 
     ackTest('config panel documents read-only GitHub PAT use', () => {
