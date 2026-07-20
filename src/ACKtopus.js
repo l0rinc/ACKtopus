@@ -5207,18 +5207,19 @@ Produce a prompt for the step after the no-peek local reproducer exists and the 
 - The generated prompt assumes there is already a local no-peek reproducer branch or patch.
 - The generated prompt makes clear that peeking at the actual PR is now allowed, but only for comparison and suggestion work.
 - The target agent must identify the actual PR base/head, the local reproducer base/head, and the exact branch relationship before rewriting history.
-- The actual PR should be split into smaller reviewable commits when that improves reviewability: tests that pass before code changes, low-risk cleanup, high-risk behavior, refactors, code moves, mechanical changes, and build wiring should be separated where useful.
+- Ask for explicit user approval before splitting or otherwise rewriting the actual PR history. Without that approval, keep the submitted author stack unchanged and perform a read-only comparison.
+- When approved, the actual PR should be split into smaller reviewable commits if that improves reviewability: tests that pass before code changes, low-risk cleanup, high-risk behavior, refactors, code moves, mechanical changes, and build wiring should be separated where useful.
 - Split commit messages should preserve author wording where useful, use original-ordinal prefixes such as 1.1 or 2.1, and explain the problem and result each commit proves.
 - The target agent must verify split/squash equivalence: squashing the split actual-PR commits should represent the original submitted PR before suggestion commits are added.
-- The local no-peek work should be compared against the split actual PR and replayed as suggestion commits either on top or immediately after the split author commit they review; choose the ordering that makes review easiest while keeping the author baseline identifiable.
-- Suggestion commits may be placed between split author commits when that makes a review point clearer. Keep author/suggestion commits clearly labeled and keep author-only squash-equivalence provable.
+- Compare the local no-peek work against the approved author baseline, then replay every retained review suggestion as a separate commit on top of the complete author stack.
+- Keep the author baseline contiguous and unchanged after it is established. Never place suggestion commits between author commits.
 - Every difference between the compared or replayed local implementation and the actual PR, including nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations, becomes its own small suggestion commit. A plausible local alternative is enough; the user filters the stack downstream.
 - Beyond local-vs-PR divergences, the generated prompt must ask the target agent to read the new code introduced by the PR with a code-reviewer's eye and propose a separate small commit for every plausible improvement: inverting contrived \`if\` conditions, replacing a custom helper with an existing simpler method, fixing typos in new code or in new commit messages, choosing a more idiomatic C++ or Python construct, deduplicating repetitive blocks in newly added code, tightening naming, and adding test coverage for newly introduced code paths.
 - Strongly prefer over-suggesting to under-suggesting. Coming up with a new commit costs the user far more than skipping a proposed one, so when in doubt, propose. The only commits the prompt must avoid are forced/empty/invalid ones, ones not grounded in the actual PR code, and ones whose entire content is "the PR is better" (those are reported in prose, not committed).
 - Verify every suggestion against the live PR, comments, tests, and branch shape before committing it. If evidence undercuts the premise, drop the suggestion instead of defending it or preserving a stack count.
 - The generated prompt should tell the target agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading. Encourage the agent to cover every angle a proofreader might check (correctness, safety, idiom, repetition, naming, typos, commit-message accuracy, test coverage, edge cases) rather than self-filtering to what it personally considers most important.
 - One commit equals one issue equals one PR comment. Each suggestion commit covers a single concrete point the agent would write as one inline review comment, and its patch is the smallest possible change that satisfies that single point. If the agent finds two issues, even in the same hunk, that becomes two commits. Never bundle them.
-- Suggestion commit messages must be phrased like actual PR code review comments: concrete problem first, why it matters, smallest suggested change, and exact GitHub code/review URLs proving the claim.
+- Suggestion commit messages must be phrased like actual PR code review comments: one concrete problem sentence followed by one short \`Could we...?\` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence.
 - When the original PR's solution is clearly better than the local one, the target agent must report that in prose instead of manufacturing an empty, forced, or invalid suggestion commit. "Clearly better" is the only exclusion; ties and ambiguous cases still produce a commit.
 
 # Constraints
@@ -5241,16 +5242,16 @@ Ask for the local reproducer branch or patch if it is not obvious, plus any user
 Grounding, local-only history changes, squash-equivalence proof, smallest-possible suggestion patches, code-review-style commit messages, no forced commits, and stop rules.
 
 ## Step 1 - Inspect And Split The Actual PR
-The expected actual-PR result: a smaller reviewable stack where useful, original-ordinal commit-message prefixes, accurate author wording where useful, and proof that the split squashes back to the submitted PR.
+First require explicit user approval for any history rewrite. The expected actual-PR result, when approved, is a smaller reviewable author stack where useful, original-ordinal commit-message prefixes, accurate author wording where useful, and proof that the split squashes back to the submitted PR. Otherwise preserve the submitted author stack exactly.
 
 ## Step 2 - Rebase The Local Reproducer
-The expected comparison base: the no-peek local implementation compared against the split actual PR and replayed either on top or as interleaved suggestion candidates after the author commits they review, with exact range-diff or diff commands recorded.
+The expected comparison base: the no-peek local implementation compared against the approved author baseline, with exact range-diff or diff commands recorded. Use the comparison to identify candidates, but do not alter the contiguous author baseline.
 
 ## Step 3 - Add Suggestion Commits
-The expected suggestion stack has one small commit per local-vs-PR difference and one small commit per plausible PR-code review nit.
-Suggestion commits can be appended after all author commits or inserted immediately after the split author commit they review, including between split author commits, when that makes the comparison easier.
+The expected suggestion stack has one small commit per local-vs-PR difference and one small commit per plausible PR-code review nit, all appended after the complete author stack.
+Never interleave suggestion commits with author commits.
 One commit equals one issue equals one PR comment. Never bundle two suggestions, even when they touch the same file or hunk; two issues require two commits.
-Each commit has a review-comment-style message and GitHub URLs proving the claim.
+Each commit message has one concrete problem sentence followed by one short \`Could we...?\` question. Add a GitHub URL when it provides useful evidence.
 Cover every difference, including nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations. A "plausible alternative" is enough; it does not need to be clearly better.
 On the PR's newly added code, scan as a code reviewer would and commit suggestions for inverting contrived \`if\` conditions, replacing custom helpers with simpler existing methods, fixing typos in new code or new commit messages, more idiomatic C++ or Python constructs, deduplicating repetitive new code, tightening naming, and adding test coverage for new code paths.
 Coming up with a new commit later costs the user far more than skipping a proposed one, so when in doubt, commit.
@@ -5258,7 +5259,7 @@ The final stack will be proofread by another capable LLM, so cover every angle a
 The only exclusion is "the PR is clearly better here". Report those cases in prose instead of creating commits.
 
 ## Step 4 - Report And Stop
-The required final report: branch shape, split PR commits, interleaved or appended suggestion commits (including nits), the command or range proving author-only squash equivalence, cases where the original PR was clearly better, exact verification, and open questions for the user.
+The required final report: branch shape, the preserved or approved split author commits, appended suggestion commits (including nits), the command or range proving author-only squash equivalence when history was split, cases where the original PR was clearly better, exact verification, and open questions for the user.
 
 ## Final Checks
 A short checklist that verifies split/squash equivalence, grounded GitHub URLs, smallest-possible suggestion patches, no manufactured commits, no pushed changes, and a clean final branch report.`,
@@ -10642,7 +10643,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated suggestion-stack prompt',
                     finalTask:
-                        'Now write one outcome-focused follow-up prompt for a target local coding agent. This prompt is for after the no-peek local reproducer exists and the user has approved inspecting the actual PR. The target agent should inspect the submitted PR, split the actual PR into reviewable commits where useful, prove author-only split/squash equivalence, compare or replay the local rediscovery work against the split PR, and produce a suggestion stack that covers EVERY local-vs-PR difference plus EVERY plausible PR-code review nit as its own focused commit. Suggestion commits do not have to be appended only after all author commits; when clearer, insert each suggestion immediately after the split author commit it reviews, including between author commits, while preserving a clearly labeled author baseline and a command/range that proves the author/split commits alone squash back to the submitted PR before any suggestion commits are considered. One commit equals one issue equals one PR comment. Never bundle two suggestions, even when they touch the same file or hunk; two issues require two commits. Each commit\'s patch must be the smallest possible change that satisfies that single suggestion. A "plausible alternative" is enough for inclusion; nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations all become commits. The generated prompt must also ask the agent to read the PR\'s newly added code as a reviewer and propose separate small commits for each plausible improvement: inverting contrived `if` conditions, swapping a custom helper for a simpler existing method, fixing typos in new code or new commit messages, choosing more idiomatic C++ or Python constructs, deduplicating repetitive new code, tightening naming, and adding test coverage for newly introduced code. Tell the agent that coming up with a new commit later costs the user far more than skipping a proposed one, so when in doubt it should commit. It must still verify each suggestion against the live PR, comments, tests, and branch shape; if evidence undercuts the premise, it should drop the suggestion rather than preserve a stack count. Only "the PR is clearly better here" cases stay out of the stack and go into the report as prose. The generated prompt should also tell the agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading, so the agent should cover every angle a proofreader might check rather than self-filtering. Each suggestion commit message must be phrased like an actual PR code review comment: concrete problem first, why it matters, smallest suggested change, and exact GitHub code or review URLs proving the claim. Before finalizing, verify that the generated prompt is grounded in the source context, asks for required branch inputs when missing, requires split/squash equivalence, allows interleaved suggestion commits while preserving author-only equivalence, asks for both divergence-based and PR-code-review-style suggestion commits with the "plausible alternative" bar and one-issue-per-commit discipline, mentions the downstream LLM proofreading handoff, requires evidence-backed GitHub URLs, and keeps all changes local.',
+                        'Now write one outcome-focused follow-up prompt for a target local coding agent. This prompt is for after the no-peek local reproducer exists and the user has approved inspecting the actual PR. Require separate, explicit user approval before splitting or otherwise rewriting the actual PR history; without it, preserve the submitted author stack and compare against it read-only. When splitting is approved and useful, produce a reviewable author stack and prove that the author-only split squashes back to the submitted PR. Compare or replay the local rediscovery work against that author baseline, then append every retained local-vs-PR difference and every plausible PR-code review nit as its own focused suggestion commit after the complete author stack. Never place suggestion commits between author commits. One commit equals one issue equals one PR comment. Never bundle two suggestions, even when they touch the same file or hunk; two issues require two commits. Each commit\'s patch must be the smallest possible change that satisfies that single suggestion. A "plausible alternative" is enough for inclusion; nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations all become commits. Ask the agent to read the PR\'s newly added code as a reviewer and propose separate small commits for each plausible improvement: inverting contrived `if` conditions, swapping a custom helper for a simpler existing method, fixing typos in new code or new commit messages, choosing more idiomatic C++ or Python constructs, deduplicating repetitive new code, tightening naming, and adding test coverage for newly introduced code. Coming up with a new commit later costs the user far more than skipping a proposed one, so when in doubt the agent should commit. It must still verify every suggestion against the live PR, comments, tests, and branch shape; if evidence undercuts the premise, drop the suggestion rather than preserving a stack count. Only "the PR is clearly better here" cases stay out of the stack and go into the report as prose. Tell the agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading, so it should cover every angle a proofreader might check rather than self-filtering. Each suggestion commit message must contain one concrete problem sentence followed by one short `Could we...?` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence. Before finalizing, verify that the generated prompt is grounded in the source context, asks for required branch inputs when missing, requires explicit approval before rewriting author history, preserves a contiguous author baseline, requires author-only split/squash equivalence when applicable, asks for both divergence-based and PR-code-review-style suggestion commits with the "plausible alternative" bar and one-issue-per-commit discipline, mentions the downstream LLM proofreading handoff, uses evidence-backed GitHub URLs where useful, and keeps all changes local.',
                 },
                 audio_walkthrough: {
                     label: 'Audio guide',
@@ -38953,11 +38954,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(prompt.includes('original-ordinal prefixes'), 'uses original ordinal prefixes');
         ackAssert(prompt.includes('compare or replay'), 'compares/replays local work');
         ackAssert(prompt.includes('suggestion commit'), 'creates suggestion commits');
-        ackAssert(prompt.includes('between split author commits'), 'allows interleaved suggestion commits');
-        ackAssert(prompt.includes('author-only squash-equivalence'), 'keeps author-only equivalence provable');
+        ackAssert(prompt.includes('explicit user approval'), 'requires approval before rewriting author history');
+        ackAssert(prompt.includes('author baseline contiguous'), 'keeps the author baseline contiguous');
+        ackAssert(prompt.includes('Never interleave suggestion commits'), 'keeps suggestions on top');
+        ackAssert(prompt.includes('author-only squash equivalence'), 'keeps author-only equivalence provable');
         ackAssert(prompt.includes('actual PR code review comments'), 'messages read like code review comments');
         ackAssert(prompt.includes('smallest possible change'), 'keeps suggestion patches minimal');
-        ackAssert(prompt.includes('exact GitHub code/review URLs'), 'requires evidence URLs');
+        ackAssert(prompt.includes('Could we...?'), 'uses short postable review questions');
+        ackAssert(prompt.includes('when it materially supports the claim'), 'uses evidence URLs only when useful');
         ackAssert(
             prompt.includes("original PR's solution is clearly better"),
             'admits when original PR is clearly better',
@@ -39016,11 +39020,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('Generate the suggestion-stack prompt now.'), 'suggestion recipe has trigger text');
         ackAssert(fn.includes('Generated suggestion-stack prompt'), 'suggestion prompt details title exists');
         ackAssert(fn.includes('after the no-peek local reproducer exists'), 'recipe assumes reproducer exists');
-        ackAssert(fn.includes('split the actual PR into reviewable commits'), 'recipe asks for PR split');
-        ackAssert(fn.includes('prove author-only split/squash equivalence'), 'recipe asks for author-only equivalence proof');
+        ackAssert(fn.includes('explicit user approval before splitting'), 'recipe gates author history rewrites');
+        ackAssert(fn.includes('author-only split squashes back'), 'recipe asks for author-only equivalence proof');
         ackAssert(fn.includes('compare or replay the local rediscovery work'), 'recipe asks for local/PR comparison');
-        ackAssert(fn.includes('including between author commits'), 'recipe allows interleaved suggestion commits');
-        ackAssert(fn.includes('author/split commits alone squash back'), 'recipe preserves author-only equivalence proof');
+        ackAssert(fn.includes('after the complete author stack'), 'recipe appends suggestions after author commits');
+        ackAssert(fn.includes('Never place suggestion commits between author commits'), 'recipe forbids interleaving');
         ackAssert(
             fn.includes('smallest possible change that satisfies that single suggestion'),
             'recipe keeps each suggestion patch minimal and single-issue',
@@ -39030,7 +39034,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'recipe enforces one-issue-per-commit discipline',
         );
         ackAssert(fn.includes('actual PR code review comment'), 'recipe asks for review-comment-style messages');
-        ackAssert(fn.includes('exact GitHub code or review URLs'), 'recipe requires GitHub evidence URLs');
+        ackAssert(fn.includes('one concrete problem sentence'), 'recipe keeps review messages focused');
+        ackAssert(fn.includes('Could we...?'), 'recipe uses short review questions');
+        ackAssert(fn.includes('when it materially supports the claim'), 'recipe uses evidence URLs when useful');
     });
 
     ackTest('recipe context includes explicit base checkout metadata', () => {
