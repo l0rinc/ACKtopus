@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.222
+// @version      1.223
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8997,6 +8997,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             seenBodies.add(body);
             const markdown = renderBodyMarkdown(body);
             if (!markdown) continue;
+            if (/^nothing to preview$/i.test(markdown)) {
+                if (diagnostics) diagnostics.placeholdersSkipped = (diagnostics.placeholdersSkipped || 0) + 1;
+                continue;
+            }
             const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
             const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
             const threadContext = gatherCommentContext(container);
@@ -36972,6 +36976,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(comments[0].markdown, 'Draft from new React markup', 'keeps the draft body');
         ackEq(diagnostics.markers, 1, 'reports the accessible pending marker');
         ackEq(diagnostics.markerContainers, 1, 'reports the marker-derived comment container');
+    });
+
+    ackTest('pending review DOM collection ignores empty preview placeholders', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="NewReviewThread">
+                <div class="NewReviewComment">
+                    <span aria-label="Pending review comment">Pending</span>
+                    <div data-testid="markdown-body"><p>Actual pending draft</p></div>
+                </div>
+                <div class="NewReviewComment">
+                    <span aria-label="Pending review comment">Pending</span>
+                    <div data-testid="markdown-body"><p>Nothing to preview</p></div>
+                </div>
+            </div>
+        `;
+        const diagnostics = {};
+        const comments = gatherPendingReviewDomComments(host, diagnostics);
+        ackEq(comments.length, 1, 'copies only the real pending draft');
+        ackEq(comments[0].markdown, 'Actual pending draft', 'keeps the real pending draft');
+        ackEq(diagnostics.placeholdersSkipped, 1, 'reports the ignored empty preview');
     });
 
     ackTest('pending review DOM collection does not assign a thread-level marker to a parent comment', () => {
