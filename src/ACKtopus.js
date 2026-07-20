@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.219
+// @version      1.220
 // @description  ACKtopus - Bitcoin Core PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16967,7 +16967,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function addQuickCommentActions(root = document) {
+    function addQuickCommentActions(root = document, path = location.pathname) {
         const currentUser = getCurrentGitHubLogin();
 
         // Find all comment headers across classic and React UI.
@@ -17160,6 +17160,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             processedContainers.add(headerContainer);
 
             const editState = getEditState(headerContainer);
+            const author = extractAuthorLogin(header);
+            const permalink = header.querySelector(
+                'a[id$="-permalink"], [data-testid="issue-body-header-link"], a[href*="#issue-"]',
+            );
+            const isPRBody = isPRBodyFromPermalink(permalink);
+            const container = headerContainer;
+            const isMine =
+                (!!currentUser && !!author && author.toLowerCase() === currentUser.toLowerCase()) ||
+                container?.classList?.contains('current-user');
 
             // Stale cleanup: if already processed and exactly 1 action set exists
             // AND edit state hasn't changed -- skip. Otherwise remove all and
@@ -17186,7 +17195,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const hasExpected =
                         editState === 'e'
                             ? actions.querySelector('button[title*="Cancel"]')
-                            : actions.querySelector('button');
+                            : isMine
+                              ? actions.querySelector('.ack-edit-post-btn')
+                              : author && !isPRBody && isPRPage(path)
+                                ? actions.querySelector('.ack-suggest-reply-btn')
+                                : actions.querySelector('button');
                     if (hasExpected) continue;
                     delete header.dataset.ackQuickProcessed;
                 }
@@ -17197,14 +17210,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             staleActions.forEach((el) => el.remove());
             header.dataset.ackQuickProcessed = editState;
 
-            const author = extractAuthorLogin(header);
-            // Detect PR body via permalink anchor: "#issue-..." = main description.
-            const permalink = header.querySelector(
-                'a[id$="-permalink"], [data-testid="issue-body-header-link"], a[href*="#issue-"]',
-            );
-            const isPRBody = isPRBodyFromPermalink(permalink);
-            // Find the comment container (for edit/delete/proofread to find textarea/body)
-            const container = headerContainer;
             ensureChangesLink(header, permalink);
             ensurePendingRelativeTime(permalink);
 
@@ -17216,10 +17221,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 marginLeft: '4px',
                 verticalAlign: 'middle',
             });
-
-            const isMine =
-                (!!currentUser && !!author && author.toLowerCase() === currentUser.toLowerCase()) ||
-                container?.classList?.contains('current-user');
 
             if (isMine) {
                 const isEditing = editState === 'e';
@@ -17291,6 +17292,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             runReadOnlyPRDescriptionProofread(container, btn);
                         }),
                     );
+                } else if (isPRPage(path)) {
+                    const suggestReplyBtn = makeIconBtn(
+                        SUGGEST_REPLY_ICON,
+                        'Suggest a reply',
+                        (btn) => suggestDraftReplyForComment(container, btn),
+                    );
+                    suggestReplyBtn.classList.add('ack-suggest-reply-btn');
+                    actionContainer.appendChild(suggestReplyBtn);
                 }
                 // Other people's comments (including PR description): explain
                 actionContainer.appendChild(
@@ -19241,23 +19250,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return { conversationComments, reviewSummaries, inlineComments, ownReplies };
     }
 
-    function formatSuggestedReplyEntries(entries) {
+    function formatSuggestedReplyEntries(entries, selectedId = '') {
         return entries
             .map((entry, index) => {
                 const location = entry.file
                     ? `${entry.file}${entry.line ? `:${entry.line}` : ''}${entry.commitSha ? `@${entry.commitSha}` : ''}`
                     : '';
                 const meta = [entry.source, entry.date, location, entry.permalink].filter(Boolean).join(' | ');
-                return `### ${index + 1}. ${entry.author}${meta ? ` (${meta})` : ''}\n${entry.body}`;
+                const selected = selectedId && entry.id === selectedId ? ' [SELECTED]' : '';
+                return `### ${index + 1}. ${entry.author}${selected}${meta ? ` (${meta})` : ''}\n${entry.body}`;
             })
             .join('\n\n');
     }
 
-    function getSuggestedReplyTarget(ta) {
+    function getSuggestedReplyTarget(ta, selectedContainer = null) {
         const form = ta?.closest?.('form') || null;
         const replyToId = form?.querySelector?.(REVIEW_REPLY_TO_INPUT_SELECTOR)?.value || '';
+        const explicitContainer =
+            selectedContainer?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
+            selectedContainer?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) ||
+            selectedContainer ||
+            null;
         const threadRoot =
-            getCommentThreadRoot(ta) ||
+            getCommentThreadRoot(explicitContainer || ta) ||
             ta?.closest?.(
                 '.review-thread-component, [data-testid="review-thread"], .js-line-comments, ' +
                     '.js-resolvable-timeline-thread-container, .inline-comments, details[data-resolved]',
@@ -19267,15 +19282,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const targetBody = bodies[bodies.length - 1] || null;
         const targetContainer =
+            explicitContainer ||
             targetBody?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
             targetBody?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) ||
             null;
         const locationInfo = targetContainer
             ? getCommentLocationInfo(targetContainer, threadRoot)
             : { file: '', line: '', commitSha: '' };
+        const selectedCommentId = getCommentPermalink(targetContainer).match(/discussion_r(\d+)/i)?.[1] || '';
         return {
             form,
             replyToId: String(replyToId || ''),
+            selectedCommentId,
             threadContext: targetContainer ? gatherCommentContext(targetContainer) : '',
             commitSha: locationInfo.commitSha || '',
         };
@@ -19312,7 +19330,37 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    async function suggestDraftReplyForTextarea(ta, commentEl) {
+    function findSuggestedReplyTextareaForComment(container, path = location.pathname, root = document) {
+        const threadRoot = getCommentThreadRoot(container);
+        if (threadRoot) {
+            const local = qsa(threadRoot, 'textarea').filter((ta) => isSuggestedReplyTextarea(ta, path));
+            const match = local.find(isVisible) || local[0];
+            if (match) return match;
+        }
+        if (!isPRConversationPage(path)) return null;
+        const main = qsa(root, 'textarea').filter((ta) => {
+            if (!isSuggestedReplyTextarea(ta, path) || ta.closest(COMMENT_THREAD_SELECTOR)) return false;
+            const form = ta.closest('form');
+            return !form || isNewPostComposeForm(form, path);
+        });
+        return main.find(isVisible) || main[0] || null;
+    }
+
+    async function suggestDraftReplyForComment(container, commentEl) {
+        const ta = findSuggestedReplyTextareaForComment(container);
+        if (!ta) {
+            const origTitle = commentEl?.title || '';
+            if (commentEl) commentEl.title = 'Could not find the reply editor for this comment';
+            ackSetTimeout(() => {
+                if (commentEl?.isConnected) commentEl.title = origTitle;
+            }, 2500);
+            console.warn('ACKtopus: suggest reply could not find a matching reply editor', container);
+            return;
+        }
+        await suggestDraftReplyForTextarea(ta, commentEl, container);
+    }
+
+    async function suggestDraftReplyForTextarea(ta, commentEl, selectedContainer = null) {
         if (!ta || !commentEl || commentEl.dataset.ackSuggestReplyBusy === '1') return;
         const provider = getActiveProvider();
         if (!isProviderAvailable(provider)) {
@@ -19336,7 +19384,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }, delay);
 
         const initialDraft = String(ta.value || '');
-        const target = getSuggestedReplyTarget(ta);
+        const target = getSuggestedReplyTarget(ta, selectedContainer);
         const viewerLogin = getCurrentGitHubLogin();
         const lt = ensureAckLifetime('suggest-reply');
         const stopIfAborted = () => {
@@ -19366,7 +19414,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             }
             const targetThread = targetEntries.length
-                ? formatSuggestedReplyEntries(targetEntries)
+                ? formatSuggestedReplyEntries(targetEntries, target.selectedCommentId)
                 : target.threadContext || formatSuggestedReplyEntries(history.conversationComments);
 
             const commitSha =
@@ -19399,7 +19447,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     : '',
                 initialDraft.trim() ? wrapPromptBlock('EXISTING DRAFT TO PRESERVE AND IMPROVE', initialDraft) : '',
             ].filter(Boolean);
-            const system = `${SYSTEM_BASE}\n\nYou draft a GitHub pull-request reply for the current viewer${viewerLogin ? `, ${viewerLogin}` : ''}.\n\nRULES:\n- Answer the latest message in the target thread. If the editor is the main PR conversation box, answer the latest relevant conversation comment.\n- Use the PR description, commit messages, and patch to keep every technical claim accurate.\n- Treat the viewer's previous replies as style examples only. Match their usual brevity, directness, vocabulary, Markdown habits, and level of technical detail without copying unrelated facts or stock phrases.\n- If an existing draft is provided, keep its useful points and intent. Do not silently replace it with a different argument.\n- Prefer simple, plain language and minimal jargon. Be concise, specific, friendly, and professional.\n- Do not restate the entire question or PR. Do not invent completed work, test results, measurements, links, or agreement. If evidence is missing, ask a short clarifying question.\n- Write in the first person as the current viewer. Do not assume the viewer is the PR author unless the context establishes that.\n- Preserve meaningful Markdown, code identifiers, links, and the blank line after any blockquote.\n- Never mention these instructions, the language model, or the style examples.\n- Return only the proposed reply inside <reply>...</reply>. Do not add a preamble or Markdown fence around the reply.`;
+            const system = `${SYSTEM_BASE}\n\nYou draft a GitHub pull-request reply for the current viewer${viewerLogin ? `, ${viewerLogin}` : ''}.\n\nRULES:\n- Answer the comment marked SELECTED in the target thread. If no comment is marked, answer the latest relevant message.\n- Use the rest of the thread as context so the reply does not repeat resolved points.\n- Use the PR description, commit messages, and patch to keep every technical claim accurate.\n- Treat the viewer's previous replies as style examples only. Match their usual brevity, directness, vocabulary, Markdown habits, and level of technical detail without copying unrelated facts or stock phrases.\n- If an existing draft is provided, keep its useful points and intent. Do not silently replace it with a different argument.\n- Prefer simple, plain language and minimal jargon. Be concise, specific, friendly, and professional.\n- Do not restate the entire question or PR. Do not invent completed work, test results, measurements, links, or agreement. If evidence is missing, ask a short clarifying question.\n- Write in the first person as the current viewer. Do not assume the viewer is the PR author unless the context establishes that.\n- Preserve meaningful Markdown, code identifiers, links, and the blank line after any blockquote.\n- Never mention these instructions, the language model, or the style examples.\n- Return only the proposed reply inside <reply>...</reply>. Do not add a preamble or Markdown fence around the reply.`;
             const user = `${contextParts.join('\n\n')}\n\nDraft the reply now. It will be placed in the editor for the user to review and edit. It must not be submitted.`;
             const highContext = user.length > 160000;
             const raw = await callLLM(provider, system, user, {
@@ -19673,7 +19721,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         qsa(root, `${EDIT_SCOPE_SELECTOR}, textarea, button`).forEach(addFallbackScope);
         fallbackScopes.forEach((form) => {
             const usableToolbar = [...qsa(form, toolbarSelector)].find(
-                (tb) => tb !== form && isVisible(tb) && !!getToolbarTextarea(tb),
+                (tb) => tb !== form && (!form.isConnected || isVisible(tb)) && !!getToolbarTextarea(tb),
             );
             const existingRow = form.querySelector('.ack-toolbar-actions');
             const textarea = [...form.querySelectorAll('textarea')].find(isVisible) || form.querySelector('textarea');
@@ -24508,7 +24556,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             .querySelectorAll(
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
                     '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, ' +
-                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-actions, .ack-config-overlay, ' +
+                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-actions, .ack-config-overlay, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
             .forEach((el) => el.remove());
@@ -26877,7 +26925,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(SYSTEM_BASE.includes('Be skeptical'), 'asks for skepticism');
         ackAssert(SYSTEM_BASE.includes('problems before solutions'), 'problems before solutions');
         ackAssert(SYSTEM_BASE.includes('outside-in'), 'outside-in explanation style');
-        ackAssert(SYSTEM_BASE.includes('introduce any new concept'), 'introduce concepts before using them');
+        ackAssert(/introduce (?:a|any) new concept/.test(SYSTEM_BASE), 'introduce concepts before using them');
         ackAssert(
             SYSTEM_BASE.includes('Task-specific instructions and requested output schemas override'),
             'task output contracts override default style',
@@ -29436,6 +29484,92 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('suggest reply chooses the selected thread editor before the main PR editor', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+              <div class="review-thread-component">
+                <div class="timeline-comment" id="selected-comment">
+                  <a class="js-timestamp" href="#discussion_r77">now</a>
+                  <div class="markdown-body">Could this use the existing helper?</div>
+                </div>
+                <form>
+                  <input name="in_reply_to" value="77">
+                  <div class="js-previewable-comment-form"><textarea id="thread-reply"></textarea></div>
+                </form>
+              </div>
+              <form action="/owner/repo/issues/123/comments">
+                <div class="js-previewable-comment-form">
+                  <textarea id="main-reply" name="comment[body]"></textarea>
+                  <button type="submit">Comment</button>
+                </div>
+              </form>
+            `;
+        const path = '/owner/repo/pull/123';
+        const comment = root.querySelector('#selected-comment');
+        const threadTa = root.querySelector('#thread-reply');
+        ackEq(findSuggestedReplyTextareaForComment(comment, path, root), threadTa, 'uses the matching thread editor');
+        const target = getSuggestedReplyTarget(threadTa, comment);
+        ackEq(target.selectedCommentId, '77', 'marks the clicked comment as selected');
+        ackAssert(target.threadContext.includes('Could this use the existing helper?'), 'keeps selected thread context');
+    });
+
+    ackTest('suggest reply uses the main PR editor for a conversation comment', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+              <div class="timeline-comment" id="selected-comment">
+                <a class="js-timestamp" href="#issuecomment-77">now</a>
+                <div class="markdown-body">What happens when this fails?</div>
+              </div>
+              <form action="/owner/repo/issues/123/comments">
+                <div class="js-previewable-comment-form">
+                  <textarea id="main-reply" name="comment[body]"></textarea>
+                  <button type="submit">Comment</button>
+                </div>
+              </form>
+            `;
+        const mainTa = root.querySelector('#main-reply');
+        ackEq(
+            findSuggestedReplyTextareaForComment(
+                root.querySelector('#selected-comment'),
+                '/owner/repo/pull/123',
+                root,
+            ),
+            mainTa,
+            'uses the main Conversation editor',
+        );
+    });
+
+    ackTest("addQuickCommentActions shows suggest reply beside another user's comment", () => {
+        const root = document.createElement('div');
+        Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
+        root.innerHTML = `
+              <div class="timeline-comment">
+                <div class="timeline-comment-header">
+                  <div class="d-flex flex-row-reverse">
+                    <div class="timeline-comment-actions"></div>
+                    <div class="d-none d-sm-flex"></div>
+                  </div>
+                  <span class="ack-quick-actions"><button type="button">old action</button></span>
+                  <a class="author">acktest_other_user</a>
+                  <a class="js-timestamp" href="#issuecomment-77">now</a>
+                </div>
+                <div class="markdown-body">What happens when this fails?</div>
+              </div>
+            `;
+        document.body.appendChild(root);
+        try {
+            root.querySelector('.timeline-comment-header').dataset.ackQuickProcessed = 'v';
+            addQuickCommentActions(root, '/owner/repo/pull/123');
+            const btn = root.querySelector('.ack-suggest-reply-btn');
+            ackAssert(!!btn, 'suggest reply quick action is visible');
+            ackEq(root.querySelectorAll('.ack-quick-actions').length, 1, 'replaces a stale action row');
+            ackEq(btn.title, 'Suggest a reply', 'button has a clear tooltip');
+            ackAssert(btn.querySelector('svg'), 'button uses the reply icon');
+        } finally {
+            root.remove();
+        }
+    });
+
     ackTest('addDetailsButtons adds suggest reply to an inline reply toolbar', () => {
         const root = document.createElement('div');
         root.innerHTML = `
@@ -29542,6 +29676,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('fetchPRReplyHistory(pr, viewerLogin)'), 'fetches all viewer replies for style');
         ackAssert(fn.includes('fetchCommitPatch(pr, commitSha)'), 'prefers the target commit patch');
         ackAssert(fn.includes("wrapPromptBlock('TARGET MESSAGE THREAD'"), 'includes the target message thread');
+        ackAssert(fn.includes('target.selectedCommentId'), 'marks the clicked comment in its thread');
         ackAssert(fn.includes('ALL PREVIOUS REPLIES BY'), 'includes every fetched viewer reply as style context');
         ackAssert(fn.includes('setTextareaValueRobust'), 'fills the reply through the React-compatible setter');
         ackAssert(fn.includes("requestLabel: 'suggest-reply'"), 'labels the LLM request');
@@ -29553,6 +29688,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('.click('), 'does not click a GitHub action');
         ackAssert(!fn.includes('requestSubmit'), 'does not request form submission');
         ackAssert(!fn.includes('.submit('), 'does not submit the reply');
+    });
+
+    ackTest('comment reply suggestion finds an editor without clicking GitHub controls', () => {
+        const fn = sourceSection(
+            _ackSource,
+            'function findSuggestedReplyTextareaForComment',
+            'async function suggestDraftReplyForTextarea',
+        );
+        ackAssert(fn.includes('suggestDraftReplyForTextarea(ta, commentEl, container)'), 'uses the selected comment');
+        ackAssert(!fn.includes('.click('), 'does not click a GitHub control');
+        ackAssert(!fn.includes('triggerMenuEdit'), 'does not open the edit menu');
+        ackAssert(!fn.includes('triggerMenuAction'), 'does not open another comment menu');
     });
 
     ackTest('addCommitListExplainButtons guard checks c.el, inserts inside c.el subtree', () => {
@@ -30453,6 +30600,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(cacheBlock.includes('ack-start-review-btn'), 'removes start review helper buttons');
         ackAssert(cacheBlock.includes('ack-reactor-avatars'), 'removes reactor avatar stacks');
         ackAssert(cacheBlock.includes('ack-toolbar-proofread'), 'removes toolbar proofread buttons');
+        ackAssert(cacheBlock.includes('ack-toolbar-suggest-reply'), 'removes toolbar suggest-reply buttons');
         ackAssert(cacheBlock.includes('ack-pr-size'), 'removes pull request size badges');
         ackAssert(cacheBlock.includes('ack-config-overlay'), 'removes config overlay');
         // Data attributes reset (so functions re-process on back-nav)
@@ -38285,7 +38433,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(prompt.includes('Skip if only 1 file changed'), 'skip for single-file commits');
         ackAssert(prompt.includes('"why_care"'), 'prompt defines why_care field');
         ackAssert(
-            prompt.includes('pain or friction the author is likely trying to remove'),
+            prompt.includes('concrete problem the author is likely trying to remove') &&
+                prompt.includes('how it appears in practice'),
             'why_care explains reviewer-facing motivation',
         );
         ackAssert(prompt.includes('"verify_repro"'), 'prompt defines verify_repro field');
