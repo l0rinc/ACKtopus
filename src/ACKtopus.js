@@ -333,7 +333,7 @@
     }
 
     const CLANG_TOOLING_CONFIGURE_CMD =
-        'cmake -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON';
+        'cmake -B build-ack-clang -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON';
 
     const SHA_FORMATS = [
         {
@@ -423,7 +423,7 @@
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
             fmt: () => {
                 const base = shellQuote(getReviewBaseBranch());
-                return `BASE_BRANCH=${base} && git fetch && git fetch upstream "$BASE_BRANCH" && BASE=$(git rev-parse FETCH_HEAD) && git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"`;
+                return `BASE_BRANCH=${base} && ${preferredRemoteCommand()} && git fetch && git fetch "$REMOTE" "$BASE_BRANCH" && BASE=$(git rev-parse FETCH_HEAD) && git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"`;
             },
         },
         {
@@ -493,8 +493,8 @@
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
-                const upstreamBase = shellQuote(`upstream/${getReviewBaseBranch()}`);
-                return `git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | contrib/devtools/clang-format-diff.py -p1 -i -v`;
+                const base = shellQuote(getReviewBaseBranch());
+                return `BASE_BRANCH=${base} && ${preferredRemoteCommand()} && git fetch "$REMOTE" "$BASE_BRANCH" && BASE=$(git merge-base HEAD "$REMOTE/$BASE_BRANCH") && git diff -U0 "$BASE" -- ${files} | contrib/devtools/clang-format-diff.py -p1 -i -v`;
             },
         },
         {
@@ -502,26 +502,26 @@
             hotkey: 'y',
             emoji: '🧼',
             label: 'clang-tidy-diff',
-            tip: 'Run clang-tidy only on changed lines in this PR (configures a clang compile database in build/ first)',
+            tip: 'Run clang-tidy only on changed lines in this PR (configures a separate clang build first)',
             cond: 'cpp',
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
-                const upstreamBase = shellQuote(`upstream/${getReviewBaseBranch()}`);
-                return `TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 $(git merge-base HEAD ${upstreamBase}) -- ${files} | "$TIDY_DIFF" -p1 -path build -j "$(getconf _NPROCESSORS_ONLN)"`;
+                const base = shellQuote(getReviewBaseBranch());
+                return `BASE_BRANCH=${base} && ${preferredRemoteCommand()} && git fetch "$REMOTE" "$BASE_BRANCH" && BASE=$(git merge-base HEAD "$REMOTE/$BASE_BRANCH") && TIDY_DIFF="\${TIDY_DIFF:-$(command -v clang-tidy-diff || command -v clang-tidy-diff.py)}" && [ -n "$TIDY_DIFF" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && git diff -U0 "$BASE" -- ${files} | "$TIDY_DIFF" -p1 -path build-ack-clang -j "$(getconf _NPROCESSORS_ONLN)"`;
             },
         },
         {
             key: 'iwyu',
             hotkey: 'i',
             emoji: '🔎',
-            label: 'IWYU (changed)',
-            tip: 'Run include-what-you-use on changed src/*.h,*.cpp files only (configures build/compile_commands.json first)',
+            label: 'IWYU report (changed)',
+            tip: 'Report include-what-you-use findings for changed src/*.h,*.cpp files without editing them',
             cond: 'cpp',
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
-                return `IWYU_TOOL="\${IWYU_TOOL:-$(command -v iwyu_tool.py || command -v iwyu_tool)}" && FIX_INCLUDES="\${FIX_INCLUDES:-$(command -v fix_includes.py || command -v fix_includes)}" && [ -n "$IWYU_TOOL" ] && [ -n "$FIX_INCLUDES" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && { "$IWYU_TOOL" -p build ${files} -- -Xiwyu --cxx17ns -Xiwyu --mapping_file=contrib/devtools/iwyu/bitcoin.core.imp -Xiwyu --max_line_length=160 2>&1 | tee /tmp/iwyu.out && "$FIX_INCLUDES" --nosafe_headers < /tmp/iwyu.out; }`;
+                return `IWYU_TOOL="\${IWYU_TOOL:-$(command -v iwyu_tool.py || command -v iwyu_tool)}" && [ -n "$IWYU_TOOL" ] && ${CLANG_TOOLING_CONFIGURE_CMD} && "$IWYU_TOOL" -p build-ack-clang ${files} -- -Xiwyu --cxx17ns -Xiwyu --mapping_file="$PWD/contrib/devtools/iwyu/bitcoin.core.imp" -Xiwyu --max_line_length=160`;
             },
         },
     ];
@@ -25587,7 +25587,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('formatdiff command uses clang-format-diff.py and merge-base vs upstream base branch', () => {
+    ackTest('formatdiff command uses clang-format-diff.py and the preferred remote base branch', () => {
         const f = SHA_FORMATS.find((f) => f.key === 'formatdiff');
         const prev = prFileCategories;
         const origBase = getReviewBaseBranch;
@@ -25595,7 +25595,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             getReviewBaseBranch = () => 'main';
             prFileCategories = { cpp: ['src/validation.cpp', 'src/validation.h'] };
             const cmd = f.fmt();
-            ackAssert(cmd.includes("git merge-base HEAD 'upstream/main'"), 'uses merge-base vs upstream/main');
+            ackAssert(
+                cmd.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'),
+                'uses upstream/origin remote fallback',
+            );
+            ackAssert(cmd.includes('git fetch "$REMOTE" "$BASE_BRANCH"'), 'fetches the selected remote base');
+            ackAssert(
+                cmd.includes('git merge-base HEAD "$REMOTE/$BASE_BRANCH"'),
+                'uses merge-base vs the selected remote base',
+            );
             ackAssert(cmd.includes('clang-format-diff.py'), 'invokes clang-format-diff.py');
             ackAssert(cmd.includes('src/validation.cpp'), 'includes exact changed file path(s)');
             ackAssert(cmd.includes('src/validation.h'), 'includes exact changed file path(s)');
@@ -25641,8 +25649,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const cmd = f.fmt();
             ackAssert(cmd.includes("BASE_BRANCH='main'"), 'captures the dynamic review base branch');
             ackAssert(
-                cmd.includes('git fetch && git fetch upstream "$BASE_BRANCH"'),
-                'fetches tracking remote and upstream base',
+                cmd.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'),
+                'uses upstream/origin remote fallback',
+            );
+            ackAssert(
+                cmd.includes('git fetch && git fetch "$REMOTE" "$BASE_BRANCH"'),
+                'fetches the tracking branch and selected remote base',
             );
             ackAssert(
                 cmd.includes('git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"'),
@@ -25653,7 +25665,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('tidydiff command uses clang-tidy-diff with repo-root diff and build path', () => {
+    ackTest('tidydiff command uses clang-tidy-diff with the selected remote and isolated build path', () => {
         const f = SHA_FORMATS.find((f) => f.key === 'tidydiff');
         const prev = prFileCategories;
         prFileCategories = { cpp: ['src/node/txdownload.cpp'] };
@@ -25665,8 +25677,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(cmd.includes('CMAKE_EXPORT_COMPILE_COMMANDS=ON'), 'configures compile commands');
         ackAssert(cmd.includes('CMAKE_CXX_COMPILER=clang++'), 'configures clang++ for tooling');
+        ackAssert(cmd.includes('cmake -B build-ack-clang'), 'uses a separate clang tooling build');
+        ackAssert(
+            cmd.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'),
+            'uses upstream/origin remote fallback',
+        );
         ackAssert(cmd.includes('-p1'), 'uses -p1 (strip a/ prefix)');
-        ackAssert(cmd.includes('-path build'), 'uses build path');
+        ackAssert(cmd.includes('-path build-ack-clang'), 'uses isolated clang build path');
         ackAssert(cmd.includes('$(getconf _NPROCESSORS_ONLN)'), 'uses portable local CPU count');
         ackAssert(!cmd.includes('$(nproc)'), 'does not require Linux-only nproc');
         ackAssert(cmd.includes('src/node/txdownload.cpp'), 'includes exact changed file path');
@@ -25679,17 +25696,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const cmd = f.fmt();
         prFileCategories = prev;
         ackAssert(cmd.includes('command -v iwyu_tool.py') || cmd.includes('command -v iwyu_tool'), 'detects IWYU tool');
-        ackAssert(
-            cmd.includes('command -v fix_includes.py') || cmd.includes('command -v fix_includes'),
-            'detects fix_includes tool',
-        );
         ackAssert(cmd.includes('CMAKE_EXPORT_COMPILE_COMMANDS=ON'), 'configures compile commands');
         ackAssert(cmd.includes('CMAKE_CXX_COMPILER=clang++'), 'configures clang++ for tooling');
-        ackAssert(cmd.includes('-p build'), 'invokes IWYU with build dir');
+        ackAssert(cmd.includes('cmake -B build-ack-clang'), 'uses a separate clang tooling build');
+        ackAssert(cmd.includes('-p build-ack-clang'), 'invokes IWYU with isolated build dir');
         ackAssert(cmd.includes('src/coins.cpp'), 'includes exact changed file path');
         ackAssert(cmd.includes('src/validation.h'), 'includes exact changed file path');
-        ackAssert(cmd.includes('contrib/devtools/iwyu/bitcoin.core.imp'), 'uses bitcoin.core.imp mapping');
-        ackAssert(cmd.includes('"$FIX_INCLUDES" --nosafe_headers'), 'runs fix_includes pass');
+        ackAssert(
+            cmd.includes('--mapping_file="$PWD/contrib/devtools/iwyu/bitcoin.core.imp"'),
+            'uses an absolute bitcoin.core.imp mapping path',
+        );
+        ackAssert(!cmd.includes('fix_includes'), 'reports findings without editing files');
     });
 
     ackTest('formatdiff/tidydiff/iwyu return null when no changed C/C++ files', () => {
