@@ -5062,7 +5062,7 @@
 
     const BITCOIN_CORE_PR_DESCRIPTION_RULES = `Bitcoin Core PR-description rules:
 - Put the concrete problem before the fix and optimize for deletion before adding prose.
-- Use compact inline prefixes such as \`**Problem:** Text\` and \`**Fix:** Text\` when that structure already exists or clearly helps. Do not put those labels on their own lines and do not use Markdown headings for PR-body structure.
+- Use compact inline prefixes such as \`**Problem:** Text\` and \`**Fix:** Text\` when that structure already exists or clearly improves a short PR body. Preserve meaningful existing headings in longer descriptions, and do not rewrite the structure only to impose a template.
 - Do not invent sections only to impose a template. Omit routine testing or verification sections unless the command or result is useful review evidence.
 - Use short references such as \`#123\` for the same repository. Use the full owner/repository form only for cross-repository references.
 - Do not use short commit hashes as reviewer-facing evidence. Prefer a GitHub link or a full 40-character hash.
@@ -5367,7 +5367,7 @@ Do not change quoted text (lines starting with >) in any way. Those are someone 
 Do not change inline code, links, or code tokens unless they are clearly broken. A generic collapsible summary is a clarity issue, so changing only the summary text is allowed when the section content supports a better label.
 Preserve existing blank lines and structural separators, except for collapsible details spacing. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.
 Blank lines after blockquotes are semantic in GitHub Markdown. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote.
-Use simple punctuation: prefer commas, semicolons, parentheses, or sentence breaks over em dashes or bare double hyphen punctuation. Do not introduce or preserve a bare double hyphen as prose punctuation, and do not mention this punctuation rule in the output. Preserve command-line flags such as \`--connect\`, quoted text, links, and code.
+Use simple punctuation: prefer commas, parentheses, or sentence breaks over semicolons, em dashes, or bare double hyphen punctuation. Do not introduce or preserve a bare double hyphen as prose punctuation, and do not mention this punctuation rule in the output. Preserve command-line flags such as \`--connect\`, quoted text, links, and code.
 When a paragraph starts with "Note", "Tip", "Important", "Warning", or "Caution" (with or without a colon), you may convert it to a GitHub alert block ([!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]) only when it clearly improves readability.
 When a collapsible section uses a generic summary (for example "Details"), replace it with a short, specific summary when the content clearly supports one. Preserve the <details><summary> and </summary> tags; change only the summary text. For benchmark or test output, prefer a result-based summary such as "aarch64 RPi5 SSD: 1024 MiB 1.5% faster".
 For fenced code blocks, check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.
@@ -12302,7 +12302,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         stripped: text !== cleaned ? text : null,
                     };
                 const headingNormalizationRule =
-                    '- Heading compaction is a required proofreading style change, not optional cleanup. For GitHub comments and PR descriptions, replace Markdown headings (any line that starts with one or more # characters) or standalone label lines with compact inline bold prefixes whenever the result remains easy to read. Treat this as a general style rule, not a fixed list of heading names. Do not invent sections. Do not leave a Markdown heading unchanged merely because its words are grammatical. When normal prose follows a heading or label, continue that prose on the same line after the colon, even when blank lines separated them. If several paragraphs or later bullets follow, fold only the first normal prose block onto the prefix line and keep the rest below. Later block content does not prevent compaction. If the first following content is a table, image, list, code fence, HTML block, or similar block content, still rewrite the heading itself as a bold prefix but keep the block below it instead of folding it onto the same line. Never leave a bold prefix alone on a line when normal prose follows.';
+                    '- Preserve meaningful Markdown headings and the existing document structure. In a short GitHub comment or PR description, compact a generic heading or standalone label to an inline bold prefix only when that clearly improves readability without flattening a meaningful section. Do not invent, remove, reorder, or rename sections merely to impose a template. When compacting a heading followed by normal prose, put the first prose block on the same line after the colon and keep later paragraphs or block content below. If a table, image, list, code fence, HTML block, or similar block follows first, keep that block below the prefix.';
                 const fenceLanguageRule =
                     '- For fenced code blocks: check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.';
                 const lineWrappingRule =
@@ -21733,7 +21733,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     '',
                     'If the selection is code:',
                     '- Output a short simplified snippet (same language if obvious; otherwise pseudocode).',
-                    '- Prefer fewer moving parts, less duplication, and reuse existing helpers/constructs when plausible.',
+                    '- Prefer fewer moving parts and less duplication. Reuse an existing helper only when its inputs, outputs, errors, side effects, lifetime, and layering match this use.',
                     '- Then add up to 3 short sentences explaining the key simplifications.',
                     '',
                     'If the selection is prose:',
@@ -21744,7 +21744,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    `${PROOFREAD_MECHANICAL_RULE}\nProofread ONLY prose. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, semicolons, parentheses, or sentence breaks; preserve command-line flags such as \`--connect\`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).`;
+                    `${PROOFREAD_MECHANICAL_RULE}\nProofread the selection. Prefer simple, plain language and do not add jargon. Remove accidental duplicate words, phrases, sentences, or repeated points when the containing text or nearby context already covers them. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, parentheses, or sentence breaks; preserve command-line flags such as \`--connect\`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).`;
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -21753,7 +21753,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const artifactRules = mode === 'proofread' && ctx.isPRDescription
                 ? `\n\n${BITCOIN_CORE_PR_DESCRIPTION_RULES}`
                 : '';
-            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}${artifactRules}\n\nReturn a concise markdown answer only.`;
+            const outputRule =
+                mode === 'proofread'
+                    ? 'Return only the corrected text with no commentary or code fence.'
+                    : 'Return a concise markdown answer only.';
+            const system = `${SYSTEM_BASE}\n\nYou are helping a reviewer with a selected snippet from a GitHub pull request.\n${systemExtra}${artifactRules}\n\n${outputRule}`;
             let user = '';
             if (mode === 'factcheck') {
                 const diff = prCtx?.diff || '';
@@ -26799,6 +26803,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('Do not hard-wrap inside a sentence'), 'avoids hard wraps');
         ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('not X, but Y'), 'rejects formulaic contrasts');
         ackAssert(BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('**Problem:** Text'), 'uses inline Problem prefix');
+        ackAssert(
+            BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('Preserve meaningful existing headings'),
+            'preserves useful structure in longer PR descriptions',
+        );
         ackAssert(BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('Omit routine testing'), 'omits routine PR testing');
         ackAssert(BITCOIN_CORE_COMMIT_MESSAGE_RULES.includes('lowercase imperative summary'), 'checks subjects');
         ackAssert(BITCOIN_CORE_COMMIT_MESSAGE_RULES.includes('routine tests-run footer'), 'omits test footers');
@@ -32539,52 +32547,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('proofreading may compact markdown headings in comments and PR descriptions', () => {
+    ackTest('proofreading preserves meaningful headings and compacts only useful labels', () => {
         const source = _ackSource;
         const makePromptSection = source.slice(source.indexOf('const makePrompt'), source.indexOf('const cleanResult'));
         ackAssert(
-            makePromptSection.includes('For GitHub comments and PR descriptions'),
-            'heading compaction applies to comments and PR descriptions',
+            makePromptSection.includes('Preserve meaningful Markdown headings'),
+            'preserves meaningful document structure',
         );
         ackAssert(
-            makePromptSection.includes('Markdown headings') && makePromptSection.includes('standalone label lines'),
-            'handles generic headings and labels',
+            makePromptSection.includes('short GitHub comment or PR description'),
+            'limits compaction to short GitHub prose',
         );
         ackAssert(
-            makePromptSection.includes('compact inline bold prefixes'),
-            'prefers compact bold prefixes',
-        );
-        ackAssert(makePromptSection.includes('required proofreading style change'), 'heading compaction is mandatory');
-        ackAssert(
-            makePromptSection.includes('any line that starts with one or more # characters'),
-            'detects markdown heading syntax generically',
+            makePromptSection.includes('generic heading or standalone label') &&
+                makePromptSection.includes('inline bold prefix'),
+            'compacts generic labels when useful',
         );
         ackAssert(
-            makePromptSection.includes('Do not leave a Markdown heading unchanged merely because its words are grammatical'),
-            'prevents unchanged grammatical headings',
-        );
-        ackAssert(makePromptSection.includes('not a fixed list of heading names'), 'does not rely on enumerated examples');
-        ackAssert(makePromptSection.includes('Do not invent sections'), 'does not invent sections');
-        ackAssert(
-            makePromptSection.includes('continue that prose on the same line after the colon'),
-            'folds following prose onto the bold prefix line',
+            makePromptSection.includes('only when that clearly improves readability'),
+            'does not normalize headings mechanically',
         );
         ackAssert(
-            makePromptSection.includes('even when blank lines separated them'),
-            'folds prose even after blank lines',
+            makePromptSection.includes('without flattening a meaningful section'),
+            'keeps meaningful sections intact',
         );
         ackAssert(
-            makePromptSection.includes('Later block content does not prevent compaction'),
-            'later bullets or tables do not block heading compaction',
+            makePromptSection.includes('Do not invent, remove, reorder, or rename sections'),
+            'does not impose a new structure',
         );
         ackAssert(
-            makePromptSection.includes('Never leave a bold prefix alone on a line when normal prose follows'),
-            'prevents standalone bold prefixes when prose follows',
+            makePromptSection.includes('put the first prose block on the same line after the colon'),
+            'keeps a compact prefix with its prose',
         );
         ackAssert(
             makePromptSection.includes('table, image, list, code fence, HTML block') &&
-                makePromptSection.includes('keep the block below it'),
-            'keeps block content below heading-style prefixes',
+                makePromptSection.includes('keep that block below the prefix'),
+            'preserves block content below a compact prefix',
         );
         ackAssert(
             makePromptSection.includes('BITCOIN_CORE_PR_DESCRIPTION_RULES') &&
@@ -33674,6 +33672,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('bare double-hyphen punctuation'), 'selection proofread avoids double-hyphen punctuation');
         ackAssert(
+            fn.includes('with commas, parentheses, or sentence breaks') &&
+                !fn.includes('with commas, semicolons, parentheses'),
+            'selection proofread does not prefer semicolons',
+        );
+        ackAssert(
             fn.includes('following reply so GitHub does not render the reply as part of the quote'),
             'selection proofread preserves blockquote reply separators',
         );
@@ -33701,6 +33704,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
         ackAssert(fn.includes('${PROOFREAD_MECHANICAL_RULE}'), 'selection proofread includes required mechanical checks');
+        ackAssert(fn.includes('const outputRule ='), 'selection actions use a mode-specific output contract');
+        ackAssert(
+            fn.includes('Return only the corrected text with no commentary or code fence.'),
+            'selection proofread requests corrected text only',
+        );
         ackAssert(
             fn.includes("mode === 'proofread' && ctx.isPRDescription") &&
                 fn.includes('${BITCOIN_CORE_PR_DESCRIPTION_RULES}'),
@@ -33713,6 +33721,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             !fn.includes('showDiffDialog(ctx.text, out)'),
             'selection proofread no longer opens modal diff dialog',
+        );
+    });
+
+    ackTest('diff selection simplify reuses helpers only when behavior matches', () => {
+        const source = _ackSource;
+        const fn = source.slice(
+            source.indexOf('async function runDiffSelectionLLM'),
+            source.indexOf('async function openChatWithDiffSelection'),
+        );
+        ackAssert(
+            fn.includes('inputs, outputs, errors, side effects, lifetime, and layering match'),
+            'simplifier checks helper semantics before proposing reuse',
         );
     });
 
@@ -34789,6 +34809,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes('simple, plain language'),
             'DEFAULT_INSTRUCTIONS.proofread prefers simple language',
+        );
+        ackAssert(
+            DEFAULT_INSTRUCTIONS.proofread.includes('prefer commas, parentheses, or sentence breaks over semicolons'),
+            'DEFAULT_INSTRUCTIONS.proofread avoids semicolons',
         );
         ackAssert(
             DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental duplication'),
@@ -38103,7 +38127,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             DEFAULT_INSTRUCTIONS.proofread.includes('you may convert it to a GitHub alert block'),
             'prompt handles alert conversions',
         );
-        ackAssert(fn.includes('not a fixed list of heading names'), 'prompt covers generic markdown heading compaction');
+        ackAssert(
+            fn.includes('generic heading or standalone label') && fn.includes('only when that clearly improves readability'),
+            'prompt limits generic heading compaction to useful cases',
+        );
         ackAssert(
             source.includes('postProcessProofreadMarkdown(parsed.fromXML'),
             'only safe URL/details-spacing post-processing is applied to proofread results',
