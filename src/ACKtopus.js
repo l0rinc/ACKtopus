@@ -436,7 +436,7 @@
             fmt: () => {
                 const b = prFileCategories?.bench;
                 return b?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter='${b.join('|')}' -min-time=1000`
+                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter=${shellQuote(b.join('|'))} -min-time=1000`
                     : null;
             },
         },
@@ -1629,6 +1629,12 @@
         return ta;
     }
 
+    function textareaIdSelector(ta, fallback = 'textarea') {
+        return ta?.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+            ? `textarea#${CSS.escape(ta.id)}`
+            : fallback;
+    }
+
     function resolveLiveTextareaContext(container, taContainer, taSelector, taFallback) {
         const escapeCss = (value) =>
             typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
@@ -2334,13 +2340,13 @@
         if (!input || !status) return;
         const pat = normalizeGithubPatInput(input.value);
         const invalid = !!pat && pat === _githubBadPat;
-        const title = invalid
-            ? 'GitHub rejected this token. It may be expired, invalid, or missing required permissions.'
+        const [icon, color, title] = invalid
+            ? ['⚠️', '#d29922', 'GitHub rejected this token. It may be expired, invalid, or missing required permissions.']
             : pat
-              ? 'Token configured. ACKtopus will warn here if GitHub rejects it.'
-              : '';
-        status.textContent = invalid ? '⚠️' : pat ? '✅' : '';
-        status.style.color = invalid ? '#d29922' : pat ? '#3fb950' : '';
+              ? ['✅', '#3fb950', 'Token configured. ACKtopus will warn here if GitHub rejects it.']
+              : ['', '', ''];
+        status.textContent = icon;
+        status.style.color = color;
         status.title = title;
         if (title) status.setAttribute('aria-label', title);
         else status.removeAttribute('aria-label');
@@ -4010,7 +4016,7 @@
         return stats;
     }
 
-    function findPullRequestListEntries(root = document, repo = currentGitHubRepo(root)) {
+    function findPullRequestListEntries(root, repo) {
         if (!repo) return [];
         const entries = [];
         const seen = new Set();
@@ -4065,19 +4071,23 @@
     }
 
     function renderPullRequestSize(marker, stats) {
-        if (!marker?.isConnected && !_ackTesting) return;
-        const normalized = normalizePullRequestSize(stats);
-        if (!normalized) return;
+        if (!marker?.isConnected) return;
+        const additionsText = stats.additions.toLocaleString('en-US');
+        const deletionsText = stats.deletions.toLocaleString('en-US');
+        // Injector passes re-run on every mutation batch; rewriting an unchanged
+        // marker would wake the observers again and echo more passes.
+        if (marker.dataset.ackPrSizeLoaded === 'true' && marker.textContent === `+${additionsText}-${deletionsText}`)
+            return;
         const additions = document.createElement('span');
         additions.style.color = 'var(--fgColor-open, #3fb950)';
-        additions.textContent = `+${normalized.additions.toLocaleString('en-US')}`;
+        additions.textContent = `+${additionsText}`;
         const deletions = document.createElement('span');
         deletions.style.color = 'var(--fgColor-danger, #f85149)';
-        deletions.textContent = `-${normalized.deletions.toLocaleString('en-US')}`;
+        deletions.textContent = `-${deletionsText}`;
         marker.replaceChildren(additions, deletions);
         marker.style.display = 'inline-flex';
         marker.dataset.ackPrSizeLoaded = 'true';
-        marker.title = `${normalized.additions.toLocaleString('en-US')} additions, ${normalized.deletions.toLocaleString('en-US')} deletions`;
+        marker.title = `${additionsText} additions, ${deletionsText} deletions`;
         marker.setAttribute('aria-label', marker.title);
     }
 
@@ -4113,7 +4123,6 @@
                         pullRequestSizeFailureWarned = true;
                         console.warn('ACKtopus: failed to fetch pull request sizes:', e?.message || e);
                     }
-                    return null;
                 })
                 .finally(() => {
                     activePullRequestSizeRequests--;
@@ -4140,7 +4149,7 @@
     function addPullRequestListSizes(root = document, opts = {}) {
         const path = opts.path || location.pathname;
         if (!isPullRequestListPage(path)) return;
-        const repo = opts.repo || parseGitHubRepoPath(path) || currentGitHubRepo(root, path);
+        const repo = parseGitHubRepoPath(path);
         for (const entry of findPullRequestListEntries(root, repo)) {
             const marker = ensurePullRequestSizeMarker(entry);
             const cached = readPullRequestSize(entry.pr);
@@ -5038,6 +5047,9 @@
     const PROOFREAD_MECHANICAL_RULE =
         'Inspect every word and character before deciding the text is correct. Fix obvious typos and accidental whitespace in prose. Collapse repeated spaces or tabs between words to one space, remove spaces before punctuation, and use normal spacing after punctuation. Remove trailing spaces or tabs before every newline, including inside fenced code blocks. These are required corrections; never return the original text unchanged while any remain.';
 
+    const PROOFREAD_SENTENCE_PER_LINE_RULE =
+        'After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.';
+
     const BITCOIN_CORE_REVIEW_PROSE_RULES = `Bitcoin Core prose preferences:
 - Use concise, plain, concrete language. Keep only details that change reviewer understanding.
 - Lead with the reviewer-visible behavior, problem, or reason before implementation details.
@@ -5345,7 +5357,7 @@ If a claim is demonstrably wrong or exaggerated vs the PR diff, commit messages,
 Make the reply make sense in light of the commit messages, current thread, and surrounding text (if any). If the surrounding thread or nearby text has already answered or moved past a point, soften or trim the redundant part instead of leaving it as if nothing was said.
 Remove accidental duplication: repeated words, repeated phrases or sentences, and repeated points that nearby text or thread context already covers.
 Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or an intentional hard break.
-When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.
+When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. ${PROOFREAD_SENTENCE_PER_LINE_RULE}
 Keep replies friendly and professional without making them more verbose or less direct.
 Prefer collaborative phrasing over adversarial second-person. When the original directs blame or finger-points (e.g. "you broke X", "you should have"), soften it by rephrasing as "we" or as a neutral observation ("X regressed", "this could"). Keep the author's voice; only soften clearly hostile or accusatory wording, never opinions or technical disagreement.
 Wrap technical identifiers in single backticks if they aren't already: function and method names, file paths, class/type names, command-line flags, environment variables, RPC/method names, and code-like terms (e.g. \`coinsCache\`, \`src/validation.cpp\`, \`--connect\`). Skip prose words that just happen to be capitalized.
@@ -5440,7 +5452,7 @@ Scripted-diff commits (mechanical renames) should be verifiable independently an
 For benchmarks and performance changes, note when inputs may not be representative or when harness overhead can dominate measurement. Prefer deterministic, reproducible setups. When benchmark input data changes intentionally, expect and explain baseline impact.
 Commit messages should describe the problem first, then the change. Prefer short narrative prose over lists. Use backticks around symbol and command names. Avoid forward references to future commits.
 Track scope carefully: mechanical renames should not be mixed with behavior changes, benchmark input changes should be separate from API changes, build-system fixes should be coupled with the functional change they unblock.
-	Bitcoin Core developer-notes conventions to watch for: snake_case variables, m_ member prefix, g_ global prefix, UpperCamelCase functions, no using namespace, no std::map::operator[] for reads (use .find()), Mutex over RecursiveMutex, explicit constructors, std::optional over sentinels, named boolean args (Foo(/*flag=*/true)).
+Bitcoin Core developer-notes conventions to watch for: snake_case variables, m_ member prefix, g_ global prefix, UpperCamelCase functions, no using namespace, no std::map::operator[] for reads (use .find()), Mutex over RecursiveMutex, explicit constructors, std::optional over sentinels, named boolean args (Foo(/*flag=*/true)).
 Prefer small, local fixes over refactors. Avoid speculative redesigns.
 When there is a tradeoff, give the best argument for and against, then ask the single most important follow-up question.
 Do not self-censor minor issues. Label them as minor if needed, but still report them.
@@ -7226,6 +7238,8 @@ Keep it concise and blunt. Skip obvious observations. Use plain ASCII. No em das
     function invalidatePRContext() {
         _prContextCache = null;
         _prContextKey = '';
+        _prReplyRowsKey = '';
+        _prReplyRowsPromise = null;
     }
 
     function wrapPromptBlock(label, content) {
@@ -12292,7 +12306,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const fenceLanguageRule =
                     '- For fenced code blocks: check whether the language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when a different GitHub-supported hint would make the block easier to read. The hint does not have to be the exact real language; prefer the hint that gives the best practical coloring for the visible content. Do not choose boring ```text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, `&&`, or runnable commands, keep or choose ```bash or ```sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces.';
                 const lineWrappingRule =
-                    '- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.';
+                    `- Remove accidental manual wrapping and leading indentation in normal prose paragraphs. GitHub comments do not need 72-column-style hard wrapping. Join a line break that splits a sentence unless it is a Markdown-meaningful separator such as a blank line, list item, table row, blockquote, code fence, HTML block, or intentional hard break. When joining wrapped prose, insert one normal space. When a line break split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression, join it without adding a space inside that token. ${PROOFREAD_SENTENCE_PER_LINE_RULE}`;
                 const fenceFormattingRule =
                     '- Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order.';
                 const prDescriptionRule = isPRBody
@@ -12416,11 +12430,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     editorRoot ||
                     container;
                 taContainer = container;
-                if (ta?.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                    taSelector = `textarea#${CSS.escape(ta.id)}`;
-                } else {
-                    taSelector = 'textarea';
-                }
+                taSelector = textareaIdSelector(ta);
                 if (
                     !isExistingPostEditForm(ta.closest('form')) &&
                     !ta.closest('.is-comment-editing') &&
@@ -12448,13 +12458,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // Tighten container + selector so we don't accidentally update a
                 // different textarea elsewhere in the thread after async awaits.
                 container = taContainer;
-                if (ta?.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                    taSelector = `textarea#${CSS.escape(ta.id)}`;
-                } else {
-                    // When scoped to the edit form, a plain textarea selector is safe.
-                    // Otherwise, use the edit-only selector to avoid matching reply boxes.
-                    taSelector = container?.tagName === 'FORM' ? 'textarea' : EDIT_TA_SELECTOR;
-                }
+                // When scoped to the edit form, a plain textarea selector is safe.
+                // Otherwise, use the edit-only selector to avoid matching reply boxes.
+                taSelector = textareaIdSelector(ta, container?.tagName === 'FORM' ? 'textarea' : EDIT_TA_SELECTOR);
             }
 
             if (ta) {
@@ -15630,11 +15636,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Skip PR review summary/approval dialog textareas (Submit review).
             // NOTE: Do NOT skip generic CommentBox containers — inline
             // code comment boxes live there too (commit prefixes must apply).
-            if (
-                ta.matches('#pull_request_review_body') ||
-                ta.closest('.js-review-body, [data-testid="review-body"], .review-changes-modal')
-            )
-                return;
+            if (isReviewSummaryBodyTextarea(ta)) return;
 
             // Only prefill code review comment boxes for NEW threads.
             // Never prefill the main commit/PR comment box.
@@ -18849,6 +18851,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
+    // The PR review summary/approval dialog textarea (Submit review).
+    function isReviewSummaryBodyTextarea(ta) {
+        return !!(
+            ta?.matches?.('#pull_request_review_body') ||
+            ta?.closest?.('.js-review-body, [data-testid="review-body"], .review-changes-modal')
+        );
+    }
+
     function isProofreadableComposeTextarea(ta, path = location.pathname) {
         if (!ta || ta.closest?.('#acktopus-analysis, #acktopus-queue, .ack-config-overlay, .ack-diff-dialog-overlay'))
             return false;
@@ -18869,10 +18879,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
-    function isProofreadableComposeToolbar(toolbar, path = location.pathname) {
-        return isProofreadableComposeTextarea(getToolbarTextarea(toolbar), path);
-    }
-
     function isSuggestedReplyTextarea(ta, path = location.pathname) {
         if (!isPRPage(path) || !isProofreadableComposeTextarea(ta, path)) return false;
         const form = ta?.closest?.('form') || null;
@@ -18880,16 +18886,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (isInlineThreadReplyTextarea(ta, form)) return true;
         if (!isPRConversationPage(path)) return false;
         if (isInlineReviewCommentCreateForm(form)) return false;
-        if (
-            ta.matches?.('#pull_request_review_body') ||
-            ta.closest?.('.js-review-body, [data-testid="review-body"], .review-changes-modal')
-        )
-            return false;
+        if (isReviewSummaryBodyTextarea(ta)) return false;
         return true;
-    }
-
-    function isSuggestedReplyToolbar(toolbar, path = location.pathname) {
-        return isSuggestedReplyTextarea(getToolbarTextarea(toolbar), path);
     }
 
     function rewriteTextareaSelectionByLine(ta, rewriteLine) {
@@ -19116,7 +19114,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function gatherVisiblePRReplyEntries() {
+    async function fetchPagedGithubRows(urlForPage, maxPages = 50) {
+        const out = [];
+        for (let page = 1; page <= maxPages; page++) {
+            const rows = await gmFetch(urlForPage(page));
+            if (!Array.isArray(rows) || rows.length === 0) break;
+            out.push(...rows);
+            if (rows.length < 100) break;
+        }
+        return out;
+    }
+
+    function prDiscussionPageUrls(pr) {
+        const repoApi = `https://api.github.com/repos/${pr.owner}/${pr.repo}`;
+        return {
+            conversationComments: (page) => `${repoApi}/issues/${pr.pr}/comments?per_page=100&page=${page}`,
+            reviewSummaries: (page) => `${repoApi}/pulls/${pr.pr}/reviews?per_page=100&page=${page}`,
+            inlineComments: (page) => `${repoApi}/pulls/${pr.pr}/comments?per_page=100&page=${page}`,
+        };
+    }
+
+    function gatherVisiblePRReplyEntries(skipPermalinks = null) {
         const entries = [];
         const seen = new Set();
         for (const bodyEl of qsa(document, MARKDOWN_BODY_SELECTOR)) {
@@ -19124,20 +19142,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const container =
                 bodyEl.closest(COMMENT_CONTAINER_SELECTOR) || bodyEl.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
             if (!container) continue;
-            const permalinkEl = getCommentPermalinkEl(container);
-            const href = permalinkEl?.getAttribute?.('href') || '';
-            if (!href) continue;
+            const permalink = getCommentPermalink(container);
+            // The PR description permalink (#issue-N) is context, not a reply.
+            if (!permalink || /#issue-\d+$/i.test(permalink) || seen.has(permalink)) continue;
+            if (skipPermalinks?.has(permalink)) continue;
             const body = renderBodyMarkdown(bodyEl).trim();
             if (!body || /^nothing to preview$/i.test(body)) continue;
-            const permalink = getCommentPermalink(container);
-            if (!permalink) continue;
-            try {
-                if (/^#issue-\d+$/i.test(new URL(permalink, location.href).hash)) continue;
-            } catch (_) {}
-            const key = permalink;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
+            seen.add(permalink);
+            const timeEl = container.querySelector('relative-time, time');
             const threadRoot = getCommentThreadRoot(container);
             const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
             entries.push({
@@ -19160,35 +19172,40 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return entries;
     }
 
+    const PR_REPLY_HISTORY_TTL_MS = 60 * 1000;
+    let _prReplyRowsKey = '';
+    let _prReplyRowsTs = 0;
+    let _prReplyRowsPromise = null;
+
+    // One sweep fetches up to 150 pages across three endpoints; consecutive
+    // suggest-reply clicks on the same PR reuse it for a short window.
+    function fetchPRReplyRows(pr) {
+        const key = `${pr.owner}/${pr.repo}/${pr.pr}`;
+        const now = Date.now();
+        if (
+            !_ackTesting &&
+            _prReplyRowsPromise &&
+            _prReplyRowsKey === key &&
+            now - _prReplyRowsTs < PR_REPLY_HISTORY_TTL_MS
+        ) {
+            return _prReplyRowsPromise;
+        }
+        const urls = prDiscussionPageUrls(pr);
+        const promise = Promise.allSettled([
+            fetchPagedGithubRows(urls.conversationComments),
+            fetchPagedGithubRows(urls.reviewSummaries),
+            fetchPagedGithubRows(urls.inlineComments),
+        ]);
+        if (!_ackTesting) {
+            _prReplyRowsKey = key;
+            _prReplyRowsTs = now;
+            _prReplyRowsPromise = promise;
+        }
+        return promise;
+    }
+
     async function fetchPRReplyHistory(pr, viewerLogin) {
-        const fetchPaged = async (urlForPage) => {
-            const out = [];
-            for (let page = 1; page <= 50; page++) {
-                const rows = await gmFetch(urlForPage(page));
-                if (!Array.isArray(rows) || rows.length === 0) break;
-                out.push(...rows);
-                if (rows.length < 100) break;
-            }
-            return out;
-        };
-        const endpoints = [
-            {
-                source: 'conversation comment',
-                fetch: (page) =>
-                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/comments?per_page=100&page=${page}`,
-            },
-            {
-                source: 'review summary',
-                fetch: (page) =>
-                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews?per_page=100&page=${page}`,
-            },
-            {
-                source: 'inline review comment',
-                fetch: (page) =>
-                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/comments?per_page=100&page=${page}`,
-            },
-        ];
-        const results = await Promise.allSettled(endpoints.map((endpoint) => fetchPaged(endpoint.fetch)));
+        const results = await fetchPRReplyRows(pr);
         const normalize = (row, source) => ({
             id: String(row?.id || ''),
             inReplyTo: String(row?.in_reply_to_id || ''),
@@ -19201,21 +19218,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             line: row?.line || row?.original_line || '',
             commitSha: row?.commit_id || row?.original_commit_id || '',
         });
-        const bySource = new Map(endpoints.map((endpoint) => [endpoint.source, []]));
-        results.forEach((result, index) => {
-            const endpoint = endpoints[index];
+        const sources = [
+            { source: 'conversation comment', plural: 'conversation comments' },
+            { source: 'review summary', plural: 'review summaries' },
+            { source: 'inline review comment', plural: 'inline review comments' },
+        ];
+        const [conversationRows, reviewRows, inlineRows] = results.map((result, index) => {
+            const { source, plural } = sources[index];
             if (result.status === 'rejected') {
-                const label = endpoint.source === 'review summary' ? 'review summaries' : `${endpoint.source}s`;
                 console.warn(
-                    `ACKtopus: suggest reply could not fetch ${label}:`,
+                    `ACKtopus: suggest reply could not fetch ${plural}:`,
                     result.reason?.message || result.reason,
                 );
-                return;
+                return [];
             }
-            bySource.set(
-                endpoint.source,
-                result.value.map((row) => normalize(row, endpoint.source)).filter((entry) => entry.body),
-            );
+            return result.value.map((row) => normalize(row, source)).filter((entry) => entry.body);
         });
 
         const mergeUnique = (...lists) => {
@@ -19231,14 +19248,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             return out.sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
         };
-        const visible = gatherVisiblePRReplyEntries();
+        const apiPermalinks = new Set(
+            [...conversationRows, ...reviewRows, ...inlineRows].map((entry) => entry.permalink).filter(Boolean),
+        );
+        const visible = gatherVisiblePRReplyEntries(apiPermalinks);
         const conversationComments = mergeUnique(
-            bySource.get('conversation comment'),
+            conversationRows,
             visible.filter((entry) => entry.source === 'visible conversation comment'),
         );
-        const reviewSummaries = mergeUnique(bySource.get('review summary'));
+        const reviewSummaries = mergeUnique(reviewRows);
         const inlineComments = mergeUnique(
-            bySource.get('inline review comment'),
+            inlineRows,
             visible.filter((entry) => entry.source === 'visible inline comment'),
         );
         const login = String(viewerLogin || '').toLowerCase();
@@ -19271,12 +19291,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             selectedContainer?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) ||
             selectedContainer ||
             null;
-        const threadRoot =
-            getCommentThreadRoot(explicitContainer || ta) ||
-            ta?.closest?.(
-                '.review-thread-component, [data-testid="review-thread"], .js-line-comments, ' +
-                    '.js-resolvable-timeline-thread-container, .inline-comments, details[data-resolved]',
-            );
+        const threadRoot = getCommentThreadRoot(explicitContainer) || getCommentThreadRoot(ta);
         const bodies = [...(threadRoot?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])].filter(
             (body) => !form?.contains(body),
         );
@@ -19292,7 +19307,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const selectedCommentId = getCommentPermalink(targetContainer).match(/discussion_r(\d+)/i)?.[1] || '';
         return {
             form,
-            replyToId: String(replyToId || ''),
+            replyToId,
             selectedCommentId,
             threadContext: targetContainer ? gatherCommentContext(targetContainer) : '',
             commitSha: locationInfo.commitSha || '',
@@ -19305,25 +19320,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return postProcessProofreadMarkdown((tagged ? tagged[1] : text.replace(/^suggested reply:\s*/i, '')).trim());
     }
 
+    function pickVisibleTextarea(scope) {
+        return [...scope.querySelectorAll('textarea')].find(isVisible) || scope.querySelector('textarea');
+    }
+
     function findLiveSuggestedReplyTextarea(ta, form, replyToId) {
         if (ta?.isConnected) return ta;
         if (ta?.id) {
-            try {
-                const found = document.getElementById(ta.id);
-                if (found?.tagName === 'TEXTAREA') return found;
-            } catch (_) {}
+            const found = document.getElementById(ta.id);
+            if (found?.tagName === 'TEXTAREA') return found;
         }
         if (form?.isConnected) {
-            const found = [...form.querySelectorAll('textarea')].find(isVisible) || form.querySelector('textarea');
+            const found = pickVisibleTextarea(form);
             if (found) return found;
         }
         if (replyToId) {
             for (const candidateForm of qsa(document, 'form')) {
                 const input = candidateForm.querySelector(REVIEW_REPLY_TO_INPUT_SELECTOR);
-                if (String(input?.value || '') !== String(replyToId)) continue;
-                const found =
-                    [...candidateForm.querySelectorAll('textarea')].find(isVisible) ||
-                    candidateForm.querySelector('textarea');
+                if ((input?.value || '') !== replyToId) continue;
+                const found = pickVisibleTextarea(candidateForm);
                 if (found) return found;
             }
         }
@@ -19383,7 +19398,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 commentEl.title = origTitle;
             }, delay);
 
-        const initialDraft = String(ta.value || '');
+        const initialDraft = ta.value;
         const target = getSuggestedReplyTarget(ta, selectedContainer);
         const viewerLogin = getCurrentGitHubLogin();
         const lt = ensureAckLifetime('suggest-reply');
@@ -19394,9 +19409,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return true;
         };
         try {
-            const [ctx, history] = await Promise.all([
+            const [ctx, history, prefetchedPatch] = await Promise.all([
                 fetchPRContext(pr),
                 fetchPRReplyHistory(pr, viewerLogin),
+                // The inline-thread commit SHA is known before any fetch starts;
+                // only the history-derived fallback SHA has to wait.
+                target.commitSha
+                    ? fetchCommitPatch(pr, target.commitSha).catch((e) => {
+                          console.warn('ACKtopus: suggest reply commit patch fetch failed:', e?.message || e);
+                          return '';
+                      })
+                    : '',
             ]);
             if (stopIfAborted()) return;
 
@@ -19419,8 +19442,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const commitSha =
                 target.commitSha || targetEntries.find((entry) => entry.commitSha)?.commitSha || pathCommitSha();
-            let patch = '';
-            if (commitSha) {
+            let patch = prefetchedPatch;
+            if (!patch && commitSha && commitSha !== target.commitSha) {
                 try {
                     patch = await fetchCommitPatch(pr, commitSha);
                 } catch (e) {
@@ -19468,7 +19491,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             const liveTa = findLiveSuggestedReplyTextarea(ta, target.form, target.replyToId);
             if (!liveTa || !isSuggestedReplyTextarea(liveTa)) throw new Error('reply editor is no longer available');
-            if (String(liveTa.value || '') !== initialDraft) {
+            if (liveTa.value !== initialDraft) {
                 stopSpin('⚠');
                 commentEl.title = 'Draft changed while the suggestion was generated; nothing was replaced';
                 restore(2500);
@@ -19476,11 +19499,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             const liveContainer =
                 liveTa.closest('form') || getToolbarEditorRoot(commentEl.closest('markdown-toolbar')) || document;
-            const selector =
-                liveTa.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-                    ? `textarea#${CSS.escape(liveTa.id)}`
-                    : 'textarea';
-            const appliedTa = await setTextareaValueRobust(liveContainer, liveTa, suggestion, selector);
+            const appliedTa = await setTextareaValueRobust(liveContainer, liveTa, suggestion, textareaIdSelector(liveTa));
             if (!appliedTa || appliedTa.value !== suggestion) throw new Error('could not fill the reply editor');
             appliedTa.focus();
             appliedTa.selectionStart = appliedTa.selectionEnd = appliedTa.value.length;
@@ -19526,8 +19545,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // `PullRequestFilesToolbar-module__toolbar__...` which still contain the
             // substring `Toolbar-module__toolbar`. Only inject into toolbars that are
             // part of an actual markdown editor.
-            const hasAssociatedTextarea = !!getToolbarTextarea(toolbar);
-            if (!hasAssociatedTextarea) {
+            const toolbarTextarea = getToolbarTextarea(toolbar);
+            if (!toolbarTextarea) {
                 toolbar.querySelectorAll(ackToolbarControlsSelector).forEach((el) => el.remove());
                 return;
             }
@@ -19568,8 +19587,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-suggest-reply');
             const isEditToolbar = !!findEditForm(toolbar);
             const allowProofread =
-                isEditToolbar || isExistingPostEditToolbar(toolbar) || isProofreadableComposeToolbar(toolbar, path);
-            const allowSuggestReply = isSuggestedReplyToolbar(toolbar, path);
+                isEditToolbar || isExistingPostEditToolbar(toolbar) || isProofreadableComposeTextarea(toolbarTextarea, path);
+            const allowSuggestReply = isSuggestedReplyTextarea(toolbarTextarea, path);
             if (!allowProofread) removeToolbarButtons(toolbar, '.ack-toolbar-proofread');
             if (!allowSuggestReply) removeToolbarButtons(toolbar, '.ack-toolbar-suggest-reply');
             let hasDetailsBtn = !!toolbar.querySelector('.ack-details-btn');
@@ -19708,13 +19727,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const fallbackScopes = new Set();
         const addFallbackScope = (el) => {
-            const replyTa = el?.tagName === 'TEXTAREA' && isSuggestedReplyTextarea(el, path) ? el : null;
-            const scope =
-                findEditForm(el) ||
-                (isExistingPostEditForm(el) ? el : null) ||
-                replyTa?.closest('form') ||
-                replyTa?.parentElement ||
-                null;
+            let scope = findEditForm(el) || (isExistingPostEditForm(el) ? el : null);
+            if (!scope && el?.tagName === 'TEXTAREA' && isSuggestedReplyTextarea(el, path)) {
+                scope = el.closest('form') || el.parentElement;
+            }
             if (scope) fallbackScopes.add(scope);
         };
         addFallbackScope(root);
@@ -19724,7 +19740,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 (tb) => tb !== form && (!form.isConnected || isVisible(tb)) && !!getToolbarTextarea(tb),
             );
             const existingRow = form.querySelector('.ack-toolbar-actions');
-            const textarea = [...form.querySelectorAll('textarea')].find(isVisible) || form.querySelector('textarea');
+            const textarea = pickVisibleTextarea(form);
             if (!textarea || usableToolbar) {
                 existingRow?.remove();
                 return;
@@ -20710,32 +20726,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function fetchAllPRDiscussionForPrecompute(pr) {
         if (!pr) return '';
-        const fetchPaged = async (urlForPage, maxPages = 10) => {
-            const out = [];
-            for (let page = 1; page <= maxPages; page++) {
-                const rows = await gmFetch(urlForPage(page));
-                if (!Array.isArray(rows) || rows.length === 0) break;
-                out.push(...rows);
-                if (rows.length < 100) break;
-            }
-            return out;
-        };
         const safeDate = (v) => v || '';
         const safeBody = (v) => (v || '').trim() || '(no text)';
         try {
+            const urls = prDiscussionPageUrls(pr);
             const [issueComments, reviews, inlineComments] = await Promise.all([
-                fetchPaged(
-                    (page) =>
-                        `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/comments?per_page=100&page=${page}`,
-                ),
-                fetchPaged(
-                    (page) =>
-                        `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews?per_page=100&page=${page}`,
-                ),
-                fetchPaged(
-                    (page) =>
-                        `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/comments?per_page=100&page=${page}`,
-                ),
+                fetchPagedGithubRows(urls.conversationComments, 10),
+                fetchPagedGithubRows(urls.reviewSummaries, 10),
+                fetchPagedGithubRows(urls.inlineComments, 10),
             ]);
 
             issueComments.sort((a, b) => String(a?.created_at || '').localeCompare(String(b?.created_at || '')));
@@ -23264,9 +23262,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function refreshExistingConversationEnhancements() {
         if (!shouldRefreshExistingConversationEnhancements()) return;
-        const ctx = currentInjectContext();
-        runRootInjectors(document, ctx);
-        runDocInjectors(ctx);
+        // Coalesce bursts: turbo:render, turbo:load, and the URL watcher can all
+        // request a refresh for one navigation.
+        scheduleAckBackgroundWork(
+            'conversation-refresh',
+            () => {
+                if (!shouldRefreshExistingConversationEnhancements()) return;
+                const ctx = currentInjectContext();
+                runRootInjectors(document, ctx);
+                runDocInjectors(ctx);
+            },
+            { delayMs: 120, timeoutMs: 1500, reason: 'turbo-restore' },
+        );
     }
 
     // --- Inject ---
@@ -25732,13 +25739,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const previous = prFileCategories;
         try {
             prFileCategories = {
+                bench: ['CCoinsCaching', 'Odd Bench'],
                 test: ["odd'name_tests"],
                 fuzz: ['target;printf unsafe'],
                 functional: ['rpc test.py'],
             };
+            const bench = SHA_FORMATS.find((f) => f.key === 'bench').fmt();
             const unit = SHA_FORMATS.find((f) => f.key === 'test').fmt();
             const fuzz = SHA_FORMATS.find((f) => f.key === 'fuzz').fmt();
             const functional = SHA_FORMATS.find((f) => f.key === 'functional').fmt();
+            ackAssert(bench.includes("--filter='CCoinsCaching|Odd Bench'"), 'quotes benchmark filter names');
             ackAssert(unit.includes("--run_test='odd'\"'\"'name_tests'"), 'quotes unit suite list');
             ackAssert(fuzz.includes("FUZZ='target;printf unsafe'"), 'quotes a single fuzz target');
             ackAssert(functional.endsWith("'rpc test.py'"), 'quotes functional test names');
@@ -29680,7 +29690,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('ALL PREVIOUS REPLIES BY'), 'includes every fetched viewer reply as style context');
         ackAssert(fn.includes('setTextareaValueRobust'), 'fills the reply through the React-compatible setter');
         ackAssert(fn.includes("requestLabel: 'suggest-reply'"), 'labels the LLM request');
-        ackAssert(fn.includes("String(liveTa.value || '') !== initialDraft"), 'does not overwrite typing during generation');
+        ackAssert(fn.includes('liveTa.value !== initialDraft'), 'does not overwrite typing during generation');
         ackAssert(fn.includes("!direct.source.startsWith('visible ')"), 'falls back to the complete visible thread');
         ackAssert(fn.includes('livePr.owner !== pr.owner'), 'does not fill an editor after navigating to another PR');
         ackAssert(fn.includes('stopIfAborted()'), 'cleans up after navigation cancels the request');
@@ -31859,19 +31869,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '<a data-hovercard-type="pull_request" href="/other/repo/pull/99">Other repo</a>',
             '</div>',
         ].join('');
-        const repo = { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' };
-        const entries = findPullRequestListEntries(host, repo);
-        ackEq(entries.length, 2, 'finds two unique PR rows');
-        ackEq(entries[0].pr.pr, '12', 'parses first PR number');
-        ackEq(entries[1].pr.pr, '13', 'parses hovercard URL variant');
+        document.body.appendChild(host);
+        try {
+            const repo = { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' };
+            const entries = findPullRequestListEntries(host, repo);
+            ackEq(entries.length, 2, 'finds two unique PR rows');
+            ackEq(entries[0].pr.pr, '12', 'parses first PR number');
+            ackEq(entries[1].pr.pr, '13', 'parses hovercard URL variant');
 
-        const marker = ensurePullRequestSizeMarker(entries[0]);
-        renderPullRequestSize(marker, { additions: 123, deletions: 45 });
-        ackEq(marker.textContent, '+123-45', 'renders compact size counts');
-        ackEq(marker.style.display, 'inline-flex', 'shows loaded size marker');
-        ackAssert(marker.title.includes('123 additions'), 'describes additions in tooltip');
-        ackAssert(marker.previousElementSibling?.classList.contains('IssueLabel'), 'places size after title labels');
-        ackAssert(marker.nextElementSibling?.classList.contains('metadata'), 'places size before PR metadata line');
+            const marker = ensurePullRequestSizeMarker(entries[0]);
+            renderPullRequestSize(marker, { additions: 123, deletions: 45 });
+            ackEq(marker.textContent, '+123-45', 'renders compact size counts');
+            ackEq(marker.style.display, 'inline-flex', 'shows loaded size marker');
+            ackAssert(marker.title.includes('123 additions'), 'describes additions in tooltip');
+            ackAssert(marker.previousElementSibling?.classList.contains('IssueLabel'), 'places size after title labels');
+            ackAssert(marker.nextElementSibling?.classList.contains('metadata'), 'places size before PR metadata line');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('pull request size cache expires and rejects invalid counts', () => {
