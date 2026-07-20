@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.221
+// @version      1.222
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -913,6 +913,19 @@
         return (typeof performance !== 'undefined' && performance.now && performance.now()) || Date.now();
     }
 
+    function ackLogEvent(message, details, level = 'log') {
+        if (_ackTesting) return;
+        const method = typeof console[level] === 'function' ? level : 'log';
+        const label = `ACKtopus: ${message}`;
+        if (details === undefined) {
+            console[method](label);
+            return;
+        }
+        console.groupCollapsed(label);
+        console[method](details);
+        console.groupEnd();
+    }
+
     function ackDebugLoggingEnabled() {
         try {
             return !GM_getValue('compactToolbar', false);
@@ -928,11 +941,7 @@
         const last = _ackBackgroundLogTimes.get(key) || 0;
         if (throttleMs && now - last < throttleMs) return;
         _ackBackgroundLogTimes.set(key, now);
-        try {
-            console.log(`ACKtopus: ${message}`, details);
-        } catch (_) {
-            console.log(`ACKtopus: ${message}`);
-        }
+        ackLogEvent(message, details);
     }
 
     function isAckUserInteracting() {
@@ -1572,7 +1581,7 @@
                 if (btn.tagName === 'A') {
                     const href = btn.getAttribute('href') || '';
                     if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                        console.warn(`ACKtopus: ${label} is a navigation link (${href}), skipping click`);
+                        ackLogEvent(`${label}: blocked navigation click`, { href }, 'warn');
                         return false;
                     }
                 }
@@ -1580,15 +1589,14 @@
                 return true;
             }
             if (attempt < maxAttempts) {
-                // This is often expected on GitHub because menu actions load via
-                // include-fragment / React overlays. Keep it as a log (not a warn)
-                // to avoid noisy consoles when the next retry succeeds.
-                console.log(`ACKtopus: ${label} not found (attempt ${attempt}/${maxAttempts}), retrying...`);
                 const aborted = await ackSleep(200 * attempt, lt);
                 if (aborted) return false;
             }
         }
-        console.warn(`ACKtopus: ${label} not found after ${maxAttempts} attempts in`, container);
+        ackLogEvent(`${label}: not found after retries`, {
+            attempts: maxAttempts,
+            container: container?.id || container?.className || 'unknown',
+        }, 'warn');
         return false;
     }
 
@@ -1609,7 +1617,10 @@
                 if (aborted) return null;
             }
         }
-        console.warn(`ACKtopus: ${label} not found after ${maxAttempts} attempts in`, container);
+        ackLogEvent(`${label}: not found after retries`, {
+            attempts: maxAttempts,
+            container: container?.id || container?.className || 'unknown',
+        }, 'warn');
         return null;
     }
 
@@ -1621,29 +1632,30 @@
             if (lt.signal.aborted)
                 return container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
             const ta = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
-            console.log(
-                `ACKtopus: setTextareaValueRobust attempt ${attempt}/3, ta=${ta?.tagName}.${ta?.className}, valueBefore=${ta?.value?.length}`,
-            );
+            const valueBefore = ta?.value?.length;
             ta.focus();
             setTextareaValue(ta, value);
             const aborted1 = await ackSleep(150, lt);
             if (aborted1) return ta;
             // Re-query to check if it stuck (React may have replaced the element)
             const check = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || ta;
-            console.log(
-                `ACKtopus: after setTextareaValue, valueAfter=${check.value.length}, expected=${value.length}, match=${check.value === value}`,
-            );
-            if (check.value === value) return check;
-            console.warn(`ACKtopus: textarea value didn't stick (attempt ${attempt}/3), retrying...`);
+            if (check.value === value) {
+                ackLogEvent(`textarea update applied on attempt ${attempt}`, {
+                    textarea: `${check?.tagName || 'unknown'}.${check?.className || ''}`,
+                    valueBefore,
+                    valueAfter: check.value.length,
+                });
+                return check;
+            }
             const aborted2 = await ackSleep(200, lt);
             if (aborted2) return check;
         }
         // Final attempt: return whatever we have
         const ta = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
-        console.warn(
-            'ACKtopus: textarea value may not have been applied after 3 attempts, current length:',
-            ta.value.length,
-        );
+        ackLogEvent('textarea update failed after retries', {
+            expectedLength: value.length,
+            currentLength: ta.value.length,
+        }, 'warn');
         return ta;
     }
 
@@ -2449,16 +2461,18 @@
     function rememberGithubRateLimit(response, headers) {
         if (!isGithubRateLimitResponse(response)) return;
         const bucket = githubAuthBucket(headers);
-        _githubRateLimitedUntil.set(bucket, Math.max(_githubRateLimitedUntil.get(bucket) || 0, githubRateLimitUntil(response)));
+        const limitedUntil = Math.max(_githubRateLimitedUntil.get(bucket) || 0, githubRateLimitUntil(response));
+        _githubRateLimitedUntil.set(bucket, limitedUntil);
         if (!_rateLimitWarned) {
             _rateLimitWarned = true;
             const authLabel = githubApiAuthLabel(headers);
             const guidance = headers?.Authorization
                 ? 'Authenticated requests are rate-limited too; wait for GitHub reset or reduce API use.'
                 : 'Add or fix the GitHub Personal Access Token in ACKtopus settings (octopus logo > config) to get 5000 req/hr instead of 60.';
-            console.warn(
-                `ACKtopus: GitHub API rate limit hit (${authLabel}). ${guidance}`,
-            );
+            ackLogEvent(`GitHub API rate limit hit (${authLabel})`, {
+                resetAt: new Date(limitedUntil).toISOString(),
+                guidance,
+            }, 'warn');
         }
     }
 
@@ -2481,11 +2495,10 @@
         refreshGithubPatStatus();
         if (_patInvalidWarned !== pat) {
             _patInvalidWarned = pat;
-            console.warn(
-                'ACKtopus: PAT returned ' +
-                    response.status +
-                    ', disabling it for this page session. Paste only the token value in ACKtopus settings, or check the token permissions.',
-            );
+            ackLogEvent(`PAT rejected (HTTP ${response.status})`, {
+                action: 'Disabled the configured token for this page session',
+                guidance: 'Paste only the token value in ACKtopus settings, or check whether it expired or can read this repository.',
+            }, 'warn');
         }
     }
 
@@ -3068,23 +3081,37 @@
         const ORG_TTL = 24 * 60 * 60 * 1000; // 24h
         const gmKey = `org_members_${owner}`;
         const now = Date.now();
+        const diagnostics = {
+            repository: `${owner}/${repo}`,
+            pullRequest: prNum || null,
+            org: {},
+            api: {},
+            dom: {},
+            errors: [],
+        };
 
         // --- Layer 1: org public members (globally cached) ---
         let orgMembers;
         if (_orgMemberCache[owner] && now - _orgMemberCache[owner].ts < ORG_TTL) {
             orgMembers = _orgMemberCache[owner].members;
-            console.log(
-                `ACKtopus: fetchRepoMembers(${owner}) - org cache hit (${orgMembers.size} members, age ${Math.round((now - _orgMemberCache[owner].ts) / 60000)}m)`,
-            );
+            diagnostics.org = {
+                source: 'memory cache',
+                members: orgMembers.size,
+                ageMinutes: Math.round((now - _orgMemberCache[owner].ts) / 60000),
+            };
         } else {
             const stored = GM_getValue(gmKey, null);
             if (stored && now - stored.ts < ORG_TTL) {
                 orgMembers = new Set(stored.logins);
                 _orgMemberCache[owner] = { members: orgMembers, ts: stored.ts };
-                console.log(`ACKtopus: fetchRepoMembers(${owner}) - org GM cache hit (${orgMembers.size} members)`);
+                diagnostics.org = {
+                    source: 'GM cache',
+                    members: orgMembers.size,
+                    ageMinutes: Math.round((now - stored.ts) / 60000),
+                };
             } else {
                 orgMembers = new Set();
-                console.log(`ACKtopus: fetchRepoMembers(${owner}) - org cache miss, fetching`);
+                diagnostics.org = { source: 'GitHub API', members: 0 };
                 let fetchFailed = false;
                 try {
                     let page = 1;
@@ -3097,13 +3124,12 @@
                         if (resp.length < 100) break;
                         page++;
                     }
-                    console.log(
-                        `ACKtopus: fetchRepoMembers - org public_members: ${orgMembers.size} found${orgMembers.size > 0 ? ` (${[...orgMembers].slice(0, 10).join(', ')}${orgMembers.size > 10 ? '...' : ''})` : ''}`,
-                    );
+                    diagnostics.org.members = orgMembers.size;
                 } catch (e) {
                     fetchFailed = true;
-                    if (shouldWarnOptionalGitHubApiError(e))
-                        console.warn('ACKtopus: fetchRepoMembers - org public_members failed:', e.message || e);
+                    if (shouldWarnOptionalGitHubApiError(e)) {
+                        diagnostics.errors.push({ source: 'org public members', error: e.message || String(e) });
+                    }
                 }
                 // Don't cache failed/partial fetches: a transient error would otherwise pin an
                 // empty/incomplete member set for the whole 24h ORG_TTL.
@@ -3128,12 +3154,15 @@
                         members.add(r.user.login);
                     }
                 }
-                console.log(
-                    `ACKtopus: fetchRepoMembers - PR reviews: +${members.size - beforeReviews} new (${reviews.length} checked, associations: ${[...new Set(reviews.map((r) => r.author_association))].join(',')})`,
-                );
+                diagnostics.api.reviews = {
+                    checked: reviews.length,
+                    added: members.size - beforeReviews,
+                    associations: [...new Set(reviews.map((r) => r.author_association))],
+                };
             } catch (e) {
-                if (shouldWarnOptionalGitHubApiError(e))
-                    console.warn('ACKtopus: fetchRepoMembers - PR reviews failed:', e.message || e);
+                if (shouldWarnOptionalGitHubApiError(e)) {
+                    diagnostics.errors.push({ source: 'PR reviews', error: e.message || String(e) });
+                }
             }
 
             const beforeIssue = members.size;
@@ -3147,12 +3176,14 @@
                         members.add(c.user.login);
                     }
                 }
-                console.log(
-                    `ACKtopus: fetchRepoMembers - issue comments: +${members.size - beforeIssue} new (${comments.length} checked)`,
-                );
+                diagnostics.api.issueComments = {
+                    checked: comments.length,
+                    added: members.size - beforeIssue,
+                };
             } catch (e) {
-                if (shouldWarnOptionalGitHubApiError(e))
-                    console.warn('ACKtopus: fetchRepoMembers - issue comments failed:', e.message || e);
+                if (shouldWarnOptionalGitHubApiError(e)) {
+                    diagnostics.errors.push({ source: 'issue comments', error: e.message || String(e) });
+                }
             }
 
             // Source: inline review comments (code comments on diff lines)
@@ -3167,12 +3198,14 @@
                         members.add(c.user.login);
                     }
                 }
-                console.log(
-                    `ACKtopus: fetchRepoMembers - inline review comments: +${members.size - beforeInline} new (${inline.length} checked)`,
-                );
+                diagnostics.api.inlineComments = {
+                    checked: inline.length,
+                    added: members.size - beforeInline,
+                };
             } catch (e) {
-                if (shouldWarnOptionalGitHubApiError(e))
-                    console.warn('ACKtopus: fetchRepoMembers - inline review comments failed:', e.message || e);
+                if (shouldWarnOptionalGitHubApiError(e)) {
+                    diagnostics.errors.push({ source: 'inline review comments', error: e.message || String(e) });
+                }
             }
         }
 
@@ -3181,7 +3214,7 @@
         const badgeEls = document.querySelectorAll(
             '.Label, [class*="Label--"], [data-testid="author-association-badge"]',
         );
-        console.log(`ACKtopus: fetchRepoMembers - scanning ${badgeEls.length} DOM badge elements`);
+        const domLogins = new Set();
         for (const badge of badgeEls) {
             const text = badge.textContent.trim().toLowerCase();
             if (text !== 'member' && text !== 'collaborator') continue;
@@ -3195,14 +3228,20 @@
             const login = authorEl?.textContent?.trim();
             if (login) {
                 members.add(login);
-                console.log(`ACKtopus: fetchRepoMembers - DOM badge: ${login} (${text})`);
+                domLogins.add(login);
             }
         }
-        if (members.size > beforeDOM) {
-            console.log(`ACKtopus: fetchRepoMembers - DOM badges: +${members.size - beforeDOM} new`);
-        }
-
-        console.log(`ACKtopus: fetchRepoMembers - FINAL: ${members.size} members: ${[...members].join(', ')}`);
+        diagnostics.dom = {
+            badgesScanned: badgeEls.length,
+            matchingLogins: [...domLogins].sort(),
+            added: members.size - beforeDOM,
+        };
+        diagnostics.members = [...members].sort();
+        ackLogEvent(
+            `member discovery: ${members.size} for ${owner}/${repo}${prNum ? `#${prNum}` : ''}`,
+            diagnostics,
+            diagnostics.errors.length ? 'warn' : 'log',
+        );
         return members;
     }
 
@@ -3225,7 +3264,9 @@
                 }
                 if (comments.length < 100) break;
             }
-            console.log(`ACKtopus: fetchReviewCommentCommits - ${Object.keys(map).length} comments mapped to commits`);
+            ackLogEvent(`review-comment commit map: ${Object.keys(map).length}`, {
+                pullRequest: prKey,
+            });
         } catch (e) {
             if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
         }
@@ -3246,10 +3287,8 @@
                     .map((s) => s.trim())
                     .filter(Boolean),
             );
-            console.log(`ACKtopus: getMaintainerLogins - from saved: [${[...set].join(', ')}]`);
             return set;
         }
-        console.log(`ACKtopus: getMaintainerLogins - using defaults: [${DEFAULT_MAINTAINERS.join(', ')}]`);
         return new Set(DEFAULT_MAINTAINERS);
     }
 
@@ -4389,7 +4428,35 @@
         if (!m) return;
         _compareActive = true;
         const [, owner, repo, baseSha, headSha] = m;
-        console.log('ACKtopus: compare page detected, base:', baseSha.slice(0, 8), 'head:', headSha.slice(0, 8));
+        const compareStartedAt = Date.now();
+        const compareDiagnostics = {
+            repository: `${owner}/${repo}`,
+            base: baseSha.slice(0, 8),
+            head: headSha.slice(0, 8),
+            pr: null,
+            prSource: null,
+            fileSources: {},
+            errors: [],
+        };
+        const noteCompareError = (stage, error) => {
+            compareDiagnostics.errors.push({ stage, message: error?.message || String(error) });
+        };
+        const logCompareOutcome = (outcome, details = {}, level = null) => {
+            ackLogEvent(
+                `compare filtering: ${outcome}`,
+                {
+                    ...compareDiagnostics,
+                    ...details,
+                    elapsedMs: Date.now() - compareStartedAt,
+                },
+                level || (compareDiagnostics.errors.length ? 'warn' : 'log'),
+            );
+        };
+        ackLogEvent('compare filtering started', {
+            repository: compareDiagnostics.repository,
+            base: compareDiagnostics.base,
+            head: compareDiagnostics.head,
+        });
         document.querySelectorAll('.ack-compare-status').forEach((el) => el.remove());
         const statusPopup = makeStatusPopup(`Compare: resolving PR for ${headSha.slice(0, 8)}...`);
         statusPopup.className = 'ack-compare-status';
@@ -4451,7 +4518,7 @@
         // Strategy 3: commits/{sha}/pulls API (works for reachable commits)
         // Strategy 4: referrer URL (fallback, trusts same-repo PR links)
         let prNum = parseComparePrParam();
-        if (prNum) console.log('ACKtopus: compare -- PR #' + prNum + ' (from URL ?pr)');
+        if (prNum) compareDiagnostics.prSource = 'URL ?pr';
 
         // Try sessionStorage next (keyed by both two-dot and three-dot paths)
         if (!prNum) {
@@ -4462,7 +4529,7 @@
                     const stored = sessionStorage.getItem(key);
                     if (stored) {
                         prNum = Number(stored);
-                        console.log('ACKtopus: compare -- PR #' + prNum + ' (from sessionStorage)');
+                        compareDiagnostics.prSource = 'sessionStorage';
                     }
                 } catch (_) {}
             }
@@ -4479,14 +4546,12 @@
                     ]);
                     if (prs.length > 0) {
                         prNum = prs[0].number;
-                        console.log(
-                            'ACKtopus: compare -- PR #' + prNum + ' (from commits/pulls, sha:',
-                            sha.slice(0, 8) + ')',
-                        );
+                        compareDiagnostics.prSource = `commits/pulls ${sha.slice(0, 8)}`;
                     }
                 } catch (e) {
-                    if (shouldWarnOptionalGitHubApiError(e))
-                        console.warn('ACKtopus: compare -- commits/pulls failed for', sha.slice(0, 8) + ':', e.message);
+                    if (shouldWarnOptionalGitHubApiError(e)) {
+                        noteCompareError(`resolve PR from ${sha.slice(0, 8)}`, e);
+                    }
                 }
             }
         }
@@ -4496,20 +4561,15 @@
             const refMatch = document.referrer.match(new RegExp(`/${owner}/${repo}/pull/(\\d+)`, 'i'));
             if (refMatch) {
                 prNum = Number(refMatch[1]);
-                console.log('ACKtopus: compare -- PR #' + prNum + ' (from referrer)');
+                compareDiagnostics.prSource = 'referrer';
             }
         }
         if (!prNum) {
-            console.warn(
-                'ACKtopus: compare -- no PR found for',
-                headSha.slice(0, 8),
-                '(referrer:',
-                document.referrer.slice(0, 80) + ')',
-            );
+            logCompareOutcome('PR not found', { referrer: document.referrer.slice(0, 120) }, 'warn');
             showComparePrMissingStatus();
             return;
         }
-        console.log('ACKtopus: compare -- PR #' + prNum);
+        compareDiagnostics.pr = prNum;
         setCompareStatus(`Compare: fetching files for PR #${prNum}...`);
 
         // Build comprehensive PR file set from multiple sources:
@@ -4544,13 +4604,14 @@
         };
         let compareApiRateLimited = false;
         let currentPrFilesIncomplete = false;
-        const noteCompareApiError = (label, error) => {
+        const noteCompareApiError = (stage, error) => {
             if (isGithubRateLimitedError(error)) {
                 compareApiRateLimited = true;
+                noteCompareError(stage, error);
                 setCompareStatus('Compare: REST API rate-limited; trying page patch fallback...');
                 return;
             }
-            if (shouldWarnOptionalGitHubApiError(error)) console.warn(label, error);
+            if (shouldWarnOptionalGitHubApiError(error)) noteCompareError(stage, error);
         };
         let triedPatchFileFallback = false;
         const addPRPatchFallbackFiles = async () => {
@@ -4559,9 +4620,9 @@
             try {
                 const patchPaths = await fetchPRPatchFilePaths({ owner, repo, pr: prNum });
                 for (const filename of patchPaths) prFileSet.add(filename);
-                if (patchPaths.length) console.log('ACKtopus: compare -- PR files from patch fallback:', patchPaths.length);
+                compareDiagnostics.fileSources.patch = patchPaths.length;
             } catch (e) {
-                if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: compare -- failed to fetch PR patch fallback', e);
+                if (shouldWarnOptionalGitHubApiError(e)) noteCompareError('PR patch fallback', e);
             }
         };
 
@@ -4569,6 +4630,7 @@
         try {
             let page = 1;
             let batch;
+            const before = prFileSet.size;
             do {
                 batch = await gmFetchTimeout(
                     `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/files?per_page=100&page=${page}`,
@@ -4576,10 +4638,11 @@
                 addFiles(batch);
                 page++;
             } while (batch.length === 100 && page <= 30); // up to 3000 files
-            console.log('ACKtopus: compare -- current PR files:', prFileSet.size);
+            compareDiagnostics.fileSources.currentPr = prFileSet.size - before;
+            compareDiagnostics.fileSources.currentPrPages = page - 1;
         } catch (e) {
             currentPrFilesIncomplete = true;
-            noteCompareApiError('ACKtopus: compare -- failed to fetch current PR files', e);
+            noteCompareApiError('current PR files', e);
         }
 
         // Source 2: PR files at the specific headSha (handles refactored PRs)
@@ -4592,7 +4655,7 @@
             );
             if (cmp.files) {
                 addFiles(cmp.files);
-                console.log('ACKtopus: compare -- PR files at', headSha.slice(0, 8) + ':', cmp.files.length);
+                compareDiagnostics.fileSources.head = cmp.files.length;
             }
             // Also check baseSha side (may be a different PR version)
             if (baseSha !== headSha) {
@@ -4602,26 +4665,28 @@
                     );
                     if (cmp2.files) {
                         addFiles(cmp2.files);
-                        console.log('ACKtopus: compare -- PR files at', baseSha.slice(0, 8) + ':', cmp2.files.length);
+                        compareDiagnostics.fileSources.base = cmp2.files.length;
                     }
-                } catch (_) {}
+                } catch (e) {
+                    if (shouldWarnOptionalGitHubApiError(e)) noteCompareError('base commit files', e);
+                }
             }
         } catch (e) {
-            noteCompareApiError('ACKtopus: compare -- failed to fetch PR files at commit', e);
+            noteCompareApiError('PR files at commit', e);
         }
 
         if (currentPrFilesIncomplete || prFileSet.size === 0) await addPRPatchFallbackFiles();
         if (prFileSet.size === 0) {
-            if (!compareApiRateLimited) console.warn('ACKtopus: compare -- no PR files found, aborting');
             finishCompareStatus(
                 compareApiRateLimited
                     ? 'Compare: REST API rate-limited and patch fallback had no files'
                     : `Compare: PR #${prNum} has no file list`,
             );
+            logCompareOutcome('no PR files found', { rateLimited: compareApiRateLimited }, 'warn');
             _compareActive = false;
             return;
         }
-        console.log('ACKtopus: compare -- total unique PR file paths:', prFileSet.size);
+        compareDiagnostics.uniquePrFilePaths = prFileSet.size;
         const normalizedPrFileSet = new Set([...prFileSet].map(normalizeComparePath).filter(Boolean));
         setCompareStatus(`Compare: filtering to ${normalizedPrFileSet.size} PR file paths...`);
 
@@ -4632,11 +4697,9 @@
                 5000,
             );
             compareRangeFileSet = addCompareRangeFiles(cmpRange.files);
-            if (compareRangeFileSet.size) {
-                console.log('ACKtopus: compare -- range files:', compareRangeFileSet.size);
-            }
+            compareDiagnostics.fileSources.compareRange = compareRangeFileSet.size;
         } catch (e) {
-            noteCompareApiError('ACKtopus: compare -- failed to fetch compare range files', e);
+            noteCompareApiError('compare range files', e);
         }
 
         // Auto-click "Files changed" tab if not already active
@@ -4647,7 +4710,7 @@
                 (el) => /files?\s*changed/i.test(el.textContent) && !el.closest('[data-tagsearch-path]'),
             );
         if (filesTab && !document.querySelector('[data-tagsearch-path]')) {
-            console.log('ACKtopus: compare -- clicking Files changed tab');
+            compareDiagnostics.clickedFilesTab = true;
             filesTab.click();
         }
 
@@ -4727,17 +4790,7 @@
             if (newCollapsed > 0) updateCollapseCSS();
             if (newCollapsed > 0 || newKept > 0) {
                 lastActivityAt = Date.now();
-                console.log(
-                    'ACKtopus: compare -- batch: +' +
-                        newCollapsed +
-                        ' collapsed, +' +
-                        newKept +
-                        ' kept (total: ' +
-                        totalCollapsed +
-                        '/' +
-                        totalKept +
-                        ')',
-                );
+                compareDiagnostics.domBatches = (compareDiagnostics.domBatches || 0) + 1;
                 const now = Date.now();
                 if (now - lastStatusUpdate > 150 || totalCollapsed + totalKept < 20) {
                     setCompareStatus(
@@ -4746,11 +4799,8 @@
                     lastStatusUpdate = now;
                 }
                 if (unmatched.length > 0 && totalCollapsed === newCollapsed) {
-                    console.log(
-                        'ACKtopus: compare -- PR file set (' + normalizedPrFileSet.size + '):',
-                        [...normalizedPrFileSet].slice(0, 15).join(', '),
-                    );
-                    console.log('ACKtopus: compare -- first unmatched:', unmatched.join(', '));
+                    compareDiagnostics.samplePrFiles = [...normalizedPrFileSet].slice(0, 15);
+                    compareDiagnostics.sampleUnmatchedFiles = unmatched;
                 }
             }
             return fileEls.length > 0;
@@ -4779,7 +4829,6 @@
         // cheap observer alive for the compare page instead of stopping after a
         // short idle window.
         clearCompareWatcher();
-        console.log('ACKtopus: compare -- watching for progressive file loading...');
         const startedAt = Date.now();
         const QUIET_STATUS_MS = 10000;
         const WATCHDOG_MS = 2000;
@@ -4804,13 +4853,13 @@
                 _compareDebounceTimer = null;
             }
             const elapsedS = Math.round((Date.now() - startedAt) / 1000);
-            console.log(
-                'ACKtopus: compare -- observer done (' + reason + ', ' + elapsedS + 's), total:',
-                totalCollapsed,
-                'collapsed,',
-                totalKept,
-                'kept',
-            );
+            logCompareOutcome('watch stopped', {
+                reason,
+                watchElapsedSeconds: elapsedS,
+                hidden: totalCollapsed,
+                kept: totalKept,
+                scanned: processed.size,
+            });
             finishCompareStatus(`Compare: done - kept ${totalKept}, hid ${totalCollapsed}`);
         };
         _compareWatchdogTimer = setInterval(() => {
@@ -4819,13 +4868,12 @@
             runCompareCollapsePass();
             if (!quietStatusShown && now - lastActivityAt >= QUIET_STATUS_MS) {
                 quietStatusShown = true;
-                console.log(
-                    'ACKtopus: compare -- observer quiet, keeping watch for late lazy-loaded files (total:',
-                    totalCollapsed,
-                    'collapsed,',
-                    totalKept,
-                    'kept)',
-                );
+                logCompareOutcome('watching lazy-loaded files', {
+                    hidden: totalCollapsed,
+                    kept: totalKept,
+                    scanned: processed.size,
+                    stillWatching: true,
+                });
                 finishCompareStatus(`Compare: kept ${totalKept}, hid ${totalCollapsed}; still watching lazy-loaded files`);
             }
         }, WATCHDOG_MS);
@@ -6864,7 +6912,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (promptKey) {
             const cached = GM_getValue(promptKey, null);
             if (cached !== null) {
-                console.log('ACKtopus: LLM prompt cache hit', promptKey.slice(-12));
+                ackLogEvent('LLM prompt cache hit', { key: promptKey.slice(-12) });
                 return Promise.resolve(cached);
             }
         }
@@ -6892,16 +6940,18 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             requestLabel,
             streaming,
         });
-        console.groupCollapsed(`ACKtopus: LLM request → ${label} (${model})`);
-        console.log('metadata:', requestMeta);
-        console.log('system:', system);
-        console.log('user:', userContent);
-        if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
-        console.log('max_tokens:', effectiveMaxTokens);
-        console.log('timeout_ms:', timeoutMs);
-        console.log('streaming:', streaming);
-        console.log('request_chars:', requestBody.length);
-        console.groupEnd();
+        if (!_ackTesting) {
+            console.groupCollapsed(`ACKtopus: LLM request → ${label} (${model})`);
+            console.log('metadata:', requestMeta);
+            console.log('system:', system);
+            console.log('user:', userContent);
+            if (reasoningEffort) console.log('reasoning_effort:', reasoningEffort);
+            console.log('max_tokens:', effectiveMaxTokens);
+            console.log('timeout_ms:', timeoutMs);
+            console.log('streaming:', streaming);
+            console.log('request_chars:', requestBody.length);
+            console.groupEnd();
+        }
         return new Promise((resolve, reject) => {
             const startedAt = Date.now();
             const streamState = streaming ? createLLMStreamState(provider) : null;
@@ -6917,10 +6967,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 if (settled) return;
                 settled = true;
                 const meta = finishMeta();
-                console.groupCollapsed(`ACKtopus: LLM ${kind} ✕ ${label} (${model})`);
-                console.log('metadata:', meta);
-                if (event) console.log('event:', event);
-                console.groupEnd();
+                if (!_ackTesting) {
+                    console.groupCollapsed(`ACKtopus: LLM ${kind} ✕ ${label} (${model})`);
+                    console.log('metadata:', meta);
+                    if (event) console.log('event:', event);
+                    console.groupEnd();
+                }
                 reject(makeLLMRequestError(label, kind, details, meta));
             };
             const resolveWithText = (text, inputTokens, outputTokens, finishReason = '') => {
@@ -6933,19 +6985,23 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 };
                 if (isLLMTruncatedFinishReason(finishReason)) {
                     settled = true;
-                    console.groupCollapsed(`ACKtopus: LLM response truncated ✕ ${label} (${model})`);
-                    console.log('metadata:', meta);
-                    console.log('partial_response:', responseText);
-                    console.groupEnd();
+                    if (!_ackTesting) {
+                        console.groupCollapsed(`ACKtopus: LLM response truncated ✕ ${label} (${model})`);
+                        console.log('metadata:', meta);
+                        console.log('partial_response:', responseText);
+                        console.groupEnd();
+                    }
                     reject(makeLLMRequestError(label, 'response truncated', `finish_reason=${finishReason}`, meta));
                     return;
                 }
                 settled = true;
                 if (inputTokens) addUsage(provider, inputTokens, outputTokens);
-                console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
-                console.log('metadata:', meta);
-                console.log(responseText);
-                console.groupEnd();
+                if (!_ackTesting) {
+                    console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
+                    console.log('metadata:', meta);
+                    console.log(responseText);
+                    console.groupEnd();
+                }
                 if (promptKey) {
                     GM_setValue(promptKey, responseText);
                     recordCacheTimestamp(promptKey);
@@ -7049,22 +7105,24 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function requestOpenAIImage(prompt, key) {
         const timeoutMs = getHighContextTimeoutMs('openai');
-        console.groupCollapsed(`ACKtopus: image request -> OpenAI (${OPENAI_IMAGE_MODEL})`);
-        console.log('prompt:', prompt);
-        console.log(
-            'size:',
-            OPENAI_IMAGE_SIZE,
-            'quality:',
-            OPENAI_IMAGE_QUALITY,
-            'format:',
-            OPENAI_IMAGE_FORMAT,
-            'background:',
-            OPENAI_IMAGE_BACKGROUND,
-            'moderation:',
-            OPENAI_IMAGE_MODERATION,
-        );
-        console.log('timeout_ms:', timeoutMs);
-        console.groupEnd();
+        if (!_ackTesting) {
+            console.groupCollapsed(`ACKtopus: image request -> OpenAI (${OPENAI_IMAGE_MODEL})`);
+            console.log('prompt:', prompt);
+            console.log(
+                'size:',
+                OPENAI_IMAGE_SIZE,
+                'quality:',
+                OPENAI_IMAGE_QUALITY,
+                'format:',
+                OPENAI_IMAGE_FORMAT,
+                'background:',
+                OPENAI_IMAGE_BACKGROUND,
+                'moderation:',
+                OPENAI_IMAGE_MODERATION,
+            );
+            console.log('timeout_ms:', timeoutMs);
+            console.groupEnd();
+        }
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -8996,7 +9054,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         let cursor = null;
         for (let page = 1; page <= 20; page++) {
             onProgress(`Fetching pending review comments, page ${page}...`);
-            console.log(`ACKtopus: pending review context: GraphQL page ${page} requested`);
             const data = await patGraphQL(query, {
                 owner: pr.owner,
                 repo: pr.repo,
@@ -9004,12 +9061,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 cursor,
             });
             const review = data?.data?.repository?.pullRequest?.viewerLatestReview;
-            console.log('ACKtopus: pending review context: GraphQL page result', {
-                page,
-                reviewState: review?.state || 'none',
-                comments: review?.comments?.nodes?.length || 0,
-                hasNextPage: !!review?.comments?.pageInfo?.hasNextPage,
-            });
             if (review?.state && review.state !== 'PENDING') break;
             const connection = review?.comments;
             const nodes = connection?.nodes || [];
@@ -9035,11 +9086,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const author = String(review?.user?.login || '').toLowerCase();
             return !login || !author || author === login;
         });
-        console.log('ACKtopus: pending review context: REST reviews result', {
-            reviews: reviews.length,
-            pendingReviews: pendingReviews.length,
-            viewerKnown: !!login,
-        });
 
         const comments = [];
         for (const [index, review] of pendingReviews.entries()) {
@@ -9048,10 +9094,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const rows = await fetchPagedGithubRows(
                 (page) => `${base}/reviews/${review.id}/comments?per_page=100&page=${page}`,
             );
-            console.log('ACKtopus: pending review context: REST review comments result', {
-                review: index + 1,
-                comments: rows.length,
-            });
             for (const row of rows) {
                 const normalized = normalizePendingReviewComment(row, 'REST pending review');
                 if (normalized) comments.push(normalized);
@@ -9086,9 +9128,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     async function gatherPendingReviewCommentsContext(onProgress = () => {}) {
         const pr = parsePR();
         if (!pr) {
-            console.warn('ACKtopus: pending review context: not on a pull request page', {
+            ackLogEvent('pending review context unavailable', {
                 pathname: location.pathname,
-            });
+                reason: 'not on a pull request page',
+            }, 'warn');
             return '';
         }
         const startedAt = Date.now();
@@ -9097,7 +9140,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             configured: !!githubPatValue(),
             usable: !!patAuthHeaderValue(),
         };
-        console.log('ACKtopus: pending review context: started', {
+        ackLogEvent('pending review context: started', {
             pullRequest: `${pr.owner}/${pr.repo}#${pr.pr}`,
             pathname: location.pathname,
             patConfigured: auth.configured,
@@ -9109,23 +9152,22 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
         let graphQLComments = [];
         let restComments = [];
+        const sourceErrors = [];
         if (auth.usable) {
             try {
                 graphQLComments = await fetchViewerPendingReviewComments(pr, onProgress);
             } catch (e) {
                 onProgress(`Could not fetch pending comments through GraphQL: ${e.message || e}`);
-                console.warn('ACKtopus: pending review context: GraphQL failed', e);
+                sourceErrors.push({ source: 'GraphQL', error: e.message || String(e) });
             }
             if (!graphQLComments.length && patAuthHeaderValue()) {
                 try {
                     restComments = await fetchViewerPendingReviewCommentsRest(pr, onProgress);
                 } catch (e) {
                     onProgress(`Could not fetch pending comments through REST: ${e.message || e}`);
-                    console.warn('ACKtopus: pending review context: REST failed', e);
+                    sourceErrors.push({ source: 'REST', error: e.message || String(e) });
                 }
             }
-        } else {
-            console.warn('ACKtopus: pending review context: authenticated sources skipped', auth);
         }
 
         const embeddedDiagnostics = {};
@@ -9134,7 +9176,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const domDiagnostics = {};
         const domComments = gatherPendingReviewDomComments(document, domDiagnostics);
         const comments = mergePendingReviewComments(graphQLComments, restComments, embeddedComments, domComments);
-        console.log('ACKtopus: pending review context: source summary', {
+        ackLogEvent(`pending review context: ${comments.length} merged comment${comments.length === 1 ? '' : 's'}`, {
+            pullRequest: `${pr.owner}/${pr.repo}#${pr.pr}`,
+            authentication: auth,
             graphQL: graphQLComments.length,
             rest: restComments.length,
             embeddedReviewFound: !!embeddedReview,
@@ -9144,7 +9188,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             domDiagnostics,
             merged: comments.length,
             elapsedMs: Date.now() - startedAt,
-        });
+            errors: sourceErrors,
+        }, sourceErrors.length ? 'warn' : 'log');
         if (!comments.length) {
             onProgress('No pending comments found; see console logs for source details');
             return '';
@@ -12249,7 +12294,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function runProofreadOnComment(commentEl) {
         if (!commentEl) {
-            console.warn('ACKtopus: proofread: missing button element');
+            ackLogEvent('proofread: missing button element', { pathname: location.pathname }, 'warn');
             return;
         }
         const active = getActiveProvider();
@@ -12274,10 +12319,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // Prevent double-click re-entrancy (React can re-render and duplicate handlers).
         if (commentEl.dataset.ackProofreadBusy === '1') {
-            console.log('ACKtopus: proofread: already running, ignoring click');
+            ackLogEvent('proofread: ignored overlapping request', { pathname: location.pathname });
             return;
         }
         commentEl.dataset.ackProofreadBusy = '1';
+        const proofreadStartedAt = Date.now();
+        const proofreadDiagnostics = { provider, pathname: location.pathname };
+        const logProofreadOutcome = (outcome, details = {}, level = 'log') =>
+            ackLogEvent(`proofread: ${outcome}`, {
+                ...proofreadDiagnostics,
+                ...details,
+                elapsedMs: Date.now() - proofreadStartedAt,
+            }, level);
         const wasDisabled = commentEl instanceof HTMLButtonElement ? commentEl.disabled : false;
         if (commentEl instanceof HTMLButtonElement) commentEl.disabled = true;
 
@@ -12293,16 +12346,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const commentContainer = commentEl.closest(COMMENT_CONTAINER_SELECTOR) || commentEl.parentElement;
             const permalink = commentContainer?.querySelector('a[id$="-permalink"]');
             const isPRBody = permalink?.getAttribute('href')?.startsWith('#issue-') || false;
-            console.log('ACKtopus: proofread: start', { provider, isPRBody, url: location.href });
+            proofreadDiagnostics.isPRBody = isPRBody;
+            ackLogEvent('proofread: started', proofreadDiagnostics);
 
             // Fetch PR context (cached) for fact-checking and enriching proofreading
             const pr = parsePR();
             const ctx = await fetchPRContext(pr);
-            console.log('ACKtopus: proofread: fetched PR context', {
+            proofreadDiagnostics.context = {
                 hasDescription: !!ctx?.description,
                 hasCommitMessages: !!ctx?.commitMessages,
                 hasDiff: !!ctx?.diff,
-            });
+            };
             // Build context string for the proofreading prompt
             let proofreadContext = '';
             if (isPRBody) {
@@ -12583,7 +12637,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             }
             if (!container) {
-                console.warn('ACKtopus: proofread container not found from', commentEl);
+                logProofreadOutcome('failed to find comment container', {}, 'warn');
                 stopSpin();
                 return;
             }
@@ -12641,7 +12695,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         null;
                 }
                 if (!ta) {
-                    console.warn('ACKtopus: proofread: toolbar textarea not found');
+                    logProofreadOutcome('failed to find toolbar textarea', {}, 'warn');
                     stopSpin();
                     return;
                 }
@@ -12661,7 +12715,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     !ta.closest('.is-comment-editing') &&
                     !isProofreadableComposeTextarea(ta)
                 ) {
-                    console.log('ACKtopus: proofread: toolbar textarea is a compose form, ignoring');
+                    logProofreadOutcome('ignored unsupported compose form');
                     stopSpin();
                     setTimeout(() => restoreButton(), 500);
                     return;
@@ -12671,7 +12725,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // It's too risky to proofread on the closed/view state.
                 ta = container.querySelector(EDIT_TA_SELECTOR);
                 if (!ta) {
-                    console.log('ACKtopus: proofread: not in edit mode (edit textarea not found)');
+                    logProofreadOutcome('ignored because edit mode is closed');
                     stopSpin();
                     commentEl.title = 'Edit the comment first to proofread';
                     setTimeout(() => {
@@ -12697,15 +12751,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const hasSelection = selStart !== selEnd;
                 const textToProofread = hasSelection ? ta.value.slice(selStart, selEnd) : ta.value;
                 if (!textToProofread.trim()) {
-                    console.log('ACKtopus: proofread: empty textarea/selection, ignoring');
+                    logProofreadOutcome('ignored empty text');
                     stopSpin();
                     return;
                 }
-                console.log('ACKtopus: proofread: textarea ready', {
+                proofreadDiagnostics.textarea = {
                     hasSelection,
                     selectionLen: hasSelection ? selEnd - selStart : 0,
                     textLen: textToProofread.length,
-                });
+                };
 
                 const oldBorder = ta.style.borderColor;
                 ta.style.borderColor = '#58a6ff';
@@ -12720,21 +12774,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         : '';
                     const { system, user, parsed, noOp } = makePrompt(textForProofread, localProofreadContext);
                     if (noOp) {
-                        console.log('ACKtopus: proofread: no mutable segments, running URL-preservation pass only');
+                        proofreadDiagnostics.mode = 'URL preservation only';
                         result = postProcessProofreadMarkdown(strippedOriginal);
                     } else {
-                        console.log('ACKtopus: proofread: calling LLM', {
-                            provider,
-                            mutableSegments: parsed.mutableCount,
-                        });
+                        proofreadDiagnostics.mode = 'LLM';
+                        proofreadDiagnostics.mutableSegments = parsed.mutableCount;
                         const llmRaw = await callLLM(provider, system, user, { skipCache: true });
                         const llmClean = cleanResult(llmRaw);
                         const tagCount = (llmClean.match(/<s\d+>/gi) || []).length;
-                        console.log('ACKtopus: proofread: LLM xml tags', { tagCount, expected: parsed.mutableCount });
+                        proofreadDiagnostics.outputTags = { received: tagCount, expected: parsed.mutableCount };
                         if (tagCount === 0) {
-                            console.warn(
-                                'ACKtopus: proofread: LLM returned no <sN> tags (using plain-text fallback when safe)',
-                            );
+                            proofreadDiagnostics.outputFallback = 'missing section tags';
                             if (parsed.mutableCount === 1) {
                                 // Fallback for occasional model formatting drift: when there is a
                                 // single mutable segment, treat the whole response as that segment.
@@ -12748,10 +12798,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 const retryRaw = await callLLM(provider, strictSystem, user, { skipCache: true });
                                 const retryClean = cleanResult(retryRaw);
                                 const retryTagCount = (retryClean.match(/<s\d+>/gi) || []).length;
-                                console.log('ACKtopus: proofread: LLM xml tags (retry)', {
-                                    retryTagCount,
+                                proofreadDiagnostics.retryOutputTags = {
+                                    received: retryTagCount,
                                     expected: parsed.mutableCount,
-                                });
+                                };
                                 if (retryTagCount > 0) {
                                     result = postProcessProofreadMarkdown(parsed.fromXML(retryClean));
                                 } else {
@@ -12773,11 +12823,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         result,
                         getTextareaDiffDialogOptions(taContainer, ta),
                     );
-                    console.log('ACKtopus: proofread: diff dialog result', {
-                        accepted,
-                        finalLen: (finalText || '').length,
-                    });
+                    proofreadDiagnostics.diffDialog = { accepted, finalLength: (finalText || '').length };
                     if (accepted === 'unchanged') {
+                        logProofreadOutcome('finished with no changes');
                         commentEl.textContent = '✅';
                         commentEl.title = NO_CHANGES_MSG;
                         setTimeout(() => {
@@ -12786,6 +12834,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         return;
                     }
                     if (accepted === false) {
+                        logProofreadOutcome('changes rejected');
                         setTimeout(() => {
                             restoreButton();
                         }, 500);
@@ -12804,9 +12853,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (hasSelection) {
                         // Verify the captured text still matches -- abort if user typed during async LLM call
                         if (freshTa.value.slice(selStart, selEnd) !== textToProofread) {
-                            console.warn(
-                                'ACKtopus: selection drifted during proofread, falling back to whole-text replace',
-                            );
+                            proofreadDiagnostics.selectionDrifted = true;
                             await setTextareaValueRobust(
                                 liveTextArea.container,
                                 freshTa,
@@ -12834,6 +12881,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                     // Refresh quick-action icons (soft rescan: no global clear needed).
                     scheduleQuickActionsSoftRescan(1500);
+                    logProofreadOutcome('changes applied', { linkRewriteCount });
                 } catch (e) {
                     // Robust cleanup: restore textarea border and button state
                     try {
@@ -12851,7 +12899,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         // Restore icons even on failure (soft rescan is enough).
                         scheduleQuickActionsSoftRescan(0);
                     }, 2000);
-                    console.error('ACKtopus: EDIT MODE proofread failed:', e?.message, e?.stack);
+                    logProofreadOutcome('failed in edit mode', { error: e?.message, stack: e?.stack }, 'error');
                 }
             }
         } catch (e) {
@@ -12863,7 +12911,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     restoreButton();
                 } catch (_) {}
             }, 2000);
-            console.error('ACKtopus: proofread failed:', e?.message, e?.stack);
+            logProofreadOutcome('failed', { error: e?.message, stack: e?.stack }, 'error');
         } finally {
             try {
                 delete commentEl.dataset.ackProofreadBusy;
@@ -18228,7 +18276,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const nativeTa = await waitForEditTextarea(container, lt, 250, roots);
                 if (nativeTa) return nativeTa;
             }
-            console.log(`ACKtopus: triggerMenuEdit: ${reason}, trying GM fragment load:`, url);
+            ackLogEvent('edit: trying fragment fallback', { reason, url });
             const html = await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
                     method: 'GET',
@@ -18258,21 +18306,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ? await waitForEditTextarea(container, lt, nativeFailureWaitMs, roots)
                     : null) || findOpenEditTextarea(container, roots);
             if (nativeTa) {
-                console.log('ACKtopus: triggerMenuEdit: native edit form is already open; ignoring GM fragment failure');
+                ackLogEvent('edit: native editor opened after fragment failure', { reason });
                 return nativeTa;
             }
             const nativeScope = activatedNativeEdit ? findOpenEditScope(container, roots) : null;
             if (nativeScope) {
-                console.log('ACKtopus: triggerMenuEdit: native edit form is opening; leaving native edit flow alone');
+                ackLogEvent('edit: native editor is opening after fragment failure', { reason });
                 return nativeScope;
             }
             activation?.cleanup();
             const msg = String(e?.message || e || '');
             if (/HTTP 403/i.test(msg)) {
-                console.log('ACKtopus: triggerMenuEdit: GM fragment load forbidden and no native editor was visible');
+                ackLogEvent('edit: fragment fallback forbidden', { reason, error: msg }, 'warn');
                 return null;
             }
-            console.warn('ACKtopus: triggerMenuEdit: GM fragment load failed:', e);
+            ackLogEvent('edit: fragment fallback failed', { reason, error: e?.message || String(e) }, 'warn');
             return null;
         }
     }
@@ -18283,9 +18331,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // waiting on slow menu fragments for several seconds) must not swallow
         // fresh user clicks for its whole lifetime.
         const prevAttempt = Number(container?.dataset?.ackEditOpening || 0);
-        if (prevAttempt && Date.now() - prevAttempt < 1500) return false;
+        if (prevAttempt && Date.now() - prevAttempt < 1500) {
+            ackLogEvent('edit: ignored overlapping request', { target: container?.id || container?.className || 'unknown' });
+            return false;
+        }
         const attemptStamp = String(Date.now());
         if (container?.dataset) container.dataset.ackEditOpening = attemptStamp;
+        ackLogEvent('edit: started', {
+            target: container?.id || container?.className || 'unknown',
+            isPRBody: !!opts.isPRBody,
+            pathname: location.pathname,
+        });
         let kebab = null;
         let menuHost = null;
         let origOpacity = '';
@@ -18293,12 +18349,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             const taDirect = await tryOpenEditFormFromFragment(container, lt, 'direct edit_form lookup', opts);
             if (taDirect) {
+                ackLogEvent('edit: editor opened directly', { target: container?.id || 'unknown' });
                 schedulePostEditRefresh(container);
                 return true;
             }
             kebab = findCommentMenuTrigger(header, !opts.isPRBody ? container : null);
             if (!kebab) {
-                console.warn('ACKtopus: triggerMenuEdit: kebab not found');
+                ackLogEvent('edit: menu button not found', { target: container?.id || 'unknown' }, 'warn');
                 const ta = await tryOpenEditFormFromFragment(container, lt, 'kebab missing', {
                     ...opts,
                     nativeWaitMs: 1200,
@@ -18316,7 +18373,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // transparent — our `isVisible()` helper treats opacity:0 as invisible,
             // which would prevent finding/clicking the Edit item.
             menuHost.style.opacity = '0.01';
-            console.log('ACKtopus: triggerMenuEdit: opening kebab menu');
+            ackLogEvent('edit: opening comment menu', { target: container?.id || 'unknown' });
             openMenuTrigger(kebab);
 
             const ok = await clickWithRetry(
@@ -18358,7 +18415,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             .map((el) => commentMenuItemTextCandidates(el).join(' | '))
                             .filter(Boolean),
                     );
-                    console.warn('ACKtopus: triggerMenuEdit: could not find Edit item. Visible menu items:', items);
+                    ackLogEvent('edit: Edit menu item not found', { visibleMenuItems: items }, 'warn');
                 } catch (_) {}
                 const ta = await tryOpenEditFormFromFragment(container, lt, 'edit item missing', {
                     ...opts,
@@ -18369,7 +18426,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     return true;
                 }
             } else {
-                console.log('ACKtopus: triggerMenuEdit: clicked Edit');
+                ackLogEvent('edit: clicked Edit', { target: container?.id || 'unknown' });
                 schedulePostEditRefresh(container);
                 // GitHub sometimes loads edit forms via <include-fragment>. If a
                 // real fragment placeholder exists and does not resolve, replace
@@ -19615,7 +19672,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackSetTimeout(() => {
                 if (commentEl?.isConnected) commentEl.title = origTitle;
             }, 2500);
-            console.warn('ACKtopus: suggest reply could not find a matching reply editor', container);
+            ackLogEvent('suggest reply: no matching editor', {
+                target: container?.id || container?.className || 'unknown',
+                pathname: location.pathname,
+            }, 'warn');
             return;
         }
         await suggestDraftReplyForTextarea(ta, commentEl, container);
@@ -19647,11 +19707,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const initialDraft = ta.value;
         const target = getSuggestedReplyTarget(ta, selectedContainer);
         const viewerLogin = getCurrentGitHubLogin();
+        const suggestStartedAt = Date.now();
+        const suggestDiagnostics = {
+            pullRequest: `${pr.owner}/${pr.repo}#${pr.pr}`,
+            provider,
+            viewer: viewerLogin || 'unknown',
+            replyToId: target.replyToId || null,
+            selectedCommentId: target.selectedCommentId || null,
+            commitSha: target.commitSha || null,
+            initialDraftLength: initialDraft.length,
+            errors: [],
+        };
+        const logSuggestOutcome = (outcome, details = {}, level = 'log') =>
+            ackLogEvent(`suggest reply: ${outcome}`, {
+                ...suggestDiagnostics,
+                ...details,
+                elapsedMs: Date.now() - suggestStartedAt,
+            }, level);
+        ackLogEvent('suggest reply: started', suggestDiagnostics);
         const lt = ensureAckLifetime('suggest-reply');
         const stopIfAborted = () => {
             if (!lt.signal.aborted) return false;
             stopSpin();
             restore(0);
+            logSuggestOutcome('aborted after navigation');
             return true;
         };
         try {
@@ -19662,7 +19741,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // only the history-derived fallback SHA has to wait.
                 target.commitSha
                     ? fetchCommitPatch(pr, target.commitSha).catch((e) => {
-                          console.warn('ACKtopus: suggest reply commit patch fetch failed:', e?.message || e);
+                          suggestDiagnostics.errors.push({ source: 'target commit patch', error: e?.message || String(e) });
                           return '';
                       })
                     : '',
@@ -19693,13 +19772,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 try {
                     patch = await fetchCommitPatch(pr, commitSha);
                 } catch (e) {
-                    console.warn('ACKtopus: suggest reply commit patch fetch failed:', e?.message || e);
+                    suggestDiagnostics.errors.push({ source: 'fallback commit patch', error: e?.message || String(e) });
                 }
             }
             if (!patch) patch = ctx.diff || '';
             if (stopIfAborted()) return;
 
             const styleExamples = formatSuggestedReplyEntries(history.ownReplies);
+            suggestDiagnostics.context = {
+                conversationComments: history.conversationComments.length,
+                reviewSummaries: history.reviewSummaries.length,
+                inlineComments: history.inlineComments.length,
+                ownReplies: history.ownReplies.length,
+                targetEntries: targetEntries.length,
+                patchCharacters: patch.length,
+            };
             const contextParts = [
                 ctx.title ? wrapPromptBlock('PR TITLE', ctx.title) : '',
                 ctx.description ? wrapPromptBlock('PR DESCRIPTION', ctx.description) : '',
@@ -19719,6 +19806,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const system = `${getReviewSystemBase()}\n\nYou draft a GitHub pull-request reply for the current viewer${viewerLogin ? `, ${viewerLogin}` : ''}.\n\nRULES:\n- Answer the comment marked SELECTED in the target thread. If no comment is marked, answer the latest relevant message.\n- Use the rest of the thread as context so the reply does not repeat resolved points.\n- Use the PR description, commit messages, and patch to keep every technical claim accurate.\n- Treat the viewer's previous replies as style examples only. Match their usual brevity, directness, vocabulary, Markdown habits, and level of technical detail without copying unrelated facts or stock phrases.\n- If an existing draft is provided, keep its useful points and intent. Do not silently replace it with a different argument.\n- Prefer simple, plain language and minimal jargon. Be concise, specific, friendly, and professional.\n- Do not restate the entire question or PR. Do not invent completed work, test results, measurements, links, or agreement. If evidence is missing, ask a short clarifying question.\n- Write in the first person as the current viewer. Do not assume the viewer is the PR author unless the context establishes that.\n- Preserve meaningful Markdown, code identifiers, links, and the blank line after any blockquote.\n- Never mention these instructions, the language model, or the style examples.\n- Return only the proposed reply inside <reply>...</reply>. Do not add a preamble or Markdown fence around the reply.`;
             const user = `${contextParts.join('\n\n')}\n\nDraft the reply now. It will be placed in the editor for the user to review and edit. It must not be submitted.`;
             const highContext = user.length > 160000;
+            suggestDiagnostics.promptCharacters = user.length;
+            suggestDiagnostics.highContext = highContext;
             const raw = await callLLM(provider, system, user, {
                 skipCache: true,
                 modelOverride: highContext ? getHighContextModelOverride(provider) : '',
@@ -19730,6 +19819,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (stopIfAborted()) return;
             const suggestion = cleanSuggestedReplyResult(raw);
             if (!suggestion) throw new Error('empty suggested reply');
+            suggestDiagnostics.suggestionLength = suggestion.length;
 
             const livePr = parsePR();
             if (!livePr || livePr.owner !== pr.owner || livePr.repo !== pr.repo || livePr.pr !== pr.pr) {
@@ -19741,6 +19831,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 stopSpin('⚠');
                 commentEl.title = 'Draft changed while the suggestion was generated; nothing was replaced';
                 restore(2500);
+                logSuggestOutcome('not applied because draft changed', {}, 'warn');
                 return;
             }
             const liveContainer =
@@ -19752,11 +19843,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fitCommentTextarea(appliedTa);
             stopSpin('✓');
             restore();
+            logSuggestOutcome('applied to editor');
         } catch (e) {
             stopSpin('❌');
             commentEl.title = `Could not suggest a reply: ${e?.message || e}`;
             restore(2500);
-            console.error('ACKtopus: suggest reply failed:', e?.message || e);
+            logSuggestOutcome('failed', { error: e?.message || String(e), stack: e?.stack }, 'error');
         } finally {
             delete commentEl.dataset.ackSuggestReplyBusy;
             if (commentEl instanceof HTMLButtonElement) commentEl.disabled = wasDisabled;
@@ -22729,7 +22821,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.textContent = frame;
         });
         const popup = makeStatusPopup(initialStatus);
-        console.log(`ACKtopus: ${errorLabel}: started`, {
+        ackLogEvent(`${errorLabel}: started`, {
             pathname: location.pathname,
             page: pageKind(),
         });
@@ -22742,22 +22834,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 GM_setClipboard(context);
                 btn.textContent = '✅';
                 popup.textContent = `✅ ${successLabel} ${(context.length / 1024).toFixed(0)}KB to clipboard`;
-                console.log(`ACKtopus: ${errorLabel}: copied`, {
+                ackLogEvent(`${errorLabel}: copied`, {
                     characters: context.length,
                     elapsedMs: Date.now() - startedAt,
                 });
             } else {
                 btn.textContent = '❌';
                 popup.textContent = `❌ ${emptyLabel}`;
-                console.warn(`ACKtopus: ${errorLabel}: no context found`, {
+                ackLogEvent(`${errorLabel}: no context found`, {
                     pathname: location.pathname,
                     elapsedMs: Date.now() - startedAt,
-                });
+                }, 'warn');
             }
         } catch (e) {
             btn.textContent = '❌';
             popup.textContent = `❌ Error: ${e.message}`;
-            console.error(`ACKtopus: ${errorLabel} failed:`, e);
+            ackLogEvent(`${errorLabel}: failed`, {
+                error: e?.message || String(e),
+                stack: e?.stack,
+                elapsedMs: Date.now() - startedAt,
+            }, 'error');
         } finally {
             stopSpin();
         }
@@ -23365,11 +23461,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function copyCommentContext(btn, container) {
         if (btn._running) return;
         btn._running = true;
+        const startedAt = Date.now();
         const origText = btn.textContent;
         const stopSpin = startBrailleAnimation((frame) => {
             btn.textContent = frame;
         });
         const popup = makeStatusPopup('Gathering comment context...');
+        ackLogEvent('copy comment context: started', {
+            target: container?.id || container?.className || 'unknown',
+            pathname: location.pathname,
+        });
         try {
             await waitForNextPaint();
             const context = gatherCommentContext(container);
@@ -23377,17 +23478,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 stopSpin();
                 btn.textContent = '❌';
                 popup.textContent = '❌ No comment context found';
+                ackLogEvent('copy comment context: no context found', {
+                    target: container?.id || container?.className || 'unknown',
+                    elapsedMs: Date.now() - startedAt,
+                }, 'warn');
             } else {
                 GM_setClipboard(context);
                 stopSpin();
                 btn.textContent = '✅';
                 popup.textContent = `✅ Copied ${(context.length / 1024).toFixed(1)}KB to clipboard`;
+                ackLogEvent('copy comment context: copied', {
+                    characters: context.length,
+                    elapsedMs: Date.now() - startedAt,
+                });
             }
         } catch (e) {
             stopSpin();
             btn.textContent = '❌';
             popup.textContent = `❌ Error: ${e.message}`;
-            console.error('ACKtopus: copy comment context failed:', e);
+            ackLogEvent('copy comment context: failed', {
+                error: e?.message || String(e),
+                stack: e?.stack,
+                elapsedMs: Date.now() - startedAt,
+            }, 'error');
         }
         setTimeout(() => {
             btn.textContent = origText;
@@ -23399,13 +23512,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function loadAsyncPRData(wrapper, toolbar) {
         const pr = parsePR();
         const ackToggleBtn = toolbar.querySelector('button[title*="ACK panel"]');
-        const applyFileCategories = (cats) => {
+        let fileCategorySignature = '';
+        const applyFileCategories = (cats, source) => {
             if (!cats) return;
             if (!wrapper.isConnected) return;
             prFileCategories = mergeFileCategories(prFileCategories, cats);
             delete prFileCategories.benchFiles;
             if (prFileCategories) {
-                console.log('ACKtopus: file categories:', JSON.stringify(prFileCategories));
+                const nextSignature = JSON.stringify(prFileCategories);
+                if (nextSignature !== fileCategorySignature) {
+                    fileCategorySignature = nextSignature;
+                    ackLogEvent(`toolbar file actions updated (${source})`, prFileCategories);
+                }
                 for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
                     if (prFileCategories[cat].length > 0) {
                         document.querySelectorAll(`[data-ack-cond="${cat}"]`).forEach((el) => {
@@ -23416,16 +23534,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         };
         const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);
-        fileCategoriesPromise.then(applyFileCategories).catch(() => {});
-        const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories(document, pr));
+        fileCategoriesPromise.then((cats) => applyFileCategories(cats, 'API/DOM')).catch(() => {});
+        const applyVisibleFileCategories = () =>
+            applyFileCategories(visibleDiffFileCategories(document, pr), 'visible diff');
         ackSetTimeout(applyVisibleFileCategories, 1000);
         ackSetTimeout(applyVisibleFileCategories, 3000);
         let acks = parseAcksFromPage();
-        console.log('ACKtopus: DOM ACKs found:', acks.length);
+        let ackSource = 'DOM';
         if (acks.length === 0) {
             acks = await parseAcksFromAPI();
-            console.log('ACKtopus: API ACKs found:', acks.length);
+            ackSource = 'GitHub API';
         }
+        ackLogEvent(`ACK discovery: ${acks.length} from ${ackSource}`, {
+            byType: Object.fromEntries(
+                [...new Set(acks.map((ack) => ack.type))].map((type) => [type, acks.filter((ack) => ack.type === type).length]),
+            ),
+            users: acks.map((ack) => ack.user),
+        });
         if (!wrapper.isConnected) return; // PR changed while loading
         if (acks.length > 0) {
             if (ackToggleBtn) {
@@ -23437,12 +23562,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const ackUsers = acks.map((a) => a.user);
             const boldUsers = ackUsers.filter((u) => memberLogins.has(u) || maintainerLogins.has(u));
             const missedUsers = ackUsers.filter((u) => !memberLogins.has(u) && !maintainerLogins.has(u));
-            console.log(
-                `ACKtopus: buildAckPanel - ${acks.length} ACKs, ${memberLogins.size} members, ${maintainerLogins.size} maintainers`,
-            );
-            console.log(
-                `ACKtopus: buildAckPanel - bold: [${boldUsers.join(', ')}], plain: [${missedUsers.join(', ')}]`,
-            );
+            ackLogEvent(`ACK panel ready: ${acks.length} ACKs`, {
+                source: ackSource,
+                repositoryMembers: memberLogins.size,
+                configuredMaintainers: maintainerLogins.size,
+                emphasizedUsers: boldUsers,
+                otherUsers: missedUsers,
+            });
             const panel = buildAckPanel(acks, memberLogins);
             if (panel) {
                 panel.style.display = GM_getValue('ackPanelVisible', false) ? '' : 'none';
@@ -23472,7 +23598,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let pushes = parseForcePushesFromPage();
         if (pushes.length === 0) pushes = await parseForcePushesFromAPI();
         if (!wrapper.isConnected) return;
-        console.log('ACKtopus: force-pushes found:', pushes.length);
+        ackLogEvent(`force-push discovery: ${pushes.length}`, pushes.length ? {
+            latest: pushes[pushes.length - 1],
+        } : {});
         lastForcePushSignature = forcePushSignature(pushes);
         if (pushes.length > 0) {
             lastForcePush = pushes[pushes.length - 1];
@@ -24663,7 +24791,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function refreshToolbarForLiveUpdate(reason = 'live-update') {
         if (!isToolbarPage()) return;
-        console.log(`ACKtopus: refreshing toolbar after ${reason}`);
+        ackLogEvent(`toolbar refresh: ${reason}`, {
+            pathname: location.pathname,
+            pullRequest: currentPRKey(),
+        });
         abortAckLifetime(`toolbar-refresh:${reason}`);
         document.getElementById(BUTTON_CONTAINER_ID)?.remove();
         lastInjectedPR = null;
@@ -24724,6 +24855,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // If PR or page view changed, tear down old toolbar and state.
             const prChanged = prKey !== lastInjectedPR;
             if (prChanged || location.pathname !== lastInjectedPath) {
+                ackLogEvent('toolbar route changed', {
+                    previousPath: lastInjectedPath,
+                    nextPath: location.pathname,
+                    previousPage: lastInjectedPR,
+                    nextPage: prKey,
+                    prChanged,
+                });
                 const old = document.getElementById(BUTTON_CONTAINER_ID);
                 if (old) old.remove();
                 const oldAcks = document.getElementById(ACK_PANEL_ID);
@@ -28525,7 +28663,61 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = source.slice(source.indexOf('function ackBackgroundLog'), source.indexOf('function isAckUserInteracting'));
         ackAssert(source.includes('function ackDebugLoggingEnabled'), 'has debug logging gate');
         ackAssert(fn.includes('!ackDebugLoggingEnabled()'), 'background logs check expanded-mode gate');
+        ackAssert(fn.includes('ackLogEvent(message, details)'), 'background details use collapsed logging');
         ackAssert(source.includes("GM_getValue('compactToolbar', false)"), 'debug gate reads compact toolbar mode');
+    });
+
+    ackTest('ackLogEvent collapses details and suppresses routine self-test output', () => {
+        const originalTesting = _ackTesting;
+        const originalGroup = console.groupCollapsed;
+        const originalLog = console.log;
+        const originalGroupEnd = console.groupEnd;
+        const calls = [];
+        try {
+            console.groupCollapsed = (label) => calls.push(['group', label]);
+            console.log = (details) => calls.push(['log', details]);
+            console.groupEnd = () => calls.push(['end']);
+            _ackTesting = false;
+            ackLogEvent('sample operation', { count: 2 });
+            ackDeepEq(calls.map((call) => call[0]), ['group', 'log', 'end'], 'uses one collapsed group');
+            ackAssert(calls[0][1].includes('sample operation'), 'labels the collapsed operation');
+            const visibleCallCount = calls.length;
+            _ackTesting = true;
+            ackLogEvent('hidden test operation', { count: 1 });
+            ackEq(calls.length, visibleCallCount, 'suppresses routine logs while tests run');
+        } finally {
+            _ackTesting = originalTesting;
+            console.groupCollapsed = originalGroup;
+            console.log = originalLog;
+            console.groupEnd = originalGroupEnd;
+        }
+    });
+
+    ackTest('important user workflows log start and outcome records', () => {
+        const source = _ackSource;
+        const copy = sourceSection(source, 'async function copyContextWith', 'async function copyPRContext');
+        ackAssert(copy.includes('errorLabel}: started'), 'context copy logs start');
+        ackAssert(copy.includes('errorLabel}: copied'), 'context copy logs success');
+        ackAssert(copy.includes('errorLabel}: no context found'), 'context copy logs empty result');
+        ackAssert(copy.includes('errorLabel}: failed'), 'context copy logs failure');
+
+        const proofread = sourceSection(source, 'async function runProofreadOnComment', 'function commitMessageText');
+        ackAssert(proofread.includes("ackLogEvent('proofread: started'"), 'proofreading logs start');
+        ackAssert(proofread.includes("logProofreadOutcome('finished with no changes'"), 'proofreading logs no-op');
+        ackAssert(proofread.includes("logProofreadOutcome('changes applied'"), 'proofreading logs apply');
+        ackAssert(proofread.includes("logProofreadOutcome('failed'"), 'proofreading logs failure');
+
+        const suggest = sourceSection(source, 'async function suggestDraftReplyForTextarea', 'function addDetailsButtons');
+        ackAssert(suggest.includes("ackLogEvent('suggest reply: started'"), 'reply suggestion logs start');
+        ackAssert(suggest.includes("logSuggestOutcome('applied to editor'"), 'reply suggestion logs apply');
+        ackAssert(suggest.includes("logSuggestOutcome('failed'"), 'reply suggestion logs failure');
+
+        const edit = sourceSection(source, 'async function triggerMenuEdit', 'function triggerMenuAction');
+        ackAssert(edit.includes("ackLogEvent('edit: started'"), 'editing logs start');
+        ackAssert(edit.includes("ackLogEvent('edit: clicked Edit'"), 'editing logs native action');
+        ackAssert(edit.includes("ackLogEvent('edit: Edit menu item not found'"), 'editing logs menu failure');
+
+        ackAssert(source.includes("ackLogEvent('toolbar route changed'"), 'toolbar navigation logs route changes');
     });
 
     ackTest('toolbar toggle uses click-on-background (no dedicated button)', () => {
@@ -31948,12 +32140,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('_orgMemberCache'), 'has in-memory org cache');
         ackAssert(fn.includes('new Set(orgMembers)'), 'copies org set before adding PR-specific');
         ackAssert(fn.includes('.Label'), 'still merges DOM badges as fallback');
-        ackAssert(fn.includes('inline review comments'), 'logs inline review comments separately');
-        // Logging
-        ackAssert(fn.includes('console.log'), 'has info logging');
-        ackAssert(fn.includes('console.warn'), 'has warning logging for failures');
-        ackAssert(fn.includes('cache miss'), 'logs cache miss');
-        ackAssert(fn.includes('FINAL'), 'logs final member set');
+        ackAssert(fn.includes("source: 'inline review comments'"), 'records inline review failures separately');
+        ackAssert(fn.includes('diagnostics.api.inlineComments'), 'records inline review counts');
+        ackAssert(fn.includes('matchingLogins'), 'deduplicates matching DOM badge users');
+        ackAssert(fn.includes('ackLogEvent('), 'emits one collapsed member-discovery record');
+        ackAssert(!fn.includes('DOM badge:'), 'does not log every matching badge');
+        ackAssert(fn.includes('diagnostics.members'), 'keeps the final member set in the collapsed details');
     });
 
     ackTest('fetchReviewCommentCommits maps comment IDs to commit SHAs with pagination', () => {
@@ -32516,12 +32708,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('compare/${baseBranch}...${headSha}'), 'fetches PR files at head SHA via compare API');
         ackAssert(fn.includes('compare/${baseBranch}...${baseSha}'), 'fetches PR files at base SHA too');
         ackAssert(fn.includes('fetchPRPatchFilePaths'), 'falls back to the same-origin PR patch when REST API is unavailable');
-        ackAssert(fn.includes('PR files from patch fallback'), 'logs patch fallback path count');
+        ackAssert(fn.includes('fileSources.patch'), 'records patch fallback path count');
         ackAssert(fn.includes('noteCompareApiError'), 'keeps optional compare API failures quiet when rate-limited');
         ackAssert(fn.includes('currentPrFilesIncomplete'), 'patch fallback supplements partial REST file lists');
         ackAssert(fn.includes('addFiles'), 'uses helper to build union of file sets');
         ackAssert(fn.includes('previous_filename'), 'includes renamed file paths');
-        ackAssert(fn.includes('total unique PR file paths'), 'logs total unique paths');
+        ackAssert(fn.includes('uniquePrFilePaths'), 'records total unique paths');
     });
 
     ackTest('autoCollapseCompareFiles pre-seeds unrelated compare range CSS', () => {
@@ -32532,7 +32724,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('addCompareRangeFiles'), 'collects files from the actual compare range');
         ackAssert(fn.includes('compare/${baseSha}...${headSha}'), 'fetches the opened compare range');
-        ackAssert(fn.includes('compare -- range files'), 'logs range-file discovery');
+        ackAssert(fn.includes('fileSources.compareRange'), 'records range-file discovery');
         ackAssert(
             fn.includes('if (path && !normalizedPrFileSet.has(path)) collapsedPaths.add(path)'),
             'pre-seeds CSS hiding for range files outside the PR file set',
@@ -32589,7 +32781,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('const HARD_MAX_MS = 30 * 60 * 1000'), 'keeps the watcher alive long enough for big compares');
         ackAssert(fn.includes('runCompareCollapsePass()'), 'reuses collapse pass from observer and watchdog');
         ackAssert(
-            fn.includes('observer quiet, keeping watch for late lazy-loaded files'),
+            fn.includes("logCompareOutcome('watching lazy-loaded files'"),
             'does not stop merely because the page was briefly idle',
         );
         ackAssert(!fn.includes("stopWatching(`idle ${"), 'does not stop on the 10s idle window');
@@ -32743,7 +32935,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Force push detection - look at the specific inject section
         const injectSection = sourceSection(
             source,
-            'force-pushes found:',
+            'force-push discovery:',
             'await fetchReviewCommentCommits(pr.owner',
         );
         ackAssert(injectSection.includes('invalidatePRContext'), 'invalidated on force push detection');
@@ -36866,7 +37058,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('readViewerPendingReviewFromSSR'), 'uses embedded page pending review data');
         ackAssert(fn.includes('gatherPendingReviewDomComments'), 'uses DOM pending comments as fallback/enrichment');
         ackAssert(fn.includes('mergePendingReviewComments'), 'deduplicates across sources');
-        ackAssert(fn.includes('source summary'), 'logs per-source counts for failed copy reports');
+        ackAssert(fn.includes('merged comment'), 'logs per-source counts for failed copy reports');
         ackAssert(fn.includes('embeddedDiagnostics'), 'logs embedded page-data discovery and parse details');
         ackAssert(fn.includes('domDiagnostics'), 'logs pending marker and container counts');
         ackAssert(!fn.includes('revealAllContext'), 'does not visually open hidden GitHub content');
@@ -39539,7 +39731,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('after the no-peek local reproducer exists'), 'recipe assumes reproducer exists');
         ackAssert(fn.includes('explicit user approval before splitting'), 'recipe gates author history rewrites');
         ackAssert(fn.includes('author-only split squashes back'), 'recipe asks for author-only equivalence proof');
-        ackAssert(fn.includes('compare or replay the local rediscovery work'), 'recipe asks for local/PR comparison');
+        ackAssert(fn.includes('Compare or replay the local rediscovery work'), 'recipe asks for local/PR comparison');
         ackAssert(fn.includes('after the complete author stack'), 'recipe appends suggestions after author commits');
         ackAssert(fn.includes('Never place suggestion commits between author commits'), 'recipe forbids interleaving');
         ackAssert(
