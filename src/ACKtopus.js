@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.224
+// @version      1.225
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -19677,6 +19677,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
+    function findPRConversationReplyTextarea(path = location.pathname, root = document) {
+        if (!isPRConversationPage(path)) return null;
+        const candidates = [];
+        const seen = new Set();
+        const add = (ta) => {
+            if (!ta || seen.has(ta)) return;
+            seen.add(ta);
+            candidates.push(ta);
+        };
+        for (const scope of qsa(root, '#issue-comment-box, form#new_comment_form, form.js-new-comment-form')) {
+            qsa(scope, 'textarea').forEach(add);
+        }
+        qsa(root, 'textarea').forEach(add);
+        const matches = candidates.filter(
+            (ta) => isSuggestedReplyTextarea(ta, path) && !ta.closest(COMMENT_THREAD_SELECTOR),
+        );
+        return matches.find(isVisible) || matches[0] || null;
+    }
+
     function findSuggestedReplyTextareaForComment(container, path = location.pathname, root = document) {
         const threadRoot = getCommentThreadRoot(container);
         if (threadRoot) {
@@ -19684,30 +19703,54 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const match = local.find(isVisible) || local[0];
             if (match) return match;
         }
-        if (!isPRConversationPage(path)) return null;
-        const main = qsa(root, 'textarea').filter((ta) => {
-            if (!isSuggestedReplyTextarea(ta, path) || ta.closest(COMMENT_THREAD_SELECTOR)) return false;
-            const form = ta.closest('form');
-            return !form || isNewPostComposeForm(form, path);
-        });
-        return main.find(isVisible) || main[0] || null;
+        return findPRConversationReplyTextarea(path, root);
+    }
+
+    async function waitForSuggestedReplyTextareaForComment(
+        container,
+        path = location.pathname,
+        root = document,
+        maxAttempts = 8,
+        interval = 100,
+    ) {
+        const lt = ensureAckLifetime('suggest-reply-editor');
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (lt.signal.aborted) return null;
+            const ta = findSuggestedReplyTextareaForComment(container, path, root);
+            if (ta) return ta;
+            if (attempt < maxAttempts && (await ackSleep(interval, lt))) return null;
+        }
+        return null;
     }
 
     async function suggestDraftReplyForComment(container, commentEl) {
-        const ta = findSuggestedReplyTextareaForComment(container);
-        if (!ta) {
-            const origTitle = commentEl?.title || '';
-            if (commentEl) commentEl.title = 'Could not find the reply editor for this comment';
-            ackSetTimeout(() => {
-                if (commentEl?.isConnected) commentEl.title = origTitle;
-            }, 2500);
-            ackLogEvent('suggest reply: no matching editor', {
-                target: container?.id || container?.className || 'unknown',
-                pathname: location.pathname,
-            }, 'warn');
-            return;
+        if (!commentEl) return;
+        const resolveOwner = container?.dataset ? container : commentEl;
+        if (resolveOwner.dataset.ackSuggestReplyResolving === '1') return;
+        resolveOwner.dataset.ackSuggestReplyResolving = '1';
+        try {
+            const ta = await waitForSuggestedReplyTextareaForComment(container);
+            if (!ta) {
+                const origTitle = commentEl.title || '';
+                commentEl.title = 'Could not find the reply editor for this comment';
+                ackSetTimeout(() => {
+                    if (commentEl.isConnected) commentEl.title = origTitle;
+                }, 2500);
+                ackLogEvent('suggest reply: no matching editor', {
+                    target: container?.id || container?.className || 'unknown',
+                    permalink: getCommentPermalink(container) || null,
+                    pathname: location.pathname,
+                    textareas: document.querySelectorAll('textarea').length,
+                    commentBox: !!document.querySelector('#issue-comment-box'),
+                    commentBoxTextareas: document.querySelectorAll('#issue-comment-box textarea').length,
+                    newCommentForms: document.querySelectorAll('form#new_comment_form, form.js-new-comment-form').length,
+                }, 'warn');
+                return;
+            }
+            await suggestDraftReplyForTextarea(ta, commentEl, container);
+        } finally {
+            delete resolveOwner.dataset.ackSuggestReplyResolving;
         }
-        await suggestDraftReplyForTextarea(ta, commentEl, container);
     }
 
     async function suggestDraftReplyForTextarea(ta, commentEl, selectedContainer = null) {
@@ -30162,16 +30205,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('suggest reply uses the main PR editor for a conversation comment', () => {
         const root = document.createElement('div');
         root.innerHTML = `
-              <div class="timeline-comment" id="selected-comment">
-                <a class="js-timestamp" href="#issuecomment-77">now</a>
-                <div class="markdown-body">What happens when this fails?</div>
-              </div>
-              <form action="/owner/repo/issues/123/comments">
-                <div class="js-previewable-comment-form">
-                  <textarea id="main-reply" name="comment[body]"></textarea>
-                  <button type="submit">Comment</button>
+              <div class="TimelineItem js-comment-container">
+                <div class="timeline-comment-group" id="issuecomment-77">
+                  <div class="timeline-comment" id="selected-comment">
+                    <a class="js-timestamp" href="#issuecomment-77">now</a>
+                    <div class="markdown-body">What happens when this fails?</div>
+                    <form class="js-comment-update" action="/owner/repo/issue_comments/77">
+                      <textarea id="comment-edit"></textarea>
+                      <button type="submit">Update comment</button>
+                      <button type="button">Cancel</button>
+                    </form>
+                  </div>
                 </div>
-              </form>
+              </div>
+              <rails-partial data-partial-name="pullRequestsConversationsRoute.TimelineActions">
+                <div id="issue-comment-box">
+                  <form action="/owner/repo/pull/123/conversation">
+                    <div class="js-previewable-comment-form">
+                      <textarea id="main-reply" name="comment[body]"></textarea>
+                    </div>
+                  </form>
+                </div>
+              </rails-partial>
             `;
         const mainTa = root.querySelector('#main-reply');
         ackEq(
@@ -30183,6 +30238,44 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             mainTa,
             'uses the main Conversation editor',
         );
+        ackAssert(
+            !isNewPostComposeForm(mainTa.closest('form'), '/owner/repo/pull/123'),
+            'does not depend on GitHub keeping a recognized form action or submit label',
+        );
+        ackAssert(
+            findSuggestedReplyTextareaForComment(
+                root.querySelector('#selected-comment'),
+                '/owner/repo/pull/123',
+                root,
+            ) !== root.querySelector('#comment-edit'),
+            'does not use the selected comment edit form',
+        );
+    });
+
+    ackTest('suggest reply waits for the conversation editor partial to hydrate', async () => {
+        const root = document.createElement('div');
+        root.innerHTML = `
+              <div class="timeline-comment" id="selected-comment">
+                <a class="js-timestamp" href="#issuecomment-77">now</a>
+                <div class="markdown-body">What happens when this fails?</div>
+              </div>
+              <div id="issue-comment-box"></div>
+            `;
+        const resultPromise = waitForSuggestedReplyTextareaForComment(
+            root.querySelector('#selected-comment'),
+            '/owner/repo/pull/123',
+            root,
+            4,
+            5,
+        );
+        setTimeout(() => {
+            root.querySelector('#issue-comment-box').innerHTML = `
+                  <form class="js-new-comment-form">
+                    <div class="js-previewable-comment-form"><textarea id="hydrated-reply"></textarea></div>
+                  </form>
+                `;
+        }, 0);
+        ackEq(await resultPromise, root.querySelector('#hydrated-reply'), 'finds the editor after hydration');
     });
 
     ackTest("addQuickCommentActions shows suggest reply beside another user's comment", () => {
@@ -30343,6 +30436,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'async function suggestDraftReplyForTextarea',
         );
         ackAssert(fn.includes('suggestDraftReplyForTextarea(ta, commentEl, container)'), 'uses the selected comment');
+        ackAssert(fn.includes('ackSuggestReplyResolving'), 'ignores duplicate presses while resolving the editor');
         ackAssert(!fn.includes('.click('), 'does not click a GitHub control');
         ackAssert(!fn.includes('triggerMenuEdit'), 'does not open the edit menu');
         ackAssert(!fn.includes('triggerMenuAction'), 'does not open another comment menu');
