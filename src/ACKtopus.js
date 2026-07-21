@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.225
+// @version      1.226
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -20229,6 +20229,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    function findOverlappingMarkdownFenceRange(text, start, end) {
+        const ranges = [];
+        let open = null;
+        for (let lineStart = 0; lineStart <= text.length; ) {
+            const newline = text.indexOf('\n', lineStart);
+            const lineEnd = newline === -1 ? text.length : newline;
+            const line = text.slice(lineStart, lineEnd).replace(/\r$/, '');
+            const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+            if (match) {
+                const marker = match[1];
+                if (!open) {
+                    open = { start: lineStart, char: marker[0], length: marker.length };
+                } else if (
+                    marker[0] === open.char &&
+                    marker.length >= open.length &&
+                    !match[2].trim()
+                ) {
+                    ranges.push({ start: open.start, end: lineEnd });
+                    open = null;
+                }
+            }
+            if (newline === -1) break;
+            lineStart = newline + 1;
+        }
+        const overlapping = ranges.filter((range) => range.start < end && range.end > start);
+        if (!overlapping.length) return null;
+        return {
+            start: Math.min(start, ...overlapping.map((range) => range.start)),
+            end: Math.max(end, ...overlapping.map((range) => range.end)),
+        };
+    }
+
     function wrapSelectionInDetails(toolbar) {
         const summaryLabel = 'Details';
         const ta = getToolbarTextarea(toolbar);
@@ -20264,14 +20296,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const selected = text.slice(start, end);
         if (!selected.trim()) return;
 
-        const inner = '```\n' + selected + '\n```';
+        const fenceRange = findOverlappingMarkdownFenceRange(text, start, end);
+        const replaceStart = fenceRange?.start ?? start;
+        const replaceEnd = fenceRange?.end ?? end;
+        const selectedContent = text.slice(replaceStart, replaceEnd).replace(/(?:\r?\n)+$/, '');
+        const selectedHasFence = /(?:^|\n) {0,3}(?:`{3,}|~{3,})/.test(selectedContent);
+        const inner = fenceRange || selectedHasFence ? selectedContent : '```\n' + selectedContent + '\n```';
 
         // Keep a blank line before the fenced content for GitHub rendering.
         const wrapped = `\n<details><summary>${summaryLabel}</summary>\n\n${inner}\n</details>`;
-        setTextareaValue(ta, text.slice(0, start) + wrapped + blockSuffix(text.slice(end)) + text.slice(end));
+        setTextareaValue(
+            ta,
+            text.slice(0, replaceStart) + wrapped + blockSuffix(text.slice(replaceEnd)) + text.slice(replaceEnd),
+        );
 
         // Reselect the summary label so it is easy to rename immediately.
-        const summaryStart = start + wrapped.indexOf(summaryLabel);
+        const summaryStart = replaceStart + wrapped.indexOf(summaryLabel);
         const summaryEnd = summaryStart + summaryLabel.length;
         ta.focus();
         ta.selectionStart = summaryStart;
@@ -38940,14 +38980,53 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- wrapSelectionInDetails behavior ---
 
-    ackTest('wrapSelectionInDetails always wraps selection in empty backtick fences', () => {
+    ackTest('wrapSelectionInDetails wraps unfenced selections in empty backtick fences', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function wrapSelectionInDetails'),
             source.indexOf('// --- Commit Explain'),
         );
-        ackAssert(fn.includes("'```\\n' + selected + '\\n```'"), 'wraps with empty fenced code block');
+        ackAssert(fn.includes("'```\\n' + selectedContent + '\\n```'"), 'wraps with empty fenced code block');
+        ackAssert(fn.includes('fenceRange || selectedHasFence'), 'preserves an existing fenced block');
         ackAssert(!fn.includes('detectCodeLang'), 'no language detection - proofreader adds hints');
+    });
+
+    ackTest('wrapSelectionInDetails preserves a selected fenced block and its language', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div class="js-previewable-comment-form"><div class="toolbar"></div><textarea></textarea></div>';
+        const toolbar = root.querySelector('.toolbar');
+        const ta = root.querySelector('textarea');
+        const fence = '`'.repeat(3);
+        ta.value = `${fence}patch\n-old\n+new\n${fence}`;
+        ta.selectionStart = 0;
+        ta.selectionEnd = ta.value.length;
+        wrapSelectionInDetails(toolbar);
+        ackEq((ta.value.match(/```/g) || []).length, 2, 'does not add another pair of backtick fences');
+        ackAssert(ta.value.includes(`${fence}patch\n-old\n+new\n${fence}`), 'keeps the patch fence unchanged');
+    });
+
+    ackTest('wrapSelectionInDetails expands a selection inside an existing fenced block', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div class="js-previewable-comment-form"><div class="toolbar"></div><textarea></textarea></div>';
+        const toolbar = root.querySelector('.toolbar');
+        const ta = root.querySelector('textarea');
+        const fence = '`'.repeat(3);
+        ta.value = `intro\n${fence}patch\n-old\n+new\n${fence}\noutro`;
+        ta.selectionStart = ta.value.indexOf('-old');
+        ta.selectionEnd = ta.value.indexOf('+new') + '+new'.length;
+        wrapSelectionInDetails(toolbar);
+        ackEq(
+            ta.value,
+            `intro\n\n<details><summary>Details</summary>\n\n${fence}patch\n-old\n+new\n${fence}\n</details>\n\noutro`,
+            'moves the complete existing fence into details',
+        );
+    });
+
+    ackTest('findOverlappingMarkdownFenceRange supports tilde fences and longer closers', () => {
+        const text = 'before\n~~~~patch\n-old\n+new\n~~~~~\nafter';
+        const start = text.indexOf('-old');
+        const range = findOverlappingMarkdownFenceRange(text, start, start + 4);
+        ackEq(text.slice(range.start, range.end), '~~~~patch\n-old\n+new\n~~~~~', 'finds the complete tilde fence');
     });
 
     ackTest('wrapSelectionInDetails keeps blank lines before fenced content only', () => {
@@ -38963,7 +39042,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('\\n\\n</details>'), 'no blank line before </details>');
         ackAssert(!fn.includes('</details>\\n`'), 'no newline after </details> inside the template');
         ackAssert(
-            fn.includes('blockSuffix(text.slice(end))'),
+            fn.includes('blockSuffix(text.slice(replaceEnd))'),
             'a blank line still separates </details> from following content (type-7 HTML block)',
         );
     });
@@ -38976,7 +39055,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes("const summaryLabel = 'Details';"), 'defines reusable summary label');
         ackAssert(
-            fn.includes('const summaryStart = start + wrapped.indexOf(summaryLabel)'),
+            fn.includes('const summaryStart = replaceStart + wrapped.indexOf(summaryLabel)'),
             'sets selectionStart to summary content',
         );
         ackAssert(fn.includes('ta.selectionStart = summaryStart'), 'reselects summary label start');
