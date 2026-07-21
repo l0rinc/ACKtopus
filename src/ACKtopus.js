@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.223
+// @version      1.224
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -4327,18 +4327,39 @@
         const href = String(rawHref || '').trim();
         const match = href.match(/^(?:https?:\/\/github\.com)?\/([^/?#]+)\/([^/?#]+)\/compare\/([^?#]+)(?:\?[^#]*)?(#.*)?$/);
         if (!match) return null;
-        const [, owner, repo, headBranch, hash = ''] = match;
+        const [, owner, repo, compareSpec, hash = ''] = match;
         const currentRepo = opts.currentRepo || currentGitHubRepo(opts.root || document, opts.path || location.pathname);
-        if (!currentRepo || currentRepo.repoKey !== `${owner}/${repo}`) return null;
-        const branchPath = opts.path || (opts.currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : location.pathname);
-        const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document, branchPath));
+        if (!currentRepo) return null;
+        let targetOwner = owner;
+        let targetRepo = repo;
+        let headBranch = compareSpec;
+        let baseBranch = '';
+        const crossFork = compareSpec.match(/^(.+)\.\.\.(.+)$/);
+        if (crossFork) {
+            const headParts = crossFork[2].split(':');
+            if (headParts.length < 2) return null;
+            targetOwner = headParts.shift();
+            targetRepo = headParts.length > 1 ? headParts.shift() : repo;
+            headBranch = headParts.join(':');
+            const currentUser = String(opts.currentUser || getCurrentGitHubLogin(opts.root || document) || '').toLowerCase();
+            const targetLogin = targetOwner.toLowerCase();
+            if (targetLogin !== currentRepo.owner.toLowerCase() && targetLogin !== currentUser) return null;
+            if (currentRepo.repo !== repo && currentRepo.repo !== targetRepo) return null;
+            baseBranch = normalizeBranchName(crossFork[1]);
+        } else {
+            if (currentRepo.repoKey !== `${owner}/${repo}`) return null;
+            const branchPath = opts.path || (opts.currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : location.pathname);
+            baseBranch = normalizeBranchName(
+                opts.baseBranch || currentGitHubRepoBaseBranch(opts.root || document, branchPath),
+            );
+        }
         if (!baseBranch) return null;
         if (!headBranch || headBranch.includes('..')) return null;
         return {
-            href: `/${owner}/${repo}/compare/${baseBranch}...${headBranch}?quick_pull=1${hash}`,
-            owner,
-            repo,
-            repoKey: `${owner}/${repo}`,
+            href: `/${targetOwner}/${targetRepo}/compare/${baseBranch}...${headBranch}?quick_pull=1${hash}`,
+            owner: targetOwner,
+            repo: targetRepo,
+            repoKey: `${targetOwner}/${targetRepo}`,
             baseBranch,
             headBranch,
         };
@@ -4360,15 +4381,13 @@
         const branchPath = opts.path || (opts.currentRepo && currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : pagePath);
         const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, branchPath));
         if (!currentRepo) return rewritten;
-        if (!baseBranch) {
-            if (opts.allowAsync !== false) queueLocalRepoCompareRewrite(root, currentRepo);
-            return rewritten;
-        }
         for (const link of qsa(root, 'a[href*="/compare/"]')) {
             if (link.dataset.localRepoPrRewritten === '1') continue;
             if (!isComparePullRequestButton(link)) continue;
-            const rewrite = rewriteLocalRepoCompareHref(link.getAttribute('href') || '', {
+            const originalHref = link.getAttribute('href') || '';
+            const rewrite = rewriteLocalRepoCompareHref(originalHref, {
                 currentRepo,
+                currentUser: opts.currentUser,
                 baseBranch,
                 root: scanRoot,
                 path: opts.path || location.pathname,
@@ -4383,8 +4402,14 @@
                 badge.title = link.title;
                 link.appendChild(badge);
             }
+            ackLogEvent('fork compare link rewritten', {
+                from: originalHref,
+                to: rewrite.href,
+                target: `${rewrite.repoKey}:${rewrite.baseBranch}`,
+            });
             rewritten++;
         }
+        if (!baseBranch && rewritten === 0 && opts.allowAsync !== false) queueLocalRepoCompareRewrite(root, currentRepo);
         return rewritten;
     }
 
@@ -32368,6 +32393,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(rewriteLocalRepoCompareHref('/upstream/demo/compare/detached537?expand=1', { currentRepo, baseBranch: 'main' }), null);
     });
 
+    ackTest('local repo compare href rewrite retargets qualified secp branches to the user fork', () => {
+        const forkRepo = { owner: 'l0rinc', repo: 'secp256k1', repoKey: 'l0rinc/secp256k1' };
+        const upstreamRepo = { owner: 'bitcoin-core', repo: 'secp256k1', repoKey: 'bitcoin-core/secp256k1' };
+        const shortHead = '/bitcoin-core/secp256k1/compare/master...l0rinc:topic/remove-foo?expand=1';
+        const explicitRepoHead =
+            '/bitcoin-core/secp256k1/compare/master...l0rinc:secp256k1:topic/remove-foo?expand=1';
+
+        for (const currentRepo of [forkRepo, upstreamRepo]) {
+            const rewrite = rewriteLocalRepoCompareHref(shortHead, { currentRepo, currentUser: 'l0rinc' });
+            ackEq(
+                rewrite.href,
+                '/l0rinc/secp256k1/compare/master...topic/remove-foo?quick_pull=1',
+                `retargets from ${currentRepo.repoKey}`,
+            );
+            ackEq(rewrite.repoKey, 'l0rinc/secp256k1');
+        }
+        ackEq(
+            rewriteLocalRepoCompareHref(explicitRepoHead, { currentRepo: forkRepo, currentUser: 'l0rinc' }).href,
+            '/l0rinc/secp256k1/compare/master...topic/remove-foo?quick_pull=1',
+        );
+        ackEq(
+            rewriteLocalRepoCompareHref(shortHead, { currentRepo: upstreamRepo, currentUser: 'someone-else' }),
+            null,
+            'does not retarget another user branch',
+        );
+    });
+
     ackTest('local repo compare rewrite reads generic GitHub repository metadata', () => {
         const host = document.createElement('div');
         host.innerHTML = [
@@ -32605,6 +32657,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             0,
         );
         ackEq((link.textContent.match(/🏠/g) || []).length, 1, 'does not duplicate emoji');
+    });
+
+    ackTest('local repo compare rewrite handles secp fork banners without default-branch metadata', () => {
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<a href="/bitcoin-core/secp256k1/compare/master...l0rinc:topic/remove-foo?expand=1" class="btn btn-primary">Compare & pull request</a>';
+        const count = rewriteLocalRepoCompareLinks(host, {
+            currentRepo: { owner: 'l0rinc', repo: 'secp256k1', repoKey: 'l0rinc/secp256k1' },
+            currentUser: 'l0rinc',
+            baseBranch: '',
+            allowAsync: false,
+        });
+        const link = host.querySelector('a');
+        ackEq(count, 1);
+        ackEq(link.getAttribute('href'), '/l0rinc/secp256k1/compare/master...topic/remove-foo?quick_pull=1');
+        ackEq(link.dataset.localRepoPrRewritten, '1');
+        ackAssert(link.title.includes('l0rinc/secp256k1:master'), 'names the fork target');
     });
 
     ackTest('local repo compare rewrite fetches missing default branch on repo pages', async () => {
