@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.227
+// @version      1.228
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -104,6 +104,15 @@
         const preferredArg = shellQuoteIfNeeded(preferred);
         const fallbackArg = shellQuoteIfNeeded(fallback);
         return `REMOTE=$(git remote | grep -qx ${preferredArg} && echo ${preferredArg} || echo ${fallbackArg})`;
+    }
+
+    function prePushRangeDiffCommand(collapsed = false) {
+        const base = shellQuote(getReviewBaseBranch());
+        const prepare = `BASE_BRANCH=${base} && ${preferredRemoteCommand()} && git fetch && git fetch "$REMOTE" "$BASE_BRANCH" && BASE=$(git rev-parse FETCH_HEAD)`;
+        if (!collapsed) {
+            return `${prepare} && git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"`;
+        }
+        return `${prepare} && OLD_BASE=$(git merge-base "$BASE" '@{u}') && NEW_BASE=$(git merge-base "$BASE" HEAD) && OLD=$(printf '%s\\n' combined | git commit-tree "@{u}^{tree}" -p "$OLD_BASE") && NEW=$(printf '%s\\n' combined | git commit-tree "HEAD^{tree}" -p "$NEW_BASE") && git range-diff --creation-factor=95 "$OLD_BASE..$OLD" "$NEW_BASE..$NEW"`;
     }
 
     // Post-proofread processing is intentionally limited to mechanical URL
@@ -422,10 +431,9 @@
             emoji: '📤',
             label: 'pre-push range-diff',
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
-            fmt: () => {
-                const base = shellQuote(getReviewBaseBranch());
-                return `BASE_BRANCH=${base} && ${preferredRemoteCommand()} && git fetch && git fetch "$REMOTE" "$BASE_BRANCH" && BASE=$(git rev-parse FETCH_HEAD) && git range-diff --creation-factor=95 "$BASE..@{u}" "$BASE..HEAD"`;
-            },
+            shiftTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
+            fmt: () => prePushRangeDiffCommand(),
+            shiftFmt: () => prePushRangeDiffCommand(true),
         },
         {
             key: 'bench',
@@ -548,6 +556,7 @@
     const SHIFT_REVEAL_HINT = '📂';
     const SHIFT_VISIBLE_ONLY_HINT = '👁';
     const SHIFT_REVERSE_HINT = '⬆';
+    const SHIFT_COLLAPSED_HINT = '🗜️';
     const EDIT_POST_SHORTCUT_KEY = 'e';
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
     let ackShiftPressed = false;
@@ -1741,9 +1750,10 @@
         return true;
     }
 
-    async function copySHA(mainBtn, updateMainLabel) {
+    async function copySHA(mainBtn, updateMainLabel, event) {
         const pr = parsePR();
         const fmt = getFormat();
+        const formatter = eventUsesShiftAlternate(event) && fmt.shiftFmt ? fmt.shiftFmt : fmt.fmt;
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation((frame) => {
@@ -1763,7 +1773,7 @@
                 if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
                     userAckSha = await resolveFullCommitSha(pr, userAckSha);
                 }
-                text = sha && pr ? fmt.fmt(sha, pr) : null;
+                text = sha && pr ? formatter(sha, pr) : null;
             }
             stopSpin();
             if (text) {
@@ -1795,13 +1805,19 @@
 
         const mainBtn = document.createElement('button');
         // Clipboard-only: the SHA copy button always copies to the clipboard.
+        const shiftSuffix = (format) => (ackShiftPressed && format.shiftFmt ? ` ${SHIFT_COLLAPSED_HINT}` : '');
+        const formatTitle = (format) =>
+            format.shiftFmt ? `${format.tip}\nShift+click: ${format.shiftTip}.` : format.tip;
         const updateMainLabel = () => {
             const f = getFormat();
             const compact = GM_getValue('compactToolbar', false);
-            mainBtn.innerHTML = compact ? `${f.emoji}` : `${f.emoji} ${f.label}${COPY_ICON}`;
-            mainBtn.title = getFormat().tip;
+            mainBtn.innerHTML = compact
+                ? `${f.emoji}${shiftSuffix(f)}`
+                : `${f.emoji} ${f.label}${shiftSuffix(f)}${COPY_ICON}`;
+            mainBtn.title = formatTitle(f);
         };
         updateMainLabel();
+        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
         if (buildSHAGroup._ac) buildSHAGroup._ac.abort();
         buildSHAGroup._ac = new AbortController();
         const { signal } = buildSHAGroup._ac;
@@ -1820,7 +1836,7 @@
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', () => copySHA(mainBtn, updateMainLabel));
+        mainBtn.addEventListener('click', (e) => copySHA(mainBtn, updateMainLabel, e));
 
         const dropBtn = document.createElement('button');
         dropBtn.textContent = '▾';
@@ -1859,8 +1875,12 @@
 
         SHA_FORMATS.forEach((f, i) => {
             const item = document.createElement('div');
-            item.textContent = `${f.emoji}  ${f.label}`;
-            item.title = f.tip;
+            const renderItem = () => {
+                item.textContent = `${f.emoji}  ${f.label}${shiftSuffix(f)}`;
+            };
+            renderItem();
+            registerShiftAlternateRenderer(item, renderItem);
+            item.title = formatTitle(f);
             item.dataset.ackFmtKey = f.key;
             if (f.hotkey) item.dataset.ackHotkey = f.hotkey;
             if (f.key === 'rdiff' || f.key === 'rebasediff') {
@@ -1883,14 +1903,14 @@
             item.addEventListener('mouseleave', () => {
                 item.style.background = f.key === selectedFormat ? '#30363d' : 'transparent';
             });
-            item.addEventListener('click', () => {
+            item.addEventListener('click', (e) => {
                 selectedFormat = f.key;
                 GM_setValue('shaFormat', f.key);
                 updateMainLabel();
                 menu.style.display = 'none';
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
-                copySHA(mainBtn, updateMainLabel);
+                copySHA(mainBtn, updateMainLabel, e);
             });
             menu.appendChild(item);
         });
@@ -26319,6 +26339,44 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             getReviewBaseBranch = origBase;
         }
+    });
+
+    ackTest('pushrdiff Shift command compares collapsed stack effects', () => {
+        const f = SHA_FORMATS.find((format) => format.key === 'pushrdiff');
+        const origBase = getReviewBaseBranch;
+        try {
+            getReviewBaseBranch = () => 'main';
+            ackAssert(typeof f.shiftFmt === 'function', 'provides a Shift alternate command');
+            const cmd = f.shiftFmt();
+            ackAssert(cmd.includes('OLD_BASE=$(git merge-base "$BASE" \'@{u}\')'), 'finds the pushed stack base');
+            ackAssert(cmd.includes('NEW_BASE=$(git merge-base "$BASE" HEAD)'), 'finds the local stack base');
+            ackAssert(
+                cmd.includes('git commit-tree "@{u}^{tree}" -p "$OLD_BASE"'),
+                'collapses the pushed stack tree into one commit',
+            );
+            ackAssert(
+                cmd.includes('git commit-tree "HEAD^{tree}" -p "$NEW_BASE"'),
+                'collapses the local stack tree into one commit',
+            );
+            ackAssert(
+                cmd.includes('git range-diff --creation-factor=95 "$OLD_BASE..$OLD" "$NEW_BASE..$NEW"'),
+                'range-diffs the two collapsed commits',
+            );
+            ackAssert(!cmd.includes('git worktree'), 'does not create a worktree');
+            ackAssert(!cmd.includes('git rebase'), 'does not rebase either stack');
+        } finally {
+            getReviewBaseBranch = origBase;
+        }
+    });
+
+    ackTest('SHA copy uses Shift alternate formats without changing the selection', () => {
+        const copy = sourceSection(_ackSource, 'async function copySHA', 'function buildSHAGroup');
+        ackAssert(copy.includes('eventUsesShiftAlternate(event)'), 'checks the click modifier');
+        ackAssert(copy.includes('fmt.shiftFmt ? fmt.shiftFmt : fmt.fmt'), 'selects the alternate formatter');
+        const group = sourceSection(_ackSource, 'function buildSHAGroup', '// --- Show Hidden');
+        ackAssert(group.includes('registerShiftAlternateRenderer(mainBtn'), 'updates the main label while Shift is held');
+        ackAssert(group.includes('SHIFT_COLLAPSED_HINT'), 'shows the collapsed comparison hint');
+        ackAssert(group.includes('copySHA(mainBtn, updateMainLabel, e)'), 'passes click modifiers to the copy helper');
     });
 
     ackTest('tidydiff command uses clang-tidy-diff with the selected remote and isolated build path', () => {
