@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.228
+// @version      1.229
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -384,10 +384,14 @@
             emoji: '⬇️',
             label: 'gh pr co',
             tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
+            shiftTip: 'Check out this PR without rebasing it',
+            shiftHint: '⏭️',
             fmt: (sha, pr) => {
                 const base = getReviewBaseBranch();
                 return `${preferredRemoteCommand()} && gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase "$REMOTE" ${shellQuoteIfNeeded(base)}`;
             },
+            shiftFmt: (_sha, pr) =>
+                `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force`,
         },
         {
             key: 'rdiff',
@@ -432,6 +436,7 @@
             label: 'pre-push range-diff',
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
             shiftTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
+            shiftHint: '🗜️',
             fmt: () => prePushRangeDiffCommand(),
             shiftFmt: () => prePushRangeDiffCommand(true),
         },
@@ -556,7 +561,7 @@
     const SHIFT_REVEAL_HINT = '📂';
     const SHIFT_VISIBLE_ONLY_HINT = '👁';
     const SHIFT_REVERSE_HINT = '⬆';
-    const SHIFT_COLLAPSED_HINT = '🗜️';
+    const SHIFT_ALTERNATE_HINT = '⇧';
     const EDIT_POST_SHORTCUT_KEY = 'e';
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
     let ackShiftPressed = false;
@@ -1805,7 +1810,8 @@
 
         const mainBtn = document.createElement('button');
         // Clipboard-only: the SHA copy button always copies to the clipboard.
-        const shiftSuffix = (format) => (ackShiftPressed && format.shiftFmt ? ` ${SHIFT_COLLAPSED_HINT}` : '');
+        const shiftSuffix = (format) =>
+            ackShiftPressed && format.shiftFmt ? ` ${format.shiftHint || SHIFT_ALTERNATE_HINT}` : '';
         const formatTitle = (format) =>
             format.shiftFmt ? `${format.tip}\nShift+click: ${format.shiftTip}.` : format.tip;
         const updateMainLabel = () => {
@@ -25781,6 +25787,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('ghco Shift format checks out without rebasing', () => {
+        const ghco = SHA_FORMATS.find((format) => format.key === 'ghco');
+        const result = ghco.shiftFmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+        ackEq(result, 'gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force');
+        ackAssert(!result.includes('git pull'), 'does not pull after checkout');
+        ackAssert(!result.includes('rebase'), 'does not rebase');
+        ackAssert(!result.includes('REMOTE='), 'does not resolve an unused remote');
+    });
+
     ackTest('rdiff format returns null when no force-push', () => {
         const rdiff = SHA_FORMATS.find((f) => f.key === 'rdiff');
         ackEq(rdiff.fmt(), null);
@@ -26375,7 +26390,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(copy.includes('fmt.shiftFmt ? fmt.shiftFmt : fmt.fmt'), 'selects the alternate formatter');
         const group = sourceSection(_ackSource, 'function buildSHAGroup', '// --- Show Hidden');
         ackAssert(group.includes('registerShiftAlternateRenderer(mainBtn'), 'updates the main label while Shift is held');
-        ackAssert(group.includes('SHIFT_COLLAPSED_HINT'), 'shows the collapsed comparison hint');
+        ackAssert(group.includes('format.shiftHint || SHIFT_ALTERNATE_HINT'), 'shows each format-specific Shift hint');
         ackAssert(group.includes('copySHA(mainBtn, updateMainLabel, e)'), 'passes click modifiers to the copy helper');
     });
 
