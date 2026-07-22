@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.229
+// @version      1.230
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -352,7 +352,10 @@
             emoji: '👍',
             label: 'ACK',
             tip: 'Copy ACK with commit hash for review sign-off',
+            shiftTip: 'Copy only the commit hash',
+            shiftHint: '🔢',
             fmt: (sha, pr) => `ACK ${sha}`,
+            shiftFmt: (sha) => sha,
         },
         {
             key: 'fetch',
@@ -376,7 +379,10 @@
             emoji: '⏮️',
             label: 'checkout parent',
             tip: 'Copy command to fetch and checkout the parent of the first commit in this PR',
+            shiftTip: 'Copy only the parent commit hash',
+            shiftHint: '🔢',
             fmt: (_sha, _pr) => null,
+            shiftFmt: (_sha, pr) => getParentCommitHash(pr),
         },
         {
             key: 'ghco',
@@ -1505,11 +1511,17 @@
         return raw;
     }
 
-    async function getParentCheckoutCommand(pr) {
+    async function getParentCommitHash(pr) {
         if (!pr) return null;
         const checkout = await getRecipeCheckoutMeta(pr);
         const baseSha = String(checkout?.baseSha || '').trim();
         if (!/^[0-9a-f]{40}$/i.test(baseSha)) return null;
+        return baseSha;
+    }
+
+    async function getParentCheckoutCommand(pr) {
+        const baseSha = await getParentCommitHash(pr);
+        if (!baseSha) return null;
         return `git fetch origin ${baseSha} && git switch --detach FETCH_HEAD`;
     }
 
@@ -1758,7 +1770,8 @@
     async function copySHA(mainBtn, updateMainLabel, event) {
         const pr = parsePR();
         const fmt = getFormat();
-        const formatter = eventUsesShiftAlternate(event) && fmt.shiftFmt ? fmt.shiftFmt : fmt.fmt;
+        const useShiftAlternate = eventUsesShiftAlternate(event) && typeof fmt.shiftFmt === 'function';
+        const formatter = useShiftAlternate ? fmt.shiftFmt : fmt.fmt;
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation((frame) => {
@@ -1768,7 +1781,7 @@
         try {
             let text = null;
             if (fmt.key === 'parent' && pr) {
-                text = await getParentCheckoutCommand(pr);
+                text = useShiftAlternate ? await formatter('', pr) : await getParentCheckoutCommand(pr);
             } else if (fmt.key === 'hashes' && pr) {
                 text = await getPRCommitHashesClipboardText(pr);
             } else {
@@ -1778,7 +1791,7 @@
                 if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
                     userAckSha = await resolveFullCommitSha(pr, userAckSha);
                 }
-                text = sha && pr ? formatter(sha, pr) : null;
+                text = sha && pr ? await formatter(sha, pr) : null;
             }
             stopSpin();
             if (text) {
@@ -25743,6 +25756,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('ack format produces correct output', () => {
         const ack = SHA_FORMATS.find((f) => f.key === 'ack');
         ackEq(ack.fmt('abc123', {}), 'ACK abc123');
+        ackEq(ack.shiftFmt('abc123', {}), 'abc123', 'Shift copies only the hash');
     });
 
     ackTest('fetch format produces correct output', () => {
@@ -26387,7 +26401,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('SHA copy uses Shift alternate formats without changing the selection', () => {
         const copy = sourceSection(_ackSource, 'async function copySHA', 'function buildSHAGroup');
         ackAssert(copy.includes('eventUsesShiftAlternate(event)'), 'checks the click modifier');
-        ackAssert(copy.includes('fmt.shiftFmt ? fmt.shiftFmt : fmt.fmt'), 'selects the alternate formatter');
+        ackAssert(copy.includes('useShiftAlternate ? fmt.shiftFmt : fmt.fmt'), 'selects the alternate formatter');
         const group = sourceSection(_ackSource, 'function buildSHAGroup', '// --- Show Hidden');
         ackAssert(group.includes('registerShiftAlternateRenderer(mainBtn'), 'updates the main label while Shift is held');
         ackAssert(group.includes('format.shiftHint || SHIFT_ALTERNATE_HINT'), 'shows each format-specific Shift hint');
@@ -32613,14 +32627,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("fmt.key === 'parent'"), 'special-cases parent checkout command');
         ackAssert(fn.includes('getParentCheckoutCommand(pr)'), 'resolves parent checkout command via helper');
         const helper = source.slice(
-            source.indexOf('async function getParentCheckoutCommand'),
+            source.indexOf('async function getParentCommitHash'),
             source.indexOf('function setTextareaValue'),
         );
         ackAssert(helper.includes('getRecipeCheckoutMeta(pr)'), 'reuses recipe checkout metadata helper');
+        ackAssert(helper.includes('return baseSha'), 'can return the raw parent hash');
         ackAssert(
             helper.includes('git fetch origin ${baseSha} && git switch --detach FETCH_HEAD'),
             'copies a detach checkout command for the series base parent',
         );
+    });
+
+    ackTest('parent Shift format copies only the resolved parent hash', async () => {
+        const parent = SHA_FORMATS.find((format) => format.key === 'parent');
+        const origCheckoutMeta = getRecipeCheckoutMeta;
+        const parentSha = 'a'.repeat(40);
+        try {
+            getRecipeCheckoutMeta = async () => ({ baseSha: parentSha });
+            ackEq(await parent.shiftFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), parentSha);
+            getRecipeCheckoutMeta = async () => ({ baseSha: 'not-a-hash' });
+            ackEq(await parent.shiftFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), null);
+        } finally {
+            getRecipeCheckoutMeta = origCheckoutMeta;
+        }
     });
 
     ackTest('DOM force push SHA extraction requires 40-char hex in href', () => {
