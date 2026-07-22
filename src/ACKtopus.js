@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.226
+// @version      1.227
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -22836,8 +22836,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- Co-authored-by avatars ---
     // Adds small avatar images next to Co-authored-by lines in commit descriptions.
-    // Primary source: avatar stack already on the page (data-testid="commit-stack-avatar").
-    // GitHub renders co-author avatars in trailer order after the main committer.
+    // Primary source: the avatar stack already rendered on the page.
 
     function parseCoAuthoredBy(text) {
         const results = [];
@@ -22852,11 +22851,105 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return m ? m[1] : null;
     }
 
-    function addCoAuthorAvatars() {
+    function normalizeGitHubIdentity(value) {
+        return String(value || '')
+            .trim()
+            .replace(/^@/, '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '');
+    }
+
+    function coAuthorIdentityAliases({ name, email }) {
+        const aliases = new Set();
+        const add = (value) => {
+            const normalized = normalizeGitHubIdentity(value);
+            if (normalized) aliases.add(normalized);
+        };
+        add(name);
+        add(resolveGitHubLogin(email));
+
+        const at = email.lastIndexOf('@');
+        if (at !== -1) {
+            add(email.slice(0, at).replace(/^\d+\+/, ''));
+        }
+        return aliases;
+    }
+
+    function mapCoAuthorsToAvatars(coAuthors, avatars) {
+        const resolved = new Map();
+        const mappedCoAuthors = new Set();
+        const mappedAvatars = new Set();
+        const avatarKeys = avatars.map(({ login }) => normalizeGitHubIdentity(login));
+        const candidates = coAuthors.map((coAuthor) => {
+            const aliases = coAuthorIdentityAliases(coAuthor);
+            return avatarKeys.flatMap((key, index) => (key && aliases.has(key) ? [index] : []));
+        });
+
+        const mapPair = (coAuthorIndex, avatarIndex) => {
+            const avatar = avatars[avatarIndex];
+            if (!avatar?.login || !avatar?.avatarUrl) return;
+            resolved.set(`${coAuthors[coAuthorIndex].name}|${coAuthors[coAuthorIndex].email}`, avatar);
+            mappedCoAuthors.add(coAuthorIndex);
+            mappedAvatars.add(avatarIndex);
+        };
+
+        // Exact name/email clues are stronger than position. GitHub's classic stack omits
+        // unresolved co-authors, so assigning every visible avatar by index shifts later rows.
+        for (let coAuthorIndex = 0; coAuthorIndex < candidates.length; coAuthorIndex++) {
+            const matches = candidates[coAuthorIndex];
+            if (matches.length !== 1) continue;
+            const avatarIndex = matches[0];
+            const competingMatches = candidates.filter((indexes) => indexes.includes(avatarIndex)).length;
+            if (competingMatches === 1) mapPair(coAuthorIndex, avatarIndex);
+        }
+
+        // Fill only unambiguous ordered gaps between exact matches. This preserves the
+        // positional behavior of stacks that contain every co-author without guessing when
+        // GitHub omitted one or more identities.
+        const exactPairs = [...mappedCoAuthors]
+            .map((coAuthorIndex) => ({
+                coAuthorIndex,
+                avatarIndex: candidates[coAuthorIndex][0],
+            }))
+            .sort((a, b) => a.coAuthorIndex - b.coAuthorIndex);
+        const monotonic = exactPairs.every(
+            (pair, index) => index === 0 || exactPairs[index - 1].avatarIndex < pair.avatarIndex,
+        );
+        if (monotonic) {
+            const anchors = [
+                { coAuthorIndex: -1, avatarIndex: -1 },
+                ...exactPairs,
+                { coAuthorIndex: coAuthors.length, avatarIndex: avatars.length },
+            ];
+            for (let i = 1; i < anchors.length; i++) {
+                const previous = anchors[i - 1];
+                const next = anchors[i];
+                const coAuthorCount = next.coAuthorIndex - previous.coAuthorIndex - 1;
+                const avatarCount = next.avatarIndex - previous.avatarIndex - 1;
+                if (coAuthorCount !== avatarCount) continue;
+                for (let offset = 1; offset <= coAuthorCount; offset++) {
+                    const coAuthorIndex = previous.coAuthorIndex + offset;
+                    const avatarIndex = previous.avatarIndex + offset;
+                    if (!mappedCoAuthors.has(coAuthorIndex) && !mappedAvatars.has(avatarIndex)) {
+                        mapPair(coAuthorIndex, avatarIndex);
+                    }
+                }
+            }
+        }
+        return resolved;
+    }
+
+    function commitStackAvatarIdentity(img) {
+        const profilePath = img.closest('a[href]')?.getAttribute('href') || '';
+        const login = (img.alt || profilePath.match(/^\/([^/?#]+)/)?.[1] || '').replace(/^@/, '');
+        return { login, avatarUrl: img.src || '' };
+    }
+
+    function addCoAuthorAvatars(root = document) {
         // Classic UI: .commit-desc pre; React UI: span with text-mono + ws-pre-wrap after h2
         const descs = [
-            ...document.querySelectorAll('.commit-desc pre'),
-            ...document.querySelectorAll('span.text-mono.ws-pre-wrap.f6'),
+            ...root.querySelectorAll('.commit-desc pre'),
+            ...root.querySelectorAll('span.text-mono.ws-pre-wrap.f6'),
         ].filter((el) => /co-authored-by/i.test(el.textContent || ''));
         if (descs.length === 0) return;
 
@@ -22870,23 +22963,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // order invariant ([committer, co-author1, ...]) only holds per row, so page-global
             // mapping would misattribute avatars on commits-list pages. Fall back to the
             // page-wide stack on single-commit pages (one stack on the page).
-            const row = desc.closest('[data-testid="commit-row-item"]');
-            const stackAvatars = (row || document).querySelectorAll('[data-testid="commit-stack-avatar"]');
-            const resolvedMap = new Map(); // name|email -> { login, avatarUrl }
+            const row = desc.closest('[data-testid="commit-row-item"], .commit');
+            const stackAvatars = (row || root).querySelectorAll(
+                '[data-testid="commit-stack-avatar"], [data-test-selector="commits-avatar-stack-avatar-image"]',
+            );
+            let resolvedMap = new Map(); // name|email -> { login, avatarUrl }
 
             if (stackAvatars.length > 1) {
-                // Skip first avatar (main committer), rest are co-authors in order
-                const coAvatars = [...stackAvatars].slice(1);
-                for (let i = 0; i < Math.min(coAuthors.length, coAvatars.length); i++) {
-                    const img = coAvatars[i];
-                    const login = img.alt || '';
-                    const avatarUrl = img.src || '';
-                    if (login && avatarUrl) {
-                        // Map by position (most reliable) and also by name/email for fallback
-                        const key = `${coAuthors[i].name}|${coAuthors[i].email}`;
-                        resolvedMap.set(key, { login, avatarUrl });
-                    }
-                }
+                const coAvatars = [...stackAvatars].slice(1).map(commitStackAvatarIdentity);
+                resolvedMap = mapCoAuthorsToAvatars(coAuthors, coAvatars);
             }
 
             // Fallback: resolve from noreply emails
@@ -33463,6 +33548,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(r[1].name, 'Bob');
     });
 
+    ackTest('parseCoAuthoredBy preserves unusual co-author emails', () => {
+        const r = parseCoAuthoredBy("Co-authored-by: MarcoFalke <*~=`'#}+{/-|&$^_@721217.xyz>");
+        ackDeepEq(r, [{ name: 'MarcoFalke', email: "*~=`'#}+{/-|&$^_@721217.xyz" }]);
+    });
+
     ackTest('parseCoAuthoredBy returns empty for no trailers', () => {
         ackEq(parseCoAuthoredBy('just some text').length, 0);
     });
@@ -33507,9 +33597,79 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function addCoAuthorAvatars'), source.indexOf('// --- Inject ---'));
         ackAssert(fn.includes('commit-stack-avatar'), 'scrapes GitHub avatar stack from page');
+        ackAssert(fn.includes('commits-avatar-stack-avatar-image'), 'supports the classic GitHub avatar stack');
         ackAssert(fn.includes('.slice(1)'), 'skips first avatar (main committer)');
         ackAssert(fn.includes('resolvedMap'), 'builds resolution map from page avatars');
         ackAssert(!fn.includes('fetchCoAuthorMap'), 'does NOT make extra network requests');
+    });
+
+    ackTest('mapCoAuthorsToAvatars does not shift classic stacks with omitted identities', () => {
+        const coAuthors = parseCoAuthoredBy(
+            "Co-authored-by: MarcoFalke <*~=`'#}+{/-|&$^_@721217.xyz>\n" +
+                'Co-authored-by: optout <13562139+optout21@users.noreply.github.com>\n' +
+                'Co-authored-by: ryanofsky <ryan@ryandesktop.com>\n' +
+                'Co-authored-by: sedited <seb.kung@gmail.com>\n' +
+                'Co-authored-by: w0xlt <94266259+w0xlt@users.noreply.github.com>\n' +
+                'Co-authored-by: Ava Chow <github@achow101.com>\n' +
+                'Co-authored-by: Pablo Martin <pablomartin4btc@gmail.com>',
+        );
+        const avatars = ['optout21', 'sedited', 'w0xlt', 'achow101', 'pablomartin4btc'].map((login) => ({
+            login,
+            avatarUrl: `https://github.com/${login}.png`,
+        }));
+        const resolved = mapCoAuthorsToAvatars(coAuthors, avatars);
+        ackEq(resolved.size, 5, 'maps only the identities exposed by GitHub');
+        ackEq(resolved.get('optout|13562139+optout21@users.noreply.github.com')?.login, 'optout21');
+        ackEq(resolved.get('sedited|seb.kung@gmail.com')?.login, 'sedited');
+        ackEq(resolved.get('w0xlt|94266259+w0xlt@users.noreply.github.com')?.login, 'w0xlt');
+        ackEq(resolved.get('Ava Chow|github@achow101.com')?.login, 'achow101');
+        ackEq(resolved.get('Pablo Martin|pablomartin4btc@gmail.com')?.login, 'pablomartin4btc');
+        ackAssert(!resolved.has("MarcoFalke|*~=`'#}+{/-|&$^_@721217.xyz"), 'does not misidentify MarcoFalke');
+        ackAssert(!resolved.has('ryanofsky|ryan@ryandesktop.com'), 'does not misidentify ryanofsky');
+    });
+
+    ackTest('mapCoAuthorsToAvatars keeps complete-stack positional fallback', () => {
+        const coAuthors = [
+            { name: 'First Person', email: 'first@example.com' },
+            { name: 'Second Person', email: 'second@example.com' },
+        ];
+        const avatars = [
+            { login: 'unrelated-login-one', avatarUrl: 'https://github.com/one.png' },
+            { login: 'unrelated-login-two', avatarUrl: 'https://github.com/two.png' },
+        ];
+        const resolved = mapCoAuthorsToAvatars(coAuthors, avatars);
+        ackEq(resolved.get('First Person|first@example.com')?.login, 'unrelated-login-one');
+        ackEq(resolved.get('Second Person|second@example.com')?.login, 'unrelated-login-two');
+    });
+
+    ackTest('addCoAuthorAvatars recognizes classic GitHub avatar markup', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `<div class="commit">
+            <div class="commit-desc"><pre>Co-authored-by: MarcoFalke &lt;odd@example.com&gt;
+Co-authored-by: optout &lt;13562139+optout21@users.noreply.github.com&gt;
+Co-authored-by: ryanofsky &lt;ryan@ryandesktop.com&gt;
+Co-authored-by: sedited &lt;seb.kung@gmail.com&gt;
+Co-authored-by: w0xlt &lt;94266259+w0xlt@users.noreply.github.com&gt;
+Co-authored-by: Ava Chow &lt;github@achow101.com&gt;
+Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
+            ${['l0rinc', 'optout21', 'sedited', 'w0xlt', 'achow101', 'pablomartin4btc']
+                .map(
+                    (login) =>
+                        `<a href="/${login}"><img data-test-selector="commits-avatar-stack-avatar-image" alt="@${login}" src="https://github.com/${login}.png"></a>`,
+                )
+                .join('')}
+        </div>`;
+        addCoAuthorAvatars(root);
+        const desc = root.querySelector('.commit-desc pre');
+        for (const login of ['optout21', 'sedited', 'w0xlt', 'achow101', 'pablomartin4btc']) {
+            ackAssert(desc.querySelector(`a[href="https://github.com/${login}"]`), `recognizes ${login}`);
+        }
+        ackAssert(desc.textContent.includes('MarcoFalke <odd@example.com>'), 'keeps unresolved MarcoFalke trailer');
+        ackAssert(
+            desc.textContent.includes('ryanofsky <ryan@ryandesktop.com>'),
+            'keeps unresolved ryanofsky trailer',
+        );
+        ackAssert(!desc.textContent.includes('@optout21'), 'strips the classic avatar alt prefix');
     });
 
     ackTest('addCoAuthorAvatars replaces Co-authored-by text with avatar chips', () => {
