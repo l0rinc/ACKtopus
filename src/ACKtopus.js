@@ -15461,14 +15461,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // --- Lazy Visibility Observer for Comment-Level Work ---
 
     // Instead of processing all comments eagerly, observe containers and run
-    // reaction/avatar functions only when they scroll into view (200px margin).
-    // addQuickCommentActions stays eager (needs re-run on edit state changes).
-    const LAZY_COMMENT_SEL = WIDE_COMMENT_CONTAINER_SELECTOR;
+    // comment controls/decorations only when they scroll into view (200px margin).
+    // Mutation-scoped editor refreshes still run immediately.
+    const LAZY_COMMENT_SEL = `${WIDE_COMMENT_CONTAINER_SELECTOR}, [data-testid="issue-body"]`;
+
+    function leafLazyCommentContainers(root = document) {
+        const candidates = qsa(root, LAZY_COMMENT_SEL);
+        const candidateSet = new Set(candidates);
+        const containersWithNestedCandidates = new Set();
+        for (const candidate of candidates) {
+            for (let parent = candidate.parentElement; parent; parent = parent.parentElement) {
+                if (candidateSet.has(parent)) containersWithNestedCandidates.add(parent);
+            }
+        }
+        return candidates.filter((candidate) => !containersWithNestedCandidates.has(candidate));
+    }
 
     function processVisibleComment(container) {
         if (_ackTesting) return;
         const started = ackNow();
-        // Deferred to visibility: API-heavy work + per-comment decoration.
+        // Deferred to visibility: comment controls, API-heavy work, and decoration.
+        addQuickCommentActions(container);
         autoOpenReactionPopup(container);
         expandReactionAvatars(container);
         verifyPGPSignatures(container);
@@ -15528,7 +15541,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     );
 
     function queueLazyComments(root = document) {
-        const containers = qsa(root, LAZY_COMMENT_SEL);
+        const containers = leafLazyCommentContainers(root);
         for (const c of containers) {
             if (c.dataset.ackLazyQueued) continue;
             c.dataset.ackLazyQueued = 'true';
@@ -15572,7 +15585,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             when: (ctx) => (ctx.onToolbar && !ctx.onCompare) || ctx.onCompose,
             fn: makeStickyEditToolbar,
         },
-        { name: 'quickActions', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: addQuickCommentActions },
+        {
+            name: 'quickActions',
+            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
+            fn: (root) => {
+                if (root !== document) addQuickCommentActions(root);
+            },
+        },
         {
             name: 'reactionHover',
             when: (ctx) => ctx.onToolbar && !ctx.onCompare,
@@ -29992,9 +30011,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('expandReactionAvatars'), 'runs expandReactionAvatars lazily');
         ackAssert(fn.includes('addCommitBadges'), 'runs addCommitBadges lazily');
-        // addQuickCommentActions stays eager (edit state tracking)
-        const fnCode = fn.replace(/\/\/.*$/gm, '');
-        ackAssert(!fnCode.includes('addQuickCommentActions('), 'addQuickCommentActions is NOT lazy (runs eager)');
+        ackAssert(fn.includes('addQuickCommentActions'), 'runs quick actions lazily');
     });
 
     ackTest('inject and MutationObserver share a single injector pipeline', () => {
@@ -30029,7 +30046,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
 
         // Pipeline includes key injectors (structural)
-        ackAssert(source.includes('fn: addQuickCommentActions'), 'root pipeline includes quick actions');
+        ackAssert(source.includes("name: 'quickActions'"), 'root pipeline includes quick actions');
         ackAssert(source.includes("name: 'reactionHover'"), 'root pipeline includes reaction hover');
         ackAssert(source.includes('fn: queueLazyComments'), 'root pipeline includes lazy comment queue');
         ackAssert(source.includes('fn: prefillCommitHash'), 'root pipeline includes commit prefix prefill');
@@ -31291,14 +31308,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(lazy.includes('lazyCommentQueue'), 'queues visible comments');
         ackAssert(lazy.includes("scheduleAckBackgroundWork(\n            'lazy-comments'"), 'processes queue in background');
         ackAssert(lazy.includes('isCanceled()'), 'checks cancellation before processing a batch');
+        ackAssert(lazy.includes('addQuickCommentActions(container)'), 'builds comment actions only near the viewport');
         ackAssert(lazy.includes('autoOpenReactionPopup(container)'), 'installs reaction hooks only near the viewport');
         ackAssert(lazy.includes('visible comment decoration was slow'), 'logs slow per-comment decoration');
     });
 
-    ackTest('initial document injection defers reaction scans to visible comments', () => {
+    ackTest('initial document injection defers comment-wide scans to visible comments', () => {
         const roots = sourceSection(_ackSource, 'const ROOT_INJECTORS', 'const DOC_INJECTORS');
+        ackAssert(roots.includes("name: 'quickActions'"), 'keeps scoped quick actions for mutations');
+        ackAssert(roots.includes('if (root !== document) addQuickCommentActions(root)'), 'skips eager document-wide actions');
         ackAssert(roots.includes("name: 'reactionHover'"), 'keeps reaction handling for added subtrees');
         ackAssert(roots.includes('if (root !== document) autoOpenReactionPopup(root)'), 'skips the eager document-wide scan');
+    });
+
+    ackTest('lazy comment queue removes nested wrapper duplicates', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="timeline-comment-group">
+                <div class="timeline-comment" id="inner-comment"></div>
+            </div>
+            <div data-testid="issue-body" id="issue-body-candidate"></div>
+        `;
+        const leaves = leafLazyCommentContainers(host);
+        ackDeepEq(
+            leaves.map((el) => el.id),
+            ['inner-comment', 'issue-body-candidate'],
+            'keeps only innermost comments and the PR body',
+        );
     });
 
     ackTest('DOM observer editor gate includes compare-page compose mode', () => {
@@ -31381,9 +31417,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('const lazyCommentObserver'),
         );
         ackAssert(pvFn.includes('expandReactionAvatars'), 'lazy includes expandReactionAvatars');
-        // Cheap functions are NOT here -- they run eagerly in the MutationObserver
-        const pvCode = pvFn.replace(/\/\/.*$/gm, '');
-        ackAssert(!pvCode.includes('addQuickCommentActions'), 'addQuickCommentActions NOT lazy');
+        ackAssert(pvFn.includes('addQuickCommentActions'), 'quick actions are lazy on initial page load');
     });
 
     ackTest('MutationObserver runs lazy queueing and essential eager functions', () => {
