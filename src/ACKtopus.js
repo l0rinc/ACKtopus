@@ -16751,7 +16751,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let _quickActionsSoftRescanTimer = null;
     let _quickActionsSoftRescanGen = 0;
 
-    function scheduleQuickActionsSoftRescan(delayMs = 180) {
+    function scheduleQuickActionsSoftRescan(delayMs = 180, resolveRoot = null) {
         if (_ackTesting) return;
         _quickActionsSoftRescanGen++;
         const gen = _quickActionsSoftRescanGen;
@@ -16759,7 +16759,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _quickActionsSoftRescanTimer = ackSetTimeout(() => {
             if (gen !== _quickActionsSoftRescanGen) return;
             _quickActionsSoftRescanTimer = null;
-            addQuickCommentActions(document);
+            const root = typeof resolveRoot === 'function' ? resolveRoot() : document;
+            if (root) addQuickCommentActions(root);
         }, delayMs);
     }
 
@@ -17063,43 +17064,97 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackSetTimeout(unarm, 400);
     }
 
+    function postEditRefreshLocator(container) {
+        const root =
+            container?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
+            container?.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) ||
+            container;
+        if (!root) return null;
+        if (root.matches?.('[data-testid="issue-body"]')) return { issueBody: true };
+        const identityEl = qsa(
+            root,
+            '[id^="issuecomment-"], [id^="discussion_r"], [id^="pullrequestreviewcomment-"], [id^="pullrequestreview-"]',
+        ).find((el) =>
+            /^(?:issuecomment-\d+|discussion_r\d+|pullrequestreviewcomment-\d+|pullrequestreview-\d+)$/.test(el.id),
+        );
+        const permalink = getCommentPermalink(root);
+        return {
+            id: identityEl?.id || '',
+            permalink: commentPermalinkIdentity(permalink),
+        };
+    }
+
+    function resolvePostEditRefreshRoot(locator, fallback = null) {
+        if (locator?.issueBody) {
+            const issueBodies = qsa(document, '[data-testid="issue-body"]');
+            const issueBody = issueBodies.find((el) => isVisible(el)) || issueBodies[0];
+            if (issueBody) return issueBody;
+        }
+        if (locator?.id) {
+            const matches = qsa(document, `[id="${locator.id}"]`);
+            const target = matches.find((el) => isVisible(el)) || matches[0];
+            if (target) return target.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || target;
+        }
+        if (/^#(?:discussion_r|issuecomment-|pullrequestreview-|issue-)\d+$/.test(locator?.permalink || '')) {
+            const candidates = qsa(
+                document,
+                `a[href="${locator.permalink}"], a[href$="${locator.permalink}"]`,
+            ).map((anchor) => anchor.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || anchor);
+            const target =
+                candidates.find((el) => isVisible(el)) ||
+                candidates[0] ||
+                findCommentElementForUrl(locator.permalink);
+            if (target) return target.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || target;
+        }
+        return fallback?.isConnected ? fallback : null;
+    }
+
+    function refreshQuickCommentActionsInRoot(root) {
+        if (!root) return;
+        for (const header of qsa(root, '[data-ack-quick-processed]')) {
+            delete header.dataset.ackQuickProcessed;
+        }
+        for (const actions of qsa(root, '.ack-quick-actions')) {
+            if (actions !== _ackPressedQuickActions) actions.remove();
+        }
+        addQuickCommentActions(root);
+    }
+
     function schedulePostEditRefresh(container) {
         // After save/cancel, React may replace the entire comment container,
-        // making `container` a stale detached reference. Always rescan from
-        // document to ensure we find the freshly rendered header.
+        // making `container` a stale detached reference. Resolve its stable
+        // comment identity for retries instead of rescanning every comment.
         ackBackgroundLog('post-edit quick-action refresh scheduled', { reason: 'edit-state-change' }, 1000);
+        const locator = postEditRefreshLocator(container);
+        const resolveRoot = () => resolvePostEditRefreshRoot(locator, container);
         if (container?.isConnected) {
             runFastEditorAffordances(container);
             scheduleFastEditorAffordances(container);
         }
-        scheduleQuickActionsSoftRescan(120);
+        scheduleQuickActionsSoftRescan(120, resolveRoot);
         // Coalesce rapid edit-mode events (save + submit + React rerender) into
-        // one refresh schedule to avoid stacking expensive full-document scans.
+        // one refresh schedule.
         _postEditRefreshGeneration++;
         for (const t of _postEditRefreshTimers) ackClearTimeout(t);
         _postEditRefreshTimers = [];
         const gen = _postEditRefreshGeneration;
-        const refresh = () => {
+        const refresh = (allowDocumentFallback = false) => {
             if (gen !== _postEditRefreshGeneration) return;
             scheduleAckBackgroundWork(
                 `post-edit-refresh-${gen}`,
                 ({ isCanceled }) => {
                     if (gen !== _postEditRefreshGeneration || isCanceled()) return;
-                    document
-                        .querySelectorAll('[data-ack-quick-processed]')
-                        .forEach((h) => delete h.dataset.ackQuickProcessed);
-                    document.querySelectorAll('.ack-quick-actions').forEach((el) => {
-                        if (el !== _ackPressedQuickActions) el.remove();
-                    });
-                    addQuickCommentActions(document);
+                    const root = resolveRoot() || (allowDocumentFallback ? document : null);
+                    refreshQuickCommentActionsInRoot(root);
                 },
                 { delayMs: 80, reason: 'post-edit-refresh' },
             );
         };
-        // Multiple sweeps to catch async state changes
-        _postEditRefreshTimers.push(ackSetTimeout(refresh, 800));
-        _postEditRefreshTimers.push(ackSetTimeout(refresh, 2500));
-        _postEditRefreshTimers.push(ackSetTimeout(refresh, 5000));
+        // Multiple targeted sweeps catch GitHub's async state changes. The last
+        // pass retains a full-page fallback for an unknown replacement shape.
+        _postEditRefreshTimers.push(ackSetTimeout(() => refresh(false), 800));
+        _postEditRefreshTimers.push(ackSetTimeout(() => refresh(false), 2500));
+        _postEditRefreshTimers.push(ackSetTimeout(() => refresh(true), 5000));
     }
 
     // Capture-phase listeners for edit form submit (save) and cancel.
@@ -32180,20 +32235,70 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('schedulePostEditRefresh sweeps at multiple intervals', () => {
+    ackTest('schedulePostEditRefresh targets the edited comment at multiple intervals', () => {
         const source = _ackSource;
         ackAssert(source.includes('function schedulePostEditRefresh'), 'has post-edit refresh function');
         const fn = sourceSection(
             source,
+            'function postEditRefreshLocator',
+            "document.addEventListener(\n        'submit'",
+        );
+        ackAssert(fn.includes('resolvePostEditRefreshRoot(locator, container)'), 'resolves replacement by stable identity');
+        ackAssert(fn.includes('runFastEditorAffordances(container)'), 'runs immediate scoped affordance refresh');
+        ackAssert(fn.includes('scheduleQuickActionsSoftRescan(120, resolveRoot)'), 'schedules a targeted soft rescan');
+        ackAssert(fn.includes('ackSetTimeout(() => refresh(false), 800)'), 'first sweep at 800ms');
+        ackAssert(fn.includes('ackSetTimeout(() => refresh(false), 2500)'), 'second sweep at 2500ms');
+        ackAssert(fn.includes('ackSetTimeout(() => refresh(true), 5000)'), 'keeps one final document fallback');
+        ackAssert(fn.includes("scheduleAckBackgroundWork(\n                `post-edit-refresh-${gen}`"), 'refresh scan runs in background');
+        ackAssert(fn.includes('delete header.dataset.ackQuickProcessed'), 'clears processed marker');
+        const scheduleFn = sourceSection(
+            source,
             'function schedulePostEditRefresh',
             "document.addEventListener(\n        'submit'",
         );
-        ackAssert(fn.includes('runFastEditorAffordances(container)'), 'runs immediate scoped affordance refresh');
-        ackAssert(fn.includes('scheduleQuickActionsSoftRescan(120)'), 'schedules quick soft rescan');
-        ackAssert(fn.includes('ackSetTimeout(refresh, 800)'), 'first sweep at 800ms');
-        ackAssert(fn.includes('ackSetTimeout(refresh, 2500)'), 'second sweep at 2500ms');
-        ackAssert(fn.includes("scheduleAckBackgroundWork(\n                `post-edit-refresh-${gen}`"), 'refresh scan runs in background');
-        ackAssert(fn.includes('delete h.dataset.ackQuickProcessed'), 'clears processed marker');
+        ackAssert(
+            !scheduleFn.includes("document.querySelectorAll('[data-ack-quick-processed]')"),
+            'timed retries do not scan every comment',
+        );
+    });
+
+    ackTest('post-edit refresh follows a replaced comment and leaves siblings alone', () => {
+        const host = document.createElement('div');
+        host.style.display = 'none';
+        host.innerHTML = `
+            <div id="issuecomment-901" class="timeline-comment">
+                <div class="timeline-comment-header" data-ack-quick-processed="v">
+                    <span class="ack-quick-actions"></span>
+                </div>
+            </div>
+            <div id="issuecomment-902" class="timeline-comment">
+                <div class="timeline-comment-header" data-ack-quick-processed="v">
+                    <span class="ack-quick-actions"></span>
+                </div>
+            </div>`;
+        document.body.appendChild(host);
+        try {
+            const original = host.querySelector('#issuecomment-901');
+            const locator = postEditRefreshLocator(original);
+            original.outerHTML = `
+                <div id="issuecomment-901" class="timeline-comment">
+                    <div class="timeline-comment-header" data-ack-quick-processed="v"></div>
+                </div>`;
+            const replacement = host.querySelector('#issuecomment-901');
+            ackEq(resolvePostEditRefreshRoot(locator, original), replacement, 'finds the live replacement by comment id');
+
+            const sibling = host.querySelector('#issuecomment-902');
+            const siblingActions = sibling.querySelector('.ack-quick-actions');
+            refreshQuickCommentActionsInRoot(replacement);
+            ackEq(sibling.querySelector('.ack-quick-actions'), siblingActions, 'does not rebuild a sibling comment');
+            ackEq(
+                sibling.querySelector('[data-ack-quick-processed]')?.dataset.ackQuickProcessed,
+                'v',
+                'does not clear a sibling marker',
+            );
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('capture-phase listeners for edit form submit and cancel', () => {
