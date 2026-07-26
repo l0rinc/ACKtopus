@@ -918,7 +918,6 @@
     const ACK_INTERACTION_KEYBOARD_IDLE_MS = 1500;
     const ACK_INTERACTION_SCROLL_IDLE_MS = 1500;
     const ACK_INTERACTION_POINTER_IDLE_MS = 1000;
-    const ACK_INTERACTION_POINTER_MOVE_IDLE_MS = 700;
     const ACK_INTERACTION_SELECTION_IDLE_MS = 1200;
     const ACK_BACKGROUND_MIN_DELAY_MS = 80;
     const ACK_BACKGROUND_IDLE_TIMEOUT_MS = 1800;
@@ -1090,10 +1089,6 @@
             if (!e?.isTrusted) return;
             markAckUserActivity(e.type, ACK_INTERACTION_POINTER_IDLE_MS);
         };
-        const pointerMove = (e) => {
-            if (!e?.isTrusted) return;
-            markAckUserActivity(e.type, ACK_INTERACTION_POINTER_MOVE_IDLE_MS);
-        };
         const selection = () => {
             const sel = document.getSelection?.();
             if (!sel || sel.isCollapsed) return;
@@ -1107,7 +1102,6 @@
         document.addEventListener('scroll', scroll, passiveCapture);
         window.addEventListener('scroll', scroll, { passive: true });
         document.addEventListener('pointerdown', pointer, passiveCapture);
-        document.addEventListener('pointermove', pointerMove, passiveCapture);
         document.addEventListener('selectionchange', selection, { passive: true });
     }
 
@@ -17512,6 +17506,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         headers.sort((a, b) => headerPriority(a) - headerPriority(b));
 
+        // Read all geometry before adding any buttons. Alternating a DOM write for
+        // one comment with getBoundingClientRect/getComputedStyle for the next
+        // forces a full layout for every comment on long conversations.
+        const headerContainers = new Map();
+        const visibleContainers = new Map();
+        for (const header of headers) {
+            const container =
+                (header.matches?.('[data-testid="issue-body"]') ? header : null) ||
+                header.closest(COMMENT_CONTAINER_SELECTOR) ||
+                header.closest('[data-testid="issue-body"]') ||
+                header.parentElement ||
+                header;
+            headerContainers.set(header, container);
+            if (!visibleContainers.has(container)) visibleContainers.set(container, isVisible(container));
+        }
+
         const processedContainers = new Set();
         const EDIT_TA_SELECTOR =
             '.is-comment-editing textarea, form.js-comment-update textarea, [data-testid="edit-comment-form"] textarea';
@@ -17644,16 +17654,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         for (const header of headers) {
             // Detect edit mode early (needed for guard + button swap)
-            const headerContainer =
-                (header.matches?.('[data-testid="issue-body"]') ? header : null) ||
-                header.closest(COMMENT_CONTAINER_SELECTOR) ||
-                header.closest('[data-testid="issue-body"]') ||
-                header.parentElement ||
-                header;
+            const headerContainer = headerContainers.get(header);
             // Skip hidden clones (GitHub React sometimes keeps both view/edit trees).
             // Use actual visibility, not aria-hidden: GitHub sometimes toggles
             // aria-hidden on containers that still contain focused elements.
-            if (!isVisible(headerContainer)) {
+            if (!visibleContainers.get(headerContainer)) {
                 headerContainer.querySelectorAll?.('.ack-quick-actions')?.forEach?.((el) => el.remove());
                 try {
                     delete header.dataset.ackQuickProcessed;
@@ -24337,7 +24342,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             placeholder.style.display = GM_getValue('ackPanelVisible', false) ? '' : 'none';
             wrapper.appendChild(placeholder);
 
-            loadAsyncPRData(wrapper, toolbar);
+            scheduleAckBackgroundWork(
+                'load-pr-data',
+                () => {
+                    void loadAsyncPRData(wrapper, toolbar).catch((e) => {
+                        if (wrapper.isConnected) console.warn('ACKtopus: PR data load failed:', e);
+                    });
+                },
+                { delayMs: 250, timeoutMs: 2500, reason: 'initial-pr-data' },
+            );
             addFloatingCommitNav();
         }
     }
@@ -31174,6 +31187,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('background work deferred for interaction'), 'logs interaction deferrals');
     });
 
+    ackTest('background interaction guards do not track pointer movement', () => {
+        const guards = sourceSection(
+            _ackSource,
+            'function installAckInteractionGuards',
+            'installAckInteractionGuards();',
+        );
+        ackAssert(guards.includes("'pointerdown'"), 'keeps intentional pointer interaction tracking');
+        ackAssert(guards.includes("'scroll'"), 'keeps scroll interaction tracking');
+        ackAssert(!guards.includes("'pointermove'"), 'mouse movement does not continually defer background work');
+    });
+
     ackTest('editor affordance buttons refresh quickly without full document rescans', () => {
         const source = _ackSource;
         const fastSection = sourceSection(source, 'const FAST_EDITOR_AFFORDANCE_SELECTOR', 'function runDocInjectors');
@@ -31921,6 +31945,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('staleActions.length === 0'), 'detects zero-button state');
         ackAssert(fn.includes('delete header.dataset.ackQuickProcessed'), 'clears stale marker');
+    });
+
+    ackTest('quick comment actions batch layout reads before DOM writes', () => {
+        const fn = sourceSection(_ackSource, 'function addQuickCommentActions', 'function getCommentMenuRoots');
+        const visibilityRead = fn.indexOf('visibleContainers.set(container, isVisible(container))');
+        const actionWrite = fn.indexOf('header.appendChild(actions)');
+        ackAssert(visibilityRead >= 0, 'precomputes comment visibility');
+        ackAssert(actionWrite > visibilityRead, 'finishes geometry reads before inserting action buttons');
+        ackAssert(
+            fn.slice(visibilityRead, actionWrite).includes('visibleContainers.get(headerContainer)'),
+            'reuses the precomputed visibility result',
+        );
     });
 
     ackTest('schedulePostEditRefresh sweeps at multiple intervals', () => {
@@ -41474,6 +41510,18 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(reviewOptions.includes('Hide whitespace-only'), 'adds GitHub-side whitespace option');
         ackAssert(reviewOptions.includes("input.type = 'checkbox'"), 'uses checkbox state in GitHub-side options');
         ackAssert(!diff.includes('ack-first-unviewed-btn'), 'does not add viewed-checkbox navigation');
+    });
+
+    ackTest('initial PR data loading runs as background work', () => {
+        const inject = sourceSection(_ackSource, 'function inject()', '// --- Hide GitHub');
+        const schedule = inject.indexOf("scheduleAckBackgroundWork(\n                'load-pr-data'");
+        const load = inject.indexOf('loadAsyncPRData(wrapper, toolbar)', schedule);
+        ackAssert(schedule >= 0, 'schedules initial PR data loading');
+        ackAssert(load > schedule, 'runs the expensive scan from the scheduled callback');
+        ackAssert(
+            !inject.slice(0, schedule).includes('loadAsyncPRData(wrapper, toolbar)'),
+            'does not start the scan synchronously',
+        );
     });
 
     ackTest('isElementOutsideViewport detects only fully out-of-view elements', () => {
