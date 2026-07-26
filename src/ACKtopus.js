@@ -674,6 +674,10 @@
         ', .is-comment-editing, .edit-comment-hide, [data-testid="markdown-editor"], ' +
         '[class*="MarkdownEditor-module__container"], [class*="ActivityThread"], [data-testid="review-thread"], ' +
         '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]';
+    const EDIT_TRACKING_CANDIDATE_SELECTOR =
+        EDIT_FORM_SELECTOR +
+        ', .is-comment-editing, .edit-comment-hide, [data-testid="markdown-editor"], ' +
+        `[class*="MarkdownEditor-module__container"], ${EDIT_BODY_TEXTAREA_SELECTOR}, textarea`;
     const EDIT_SAVE_DIFF_EMOJI = '🧾';
     const EXTENDED_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_SELECTOR + ', .js-comment, .js-line-comments, .inline-comment-form-container';
@@ -16721,11 +16725,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const closestForm = root.closest?.('form');
         if (closestForm) pushScope(closestForm);
         if (root.querySelectorAll) {
-            qsa(root, EDIT_SCOPE_SELECTOR).forEach(pushScope);
-            qsa(root, EDIT_BODY_TEXTAREA_SELECTOR).forEach((ta) => {
-                pushScope(ta);
-            });
-            qsa(root, 'textarea, button[type="submit"], button').forEach(pushScope);
+            qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR).forEach(pushScope);
         }
         for (const form of forms) {
             if (!isExistingPostEditForm(form)) continue;
@@ -20364,7 +20364,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (scope) fallbackScopes.add(scope);
         };
         addFallbackScope(root);
-        qsa(root, `${EDIT_SCOPE_SELECTOR}, textarea, button`).forEach(addFallbackScope);
+        qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR).forEach(addFallbackScope);
         fallbackScopes.forEach((form) => {
             const usableToolbar = [...qsa(form, toolbarSelector)].find(
                 (tb) => tb !== form && (!form.isConnected || isVisible(tb)) && !!getToolbarTextarea(tb),
@@ -42487,6 +42487,28 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             host.remove();
         }
+    });
+
+    ackTest('edit-form discovery does not scan every page button', () => {
+        const tracking = sourceSection(_ackSource, 'function trackEditForms', 'function isNoOpEditSave');
+        const details = sourceSection(
+            _ackSource,
+            'function addDetailsButtons',
+            'function findOverlappingMarkdownFenceRange',
+        );
+        ackAssert(
+            tracking.includes('qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR)'),
+            'tracks only editor candidates',
+        );
+        ackAssert(!tracking.includes("'textarea, button"), 'does not inspect unrelated comment buttons');
+        ackAssert(
+            details.includes('qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR)'),
+            'fallback toolbar discovery uses the same editor candidates',
+        );
+        ackAssert(
+            !details.includes('`${EDIT_SCOPE_SELECTOR}, textarea, button`'),
+            'fallback discovery does not inspect every page button',
+        );
     });
 
     ackTest('trackEditForms ignores compare-page PR creation forms', () => {
