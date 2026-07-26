@@ -2699,9 +2699,15 @@
         return { key: cached.key, ...value };
     }
 
+    const _githubJsonRequests = new Map();
+
     function gmFetch(url) {
-        return new Promise((resolve, reject) => {
-            const baseHeaders = ghApiHeaders();
+        const baseHeaders = ghApiHeaders();
+        const requestKey = githubHttpCacheKey(url, baseHeaders);
+        const pending = _githubJsonRequests.get(requestKey);
+        if (pending) return pending;
+
+        const request = new Promise((resolve, reject) => {
             const cached = readGithubHttpCache(url, baseHeaders);
             const headers = githubConditionalHeaders(baseHeaders, cached);
             const preflight = githubRateLimitPreflightError(url, headers);
@@ -2771,6 +2777,11 @@
                 ...githubGetTransportHandlers(url, reject),
             });
         });
+        const tracked = request.finally(() => {
+            if (_githubJsonRequests.get(requestKey) === tracked) _githubJsonRequests.delete(requestKey);
+        });
+        _githubJsonRequests.set(requestKey, tracked);
+        return tracked;
     }
 
     // Like gmFetch, but returns raw text instead of parsed JSON.
@@ -34838,6 +34849,34 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             GM_xmlhttpRequest = originalRequest;
             invalidateGithubHttpCacheForPR('ack-cache-test/demo#77');
+        }
+    });
+
+    ackTest('concurrent gmFetch callers share one transport request', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/79/comments?per_page=100';
+        const originalRequest = GM_xmlhttpRequest;
+        let requests = 0;
+        let completeFirst = null;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                requests++;
+                if (requests === 1) {
+                    completeFirst = opts.onload;
+                } else {
+                    opts.onload?.({ status: 200, responseText: '[{"id":2}]', responseHeaders: '' });
+                }
+            };
+            const first = gmFetch(url);
+            const second = gmFetch(url);
+            ackEq(requests, 1, 'starts one request for simultaneous callers');
+            completeFirst?.({ status: 200, responseText: '[{"id":1}]', responseHeaders: '' });
+            ackDeepEq(await Promise.all([first, second]), [[{ id: 1 }], [{ id: 1 }]], 'shares the parsed result');
+
+            ackDeepEq(await gmFetch(url), [{ id: 2 }], 'a later call starts a fresh validation');
+            ackEq(requests, 2, 'removes settled requests from the in-flight map');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            _githubJsonRequests.clear();
         }
     });
 
