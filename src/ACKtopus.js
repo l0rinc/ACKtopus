@@ -3388,7 +3388,7 @@
             const beforeReviews = members.size;
             try {
                 const reviews = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/reviews?per_page=100`,
+                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/reviews?per_page=100&page=1`,
                 );
                 for (const r of reviews) {
                     const assoc = r.author_association;
@@ -3410,7 +3410,7 @@
             const beforeIssue = members.size;
             try {
                 const comments = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/issues/${prNum}/comments?per_page=100`,
+                    `https://api.github.com/repos/${owner}/${repo}/issues/${prNum}/comments?per_page=100&page=1`,
                 );
                 for (const c of comments) {
                     const assoc = c.author_association;
@@ -3432,7 +3432,7 @@
             const beforeInline = members.size;
             try {
                 const inline = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100`,
+                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=1`,
                 );
                 for (const c of inline) {
                     const assoc = c.author_association;
@@ -33346,6 +33346,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('pulls/${prNum}/reviews'), 'fetches PR reviews');
         ackAssert(fn.includes('pulls/${prNum}/comments'), 'fetches inline review comments');
         ackAssert(fn.includes('issues/${prNum}/comments'), 'fetches issue comments');
+        ackEq((fn.match(/per_page=100&page=1/g) || []).length, 3, 'shares canonical first-page request URLs');
         ackAssert(fn.includes('org_members_'), 'org members cached globally');
         ackAssert(fn.includes('_orgMemberCache'), 'has in-memory org cache');
         ackAssert(fn.includes('new Set(orgMembers)'), 'copies org set before adding PR-specific');
