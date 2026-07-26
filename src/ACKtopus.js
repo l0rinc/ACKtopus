@@ -7878,8 +7878,21 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     // --- Page Index for Navigation Queries ---
     // Collects all visible comments and code sections with DOM anchors for /find queries.
+    function getPageIndexThreadInfo(threadRoot, cache) {
+        if (!threadRoot) return null;
+        const cached = cache.get(threadRoot);
+        if (cached) return cached;
+
+        const comments = [...threadRoot.querySelectorAll(COMMENT_CONTAINER_SELECTOR)];
+        const positions = new Map(comments.map((comment, index) => [comment, index]));
+        const info = { count: comments.length, positions };
+        cache.set(threadRoot, info);
+        return info;
+    }
+
     function gatherPageIndex() {
         const items = [];
+        const threadInfoCache = new Map();
         // Comments
         document.querySelectorAll(COMMENT_CONTAINER_SELECTOR).forEach((container) => {
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
@@ -7893,8 +7906,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
             const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
             const permalink = getCommentPermalink(container);
-            const threadComments = threadRoot ? [...threadRoot.querySelectorAll(COMMENT_CONTAINER_SELECTOR)] : [];
-            const isReply = threadComments.length > 1 && threadComments.indexOf(container) > 0;
+            const threadInfo = getPageIndexThreadInfo(threadRoot, threadInfoCache);
+            const isReply = !!threadInfo && threadInfo.count > 1 && (threadInfo.positions.get(container) ?? -1) > 0;
             const kind = file
                 ? isReply
                     ? 'inline review reply'
@@ -36016,6 +36029,23 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gatherPageIndex'), source.indexOf('const NAV_QUERY_RE'));
         ackAssert(fn.includes('getCommentAuthor(body)'), 'uses getCommentAuthor(body) for comment author');
+    });
+
+    ackTest('gatherPageIndex caches comment positions per discussion', () => {
+        const thread = document.createElement('div');
+        thread.innerHTML = `
+            <div class="timeline-comment" id="first"></div>
+            <div class="timeline-comment" id="second"></div>
+        `;
+        const cache = new Map();
+        const first = getPageIndexThreadInfo(thread, cache);
+        const second = getPageIndexThreadInfo(thread, cache);
+        ackEq(first, second, 'reuses one thread scan');
+        ackEq(cache.size, 1, 'stores one entry per discussion');
+        ackEq(first.count, 2, 'indexes each comment once');
+        ackEq(first.positions.get(thread.querySelector('#first')), 0, 'records the parent position');
+        ackEq(first.positions.get(thread.querySelector('#second')), 1, 'records the reply position');
+        ackEq(getPageIndexThreadInfo(null, cache), null, 'handles comments without a discussion root');
     });
 
     ackTest('NAV_QUERY_RE detects navigation patterns', () => {
