@@ -24744,39 +24744,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const cacheKey = `${owner}/${repo}/${prNum}`;
         if (commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
 
-        // Try API first via GM_xmlhttpRequest (bypasses CSP)
+        // Try the validated, shared API path first.
         const apiResult = [];
         let apiFailed = false;
         for (let pageNum = 1; pageNum <= 20; pageNum++) {
-            const batch = await new Promise((resolve) => {
-                const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100&page=${pageNum}`;
-                const headers = ghApiHeaders();
-                const preflight = githubRateLimitPreflightError(url, headers);
-                if (preflight) {
-                    resolve(null);
-                    return;
+            const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100&page=${pageNum}`;
+            let batch;
+            try {
+                batch = await gmFetch(url);
+            } catch (e) {
+                if (shouldWarnOptionalGitHubApiError(e)) {
+                    console.warn('ACKtopus: commits API failed, falling back to HTML scrape:', e.message || e);
                 }
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url,
-                    headers,
-                    onload: (r) => {
-                        if (r.status >= 200 && r.status < 300) {
-                            try {
-                                resolve(JSON.parse(r.responseText));
-                                return;
-                            } catch {}
-                        }
-                        if (isGithubRateLimitResponse(r)) rememberGithubRateLimit(r, headers);
-                        else if (headers.Authorization && (r.status === 401 || r.status === 403)) rememberGithubBadPat(r);
-                        else console.warn(`ACKtopus: commits API returned ${r.status}, falling back to HTML scrape`);
-                        resolve(null);
-                    },
-                    onerror: () => {
-                        resolve(null);
-                    },
-                });
-            });
+                apiFailed = true;
+                break;
+            }
             if (!Array.isArray(batch)) {
                 apiFailed = true;
                 break;
@@ -35165,9 +35147,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('fetchCommitList shares bad-PAT and rate-limit guards', () => {
         const source = _ackSource;
         const fn = sourceSection(source, 'async function fetchCommitList', 'const COMMIT_SEARCH_JUMP_KEY');
-        ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips API page when auth bucket is rate-limited');
-        ackAssert(fn.includes('rememberGithubRateLimit(r, headers)'), 'records API rate-limit responses');
-        ackAssert(fn.includes('rememberGithubBadPat(r)'), 'records invalid PAT responses');
+        ackAssert(fn.includes('await gmFetch(url)'), 'uses shared conditional GitHub reader');
+        ackAssert(fn.includes('shouldWarnOptionalGitHubApiError(e)'), 'keeps known rate-limit failures quiet');
         ackAssert(fn.includes('falling back to HTML scrape'), 'still keeps the HTML scrape fallback');
     });
 
@@ -38837,7 +38818,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function fetchCommitList'),
             source.indexOf('async function _addFloatingCommitNavInner'),
         );
-        ackAssert(commitListFn.includes('ghApiHeaders()'), 'fetchCommitList uses ghApiHeaders');
+        ackAssert(commitListFn.includes('await gmFetch(url)'), 'fetchCommitList uses validated shared API reads');
         ackAssert(commitListFn.includes('pageNum <= 20'), 'fetchCommitList paginates large PR commit lists');
         ackAssert(commitListFn.includes('page=${pageNum}'), 'fetchCommitList requests explicit API pages');
         ackAssert(commitListFn.includes('apiResult.push(...batch)'), 'fetchCommitList appends each API page');
