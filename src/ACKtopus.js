@@ -2559,9 +2559,151 @@
         };
     }
 
+    const GITHUB_HTTP_CACHE_PREFIX = 'github_http_cache_v1_';
+    const GITHUB_HTTP_CACHE_INDEX_KEY = 'github_http_cache_index_v1';
+    const GITHUB_HTTP_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+    const GITHUB_HTTP_CACHE_MAX_ENTRIES = 48;
+    const GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES = 1500 * 1024;
+    const GITHUB_HTTP_CACHE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+
+    function githubHttpCachePRKey(url) {
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname !== 'api.github.com') return '';
+            const match = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(?:pulls|issues)\/(\d+)(?:\/|$)/);
+            return match ? `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}#${match[3]}` : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function githubHttpCacheScope(headers = {}) {
+        const authorization = String(headers.Authorization || '');
+        return authorization ? `auth:${hashPrompt(authorization)}` : 'anonymous';
+    }
+
+    function githubHttpCacheKey(url, headers = {}) {
+        const accept = String(headers.Accept || '');
+        return `${GITHUB_HTTP_CACHE_PREFIX}${hashPrompt(`${githubHttpCacheScope(headers)}\0${accept}\0${url}`)}`;
+    }
+
+    function readGithubHttpCacheIndex() {
+        const value = GM_getValue(GITHUB_HTTP_CACHE_INDEX_KEY, []);
+        return Array.isArray(value) ? value.filter((entry) => entry?.key) : [];
+    }
+
+    function writeGithubHttpCacheIndex(entries) {
+        GM_setValue(GITHUB_HTTP_CACHE_INDEX_KEY, entries);
+    }
+
+    function pruneGithubHttpCache(now = Date.now()) {
+        const entries = readGithubHttpCacheIndex().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+        const kept = [];
+        let totalBytes = 0;
+        for (const entry of entries) {
+            const bytes = Math.max(0, Number(entry.bytes || 0));
+            const expired = !Number.isFinite(entry.ts) || now - Number(entry.ts) > GITHUB_HTTP_CACHE_MAX_AGE_MS;
+            const overBudget =
+                kept.length >= GITHUB_HTTP_CACHE_MAX_ENTRIES || totalBytes + bytes > GITHUB_HTTP_CACHE_MAX_TOTAL_BYTES;
+            if (expired || overBudget) {
+                GM_deleteValue(entry.key);
+                continue;
+            }
+            kept.push(entry);
+            totalBytes += bytes;
+        }
+        writeGithubHttpCacheIndex(kept);
+        return kept;
+    }
+
+    function readGithubHttpCache(url, headers = {}, now = Date.now()) {
+        const key = githubHttpCacheKey(url, headers);
+        const cached = GM_getValue(key, null);
+        if (
+            !cached ||
+            cached.url !== url ||
+            cached.scope !== githubHttpCacheScope(headers) ||
+            typeof cached.etag !== 'string' ||
+            !cached.etag ||
+            !Object.prototype.hasOwnProperty.call(cached, 'data') ||
+            !Number.isFinite(cached.ts) ||
+            now - cached.ts > GITHUB_HTTP_CACHE_MAX_AGE_MS
+        ) {
+            if (cached) GM_deleteValue(key);
+            return null;
+        }
+        return { key, ...cached };
+    }
+
+    function invalidateGithubHttpCacheForPR(prKey) {
+        if (!prKey) return 0;
+        const entries = readGithubHttpCacheIndex();
+        const kept = [];
+        let removed = 0;
+        for (const entry of entries) {
+            if (entry.prKey === prKey) {
+                GM_deleteValue(entry.key);
+                removed++;
+            } else {
+                kept.push(entry);
+            }
+        }
+        if (removed) writeGithubHttpCacheIndex(kept);
+        return removed;
+    }
+
+    function rememberGithubHttpCache(url, headers, response, data) {
+        const etag = githubResponseHeader(response, 'etag');
+        const bytes = String(response?.responseText || '').length;
+        if (!etag || bytes > GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES) return null;
+
+        const key = githubHttpCacheKey(url, headers);
+        const previous = readGithubHttpCache(url, headers);
+        const prKey = githubHttpCachePRKey(url);
+        if (previous?.etag && previous.etag !== etag && prKey) invalidateGithubHttpCacheForPR(prKey);
+
+        const value = {
+            url,
+            scope: githubHttpCacheScope(headers),
+            etag,
+            data,
+            ts: Date.now(),
+            bytes,
+        };
+        GM_setValue(key, value);
+        const index = readGithubHttpCacheIndex().filter((entry) => entry.key !== key);
+        index.push({ key, prKey, ts: value.ts, bytes });
+        writeGithubHttpCacheIndex(index);
+        pruneGithubHttpCache(value.ts);
+        return value;
+    }
+
+    function githubConditionalHeaders(headers, cached) {
+        return cached?.etag ? { ...headers, 'If-None-Match': cached.etag } : headers;
+    }
+
+    function touchGithubHttpCache(cached) {
+        if (!cached?.key) return cached;
+        const value = { ...cached, ts: Date.now() };
+        delete value.key;
+        GM_setValue(cached.key, value);
+        const index = readGithubHttpCacheIndex().filter((entry) => entry.key !== cached.key);
+        index.push({
+            key: cached.key,
+            prKey: githubHttpCachePRKey(cached.url),
+            ts: value.ts,
+            bytes: value.bytes,
+        });
+        writeGithubHttpCacheIndex(index);
+        pruneGithubHttpCache(value.ts);
+        return { key: cached.key, ...value };
+    }
+
     function gmFetch(url) {
         return new Promise((resolve, reject) => {
-            const headers = ghApiHeaders();
+            const baseHeaders = ghApiHeaders();
+            const cached = readGithubHttpCache(url, baseHeaders);
+            const headers = githubConditionalHeaders(baseHeaders, cached);
             const preflight = githubRateLimitPreflightError(url, headers);
             if (preflight) {
                 reject(preflight);
@@ -2572,9 +2714,13 @@
                 url,
                 headers,
                 onload: (r) => {
-                    if (r.status >= 200 && r.status < 300) {
+                    if (r.status === 304 && cached) {
+                        resolve(touchGithubHttpCache(cached).data);
+                    } else if (r.status >= 200 && r.status < 300) {
                         try {
-                            resolve(parseGithubJson(r, url));
+                            const data = parseGithubJson(r, url);
+                            rememberGithubHttpCache(url, baseHeaders, r, data);
+                            resolve(data);
                         } catch (e) {
                             reject(e);
                         }
@@ -2587,7 +2733,9 @@
                             return;
                         }
                         rememberGithubBadPat(r);
-                        const fallbackHeaders = { Accept: 'application/vnd.github+json' };
+                        const fallbackBaseHeaders = { Accept: 'application/vnd.github+json' };
+                        const fallbackCached = readGithubHttpCache(url, fallbackBaseHeaders);
+                        const fallbackHeaders = githubConditionalHeaders(fallbackBaseHeaders, fallbackCached);
                         const fallbackPreflight = githubRateLimitPreflightError(url, fallbackHeaders);
                         if (fallbackPreflight) {
                             reject(fallbackPreflight);
@@ -2598,9 +2746,13 @@
                             url,
                             headers: fallbackHeaders,
                             onload: (r2) => {
-                                if (r2.status >= 200 && r2.status < 300) {
+                                if (r2.status === 304 && fallbackCached) {
+                                    resolve(touchGithubHttpCache(fallbackCached).data);
+                                } else if (r2.status >= 200 && r2.status < 300) {
                                     try {
-                                        resolve(parseGithubJson(r2, url));
+                                        const data = parseGithubJson(r2, url);
+                                        rememberGithubHttpCache(url, fallbackBaseHeaders, r2, data);
+                                        resolve(data);
                                     } catch (e) {
                                         reject(e);
                                     }
@@ -5893,6 +6045,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 count++;
             }
         });
+        count += invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         count += clearRobotChatHistoryForPage();
         return count;
     }
@@ -5914,6 +6067,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('pr_context_') ||
             k.startsWith('commitlist_') ||
             k.startsWith('forcepush_sig_') ||
+            k.startsWith(GITHUB_HTTP_CACHE_PREFIX) ||
+            k === GITHUB_HTTP_CACHE_INDEX_KEY ||
             k === 'llm_cache_timestamps';
         keys.forEach((k) => {
             if (isCacheKey(k)) {
@@ -34640,6 +34795,69 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('isGithubRateLimitResponse(r)'), 'does NOT retry on rate limit (that needs auth, not less auth)');
     });
 
+    ackTest('GitHub HTTP cache identifies PR endpoints without exposing credentials', () => {
+        ackEq(
+            githubHttpCachePRKey('https://api.github.com/repos/octo/demo/pulls/42/comments?per_page=100'),
+            'octo/demo#42',
+            'maps review-comment endpoints to their PR',
+        );
+        ackEq(
+            githubHttpCachePRKey('https://api.github.com/repos/octo/demo/issues/42/comments?per_page=100'),
+            'octo/demo#42',
+            'maps issue-comment endpoints to the same PR',
+        );
+        ackEq(githubHttpCachePRKey('https://api.github.com/repos/octo/demo/commits/abc'), '', 'ignores repo-wide endpoints');
+        const key = githubHttpCacheKey('https://api.github.com/repos/octo/demo/pulls/42', {
+            Accept: 'application/vnd.github+json',
+            Authorization: 'Bearer secret-token',
+        });
+        ackAssert(key.startsWith(GITHUB_HTTP_CACHE_PREFIX), 'uses the dedicated cache namespace');
+        ackAssert(!key.includes('secret-token'), 'does not expose the token in the cache key');
+    });
+
+    ackTest('gmFetch reuses JSON only after an ETag validation', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/77/comments?per_page=100';
+        const baseHeaders = ghApiHeaders();
+        const cachedData = [{ id: 1, body: 'cached' }];
+        rememberGithubHttpCache(
+            url,
+            baseHeaders,
+            { responseText: JSON.stringify(cachedData), responseHeaders: 'etag: "comments-v1"' },
+            cachedData,
+        );
+
+        const originalRequest = GM_xmlhttpRequest;
+        let requestedHeaders = null;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                requestedHeaders = opts.headers;
+                opts.onload?.({ status: 304, responseText: '', responseHeaders: 'etag: "comments-v1"' });
+            };
+            ackDeepEq(await gmFetch(url), cachedData, 'returns the previously parsed response after 304');
+            ackEq(requestedHeaders?.['If-None-Match'], '"comments-v1"', 'asks GitHub to validate the cached ETag');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#77');
+        }
+    });
+
+    ackTest('a changed GitHub ETag invalidates every cached endpoint for that PR', () => {
+        const headers = { Accept: 'application/vnd.github+json' };
+        const commentsUrl = 'https://api.github.com/repos/ack-cache-test/demo/issues/78/comments?per_page=100';
+        const reviewsUrl = 'https://api.github.com/repos/ack-cache-test/demo/pulls/78/reviews?per_page=100';
+        const response = (etag, data) => ({
+            responseText: JSON.stringify(data),
+            responseHeaders: `etag: "${etag}"`,
+        });
+        rememberGithubHttpCache(commentsUrl, headers, response('comments-v1', [{ id: 1 }]), [{ id: 1 }]);
+        rememberGithubHttpCache(reviewsUrl, headers, response('reviews-v1', [{ id: 2 }]), [{ id: 2 }]);
+        rememberGithubHttpCache(commentsUrl, headers, response('comments-v2', [{ id: 3 }]), [{ id: 3 }]);
+
+        ackEq(readGithubHttpCache(reviewsUrl, headers), null, 'drops sibling endpoint data after a detected change');
+        ackDeepEq(readGithubHttpCache(commentsUrl, headers)?.data, [{ id: 3 }], 'keeps only the new response');
+        invalidateGithubHttpCacheForPR('ack-cache-test/demo#78');
+    });
+
     ackTest('GitHub API helpers remember bad PATs and rate limits', () => {
         const source = _ackSource;
         const helpers = sourceSection(source, 'function githubPatValue', 'function githubTransportError');
@@ -34712,7 +34930,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('gmFetch fails fast after known rate limits and disables bad PATs', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
-        ackAssert(fn.includes('const headers = ghApiHeaders()'), 'captures request headers once');
+        ackAssert(fn.includes('const baseHeaders = ghApiHeaders()'), 'captures request headers once');
         ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips known rate-limited auth bucket');
         ackAssert(fn.includes('rememberGithubBadPat(r)'), 'memoizes invalid PAT before retrying anonymously');
         ackAssert(fn.includes('fallbackPreflight'), 'checks anonymous rate limit before fallback request');
@@ -37727,6 +37945,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('llm_lightbulb_autoopen_'), 'clears auto-open cache flags');
         ackAssert(fn.includes('infographicPrefix'), 'has infographic prefix');
         ackAssert(fn.includes('prInfographicCachePrefix(pr)'), 'clears infographic cache through helper prefix');
+        ackAssert(fn.includes('invalidateGithubHttpCacheForPR'), 'clears cached GitHub responses for this PR');
         ackAssert(fn.includes('clearRobotChatHistoryForPage()'), 'clears PR robot chat history with PR caches');
         ackAssert(_ackSource.includes('function robotChatHistoryKeyForPage'), 'has shared robot history key helper');
         ackAssert(_ackSource.includes('ack_robot_chat_threads:'), 'robot history uses dedicated storage prefix');
@@ -38742,6 +38961,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('llm_prompt_'), 'clears LLM prompt caches');
         ackAssert(fn.includes('org_members_'), 'clears org member cache');
         ackAssert(fn.includes('repo_members_'), 'clears legacy repo member cache');
+        ackAssert(fn.includes('GITHUB_HTTP_CACHE_PREFIX'), 'clears cached GitHub responses');
+        ackAssert(fn.includes('GITHUB_HTTP_CACHE_INDEX_KEY'), 'clears the GitHub response cache index');
         ackAssert(fn.includes('llm_cache_timestamps'), 'clears cache timestamps');
         ackAssert(fn.includes('_orgMemberCache'), 'clears in-memory org cache');
         ackAssert(fn.includes('_reviewCommitMap'), 'clears review commit map');
