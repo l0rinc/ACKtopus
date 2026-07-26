@@ -26415,6 +26415,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('pre-push commands quote every upstream shorthand for zsh', () => {
+        const origBase = getReviewBaseBranch;
+        try {
+            getReviewBaseBranch = () => 'main';
+            // zsh brace-expands a bare @{u} into @u, so each use must stay quoted.
+            for (const cmd of [prePushRangeDiffCommand(), prePushRangeDiffCommand(true)]) {
+                const occurrences = (cmd.match(/@\{u\}/g) || []).length;
+                ackAssert(occurrences > 0, 'references the upstream tracking branch');
+                const quoted = (cmd.match(/['"][^'"]*@\{u\}[^'"]*['"]/g) || []).length;
+                ackEq(quoted, occurrences, 'every upstream shorthand is quoted');
+            }
+        } finally {
+            getReviewBaseBranch = origBase;
+        }
+    });
+
     ackTest('pushrdiff Shift command compares collapsed stack effects', () => {
         const f = SHA_FORMATS.find((format) => format.key === 'pushrdiff');
         const origBase = getReviewBaseBranch;
