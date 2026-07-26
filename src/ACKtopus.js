@@ -4516,6 +4516,17 @@
         }
     }
 
+    function mutationBatchMightContainCompareFiles(mutations) {
+        for (const mutation of mutations || []) {
+            for (const node of mutation.addedNodes || []) {
+                if (node.nodeType !== 1) continue;
+                if (node.matches?.('[data-tagsearch-path]') || node.querySelector?.('[data-tagsearch-path]'))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     async function autoCollapseCompareFiles() {
         if (!location.pathname.includes('/compare/')) return;
         const compareLocationKey = `${location.pathname}${location.search}`;
@@ -4936,7 +4947,7 @@
         clearCompareWatcher();
         const startedAt = Date.now();
         const QUIET_STATUS_MS = 10000;
-        const WATCHDOG_MS = 2000;
+        const WATCHDOG_MS = 10000;
         const HARD_MAX_MS = 30 * 60 * 1000;
         let quietStatusShown = false;
         const runCompareCollapsePass = () => {
@@ -4982,8 +4993,9 @@
                 finishCompareStatus(`Compare: kept ${totalKept}, hid ${totalCollapsed}; still watching lazy-loaded files`);
             }
         }, WATCHDOG_MS);
-        _compareObserver = new MutationObserver(() => {
+        _compareObserver = new MutationObserver((mutations) => {
             if (_ackTesting) return;
+            if (!mutationBatchMightContainCompareFiles(mutations)) return;
             if (_compareDebounceTimer) clearTimeout(_compareDebounceTimer);
             _compareDebounceTimer = setTimeout(() => {
                 _compareDebounceTimer = null;
@@ -33688,14 +33700,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('clearCompareWatcher()'), 'clears any previous compare watcher before starting');
         ackAssert(fn.includes('const QUIET_STATUS_MS = 10000'), 'keeps the short quiet window only for status');
-        ackAssert(fn.includes('const WATCHDOG_MS = 2000'), 'polls periodically for late file cards');
+        ackAssert(fn.includes('const WATCHDOG_MS = 10000'), 'uses a low-frequency fallback for late file cards');
         ackAssert(fn.includes('const HARD_MAX_MS = 30 * 60 * 1000'), 'keeps the watcher alive long enough for big compares');
         ackAssert(fn.includes('runCompareCollapsePass()'), 'reuses collapse pass from observer and watchdog');
+        ackAssert(
+            fn.includes('mutationBatchMightContainCompareFiles(mutations)'),
+            'ignores unrelated body mutations',
+        );
         ackAssert(
             fn.includes("logCompareOutcome('watching lazy-loaded files'"),
             'does not stop merely because the page was briefly idle',
         );
         ackAssert(!fn.includes("stopWatching(`idle ${"), 'does not stop on the 10s idle window');
+    });
+
+    ackTest('compare mutation gate only accepts new file cards', () => {
+        const unrelated = document.createElement('div');
+        unrelated.innerHTML = '<span>status</span>';
+        const file = document.createElement('div');
+        file.dataset.tagsearchPath = 'src/file.cpp';
+        const wrapper = document.createElement('div');
+        wrapper.appendChild(file);
+        ackEq(
+            mutationBatchMightContainCompareFiles([{ addedNodes: [unrelated] }]),
+            false,
+            'ignores unrelated GitHub updates',
+        );
+        ackEq(
+            mutationBatchMightContainCompareFiles([{ addedNodes: [file] }]),
+            true,
+            'accepts a directly added file card',
+        );
+        ackEq(
+            mutationBatchMightContainCompareFiles([{ addedNodes: [wrapper] }]),
+            true,
+            'accepts a subtree containing file cards',
+        );
     });
 
     ackTest('config panel shows GitHub Token before AI provider section', () => {
