@@ -2565,6 +2565,8 @@
     const GITHUB_HTTP_CACHE_MAX_ENTRIES = 48;
     const GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES = 1500 * 1024;
     const GITHUB_HTTP_CACHE_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+    const GITHUB_PAGED_HINTS_KEY = 'github_paged_hints_v1';
+    const GITHUB_PAGED_HINTS_MAX = 96;
 
     function githubHttpCachePRKey(url) {
         try {
@@ -2585,6 +2587,53 @@
     function githubHttpCacheKey(url, headers = {}) {
         const accept = String(headers.Accept || '');
         return `${GITHUB_HTTP_CACHE_PREFIX}${hashPrompt(`${githubHttpCacheScope(headers)}\0${accept}\0${url}`)}`;
+    }
+
+    function githubPagedRequestTemplate(urlForPage) {
+        const firstPage = String(urlForPage?.(1) || '');
+        const template = firstPage.replace(/([?&]page=)1(?=&|$)/, '$1{page}');
+        return template === firstPage ? '' : template;
+    }
+
+    function readGithubPagedHints() {
+        const value = GM_getValue(GITHUB_PAGED_HINTS_KEY, {});
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    }
+
+    function githubPagedHint(urlForPage) {
+        const template = githubPagedRequestTemplate(urlForPage);
+        if (!template) return 0;
+        const entry = readGithubPagedHints()[hashPrompt(template)];
+        return entry?.template === template && Number.isInteger(entry.pages) && entry.pages > 0 ? entry.pages : 0;
+    }
+
+    function rememberGithubPagedHint(urlForPage, pages) {
+        const template = githubPagedRequestTemplate(urlForPage);
+        if (!template || !Number.isInteger(pages) || pages < 1) return;
+        const hints = readGithubPagedHints();
+        hints[hashPrompt(template)] = {
+            template,
+            pages,
+            prKey: githubHttpCachePRKey(urlForPage(1)),
+            ts: Date.now(),
+        };
+        const kept = Object.entries(hints)
+            .sort(([, a], [, b]) => Number(b?.ts || 0) - Number(a?.ts || 0))
+            .slice(0, GITHUB_PAGED_HINTS_MAX);
+        GM_setValue(GITHUB_PAGED_HINTS_KEY, Object.fromEntries(kept));
+    }
+
+    function invalidateGithubPagedHintsForPR(prKey) {
+        if (!prKey) return 0;
+        const hints = readGithubPagedHints();
+        let removed = 0;
+        for (const [key, entry] of Object.entries(hints)) {
+            if (entry?.prKey !== prKey) continue;
+            delete hints[key];
+            removed++;
+        }
+        if (removed) GM_setValue(GITHUB_PAGED_HINTS_KEY, hints);
+        return removed;
     }
 
     function readGithubHttpCacheIndex() {
@@ -2649,7 +2698,7 @@
             }
         }
         if (removed) writeGithubHttpCacheIndex(kept);
-        return removed;
+        return removed + invalidateGithubPagedHintsForPR(prKey);
     }
 
     function rememberGithubHttpCache(url, headers, response, data) {
@@ -6080,6 +6129,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('forcepush_sig_') ||
             k.startsWith(GITHUB_HTTP_CACHE_PREFIX) ||
             k === GITHUB_HTTP_CACHE_INDEX_KEY ||
+            k === GITHUB_PAGED_HINTS_KEY ||
             k === 'llm_cache_timestamps';
         keys.forEach((k) => {
             if (isCacheKey(k)) {
@@ -19933,14 +19983,78 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    async function fetchPagedGithubRows(urlForPage, maxPages = 50) {
-        const out = [];
-        for (let page = 1; page <= maxPages; page++) {
-            const rows = await gmFetch(urlForPage(page));
-            if (!Array.isArray(rows) || rows.length === 0) break;
-            out.push(...rows);
-            if (rows.length < 100) break;
+    const GITHUB_PAGED_VALIDATION_CONCURRENCY = 4;
+    const githubPagedValidationQueue = [];
+    let githubPagedValidationActive = 0;
+
+    function drainGithubPagedValidationQueue() {
+        while (
+            githubPagedValidationActive < GITHUB_PAGED_VALIDATION_CONCURRENCY &&
+            githubPagedValidationQueue.length
+        ) {
+            const next = githubPagedValidationQueue.shift();
+            githubPagedValidationActive++;
+            Promise.resolve()
+                .then(next.task)
+                .then(next.resolve, next.reject)
+                .finally(() => {
+                    githubPagedValidationActive--;
+                    drainGithubPagedValidationQueue();
+                });
         }
+    }
+
+    function runGithubPagedValidation(task) {
+        return new Promise((resolve, reject) => {
+            githubPagedValidationQueue.push({ task, resolve, reject });
+            drainGithubPagedValidationQueue();
+        });
+    }
+
+    async function fetchPagedGithubRows(urlForPage, maxPages = 50, fetchPage = gmFetch) {
+        const out = [];
+        const knownPages = Math.min(maxPages, githubPagedHint(urlForPage));
+        let nextPage = 1;
+
+        // Every cached page is still conditionally validated. Bounded parallelism
+        // removes serial 304 latency without flooding GitHub on long discussions.
+        for (let start = 1; start <= knownPages; start += GITHUB_PAGED_VALIDATION_CONCURRENCY) {
+            const pages = Array.from(
+                { length: Math.min(GITHUB_PAGED_VALIDATION_CONCURRENCY, knownPages - start + 1) },
+                (_, index) => start + index,
+            );
+            const batches = await Promise.all(
+                pages.map((page) => runGithubPagedValidation(() => fetchPage(urlForPage(page)))),
+            );
+            for (let index = 0; index < batches.length; index++) {
+                const page = pages[index];
+                const rows = batches[index];
+                nextPage = page + 1;
+                if (!Array.isArray(rows) || rows.length === 0) {
+                    rememberGithubPagedHint(urlForPage, page);
+                    return out;
+                }
+                out.push(...rows);
+                if (rows.length < 100) {
+                    rememberGithubPagedHint(urlForPage, page);
+                    return out;
+                }
+            }
+        }
+
+        for (let page = nextPage; page <= maxPages; page++) {
+            const rows = await fetchPage(urlForPage(page));
+            if (!Array.isArray(rows) || rows.length === 0) {
+                rememberGithubPagedHint(urlForPage, page);
+                return out;
+            }
+            out.push(...rows);
+            if (rows.length < 100) {
+                rememberGithubPagedHint(urlForPage, page);
+                return out;
+            }
+        }
+        if (maxPages > 0) rememberGithubPagedHint(urlForPage, maxPages);
         return out;
     }
 
@@ -35018,6 +35132,78 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             GM_xmlhttpRequest = originalRequest;
             _githubJsonRequests.clear();
+        }
+    });
+
+    ackTest('paged GitHub reads validate remembered pages concurrently and detect growth', async () => {
+        const urlForPage = (page) =>
+            `https://api.github.com/repos/ack-paged-test/demo/issues/80/comments?per_page=100&page=${page}`;
+        let growing = false;
+        let active = 0;
+        let maxActive = 0;
+        let calls = [];
+        const originalHints = GM_getValue(GITHUB_PAGED_HINTS_KEY, null);
+        try {
+            GM_deleteValue(GITHUB_PAGED_HINTS_KEY);
+            const fetchPage = async (url) => {
+                const page = Number(new URL(url).searchParams.get('page'));
+                calls.push(page);
+                active++;
+                maxActive = Math.max(maxActive, active);
+                await Promise.resolve();
+                active--;
+                if (page === 1 || (growing && page === 2)) return Array.from({ length: 100 }, (_, id) => ({ id }));
+                if (page === 2 || (growing && page === 3)) return [{ id: page * 100 }];
+                return [];
+            };
+
+            ackEq(
+                (await fetchPagedGithubRows(urlForPage, 50, fetchPage)).length,
+                101,
+                'fetches every row on the first visit',
+            );
+            ackDeepEq(calls, [1, 2], 'discovers the initial page count serially');
+            ackEq(githubPagedHint(urlForPage), 2, 'remembers the validated page count');
+
+            calls = [];
+            maxActive = 0;
+            ackEq(
+                (await fetchPagedGithubRows(urlForPage, 50, fetchPage)).length,
+                101,
+                'reuses every conditionally validated page',
+            );
+            ackDeepEq(calls, [1, 2], 'validates the remembered pages');
+            ackAssert(maxActive <= GITHUB_PAGED_VALIDATION_CONCURRENCY, 'keeps validation concurrency bounded');
+
+            const relatedEndpoints = [
+                urlForPage,
+                (page) =>
+                    `https://api.github.com/repos/ack-paged-test/demo/pulls/80/reviews?per_page=100&page=${page}`,
+                (page) =>
+                    `https://api.github.com/repos/ack-paged-test/demo/pulls/80/comments?per_page=100&page=${page}`,
+            ];
+            relatedEndpoints.forEach((endpoint) => rememberGithubPagedHint(endpoint, 2));
+            calls = [];
+            maxActive = 0;
+            const relatedResults = await Promise.all(
+                relatedEndpoints.map((endpoint) => fetchPagedGithubRows(endpoint, 50, fetchPage)),
+            );
+            ackAssert(relatedResults.every((rows) => rows.length === 101), 'validates every related collection');
+            ackAssert(maxActive <= GITHUB_PAGED_VALIDATION_CONCURRENCY, 'shares one concurrency gate across collections');
+
+            growing = true;
+            calls = [];
+            ackEq(
+                (await fetchPagedGithubRows(urlForPage, 50, fetchPage)).length,
+                201,
+                'continues when the last known page fills',
+            );
+            ackDeepEq(calls, [1, 2, 3], 'checks the newly created page');
+            ackEq(githubPagedHint(urlForPage), 3, 'updates the page-count hint after growth');
+        } finally {
+            invalidateGithubHttpCacheForPR('ack-paged-test/demo#80');
+            if (originalHints === null) GM_deleteValue(GITHUB_PAGED_HINTS_KEY);
+            else GM_setValue(GITHUB_PAGED_HINTS_KEY, originalHints);
         }
     });
 
