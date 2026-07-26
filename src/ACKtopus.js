@@ -15633,12 +15633,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function leafLazyCommentContainers(root = document) {
         const candidates = qsa(root, LAZY_COMMENT_SEL);
-        const candidateSet = new Set(candidates);
         const containersWithNestedCandidates = new Set();
+        const ancestorStack = [];
         for (const candidate of candidates) {
-            for (let parent = candidate.parentElement; parent; parent = parent.parentElement) {
-                if (candidateSet.has(parent)) containersWithNestedCandidates.add(parent);
+            while (ancestorStack.length && !ancestorStack[ancestorStack.length - 1].contains(candidate)) {
+                ancestorStack.pop();
             }
+            if (ancestorStack.length) containersWithNestedCandidates.add(ancestorStack[ancestorStack.length - 1]);
+            ancestorStack.push(candidate);
         }
         return candidates.filter((candidate) => !containersWithNestedCandidates.has(candidate));
     }
@@ -21179,8 +21181,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = parsePR();
         if (!pr) return;
         const reviewCommitMap = _reviewCommitMap?.map || {};
+        const hasReviewCommitMap = Object.keys(reviewCommitMap).length > 0;
 
-        const containers = root.querySelectorAll(WIDE_COMMENT_CONTAINER_SELECTOR);
+        const containers = qsa(root, WIDE_COMMENT_CONTAINER_SELECTOR);
         const seen = new Set();
         for (const container of containers) {
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
@@ -21214,7 +21217,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             // Fallback: look up comment ID in API review commit map
-            if (!commitSha && Object.keys(reviewCommitMap).length > 0) {
+            if (!commitSha && hasReviewCommitMap) {
                 // Try turbo-frame id pattern: review-thread-or-comment-id-XXXXXXXX
                 const frame =
                     container.closest('turbo-frame[id*="comment-id-"]') ||
@@ -31592,6 +31595,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ['inner-comment', 'issue-body-candidate'],
             'keeps only innermost comments and the PR body',
         );
+        const fn = sourceSection(_ackSource, 'function leafLazyCommentContainers', 'function processVisibleComment');
+        ackAssert(fn.includes('ancestorStack'), 'tracks nested candidates in document order');
+        ackAssert(!fn.includes('candidate.parentElement'), 'does not walk every ancestor for every comment');
     });
 
     ackTest('DOM observer editor gate includes compare-page compose mode', () => {
@@ -42328,6 +42334,12 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('_reviewCommitMap'), 'reads API commit map from module state');
         ackAssert(fn.includes('comment-id-'), 'looks up turbo-frame comment IDs');
         ackAssert(fn.includes('discussion_r'), 'looks up permalink discussion IDs');
+        ackAssert(fn.includes('qsa(root, WIDE_COMMENT_CONTAINER_SELECTOR)'), 'includes a visible root comment itself');
+        ackAssert(fn.includes('const hasReviewCommitMap'), 'checks API map availability once per batch');
+        ackAssert(
+            !fn.includes('if (!commitSha && Object.keys(reviewCommitMap).length > 0)'),
+            'does not enumerate the API map for every comment',
+        );
     });
 
     ackTest('addCommitBadges reads _reviewCommitMap and runs lazily + after API fetch', () => {
