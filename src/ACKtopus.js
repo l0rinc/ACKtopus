@@ -2918,7 +2918,7 @@
     const ACK_TABLE_RE =
         /[|>\t ]\s*(?:\[)?(ACK|Concept ACK|NACK|Concept NACK|Approach ACK|Approach NACK|tACK|Stale ACK)(?:\][^\|]*)?\s*[|\t]\s*(.+)/;
 
-    async function parseAcksFromAPI() {
+    async function parseAcksFromAPI(apiSnapshots = null) {
         const pr = parsePR();
         if (!pr) return [];
         try {
@@ -2926,6 +2926,7 @@
                 const comments = await gmFetch(
                     `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/comments?per_page=100&page=${page}`,
                 );
+                if (page === 1 && apiSnapshots) apiSnapshots.issueComments = comments;
                 for (const c of comments) {
                     if (c.user.login !== 'DrahtBot') continue;
                     if (!c.body.includes('### Reviews')) continue;
@@ -3368,7 +3369,7 @@
     // Fetch members: org public list (cached globally 24h) + per-PR associations (always fresh).
     const _orgMemberCache = {}; // { org: { members: Set, ts: number } }
 
-    async function fetchRepoMembers(owner, repo, prNum) {
+    async function fetchRepoMembers(owner, repo, prNum, apiSnapshots = {}) {
         const ORG_TTL = 24 * 60 * 60 * 1000; // 24h
         const gmKey = `org_members_${owner}`;
         const now = Date.now();
@@ -3458,9 +3459,12 @@
 
             const beforeIssue = members.size;
             try {
-                const comments = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/issues/${prNum}/comments?per_page=100&page=1`,
-                );
+                const comments =
+                    (Array.isArray(apiSnapshots.issueComments) && apiSnapshots.issueComments) ||
+                    (await gmFetch(
+                        `https://api.github.com/repos/${owner}/${repo}/issues/${prNum}/comments?per_page=100&page=1`,
+                    ));
+                apiSnapshots.issueComments = comments;
                 for (const c of comments) {
                     const assoc = c.author_association;
                     if (assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') {
@@ -3480,9 +3484,12 @@
             // Source: inline review comments (code comments on diff lines)
             const beforeInline = members.size;
             try {
-                const inline = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=1`,
-                );
+                const inline =
+                    (Array.isArray(apiSnapshots.inlineComments) && apiSnapshots.inlineComments) ||
+                    (await gmFetch(
+                        `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=1`,
+                    ));
+                apiSnapshots.inlineComments = inline;
                 for (const c of inline) {
                     const assoc = c.author_association;
                     if (assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') {
@@ -3539,15 +3546,18 @@
     // Map review comment ID → original_commit_id (cached per PR)
     let _reviewCommitMap = null; // { prKey, map: { commentId: commitSha } }
 
-    async function fetchReviewCommentCommits(owner, repo, prNum) {
+    async function fetchReviewCommentCommits(owner, repo, prNum, apiSnapshots = {}) {
         const prKey = `${owner}/${repo}#${prNum}`;
         if (_reviewCommitMap && _reviewCommitMap.prKey === prKey) return _reviewCommitMap.map;
         const map = {};
         try {
             for (let page = 1; page <= 5; page++) {
-                const comments = await gmFetch(
-                    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=${page}`,
-                );
+                const comments =
+                    (page === 1 && Array.isArray(apiSnapshots.inlineComments) && apiSnapshots.inlineComments) ||
+                    (await gmFetch(
+                        `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=${page}`,
+                    ));
+                if (page === 1) apiSnapshots.inlineComments = comments;
                 for (const c of comments) {
                     if (c.id && c.original_commit_id) {
                         map[c.id] = c.original_commit_id.slice(0, 7);
@@ -24350,6 +24360,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function loadAsyncPRData(wrapper, toolbar) {
         const pr = parsePR();
+        const apiSnapshots = {};
         const ackToggleBtn = toolbar.querySelector('button[title*="ACK panel"]');
         let fileCategorySignature = '';
         const applyFileCategories = (cats, source) => {
@@ -24381,7 +24392,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let acks = parseAcksFromPage();
         let ackSource = 'DOM';
         if (acks.length === 0) {
-            acks = await parseAcksFromAPI();
+            acks = await parseAcksFromAPI(apiSnapshots);
             ackSource = 'GitHub API';
         }
         ackLogEvent(`ACK discovery: ${acks.length} from ${ackSource}`, {
@@ -24396,7 +24407,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ackToggleBtn.disabled = false;
                 Object.assign(ackToggleBtn.style, { opacity: '', cursor: '' });
             }
-            const memberLogins = pr ? await fetchRepoMembers(pr.owner, pr.repo, pr.pr) : new Set();
+            const memberLogins = pr ? await fetchRepoMembers(pr.owner, pr.repo, pr.pr, apiSnapshots) : new Set();
             const maintainerLogins = getMaintainerLogins();
             const ackUsers = acks.map((a) => a.user);
             const boldUsers = ackUsers.filter((u) => memberLogins.has(u) || maintainerLogins.has(u));
@@ -24482,7 +24493,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
 
         if (pr) {
-            await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
+            await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr, apiSnapshots);
             scheduleAckBackgroundWork('commit-badges-after-api', () => addCommitBadges(document), {
                 delayMs: 120,
                 reason: 'review-comment-commit-map',
@@ -33443,6 +33454,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('pulls/${prNum}/comments'), 'fetches inline review comments');
         ackAssert(fn.includes('issues/${prNum}/comments'), 'fetches issue comments');
         ackEq((fn.match(/per_page=100&page=1/g) || []).length, 3, 'shares canonical first-page request URLs');
+        ackAssert(fn.includes('apiSnapshots.issueComments'), 'reuses issue comments from ACK discovery');
+        ackAssert(fn.includes('apiSnapshots.inlineComments'), 'shares inline comments with commit badge setup');
         ackAssert(fn.includes('org_members_'), 'org members cached globally');
         ackAssert(fn.includes('_orgMemberCache'), 'has in-memory org cache');
         ackAssert(fn.includes('new Set(orgMembers)'), 'copies org set before adding PR-specific');
@@ -33467,6 +33480,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('_reviewCommitMap'), 'caches per PR in memory');
         ackAssert(fn.includes('page <= 5'), 'paginates up to 5 pages');
         ackAssert(fn.includes('comments.length < 100'), 'stops on last page');
+        ackAssert(fn.includes('apiSnapshots.inlineComments'), 'accepts the inline-comment first page from member discovery');
+    });
+
+    ackTest('fetchReviewCommentCommits reuses an inline-comment snapshot without a request', async () => {
+        const previousMap = _reviewCommitMap;
+        try {
+            _reviewCommitMap = null;
+            const map = await fetchReviewCommentCommits('ack-snapshot-test', 'demo', 81, {
+                inlineComments: [
+                    {
+                        id: 123,
+                        original_commit_id: 'abcdef0123456789',
+                    },
+                ],
+            });
+            ackDeepEq(map, { 123: 'abcdef0' }, 'builds the map from the supplied first page');
+        } finally {
+            _reviewCommitMap = previousMap;
+        }
     });
 
     ackTest('parseAcksFromAPI paginates issue comments to find DrahtBot', () => {
@@ -33479,6 +33511,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('comments.length < 100'), 'stops on last page');
         ackAssert(fn.includes('DrahtBot'), 'searches for DrahtBot comment');
         ackAssert(fn.includes('### Reviews'), 'looks for Reviews table');
+        ackAssert(fn.includes('apiSnapshots.issueComments = comments'), 'shares the first page with member discovery');
     });
 
     ackTest('parseAcksFromPage accepts Approach NACK rows from DrahtBot tables', () => {
@@ -44107,8 +44140,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'starts file category fetch immediately',
         );
         ackAssert(
-            fn.indexOf('fetchPRFileCategories(pr)') < fn.indexOf('parseAcksFromAPI()'),
+            fn.indexOf('fetchPRFileCategories(pr)') < fn.indexOf('parseAcksFromAPI(apiSnapshots)'),
             'starts file category fetch before ACK API fallback',
+        );
+        ackAssert(fn.includes('fetchRepoMembers(pr.owner, pr.repo, pr.pr, apiSnapshots)'), 'reuses ACK comment rows');
+        ackAssert(
+            fn.includes('fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr, apiSnapshots)'),
+            'reuses inline comment rows',
         );
         ackAssert(
             fn.includes('fileCategoriesPromise.then(') && fn.includes("applyFileCategories(cats, 'API/DOM')"),
