@@ -2206,9 +2206,14 @@
         };
     }
 
-    function getLoadableElements() {
+    function getConversationLoaderElements() {
         const paginationBtns = [...document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR)];
         const timelineLoadMore = getIssueTimelineLoadMoreButtons();
+        return { paginationBtns, timelineLoadMore };
+    }
+
+    function getLoadableElements() {
+        const { paginationBtns, timelineLoadMore } = getConversationLoaderElements();
         const minimized = [
             ...document.querySelectorAll(
                 '.minimized-comment .timeline-comment-header,' +
@@ -2805,7 +2810,8 @@
     let reviewCommentHashNavigationKey = '';
     let reviewCommentHashNavigationCompletedKey = '';
     let reviewCommentHashNavigationTimer = null;
-    let reviewCommentHashRevealActive = false;
+    const REVIEW_COMMENT_HASH_MAX_ATTEMPTS = 24;
+    const REVIEW_COMMENT_HASH_REVEAL_BATCH_SIZE = 3;
 
     function reviewCommentDiscussionHashId(hash = location.hash) {
         const match = String(hash || '').match(/^#discussion_r(\d+)$/);
@@ -2830,10 +2836,13 @@
     }
 
     function navigateToReviewCommentHashTarget(id) {
-        const target =
-            navigateToFragment(`${location.pathname}${location.search}#discussion_r${id}`) ||
-            findReviewCommentHashTarget(id);
+        const target = findReviewCommentHashTarget(id);
         if (!target) return null;
+        let parent = target.closest?.('details:not([open])');
+        while (parent) {
+            parent.setAttribute('open', '');
+            parent = parent.parentElement?.closest?.('details:not([open])');
+        }
         scrollToAndHighlight(target);
         return target;
     }
@@ -2843,7 +2852,19 @@
     }
 
     function getReviewCommentRevealState() {
-        const { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs } = getLoadableElements();
+        const { paginationBtns, timelineLoadMore } = getConversationLoaderElements();
+        if (paginationBtns.length || timelineLoadMore.length) {
+            return {
+                paginationBtns,
+                timelineLoadMore,
+                minimized: [],
+                outdated: [],
+                loadDiffs: [],
+                resolved: [],
+                total: paginationBtns.length + timelineLoadMore.length,
+            };
+        }
+        const { minimized, outdated, loadDiffs } = getLoadableElements();
         const resolved = getCollapsedResolved();
         return {
             paginationBtns,
@@ -2862,24 +2883,36 @@
         };
     }
 
-    function openReviewCommentRevealState(state) {
-        state.paginationBtns.forEach((b) => b.click());
-        state.timelineLoadMore.forEach((b) => b.click());
-        state.resolved.forEach((item) => item.click());
-        state.minimized.forEach((h) => h.click());
-        state.outdated.forEach((d) => d.setAttribute('open', ''));
-        state.loadDiffs.forEach((b) => b.click());
-    }
+    function openReviewCommentRevealState(state, attempted = new WeakSet()) {
+        for (const loaders of [state.paginationBtns, state.timelineLoadMore]) {
+            while (loaders.length) {
+                const loader = loaders.shift();
+                if (!loader?.isConnected || attempted.has(loader)) continue;
+                attempted.add(loader);
+                loader.click();
+                return { opened: 1, loader: true };
+            }
+        }
 
-    function scrollToReviewCommentRevealWork(state) {
-        const target =
-            state.paginationBtns[0] ||
-            state.timelineLoadMore[0] ||
-            state.resolved[0]?.el ||
-            state.minimized[0] ||
-            state.outdated[0] ||
-            state.loadDiffs[0];
-        target?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+        const groups = [
+            { items: state.resolved, element: (item) => item.el, open: (item) => item.click() },
+            { items: state.minimized, element: (item) => item, open: (item) => item.click() },
+            { items: state.outdated, element: (item) => item, open: (item) => item.setAttribute('open', '') },
+            { items: state.loadDiffs, element: (item) => item, open: (item) => item.click() },
+        ];
+        let opened = 0;
+        for (const group of groups) {
+            while (group.items.length && opened < REVIEW_COMMENT_HASH_REVEAL_BATCH_SIZE) {
+                const item = group.items.shift();
+                const el = group.element(item);
+                if (!el?.isConnected || attempted.has(el)) continue;
+                attempted.add(el);
+                group.open(item);
+                opened++;
+            }
+            if (opened >= REVIEW_COMMENT_HASH_REVEAL_BATCH_SIZE) break;
+        }
+        return { opened, loader: false };
     }
 
     async function handleReviewCommentHashNavigation(reason = '') {
@@ -2894,10 +2927,11 @@
         reviewCommentHashNavigationKey = key;
 
         let popup = null;
-        reviewCommentHashRevealActive = true;
+        const attempted = new WeakSet();
+        let state = null;
         try {
             const startedAt = location.href;
-            for (let attempt = 0; attempt < 80; attempt++) {
+            for (let attempt = 0; attempt < REVIEW_COMMENT_HASH_MAX_ATTEMPTS; attempt++) {
                 if (location.href !== startedAt) return false;
                 const target = navigateToReviewCommentHashTarget(id);
                 if (target) {
@@ -2907,43 +2941,53 @@
                     return true;
                 }
 
-                const state = getReviewCommentRevealState();
+                state ||= getReviewCommentRevealState();
                 if (state.total === 0) {
                     if (!popup) popup = makeStatusPopup('Waiting for GitHub to render linked review comment...');
                     popup.textContent = 'Waiting for GitHub to render linked review comment...';
                     if (await ackSleep(500)) return false;
+                    state = null;
                     continue;
                 }
 
                 if (!popup) popup = makeStatusPopup('Opening collapsed sections to find linked review comment...');
                 popup.textContent = `Opening collapsed sections to find linked review comment... ${state.total} remaining`;
-                if (attempt === 0 || attempt % 4 === 0) scrollToReviewCommentRevealWork(state);
-                openReviewCommentRevealState(state);
-                if (await ackSleep(state.paginationBtns.length + state.timelineLoadMore.length > 0 ? 1800 : 700))
-                    return false;
+                const result = openReviewCommentRevealState(state, attempted);
+                if (await ackSleep(result.loader ? 1200 : result.opened ? 350 : 500)) return false;
+                if (result.loader || result.opened === 0) state = null;
             }
 
+            if (location.href !== startedAt) return false;
+            const finalTarget = navigateToReviewCommentHashTarget(id);
+            if (finalTarget) {
+                reviewCommentHashNavigationCompletedKey = key;
+                if (popup) popup.textContent = 'Opened linked review comment';
+                if (popup) setTimeout(() => popup.remove(), 1200);
+                return true;
+            }
+            reviewCommentHashNavigationCompletedKey = key;
             if (popup) popup.textContent = 'Could not find linked review comment after opening collapsed sections';
             if (popup) setTimeout(() => popup.remove(), 2500);
             console.warn(`ACKtopus: could not find review-comment hash target after ${reason || 'navigation'}: #discussion_r${id}`);
             return false;
         } finally {
-            reviewCommentHashRevealActive = false;
             if (popup?.isConnected) {
                 setTimeout(() => {
                     if (popup?.isConnected) popup.remove();
                 }, 2500);
             }
-            ackSetTimeout(() => {
-                if (reviewCommentHashNavigationKey === key) reviewCommentHashNavigationKey = '';
-            }, 5000);
+            if (reviewCommentHashNavigationKey === key) reviewCommentHashNavigationKey = '';
         }
     }
 
     function scheduleReviewCommentHashNavigation(reason = '') {
         if (_ackTesting || !reviewCommentDiscussionHashId()) return;
         if (shouldSkipHashRevealOnce(location.hash, { consume: reason !== 'hashchange' })) return;
-        if (reviewCommentHashNavigationCompletedKey === currentReviewCommentHashNavigationKey()) return;
+        const key = currentReviewCommentHashNavigationKey();
+        if (reviewCommentHashNavigationCompletedKey && reviewCommentHashNavigationCompletedKey !== key) {
+            reviewCommentHashNavigationCompletedKey = '';
+        }
+        if (reviewCommentHashNavigationCompletedKey === key) return;
         if (reviewCommentHashNavigationTimer) ackClearTimeout(reviewCommentHashNavigationTimer);
         reviewCommentHashNavigationTimer = ackSetTimeout(() => {
             reviewCommentHashNavigationTimer = null;
@@ -2951,14 +2995,9 @@
         }, 500);
     }
 
-    function shouldSuppressHiddenConversationRefresh() {
-        return reviewCommentHashRevealActive;
-    }
-
     function resetReviewCommentHashNavigation() {
         reviewCommentHashNavigationKey = '';
         reviewCommentHashNavigationCompletedKey = '';
-        reviewCommentHashRevealActive = false;
         if (reviewCommentHashNavigationTimer) {
             ackClearTimeout(reviewCommentHashNavigationTimer);
             reviewCommentHashNavigationTimer = null;
@@ -3687,9 +3726,9 @@
     // compare page can identify which files belong to the PR and collapse
     // upstream noise. Targets links directly by href pattern -- works in both
     // Classic and React UI.
-    function enhanceForcePushLinks() {
+    function enhanceForcePushLinks(root = document) {
         const pr = parsePR();
-        document.querySelectorAll('a[href*="/compare/"]').forEach((link) => {
+        qsa(root, 'a[href*="/compare/"]').forEach((link) => {
             if (link.dataset.ackCompareEnhanced) return;
             const href = link.getAttribute('href') || '';
             if (!/\/compare\/[0-9a-f]+\.{2,3}[0-9a-f]+/.test(href)) return;
@@ -3705,6 +3744,7 @@
             }
             // Visual indicator that ACKtopus enhanced this link
             const badge = document.createElement('span');
+            badge.className = 'ack-compare-badge';
             badge.textContent = ' \ud83d\udd0d';
             badge.title = 'ACKtopus: upstream files will be collapsed';
             badge.style.fontSize = '12px';
@@ -14655,6 +14695,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function makeStatusPopup(initialText = '') {
         const popup = document.createElement('div');
+        popup.className = 'ack-status-popup';
         Object.assign(popup.style, {
             position: 'fixed',
             bottom: '80px',
@@ -14776,16 +14817,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function applyTimelineFilter(root = document) {
+        const fullPass = root === document;
+        const scope = fullPass ? document : root.closest?.(TIMELINE_FILTER_ITEM_SELECTOR) || root;
         if (!isTimelineFilterPage()) {
-            restoreTimelineFilterItems(document);
-            updateGithubReviewOptions();
+            restoreTimelineFilterItems(scope);
+            if (fullPass) updateGithubReviewOptions();
             return 0;
         }
         const mode = getTimelineFilterMode();
-        restoreTimelineFilterItems(document);
+        restoreTimelineFilterItems(scope);
         let hidden = 0;
         if (mode !== 'all') {
-            for (const item of gatherTimelineFilterItems(document)) {
+            for (const item of gatherTimelineFilterItems(scope)) {
                 if (timelineFilterShouldShowItem(item, mode)) continue;
                 item.dataset.ackTimelineFilterHidden = '1';
                 item.dataset.ackTimelineFilterDisplay = item.style.display || '';
@@ -14793,7 +14836,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 hidden++;
             }
         }
-        updateGithubReviewOptions();
+        if (fullPass) updateGithubReviewOptions();
         return hidden;
     }
 
@@ -15467,6 +15510,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
         { name: 'localRepoCompareLinks', when: (ctx) => ctx.onRepositoryPage, fn: rewriteLocalRepoCompareLinks },
         { name: 'pullRequestListPage', when: (ctx) => ctx.onRepositoryPage, fn: enhancePullRequestListPage },
+        { name: 'enhanceForcePushLinks', when: (ctx) => ctx.onPR, fn: enhanceForcePushLinks },
+        {
+            name: 'timelineFilter',
+            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
+            fn: applyTimelineFilter,
+        },
         { name: 'queueLazyComments', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: queueLazyComments },
         { name: 'startReviewButtons', when: (ctx) => ctx.onPR, fn: addStartReviewButtons },
         {
@@ -15498,12 +15547,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'hideNativeCommitNav', when: (ctx) => ctx.onPR, fn: hideNativeCommitNav },
         { name: 'normalizePRHeaderHeadBranch', when: (ctx) => ctx.onPR, fn: normalizePRHeaderHeadBranch },
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
-        { name: 'enhanceForcePushLinks', when: (ctx) => ctx.onPR, fn: enhanceForcePushLinks },
-        {
-            name: 'timelineFilter',
-            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
-            fn: () => applyTimelineFilter(document),
-        },
         {
             name: 'githubReviewOptions',
             when: (ctx) => ctx.onToolbar,
@@ -15606,7 +15649,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (fastEditorAffordanceTimer) return;
         fastEditorAffordanceTimer = ackSetTimeout(() => {
             fastEditorAffordanceTimer = null;
-            const roots = [...pendingFastEditorRoots];
+            const roots = compactMutationRoots([...pendingFastEditorRoots]);
             pendingFastEditorRoots.clear();
             const ctx = currentInjectContext();
             for (const queuedRoot of roots) runFastEditorAffordances(queuedRoot, ctx);
@@ -15632,22 +15675,85 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // Watch for dynamically added elements. Batches are coalesced and run in
     // idle time so GitHub typing/scrolling stays responsive on huge PRs.
-    const HIDDEN_LOADER_SELECTOR =
-        '.js-review-hidden-comment-ids.ajax-pagination-form, .ajax-pagination-form, .ajax-pagination-btn, ' +
-        ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR;
     const ACK_MUTATION_ROOT_BATCH_SIZE = 16;
+    const ACK_MUTATION_DOC_QUIET_MS = 900;
+    const ACK_MUTATION_OWNED_SELECTOR = [
+        '[id^="acktopus-"]',
+        '[id^="ack-"]',
+        '[class^="ack-"]',
+        '.ack-config-overlay',
+        '.ack-diff-dialog-overlay',
+        '.ack-quick-actions',
+        '.ack-commit-explain-panel',
+        '.ack-explain-panel',
+        '.ack-github-review-options',
+    ].join(', ');
+    const PENDING_REVIEW_MUTATION_SELECTOR = [
+        '.js-pending-review-comment',
+        '.Label--warning',
+        '[title="Label: Pending"]',
+        '[data-testid="pending-badge"]',
+        'input[name="in_reply_to"]',
+        'input[name="inReplyTo"]',
+        'button[name="comment_and_close"]',
+        'button[data-ack-orig-label]',
+        'button[data-testid="submit-review-button"]',
+        'button.js-reviews-toggle',
+        'form[action*="review_comment/create"]',
+        '.ack-submit-review-wrap',
+    ].join(', ');
+    const DOC_INJECTOR_MUTATION_SELECTOR = [
+        'a[aria-label*="next commit" i]',
+        'a[aria-label*="previous commit" i]',
+        'a[data-testid="next-commit-link"]',
+        'a[data-testid="prev-commit-link"]',
+        '.PullRequestHeaderSummary-module__summaryContainer__dA7dP',
+        '[data-testid="commit-row-item"]',
+        '.js-commits-list-item',
+        '.TimelineItem--condensed',
+        '.file-navigation',
+        '[data-component="PH_Actions"]',
+        '.gh-header-actions',
+    ].join(', ');
     let mutationPending = false;
     const pendingMutationRoots = new Set();
-    let pendingMutationHadRemovals = false;
-    let pendingMutationPrTitleBtnRemoved = false;
-    let pendingMutationHiddenLoadersChanged = false;
+    let pendingMutationReviewUiChanged = false;
+    let pendingMutationDocRefreshNeeded = false;
     let _domObserverAbortGen = 0;
 
-    function mutationRootHasHiddenLoader(root) {
+    function isAckOwnedMutationRoot(root) {
+        if (!root || root.nodeType !== 1) return false;
+        return !!root.closest?.(ACK_MUTATION_OWNED_SELECTOR);
+    }
+
+    function compactMutationRoots(roots) {
+        const connected = roots.filter((root) => root === document || root?.isConnected);
+        const rootSet = new Set(connected);
+        return connected.filter((root) => {
+            for (let parent = root.parentElement; parent; parent = parent.parentElement) {
+                if (rootSet.has(parent)) return false;
+            }
+            return true;
+        });
+    }
+
+    function mutationRootMayAffectPendingReview(root) {
         try {
-            if (root.matches?.(HIDDEN_LOADER_SELECTOR)) return true;
-            if (isPullRequestBulkDiffPage()) return false;
-            return !!root.querySelector?.(HIDDEN_LOADER_SELECTOR);
+            return (
+                root?.matches?.(PENDING_REVIEW_MUTATION_SELECTOR) ||
+                !!root?.querySelector?.(PENDING_REVIEW_MUTATION_SELECTOR)
+            );
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function mutationRootMayNeedDocInjectors(root) {
+        try {
+            return (
+                root?.matches?.(DOC_INJECTOR_MUTATION_SELECTOR) ||
+                !!root?.querySelector?.(DOC_INJECTOR_MUTATION_SELECTOR)
+            );
         } catch (_) {
             return false;
         }
@@ -15657,21 +15763,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let changed = false;
         for (const m of mutations) {
             for (const n of m.addedNodes) {
-                if (n.nodeType !== 1) continue;
+                if (n.nodeType !== 1 || isAckOwnedMutationRoot(n)) continue;
                 changed = true;
                 pendingMutationRoots.add(n);
                 scheduleFastEditorAffordancesForMutation(n);
                 scheduleFastCommitPrefill(n);
-                if (mutationRootHasHiddenLoader(n)) pendingMutationHiddenLoadersChanged = true;
+                if (mutationRootMayNeedDocInjectors(n)) pendingMutationDocRefreshNeeded = true;
             }
             for (const n of m.removedNodes) {
                 if (n.nodeType !== 1) continue;
-                changed = true;
-                pendingMutationHadRemovals = true;
-                if (n.matches?.('.ack-pr-title-proofread') || n.querySelector?.('.ack-pr-title-proofread')) {
-                    pendingMutationPrTitleBtnRemoved = true;
+                if (mutationRootMayAffectPendingReview(n)) {
+                    changed = true;
+                    pendingMutationReviewUiChanged = true;
                 }
-                if (mutationRootHasHiddenLoader(n)) pendingMutationHiddenLoadersChanged = true;
+                if (isAckOwnedMutationRoot(n)) continue;
             }
         }
         return changed;
@@ -15682,11 +15787,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
+    function scheduleDocInjectorsAfterMutation() {
+        scheduleAckBackgroundWork(
+            'mutation-doc-injectors',
+            () => {
+                const ctx = currentInjectContext();
+                if (shouldRunDocInjectorsAfterMutation(ctx)) runDocInjectors(ctx);
+            },
+            { delayMs: ACK_MUTATION_DOC_QUIET_MS, timeoutMs: 2500, reason: 'mutation-settled' },
+        );
+    }
+
     function requeueDomMutationBatch(roots, startIndex, flags, delayMs, reason) {
         for (let j = startIndex; j < roots.length; j++) pendingMutationRoots.add(roots[j]);
-        pendingMutationHadRemovals ||= flags.hadRemovals;
-        pendingMutationPrTitleBtnRemoved ||= flags.prTitleBtnRemoved;
-        pendingMutationHiddenLoadersChanged ||= flags.hiddenLoadersChanged;
+        pendingMutationReviewUiChanged ||= flags.reviewUiChanged;
+        pendingMutationDocRefreshNeeded ||= flags.docRefreshNeeded;
         mutationPending = true;
         scheduleAckBackgroundWork('dom-observer', ({ isCanceled }) => drainDomMutationBatch(isCanceled), {
             delayMs,
@@ -15696,25 +15811,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function drainDomMutationBatch(isCanceled) {
         mutationPending = false;
-        const roots = [...pendingMutationRoots];
-        const hadRemovals = pendingMutationHadRemovals;
-        const prTitleBtnRemoved = pendingMutationPrTitleBtnRemoved;
-        const hiddenLoadersChanged = pendingMutationHiddenLoadersChanged;
+        const roots = compactMutationRoots([...pendingMutationRoots]);
+        const reviewUiChanged = pendingMutationReviewUiChanged;
+        const docRefreshNeeded = pendingMutationDocRefreshNeeded;
         pendingMutationRoots.clear();
-        pendingMutationHadRemovals = false;
-        pendingMutationPrTitleBtnRemoved = false;
-        pendingMutationHiddenLoadersChanged = false;
-        if (roots.length === 0 && !prTitleBtnRemoved && !hadRemovals) return;
+        pendingMutationReviewUiChanged = false;
+        pendingMutationDocRefreshNeeded = false;
+        if (roots.length === 0 && !reviewUiChanged) return;
         const ctx = currentInjectContext();
         ackBackgroundLog('mutation injector batch', {
             roots: roots.length,
-            removals: hadRemovals,
-            hidden_loaders: hiddenLoadersChanged,
+            pending_review: reviewUiChanged,
+            document_refresh: docRefreshNeeded,
             last_activity: _ackLastActivityReason,
         });
         let processed = 0;
         let processedThisRun = 0;
-        const flags = { hadRemovals, prTitleBtnRemoved, hiddenLoadersChanged };
+        const flags = { reviewUiChanged, docRefreshNeeded };
         for (const root of roots) {
             if (isCanceled()) {
                 // Re-queue the current root plus all unprocessed ones and restore the
@@ -15733,15 +15846,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
         focusVisibleDeleteCommentConfirmButton();
-        if (prTitleBtnRemoved && (ctx.onPR || ctx.onCompose)) addPRTitleProofreadButton(document);
-        if (shouldRunDocInjectorsAfterMutation(ctx)) runDocInjectors(ctx);
-        if (hiddenLoadersChanged) {
-            if (!shouldSuppressHiddenConversationRefresh()) {
-                refreshToolbarForLiveUpdate('hidden-conversations');
-            }
-            return;
-        }
-        if (ctx.onPR && hadRemovals) resyncPendingReviewUi(document);
+        if (docRefreshNeeded && shouldRunDocInjectorsAfterMutation(ctx)) scheduleDocInjectorsAfterMutation();
+        if (ctx.onPR && reviewUiChanged) resyncPendingReviewUi(document);
     }
 
     new MutationObserver((mutations) => {
@@ -15753,9 +15859,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             lt.onAbort(() => {
                 mutationPending = false;
                 pendingMutationRoots.clear();
-                pendingMutationHadRemovals = false;
-                pendingMutationPrTitleBtnRemoved = false;
-                pendingMutationHiddenLoadersChanged = false;
+                pendingMutationReviewUiChanged = false;
+                pendingMutationDocRefreshNeeded = false;
             });
         }
         if (mutationPending) return;
@@ -15772,23 +15877,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let attrRefreshPending = false;
     const pendingAttrRoots = new Set();
     let _attrObserverAbortGen = 0;
+    const ATTR_REFRESH_SELECTOR =
+        `${COMMENT_CONTAINER_SELECTOR}, ${EDIT_FORM_SELECTOR}, [data-testid="markdown-editor"], ` +
+        '[class*="MarkdownEditor-module__container"], .js-previewable-comment-form, .js-write-bucket, form, ' +
+        'details[data-resolved], .outdated-comment, .minimized-comment, .js-resolvable-timeline-thread-container, ' +
+        '[data-testid="review-thread"], .review-thread-component';
 
     function attrRefreshRoot(target) {
-        return (
-            target?.closest?.(
-                `${COMMENT_CONTAINER_SELECTOR}, ${EDIT_FORM_SELECTOR}, [data-testid="markdown-editor"], ` +
-                    '[class*="MarkdownEditor-module__container"], .js-previewable-comment-form, .js-write-bucket, form',
-            ) ||
-            target?.parentElement ||
-            null
-        );
+        return target?.closest?.(ATTR_REFRESH_SELECTOR) || null;
     }
 
     function collectAttrMutationBatch(mutations) {
         let changed = false;
         for (const m of mutations) {
             const root = attrRefreshRoot(m.target);
-            if (!root) continue;
+            if (!root || isAckOwnedMutationRoot(root)) continue;
             changed = true;
             pendingAttrRoots.add(root);
             if (attrTargetMayNeedFastEditorAffordances(m.target)) scheduleFastEditorAffordances(root);
@@ -15798,7 +15901,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function drainAttrMutationBatch(isCanceled) {
         attrRefreshPending = false;
-        const roots = [...pendingAttrRoots];
+        const roots = compactMutationRoots([...pendingAttrRoots]);
         pendingAttrRoots.clear();
         if (!roots.length) return;
         const ctx = currentInjectContext();
@@ -25096,12 +25199,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function mutationBatchMightContainForcePush(mutations) {
         for (const m of mutations) {
             for (const n of [...m.addedNodes, ...m.removedNodes]) {
-                if (n.nodeType !== 1) continue;
-                const text = String(n.textContent || '');
-                if (/force[- ]?pushed/i.test(text)) return true;
-                if (n.querySelector?.('a[href*="/compare/"], a[href*="/commit/"]') && /force/i.test(text)) {
-                    return true;
-                }
+                if (n.nodeType !== 1 || isAckOwnedMutationRoot(n)) continue;
+                const compareLink =
+                    (n.matches?.('a[href*="/compare/"]') && n) || n.querySelector?.('a[href*="/compare/"]');
+                if (!compareLink) continue;
+                const event = compareLink.closest?.('.TimelineItem, .js-timeline-item') || n;
+                if (/force[- ]?pushed/i.test(String(event.textContent || ''))) return true;
             }
         }
         return false;
@@ -28783,17 +28886,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('\n    function findUserAcks'),
         );
         ackAssert(helper.includes('getReviewCommentRevealState()'), 'uses local reveal state');
-        ackAssert(helper.includes('openReviewCommentRevealState(state)'), 'opens collapsed content in the current view');
+        ackAssert(
+            helper.includes('openReviewCommentRevealState(state, attempted)'),
+            'opens collapsed content incrementally in the current view',
+        );
         ackAssert(!helper.includes('location.assign'), 'does not switch to the changes/files view');
         ackAssert(!helper.includes('buildReviewCommentChangesUrl'), 'does not build a redirect URL');
+        ackAssert(!helper.includes('scrollToReviewCommentRevealWork'), 'does not move the viewport to loader controls');
+        ackAssert(
+            helper.includes('attempt < REVIEW_COMMENT_HASH_MAX_ATTEMPTS'),
+            'uses a fixed recovery attempt budget',
+        );
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('initial load')"), 'runs on initial load');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('hashchange')"), 'runs on hash changes');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
-        ackAssert(source.includes('shouldSuppressHiddenConversationRefresh()'), 'suppresses toolbar refresh churn during hash reveal');
         ackAssert(!source.includes('schedulePostHashRevealToolbarRefresh'), 'does not schedule delayed toolbar rebuild after hash reveal');
     });
 
-    ackTest('review comment hash navigation stops after successful jump', () => {
+    ackTest('review comment hash navigation settles after success or exhaustion', () => {
         const source = _ackSource;
         const helper = source.slice(
             source.indexOf('async function handleReviewCommentHashNavigation'),
@@ -28801,7 +28911,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const scheduler = source.slice(
             source.indexOf('function scheduleReviewCommentHashNavigation'),
-            source.indexOf('\n    function shouldSuppressHiddenConversationRefresh'),
+            source.indexOf('\n    function resetReviewCommentHashNavigation'),
         );
         const reset = source.slice(
             source.indexOf('function resetReviewCommentHashNavigation'),
@@ -28814,10 +28924,87 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'successful target reveal marks the hash as completed',
         );
         ackAssert(
-            scheduler.includes('reviewCommentHashNavigationCompletedKey === currentReviewCommentHashNavigationKey()'),
+            (helper.match(/reviewCommentHashNavigationCompletedKey = key/g) || []).length >= 3,
+            'an exhausted bounded search is also marked complete',
+        );
+        ackAssert(
+            scheduler.includes('reviewCommentHashNavigationCompletedKey === key'),
             'scheduler skips hashes already reached',
         );
+        ackAssert(
+            scheduler.includes('reviewCommentHashNavigationCompletedKey !== key'),
+            'a different hash clears the settled state',
+        );
         ackAssert(reset.includes("reviewCommentHashNavigationCompletedKey = ''"), 'reset clears completed hash key');
+    });
+
+    ackTest('review comment hash reveal opens bounded, unrepeated work', () => {
+        const makeButton = () => {
+            const button = document.createElement('button');
+            let clicks = 0;
+            button.addEventListener('click', () => clicks++);
+            document.body.appendChild(button);
+            return { button, clicks: () => clicks };
+        };
+        const loaders = [makeButton(), makeButton()];
+        const sections = [makeButton(), makeButton(), makeButton(), makeButton()];
+        const attempted = new WeakSet();
+        try {
+            const state = {
+                paginationBtns: loaders.map((item) => item.button),
+                timelineLoadMore: [],
+                resolved: [],
+                minimized: sections.map((item) => item.button),
+                outdated: [],
+                loadDiffs: [],
+            };
+            ackDeepEq(
+                openReviewCommentRevealState(state, attempted),
+                { opened: 1, loader: true },
+                'opens one loader per pass',
+            );
+            ackDeepEq(
+                openReviewCommentRevealState(state, attempted),
+                { opened: 1, loader: true },
+                'advances to the next loader',
+            );
+            ackDeepEq(
+                openReviewCommentRevealState(state, attempted),
+                { opened: REVIEW_COMMENT_HASH_REVEAL_BATCH_SIZE, loader: false },
+                'caps collapsed-section work per pass',
+            );
+            ackEq(loaders.reduce((sum, item) => sum + item.clicks(), 0), 2, 'does not repeat loader clicks');
+            ackEq(
+                sections.reduce((sum, item) => sum + item.clicks(), 0),
+                REVIEW_COMMENT_HASH_REVEAL_BATCH_SIZE,
+                'opens only the bounded collapsed-section batch',
+            );
+        } finally {
+            [...loaders, ...sections].forEach((item) => item.button.remove());
+        }
+    });
+
+    ackTest('hash-only URL changes do not reinject the page', () => {
+        const source = _ackSource;
+        const watcher = source.slice(
+            source.indexOf('const checkUrlChange = () =>'),
+            source.indexOf('let pending = false', source.indexOf('const checkUrlChange = () =>')),
+        );
+        ackAssert(watcher.includes('previousUrl.pathname === nextUrl.pathname'), 'compares the page path');
+        ackAssert(watcher.includes('previousUrl.search === nextUrl.search'), 'compares the page query');
+        const hashBranch = watcher.slice(
+            watcher.indexOf('previousUrl.origin === nextUrl.origin'),
+            watcher.indexOf('tryInject()'),
+        );
+        ackAssert(hashBranch.includes("scheduleReviewCommentHashNavigation('hash url change')"), 'still reveals the hash');
+        ackAssert(hashBranch.includes('return;'), 'returns before page reinjection');
+        ackAssert(watcher.includes('lastUrl = location.href'), 'records hash changes immediately');
+        const observer = source.slice(
+            source.indexOf('let pending = false', source.indexOf('const checkUrlChange = () =>')),
+            source.indexOf('let liveRefreshPending = false'),
+        );
+        ackAssert(observer.includes('checkUrlChange()'), 'URL observer delegates to the route checker');
+        ackAssert(!observer.includes('tryInject()'), 'URL observer does not reinject a second time');
     });
 
     // ============================================================================
@@ -29217,7 +29404,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('runDocInjectors(ctx)'), 'attribute observer does not run doc injectors');
         const drainFn = source.slice(source.indexOf('function drainAttrMutationBatch'), source.indexOf('new MutationObserver((mutations) => {', source.indexOf('function drainAttrMutationBatch')));
         ackAssert(drainFn.includes('runRootInjectorsForNames'), 'attribute refresh uses named root injectors');
+        ackAssert(drainFn.includes('compactMutationRoots'), 'coalesces nested attribute roots');
         ackAssert(drainFn.includes('roots: roots.length'), 'logs targeted root count');
+
+        const unrelated = document.createElement('div');
+        const comment = document.createElement('div');
+        const commentChild = document.createElement('span');
+        comment.className = 'timeline-comment';
+        comment.appendChild(commentChild);
+        ackEq(attrRefreshRoot(unrelated), null, 'ignores unrelated React class changes');
+        ackEq(attrRefreshRoot(commentChild), comment, 'maps comment descendants to their comment scope');
     });
 
     ackTest('proofread edit mode uses React-compatible textarea updates', () => {
@@ -29755,7 +29951,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             drainFn.includes('runRootInjectors(root, ctx)'),
             'MutationObserver runs root injectors for added subtrees',
         );
-        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors after mutations');
+        ackAssert(
+            drainFn.includes('scheduleDocInjectorsAfterMutation()'),
+            'MutationObserver defers document injectors until mutations settle',
+        );
         ackAssert(
             drainFn.includes('shouldRunDocInjectorsAfterMutation(ctx)'),
             'MutationObserver gates document injectors for expensive pages',
@@ -30882,6 +31081,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('for (const root of roots)'), 'calls helpers per root');
     });
 
+    ackTest('MutationObserver coalesces nested roots and ignores ACKtopus UI', () => {
+        const parent = document.createElement('div');
+        const child = document.createElement('div');
+        const ackUi = document.createElement('div');
+        const ackChild = document.createElement('span');
+        ackUi.className = 'ack-quick-actions';
+        ackUi.appendChild(ackChild);
+        parent.append(child, ackUi);
+        document.body.appendChild(parent);
+        try {
+            ackDeepEq(compactMutationRoots([child, parent]), [parent], 'keeps only the outer added subtree');
+            ackEq(isAckOwnedMutationRoot(ackUi), true, 'recognizes an ACKtopus root');
+            ackEq(isAckOwnedMutationRoot(ackChild), true, 'recognizes descendants of ACKtopus UI');
+            ackEq(isAckOwnedMutationRoot(child), false, 'keeps GitHub-owned content');
+            parent.className = 'timeline-comment ack-overflow-fix';
+            ackEq(isAckOwnedMutationRoot(parent), false, 'keeps GitHub hosts annotated by ACKtopus');
+            ackEq(mutationRootMayAffectPendingReview(child), false, 'ordinary removals need no pending-review rescan');
+            child.className = 'js-pending-review-comment';
+            ackEq(mutationRootMayAffectPendingReview(child), true, 'pending-comment removal requests a state rescan');
+            ackEq(mutationRootMayNeedDocInjectors(parent), false, 'ordinary comments need no document injector pass');
+            const commitRow = document.createElement('div');
+            commitRow.setAttribute('data-testid', 'commit-row-item');
+            ackEq(mutationRootMayNeedDocInjectors(commitRow), true, 'late commit rows request document injectors');
+        } finally {
+            parent.remove();
+        }
+    });
+
     ackTest('MutationObserver caps root processing per drain', () => {
         const source = _ackSource;
         const drainFn = source.slice(
@@ -30921,6 +31148,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fastSection.includes('runRootInjectorsForNames(root, FAST_EDITOR_INJECTORS, ctx)'),
             'fast refresh runs only selected root injectors',
         );
+        ackAssert(fastSection.includes('compactMutationRoots'), 'fast refresh coalesces nested editor roots');
         ackAssert(!fastSection.includes('runRootInjectors(document'), 'fast refresh does not run document injectors');
 
         const childBatch = sourceSection(source, 'function collectDomMutationBatch', 'function drainDomMutationBatch');
@@ -31043,7 +31271,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Shared injector runner keeps root-scoped mutations consistent
         ackAssert(drainFn.includes('runRootInjectors(root, ctx)'), 'runs root injectors from observer');
         ackAssert(drainFn.includes('shouldRunDocInjectorsAfterMutation(ctx)'), 'guards doc injectors from observer');
-        ackAssert(drainFn.includes('runDocInjectors(ctx)'), 'can still run doc injectors from observer');
+        ackAssert(
+            drainFn.includes('scheduleDocInjectorsAfterMutation()'),
+            'schedules document injectors after the mutation burst',
+        );
         // addCommitBadges is deferred (IntersectionObserver) and should not be forced eagerly.
         ackAssert(!drainFn.includes('addCommitBadges(root)'), 'addCommitBadges is lazy now');
     });
@@ -32006,28 +32237,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(group.includes('getRevealAllState().total'), 'reveal-all menu item shows live remaining count');
     });
 
-    ackTest('childList observer refreshes toolbar when hidden loaders appear later', () => {
+    ackTest('childList observer does not rebuild the toolbar for comment loaders', () => {
         const source = _ackSource;
         const collectFn = source.slice(
-            source.indexOf('const HIDDEN_LOADER_SELECTOR'),
+            source.indexOf('function collectDomMutationBatch'),
             source.indexOf('function drainDomMutationBatch'),
         );
         const drainFn = source.slice(
             source.indexOf('function drainDomMutationBatch'),
             source.indexOf('// Attribute observer'),
         );
-        ackAssert(collectFn.includes('pendingMutationHiddenLoadersChanged = true'), 'detects hidden loader mutations');
         ackAssert(
-            collectFn.includes('ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR'),
-            'detects React issue timeline loader mutations',
+            !collectFn.includes('HIDDEN_LOADER_SELECTOR') && !collectFn.includes('mutationRootHasHiddenLoader'),
+            'does not scan every added subtree for loader controls',
         );
         ackAssert(
-            drainFn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
-            'refreshes toolbar when hidden conversation loaders appear',
-        );
-        ackAssert(
-            drainFn.includes('!shouldSuppressHiddenConversationRefresh()'),
-            'skips toolbar refresh while a review-comment hash reveal is active',
+            !drainFn.includes("refreshToolbarForLiveUpdate('hidden-conversations')"),
+            'does not abort and rebuild the toolbar during progressive comment loading',
         );
     });
 
@@ -33453,21 +33679,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('enhanceForcePushLinks is called from inject and MutationObserver', () => {
         const source = _ackSource;
-        // Called via DOC_INJECTORS (keeps direct DOM mutations centralized)
-        const docs = source.slice(
+        const roots = source.slice(
+            source.indexOf('const ROOT_INJECTORS'),
             source.indexOf('const DOC_INJECTORS'),
-            source.indexOf('function currentInjectContext'),
         );
-        ackAssert(docs.includes("name: 'enhanceForcePushLinks'"), 'present in DOC_INJECTORS');
+        ackAssert(roots.includes("name: 'enhanceForcePushLinks'"), 'present in ROOT_INJECTORS');
 
         const injectFn = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
-        ackAssert(injectFn.includes('runDocInjectors(ctx)'), 'inject runs doc injectors');
+        ackAssert(injectFn.includes('runRootInjectors(document, ctx)'), 'inject runs root injectors');
 
         const domObserver = source.slice(
             source.indexOf('function drainDomMutationBatch'),
             source.indexOf('// Attribute observer'),
         );
-        ackAssert(domObserver.includes('runDocInjectors(ctx)'), 'MutationObserver runs doc injectors');
+        ackAssert(domObserver.includes('runRootInjectors(root, ctx)'), 'MutationObserver scopes force-push work to added roots');
+        const helper = sourceSection(source, 'function enhanceForcePushLinks', 'function parseGitHubRepoPath');
+        ackAssert(helper.includes("qsa(root, 'a[href*=\"/compare/\"]')"), 'force-push link scan is root-scoped');
     });
 
     // --- parseCoAuthoredBy ---
@@ -33546,6 +33773,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(
             observer.includes('maybeRefreshToolbarForForcePushLiveUpdate()'),
             'same-URL observer checks for force-push live updates',
+        );
+    });
+
+    ackTest('force-push mutation gate ignores ordinary comment text', () => {
+        const comment = document.createElement('div');
+        comment.textContent = 'Please force-push this change later';
+        ackEq(
+            mutationBatchMightContainForcePush([{ addedNodes: [comment], removedNodes: [] }]),
+            false,
+            'comment prose alone does not trigger a toolbar refresh',
+        );
+
+        const event = document.createElement('div');
+        event.className = 'TimelineItem';
+        event.innerHTML = '<span>force-pushed commits</span><a href="/owner/repo/compare/abc...def">Compare</a>';
+        ackEq(
+            mutationBatchMightContainForcePush([{ addedNodes: [event], removedNodes: [] }]),
+            true,
+            'a timeline compare event triggers the refresh check',
         );
     });
 
@@ -34084,7 +34330,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes('setTimeout(refreshQueuePanel'), 'defers refresh');
     });
 
-    ackTest('doc injectors run once per mutation batch, not per root', () => {
+    ackTest('doc injectors run once after a quiet mutation period, not per root', () => {
         const source = _ackSource;
         const obsBlock = source.slice(
             source.indexOf('function drainDomMutationBatch'),
@@ -34096,8 +34342,19 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const afterLoopStart = obsBlock.indexOf('focusVisibleDeleteCommentConfirmButton', loopStart);
         const insideLoop = obsBlock.slice(loopStart, afterLoopStart);
         const afterLoop = obsBlock.slice(afterLoopStart);
-        ackAssert(afterLoop.includes('runDocInjectors(ctx)'), 'doc injectors run after the root loop');
+        ackAssert(
+            afterLoop.includes('scheduleDocInjectorsAfterMutation()'),
+            'doc injectors are scheduled after the root loop',
+        );
+        ackAssert(afterLoop.includes('docRefreshNeeded &&'), 'ordinary comment mutations do not schedule them');
         ackAssert(!insideLoop.includes('runDocInjectors('), 'doc injectors do NOT run inside the root loop');
+        const scheduler = sourceSection(
+            source,
+            'function scheduleDocInjectorsAfterMutation',
+            'function requeueDomMutationBatch',
+        );
+        ackAssert(scheduler.includes("'mutation-doc-injectors'"), 'coalesces repeated requests under one job key');
+        ackAssert(scheduler.includes('ACK_MUTATION_DOC_QUIET_MS'), 'waits for a quiet period');
     });
 
     ackTest('bulk PR diff mutations skip document-wide rescans', () => {
@@ -34113,20 +34370,18 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(helper.includes('ctx.onPR && isPullRequestBulkDiffPage()'), 'bulk PR diff pages are gated');
         ackAssert(helper.includes('return false'), 'bulk PR diff mutation batches skip doc injectors');
         ackAssert(
-            drainFn.includes('if (shouldRunDocInjectorsAfterMutation(ctx)) runDocInjectors(ctx)'),
+            drainFn.includes(
+                'if (docRefreshNeeded && shouldRunDocInjectorsAfterMutation(ctx)) scheduleDocInjectorsAfterMutation()',
+            ),
             'drain consults the doc-injector gate',
         );
     });
 
-    ackTest('bulk PR diff mutation collection avoids deep subtree scans', () => {
+    ackTest('mutation collection avoids duplicate and ACK-owned subtree work', () => {
         const source = _ackSource;
         const fastHelper = source.slice(
             source.indexOf('function scheduleFastEditorAffordancesForMutation'),
             source.indexOf('function runDocInjectors'),
-        );
-        const hiddenHelper = source.slice(
-            source.indexOf('function mutationRootHasHiddenLoader'),
-            source.indexOf('function collectDomMutationBatch'),
         );
         const collectFn = source.slice(
             source.indexOf('function collectDomMutationBatch'),
@@ -34137,17 +34392,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'bulk PR diff fast editor check is shallow',
         );
         ackAssert(
-            hiddenHelper.includes('if (isPullRequestBulkDiffPage()) return false'),
-            'bulk PR diff hidden-loader check avoids descendant scans',
+            collectFn.includes('isAckOwnedMutationRoot(n)'),
+            'collector skips mutations caused by ACKtopus UI',
         );
         ackAssert(
             collectFn.includes('scheduleFastEditorAffordancesForMutation(n)'),
             'collector uses the shallow fast editor gate',
         );
-        ackAssert(
-            collectFn.includes('mutationRootHasHiddenLoader(n)'),
-            'collector uses the guarded hidden-loader helper',
-        );
+        ackAssert(source.includes('compactMutationRoots([...pendingMutationRoots])'), 'drain coalesces nested roots');
     });
 
     ackTest('escapeHTML and safeHref defined early and used by marked renderer', () => {
@@ -41046,9 +41298,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const toolbar = sourceSection(source, 'async function loadAsyncPRData', 'function isToolbarPage');
         ackAssert(!timeline.includes('function buildTimelineFilterButton'), 'has no ACK toolbar button');
         ackAssert(!toolbar.includes('buildTimelineFilterButton'), 'does not add button to toolbar');
-        ackAssert(source.includes("name: 'timelineFilter'"), 'has document injector');
+        const roots = sourceSection(source, 'const ROOT_INJECTORS', 'const DOC_INJECTORS');
+        ackAssert(roots.includes("name: 'timelineFilter'"), 'has root-scoped timeline injector');
         ackAssert(source.includes("name: 'githubReviewOptions'"), 'has GitHub-side options injector');
-        ackAssert(source.includes('fn: () => applyTimelineFilter(document)'), 'injector reapplies filter');
+        ackAssert(roots.includes('fn: applyTimelineFilter'), 'injector applies the filter to added roots');
+        ackAssert(timeline.includes('const fullPass = root === document'), 'full-page option refresh is explicit');
         ackAssert(timeline.includes('sessionStorage.setItem(timelineFilterStorageKey(path), safeMode)'), 'persists mode');
         ackAssert(timeline.includes('setTimelineCommentsMinimized'), 'has checkbox setter for comment minimization');
     });
@@ -43781,7 +44035,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         openReviewCommentRevealState,
         handleReviewCommentHashNavigation,
         scheduleReviewCommentHashNavigation,
-        shouldSuppressHiddenConversationRefresh,
+        compactMutationRoots,
+        isAckOwnedMutationRoot,
         waitForEl,
         clickWithRetry,
         waitForElement,
@@ -43843,7 +44098,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     const checkUrlChange = () => {
         if (_ackTesting) return;
         if (location.href !== lastUrl) {
+            const previousUrl = new URL(lastUrl, location.href);
+            const nextUrl = new URL(location.href);
             lastUrl = location.href;
+            if (
+                previousUrl.origin === nextUrl.origin &&
+                previousUrl.pathname === nextUrl.pathname &&
+                previousUrl.search === nextUrl.search
+            ) {
+                scheduleReviewCommentHashNavigation('hash url change');
+                return;
+            }
             tryInject();
             addFloatingCommitNav({ immediate: true });
             scheduleReviewCommentHashNavigation('url change');
@@ -43865,6 +44130,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     });
     navWindow.addEventListener('hashchange', () => {
         if (_ackTesting) return;
+        lastUrl = location.href;
         scheduleReviewCommentHashNavigation('hashchange');
     });
 
@@ -43876,7 +44142,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackSetTimeout(() => {
             pending = false;
             checkUrlChange();
-            if (isToolbarPage() || isGitHubRepoPage()) tryInject();
         }, 0);
     }).observe(document.body, { childList: true, subtree: true });
 
@@ -43885,6 +44150,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     new MutationObserver((mutations) => {
         if (_ackTesting) return;
         if (liveRefreshPending || location.href !== lastUrl) return;
+        if (!isPRPage()) return;
         if (!mutationBatchMightContainForcePush(mutations)) return;
         // A lifetime abort drops the scheduled job and its flag reset; clear the
         // flag on abort or live refresh stays disabled.
