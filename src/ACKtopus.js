@@ -25380,12 +25380,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             addFloatingCommitNav({ immediate: true });
             hideNativeCommitNav();
         }
-        try {
-            autoOpenReactionPopup(document);
-        } catch (_) {}
-        try {
-            prefillCommitHash(document);
-        } catch (_) {}
     });
     // Clean injected elements before turbo caches the page snapshot.
     // Without this, pressing back shows a stale cached page with old toolbar/ACKs,
@@ -29059,6 +29053,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(hashBranch.includes("scheduleReviewCommentHashNavigation('hash url change')"), 'still reveals the hash');
         ackAssert(hashBranch.includes('return;'), 'returns before page reinjection');
         ackAssert(watcher.includes('lastUrl = location.href'), 'records hash changes immediately');
+        ackAssert(!watcher.includes('autoOpenReactionPopup(document)'), 'route changes do not rescan every comment');
+        ackAssert(!watcher.includes('prefillCommitHash(document)'), 'route changes do not duplicate root injectors');
         const observer = source.slice(
             source.indexOf('let pending = false', source.indexOf('const checkUrlChange = () =>')),
             source.indexOf('let liveRefreshPending = false'),
@@ -32090,6 +32086,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(block.includes('lastInjectedPath = null'), 'clears injected path cache before reinject');
         ackAssert(block.includes('tryInject()'), 'forces fresh reinject on pageshow');
         ackAssert(block.includes('addFloatingCommitNav({ immediate: true })'), 'rebuilds floating commit nav immediately on pageshow');
+        ackAssert(!block.includes('autoOpenReactionPopup(document)'), 'does not eagerly scan every restored comment');
+        ackAssert(!block.includes('prefillCommitHash(document)'), 'does not duplicate the injector prefill pass');
     });
 
     ackTest('existing toolbar refreshes conversation enhancements after Turbo restore', () => {
@@ -44307,14 +44305,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             tryInject();
             addFloatingCommitNav({ immediate: true });
             scheduleReviewCommentHashNavigation('url change');
-            // Some SPA navigations update the main content without recreating the toolbar.
-            // Re-run cheap DOM passes so hover reactions + commit-prefix prefill stay reliable.
-            try {
-                autoOpenReactionPopup(document);
-            } catch (_) {}
-            try {
-                prefillCommitHash(document);
-            } catch (_) {}
         }
     };
     navWindow.addEventListener('popstate', () => {
