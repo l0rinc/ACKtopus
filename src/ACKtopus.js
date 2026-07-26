@@ -2494,7 +2494,10 @@
     function githubRateLimitUntil(response) {
         const resetSeconds = Number(githubResponseHeader(response, 'x-ratelimit-reset'));
         const resetMs = Number.isFinite(resetSeconds) && resetSeconds > 0 ? resetSeconds * 1000 + 1000 : 0;
-        return Math.max(Date.now() + 5 * 60 * 1000, resetMs);
+        const now = Date.now();
+        // A wrongly scaled or absurd reset header must not fail-fast every later
+        // request for the rest of the session, so never block for more than an hour.
+        return Math.min(Math.max(now + 5 * 60 * 1000, resetMs), now + 60 * 60 * 1000);
     }
 
     function rememberGithubRateLimit(response, headers) {
@@ -34013,6 +34016,24 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(helpers.includes('refreshGithubPatStatus();'), 'refreshes an open settings panel after PAT rejection');
         ackAssert(helpers.includes('rememberGithubRateLimit'), 'has rate-limit memoization helper');
         ackAssert(!helpers.includes('auth:${headers.Authorization}'), 'does not store Authorization header in rate-limit bucket key');
+    });
+
+    ackTest('rate-limit backoff honours the reset header but stays bounded', () => {
+        const makeResponse = (resetSeconds) => ({
+            status: 403,
+            responseText: 'API rate limit exceeded',
+            responseHeaders: `x-ratelimit-remaining: 0\r\nx-ratelimit-reset: ${resetSeconds}`,
+        });
+        const now = Date.now();
+        const soon = githubRateLimitUntil(makeResponse(Math.round((now + 20 * 60 * 1000) / 1000)));
+        ackAssert(soon > now + 19 * 60 * 1000, 'waits until the announced reset time');
+        ackAssert(soon <= now + 60 * 60 * 1000 + 5000, 'a normal reset stays under the cap');
+        const missing = githubRateLimitUntil({ status: 403, responseText: 'API rate limit exceeded' });
+        ackAssert(missing >= now + 5 * 60 * 1000, 'falls back to a five minute pause without a header');
+        // A wrongly scaled header (milliseconds) must not disable the API for the session.
+        const absurd = githubRateLimitUntil(makeResponse(now));
+        ackAssert(absurd <= now + 60 * 60 * 1000 + 5000, 'clamps an absurd reset to at most an hour');
+        ackAssert(Number.isFinite(new Date(absurd).getTime()), 'stays a representable date for logging');
     });
 
     ackTest('PAT GraphQL auth stops using a token rejected earlier in the page session', () => {
