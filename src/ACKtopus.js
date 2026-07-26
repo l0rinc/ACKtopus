@@ -33024,6 +33024,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(marker.title.includes('123 additions'), 'describes additions in tooltip');
             ackAssert(marker.previousElementSibling?.classList.contains('IssueLabel'), 'places size after title labels');
             ackAssert(marker.nextElementSibling?.classList.contains('metadata'), 'places size before PR metadata line');
+
+            // Injector passes re-run constantly; rewriting an unchanged marker
+            // would wake the mutation observers and echo more passes.
+            const rendered = marker.firstChild;
+            renderPullRequestSize(marker, { additions: 123, deletions: 45 });
+            ackEq(marker.firstChild, rendered, 'a repeated render with the same counts changes nothing');
+            renderPullRequestSize(marker, { additions: 124, deletions: 45 });
+            ackEq(marker.textContent, '+124-45', 'a changed count is rendered');
+
+            const detached = document.createElement('span');
+            renderPullRequestSize(detached, { additions: 1, deletions: 2 });
+            ackEq(detached.textContent, '', 'a marker removed from the page is left alone');
         } finally {
             host.remove();
         }
