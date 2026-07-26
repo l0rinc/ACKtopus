@@ -19508,7 +19508,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
     }
 
-    function gatherVisiblePRReplyEntries(skipPermalinks = null) {
+    // DOM permalinks resolve against the current URL, so the same comment reads as
+    // /pull/7#discussion_r1 from the API but /pull/7/files#discussion_r1 in the
+    // page. Compare only the comment fragment so both forms deduplicate.
+    function commentPermalinkIdentity(permalink) {
+        const text = String(permalink || '');
+        const fragment = text.match(/#[A-Za-z0-9_-]+$/);
+        return fragment ? fragment[0] : text;
+    }
+
+    function gatherVisiblePRReplyEntries(skipIdentities = null) {
         const entries = [];
         const seen = new Set();
         for (const bodyEl of qsa(document, MARKDOWN_BODY_SELECTOR)) {
@@ -19518,11 +19527,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!container) continue;
             const permalink = getCommentPermalink(container);
             // The PR description permalink (#issue-N) is context, not a reply.
-            if (!permalink || /#issue-\d+$/i.test(permalink) || seen.has(permalink)) continue;
-            if (skipPermalinks?.has(permalink)) continue;
+            if (!permalink || /#issue-\d+$/i.test(permalink)) continue;
+            const identity = commentPermalinkIdentity(permalink);
+            if (seen.has(identity) || skipIdentities?.has(identity)) continue;
             const body = renderBodyMarkdown(bodyEl).trim();
             if (!body || /^nothing to preview$/i.test(body)) continue;
-            seen.add(permalink);
+            seen.add(identity);
             const timeEl = container.querySelector('relative-time, time');
             const threadRoot = getCommentThreadRoot(container);
             const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
@@ -19556,12 +19566,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function fetchPRReplyRows(pr) {
         const key = `${pr.owner}/${pr.repo}/${pr.pr}`;
         const now = Date.now();
-        if (
-            !_ackTesting &&
-            _prReplyRowsPromise &&
-            _prReplyRowsKey === key &&
-            now - _prReplyRowsTs < PR_REPLY_HISTORY_TTL_MS
-        ) {
+        if (_prReplyRowsPromise && _prReplyRowsKey === key && now - _prReplyRowsTs < PR_REPLY_HISTORY_TTL_MS) {
             return _prReplyRowsPromise;
         }
         const urls = prDiscussionPageUrls(pr);
@@ -19569,12 +19574,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fetchPagedGithubRows(urls.conversationComments),
             fetchPagedGithubRows(urls.reviewSummaries),
             fetchPagedGithubRows(urls.inlineComments),
-        ]);
-        if (!_ackTesting) {
-            _prReplyRowsKey = key;
-            _prReplyRowsTs = now;
-            _prReplyRowsPromise = promise;
-        }
+        ]).then((results) => {
+            // A fully failed sweep (offline, rate limited) must not silence the
+            // next click for the rest of the cache window.
+            if (results.every((result) => result.status === 'rejected') && _prReplyRowsPromise === promise) {
+                _prReplyRowsKey = '';
+                _prReplyRowsPromise = null;
+            }
+            return results;
+        });
+        _prReplyRowsKey = key;
+        _prReplyRowsTs = now;
+        _prReplyRowsPromise = promise;
         return promise;
     }
 
@@ -19614,7 +19625,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const seen = new Set();
             for (const entry of lists.flat()) {
                 const key = entry.permalink
-                    ? `permalink:${entry.permalink}`
+                    ? `permalink:${commentPermalinkIdentity(entry.permalink)}`
                     : `${entry.source}:${entry.id}\n${entry.body}`;
                 if (!entry.body || seen.has(key)) continue;
                 seen.add(key);
@@ -19622,10 +19633,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             return out.sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
         };
-        const apiPermalinks = new Set(
-            [...conversationRows, ...reviewRows, ...inlineRows].map((entry) => entry.permalink).filter(Boolean),
+        const apiIdentities = new Set(
+            [...conversationRows, ...reviewRows, ...inlineRows]
+                .filter((entry) => entry.permalink)
+                .map((entry) => commentPermalinkIdentity(entry.permalink)),
         );
-        const visible = gatherVisiblePRReplyEntries(apiPermalinks);
+        const visible = gatherVisiblePRReplyEntries(apiIdentities);
         const conversationComments = mergeUnique(
             conversationRows,
             visible.filter((entry) => entry.source === 'visible conversation comment'),
@@ -19691,7 +19704,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function cleanSuggestedReplyResult(raw) {
         const text = String(raw || '').trim();
         const tagged = text.match(/<reply>\s*([\s\S]*?)\s*<\/reply>/i);
-        return postProcessProofreadMarkdown((tagged ? tagged[1] : text.replace(/^suggested reply:\s*/i, '')).trim());
+        let reply = (tagged ? tagged[1] : text.replace(/^suggested reply:\s*/i, '')).trim();
+        // Some models wrap the whole reply in a markdown fence despite the prompt.
+        // Only unwrap a prose fence, never a real code block the reply contains.
+        const wrapped = reply.match(/^```(?:markdown|md)\r?\n([\s\S]*?)\r?\n```$/i);
+        if (wrapped) reply = wrapped[1].trim();
+        return postProcessProofreadMarkdown(reply);
     }
 
     function pickVisibleTextarea(scope) {
@@ -19911,9 +19929,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                           clampLLMContext(patch, 150000),
                       )
                     : '',
-                targetThread ? wrapPromptBlock('TARGET MESSAGE THREAD', targetThread) : '',
+                targetThread ? wrapPromptBlock('TARGET MESSAGE THREAD', clampLLMContext(targetThread, 60000)) : '',
+                // Keep early and recent style examples without letting a long PR
+                // overflow the model context.
                 styleExamples
-                    ? wrapPromptBlock(`ALL PREVIOUS REPLIES BY ${viewerLogin || 'CURRENT USER'} IN THIS PR`, styleExamples)
+                    ? wrapPromptBlock(
+                          `ALL PREVIOUS REPLIES BY ${viewerLogin || 'CURRENT USER'} IN THIS PR`,
+                          clampLLMContext(styleExamples, 60000),
+                      )
                     : '',
                 initialDraft.trim() ? wrapPromptBlock('EXISTING DRAFT TO PRESERVE AND IMPROVE', initialDraft) : '',
             ].filter(Boolean);
@@ -25949,6 +25972,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('textareaIdSelector escapes ids and keeps a usable fallback', () => {
+        const ta = document.createElement('textarea');
+        ta.id = 'new_inline_comment_discussion_r123';
+        ackEq(textareaIdSelector(ta), 'textarea#new_inline_comment_discussion_r123', 'targets the exact editor');
+        const odd = document.createElement('textarea');
+        odd.id = 'reply:body.1';
+        const selector = textareaIdSelector(odd);
+        ackAssert(selector.includes('\\'), 'escapes CSS-significant characters');
+        ackAssert(!!document.createElement('div').querySelector(selector) === false, 'stays a valid selector');
+        ackEq(textareaIdSelector(document.createElement('textarea')), 'textarea', 'falls back without an id');
+        ackEq(textareaIdSelector(null, EDIT_TA_SELECTOR), EDIT_TA_SELECTOR, 'keeps a caller-supplied fallback');
+    });
+
     // --- Edge cases / regression tests ---
 
     ackTest('parsePR handles usernames with hyphens', () => {
@@ -30628,6 +30664,98 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('suggest reply output parser preserves reply markdown and trims trailing whitespace', () => {
         const result = cleanSuggestedReplyResult('<reply>> Quoted question\nMy answer.  \n\n```bash\necho ok\n```\n</reply>');
         ackEq(result, '> Quoted question\n\nMy answer.\n\n```bash\necho ok\n```');
+    });
+
+    ackTest('suggest reply output parser unwraps a prose fence but keeps code replies', () => {
+        const fence = '`'.repeat(3);
+        ackEq(
+            cleanSuggestedReplyResult(`${fence}markdown\nGood catch, will fix.\n${fence}`),
+            'Good catch, will fix.',
+            'unwraps a markdown-fenced reply',
+        );
+        ackEq(
+            cleanSuggestedReplyResult(`${fence}bash\necho ok\n${fence}`),
+            `${fence}bash\necho ok\n${fence}`,
+            'keeps a reply that is itself a code block',
+        );
+        ackEq(
+            cleanSuggestedReplyResult(`${fence}\nplain code\n${fence}`),
+            `${fence}\nplain code\n${fence}`,
+            'keeps an unlabeled code block',
+        );
+        ackEq(
+            cleanSuggestedReplyResult(`${fence}markdown\nSee below:\n\n${fence}bash\necho ok\n${fence}\n${fence}`),
+            `See below:\n\n${fence}bash\necho ok\n${fence}`,
+            'unwraps markdown while preserving its nested code block',
+        );
+    });
+
+    ackTest('reply history rows are reused per pull request and dropped on invalidation', async () => {
+        const origGmFetch = gmFetch;
+        let calls = 0;
+        try {
+            gmFetch = async () => {
+                calls++;
+                return [];
+            };
+            const pr = { owner: 'o', repo: 'r', pr: '9' };
+            await fetchPRReplyRows(pr);
+            ackEq(calls, 3, 'one sweep covers the three discussion endpoints');
+            await fetchPRReplyRows(pr);
+            ackEq(calls, 3, 'a second suggestion on the same PR reuses the fetched rows');
+            await fetchPRReplyRows({ owner: 'o', repo: 'r', pr: '10' });
+            ackEq(calls, 6, 'another pull request fetches its own rows');
+            invalidatePRContext();
+            await fetchPRReplyRows(pr);
+            ackEq(calls, 9, 'invalidation forces a refetch');
+        } finally {
+            gmFetch = origGmFetch;
+        }
+    });
+
+    ackTest('a fully failed reply history sweep is not cached', async () => {
+        const origGmFetch = gmFetch;
+        let calls = 0;
+        try {
+            gmFetch = async () => {
+                calls++;
+                throw new Error('offline');
+            };
+            const pr = { owner: 'o', repo: 'r', pr: '11' };
+            const results = await fetchPRReplyRows(pr);
+            ackEq(calls, 3, 'tries every endpoint');
+            ackAssert(
+                results.every((result) => result.status === 'rejected'),
+                'reports the failures instead of throwing',
+            );
+            await fetchPRReplyRows(pr);
+            ackEq(calls, 6, 'the next click retries instead of reusing the failure');
+        } finally {
+            gmFetch = origGmFetch;
+        }
+    });
+
+    ackTest('comment permalinks from the API and the page deduplicate by fragment', () => {
+        ackEq(
+            commentPermalinkIdentity('https://github.com/o/r/pull/7/files#discussion_r1'),
+            commentPermalinkIdentity('https://github.com/o/r/pull/7#discussion_r1'),
+            'the same comment matches from a files page and the API',
+        );
+        ackEq(
+            commentPermalinkIdentity('https://github.com/o/r/pull/7#issuecomment-1'),
+            '#issuecomment-1',
+            'keeps the comment fragment as the identity',
+        );
+        ackAssert(
+            commentPermalinkIdentity('https://github.com/o/r/pull/7#discussion_r1') !==
+                commentPermalinkIdentity('https://github.com/o/r/pull/7#discussion_r2'),
+            'different comments stay distinct',
+        );
+        ackEq(
+            commentPermalinkIdentity('https://github.com/o/r/pull/7'),
+            'https://github.com/o/r/pull/7',
+            'falls back to the whole URL without a fragment',
+        );
     });
 
     ackTest('suggest reply uses complete context but never submits', () => {
@@ -43372,6 +43500,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             _githubAuthBucketPat = '';
             _githubAuthBucketId = 0;
             _githubRateLimitedUntil.clear();
+            invalidatePRContext();
             if (gmMode === 'stub') {
                 gmMem.clear();
             } else if (gmMode === 'snapshot' && gmOrig.deleteValue && gmOrig.listValues) {
