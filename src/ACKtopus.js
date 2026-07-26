@@ -16413,9 +16413,44 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Some GitHub diff UIs reveal (unhide) an existing inline-comment textarea
     // without adding nodes or focusing it immediately. Sweep after clicks on
     // commit-scoped views so the prefix appears reliably.
+    const INLINE_COMMENT_TRIGGER_SELECTOR = [
+        '.js-add-line-comment',
+        '.add-line-comment',
+        '[data-testid*="add-comment" i]',
+        '[data-testid*="comment-button" i]',
+        '[data-testid*="new-comment" i]',
+        '[aria-label*="add a comment" i]',
+        '[aria-label*="comment on" i]',
+        '[title*="add a comment" i]',
+        '[data-marker-navigation-new-thread="true"]',
+    ].join(', ');
+
+    function inlineCommentClickScope(target) {
+        const el = target?.nodeType === 1 ? target : target?.parentElement;
+        if (!el?.closest) return null;
+        let trigger = el.closest(INLINE_COMMENT_TRIGGER_SELECTOR);
+        if (!trigger) {
+            const control = el.closest('button, [role="button"], summary');
+            const label = [
+                control?.textContent,
+                control?.getAttribute?.('aria-label'),
+                control?.getAttribute?.('title'),
+            ]
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!/(?:add|open|start|new).{0,24}(?:comment|review)|(?:comment|review).{0,24}(?:line|code)/i.test(label)) {
+                return null;
+            }
+            trigger = control;
+        }
+        return trigger.closest(DIFF_FILE_SELECTOR) || trigger.closest('[data-inline-markers="true"]') || document;
+    }
+
     let _commitPrefillSweepPending = false;
     let _commitPrefillSweepAbortGen = 0;
-    const scheduleCommitPrefillSweep = () => {
+    const scheduleCommitPrefillSweep = (root = document) => {
         const lt = ensureAckLifetime('commit-prefill-sweep');
         if (lt.gen !== _commitPrefillSweepAbortGen) {
             _commitPrefillSweepAbortGen = lt.gen;
@@ -16427,19 +16462,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _commitPrefillSweepPending = true;
         ackRaf(() => {
             try {
-                prefillCommitHash(document);
+                prefillCommitHash(root);
             } catch {}
             // Some inline forms appear after an async include-fragment render.
             for (const delay of [60, 180, 450]) {
                 ackSetTimeout(() => {
                     try {
-                        prefillCommitHash(document);
+                        prefillCommitHash(root);
                     } catch {}
                 }, delay);
             }
             ackSetTimeout(() => {
                 try {
-                    prefillCommitHash(document);
+                    prefillCommitHash(root);
                 } catch {}
                 _commitPrefillSweepPending = false;
             }, 800);
@@ -16447,10 +16482,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     };
     document.addEventListener(
         'click',
-        () => {
+        (e) => {
             if (_ackTesting || !isPRPage()) return;
             if (!isCommitScopedPRView(location.pathname)) return;
-            scheduleCommitPrefillSweep();
+            const root = inlineCommentClickScope(e.target);
+            if (root) scheduleCommitPrefillSweep(root);
         },
         true,
     );
@@ -43643,12 +43679,37 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             _ackSource.indexOf('// Auto-prefills new inline comment textareas'),
         );
         const sweepFn = _ackSource.slice(
-            _ackSource.indexOf('const scheduleCommitPrefillSweep'),
+            _ackSource.indexOf('const INLINE_COMMENT_TRIGGER_SELECTOR'),
             _ackSource.indexOf("document.addEventListener(\n        'click'", _ackSource.indexOf('const scheduleCommitPrefillSweep')),
+        );
+        const clickFn = _ackSource.slice(
+            _ackSource.indexOf("document.addEventListener(\n        'click'", _ackSource.indexOf('const scheduleCommitPrefillSweep')),
+            _ackSource.indexOf('// Note: commit prefixes'),
         );
         ackAssert(collectFn.includes('scheduleFastCommitPrefill(n)'), 'added roots trigger fast prefill');
         ackAssert(helperFn.includes('prefillCommitHash(r)'), 'fast path calls targeted prefill');
         ackAssert(sweepFn.includes('[60, 180, 450]'), 'click sweep retries quickly for async form mount');
+        ackAssert(sweepFn.includes('prefillCommitHash(root)'), 'click sweep stays inside the affected diff');
+        ackAssert(clickFn.includes('inlineCommentClickScope(e.target)'), 'ordinary page clicks do not start a sweep');
+    });
+
+    ackTest('commit prefix click fallback recognizes comment controls only', () => {
+        const file = document.createElement('div');
+        file.className = 'js-file';
+        file.innerHTML = `
+            <button aria-label="Add a comment"><span id="comment-trigger">+</span></button>
+            <button><span id="ordinary-trigger">Expand</span></button>`;
+        document.body.appendChild(file);
+        try {
+            ackEq(
+                inlineCommentClickScope(file.querySelector('#comment-trigger')),
+                file,
+                'scopes an add-comment click to its diff file',
+            );
+            ackEq(inlineCommentClickScope(file.querySelector('#ordinary-trigger')), null, 'ignores an unrelated click');
+        } finally {
+            file.remove();
+        }
     });
 
     ackTest('buildCommitPrefix returns prefix for /changes/<sha> URLs', () => {
