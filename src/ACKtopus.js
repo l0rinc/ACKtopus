@@ -21124,6 +21124,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    const OPEN_GITHUB_DETAILS_MENU_SELECTOR =
+        'details.details-overlay[open], details.js-reaction-popover-container[open], ' +
+        'details.new-reactions-dropdown[open]';
+
+    function openNativePopovers() {
+        try {
+            return [...document.querySelectorAll('[popover]:popover-open')];
+        } catch (_) {
+            return [...document.querySelectorAll('[popover]')].filter(isOpenNativePopover);
+        }
+    }
+
     // Primer dropdowns absolutely position the menu, so an open <details>'
     // own box reflects only the in-flow <summary> trigger. Measure the
     // rendered popup child instead, or a menu the user is reading closes as
@@ -21139,15 +21151,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function closeOutOfViewMenus() {
         let closed = 0;
-        for (const details of document.querySelectorAll('details[open]')) {
+        for (const details of document.querySelectorAll(OPEN_GITHUB_DETAILS_MENU_SELECTOR)) {
             if (isAckOwnedOverlay(details)) continue;
-            if (!details.matches?.('.details-overlay, .js-reaction-popover-container, .new-reactions-dropdown')) continue;
             if (!isElementOutsideViewport(menuGeometrySource(details))) continue;
             details.removeAttribute('open');
             closed++;
         }
-        for (const popover of document.querySelectorAll('[popover]')) {
-            if (isAckOwnedOverlay(popover) || !isOpenNativePopover(popover)) continue;
+        for (const popover of openNativePopovers()) {
+            if (isAckOwnedOverlay(popover)) continue;
             if (!isElementOutsideViewport(popover)) continue;
             popover.hidePopover?.();
             closed++;
@@ -42097,7 +42108,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         });
         const origQS = document.querySelectorAll;
         document.querySelectorAll = (sel) => {
-            if (sel === 'details[open]' || sel === '[popover]') return host.querySelectorAll(sel);
+            if (sel === OPEN_GITHUB_DETAILS_MENU_SELECTOR) return host.querySelectorAll(sel);
+            if (sel === '[popover]:popover-open' || sel === '[popover]') return [];
             return origQS.call(document, sel);
         };
         try {
@@ -42120,6 +42132,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes('function installOutOfViewMenuCloser'), 'has installer');
         ackAssert(source.includes("name: 'outOfViewMenuCloser'"), 'has document injector');
         ackAssert(source.includes('closeOutOfViewMenus'), 'has close helper');
+        const fn = sourceSection(source, 'function closeOutOfViewMenus', 'function scheduleCloseOutOfViewMenus');
+        ackAssert(fn.includes('OPEN_GITHUB_DETAILS_MENU_SELECTOR'), 'scans only open GitHub menu details');
+        ackAssert(!fn.includes("querySelectorAll('details[open]')"), 'does not scan every expanded details element');
+        ackAssert(source.includes("'[popover]:popover-open'"), 'selects only open native popovers when supported');
     });
 
     ackTest('gatherCommentElements exists and sorts posted comments newest first', () => {
