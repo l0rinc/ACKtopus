@@ -22999,7 +22999,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (desc.dataset.ackCoauthorProcessed) continue;
             const coAuthors = parseCoAuthoredBy(desc.textContent);
             if (coAuthors.length === 0) continue;
-            desc.dataset.ackCoauthorProcessed = 'true';
 
             // Scrape resolved avatars from this commit row's attribution stack -- the trailer
             // order invariant ([committer, co-author1, ...]) only holds per row, so page-global
@@ -23042,7 +23041,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     return `Co-authored-by: ${avatarImg}${profileLink}`;
                 },
             );
-            if (replaced !== text) desc.innerHTML = replaced;
+            // Stay retryable until every trailer is resolved: GitHub can hydrate
+            // the avatar stack in several passes.
+            if (replaced !== text) {
+                desc.innerHTML = replaced;
+                if (parseCoAuthoredBy(desc.textContent).length === 0) {
+                    desc.dataset.ackCoauthorProcessed = 'true';
+                }
+            }
         }
     }
 
@@ -33775,6 +33781,30 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'keeps unresolved ryanofsky trailer',
         );
         ackAssert(!desc.textContent.includes('@optout21'), 'strips the classic avatar alt prefix');
+        ackEq(desc.dataset.ackCoauthorProcessed, undefined, 'keeps retrying while any trailer is unresolved');
+    });
+
+    ackTest('addCoAuthorAvatars retries after GitHub hydrates the avatar stack', () => {
+        const root = document.createElement('div');
+        root.innerHTML =
+            '<div class="commit"><div class="commit-desc"><pre>' +
+            'Co-authored-by: Ava Chow &lt;github@achow101.com&gt;' +
+            '</pre></div></div>';
+        const desc = root.querySelector('.commit-desc pre');
+        addCoAuthorAvatars(root);
+        ackAssert(!desc.querySelector('img'), 'renders nothing while the avatar stack is missing');
+        ackEq(desc.dataset.ackCoauthorProcessed, undefined, 'stays retryable while unresolved');
+
+        const commit = root.querySelector('.commit');
+        for (const login of ['l0rinc', 'achow101']) {
+            commit.insertAdjacentHTML(
+                'beforeend',
+                `<a href="/${login}"><img data-test-selector="commits-avatar-stack-avatar-image" alt="@${login}" src="https://github.com/${login}.png"></a>`,
+            );
+        }
+        addCoAuthorAvatars(root);
+        ackAssert(desc.querySelector('a[href="https://github.com/achow101"]'), 'resolves once the stack hydrates');
+        ackEq(desc.dataset.ackCoauthorProcessed, 'true', 'stops reprocessing after chips are rendered');
     });
 
     ackTest('addCoAuthorAvatars replaces Co-authored-by text with avatar chips', () => {
