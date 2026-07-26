@@ -28265,7 +28265,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('proofread falls back when LLM omits <sN> tags', () => {
         const fn = _ackSource.slice(
-            _ackSource.indexOf('proofread: calling LLM'),
+            _ackSource.indexOf("proofreadDiagnostics.mode = 'LLM'"),
             _ackSource.indexOf('// Compare stripped original vs LLM result'),
         );
         ackAssert(fn.includes('tagCount === 0'), 'detects missing section tags');
@@ -28301,7 +28301,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('// --- Start a review ---'),
         );
         ackAssert(
-            fn.includes('toolbar textarea is a compose form, ignoring'),
+            fn.includes("logProofreadOutcome('ignored unsupported compose form')"),
             'toolbar proofread exits on compose/new-post textareas',
         );
         ackAssert(
@@ -28349,7 +28349,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function runProofreadOnComment'),
             source.indexOf('// --- Start a review ---'),
         );
-        ackAssert(proofFn.includes('empty textarea/selection, ignoring'), 'empty proofread exits without drafting');
+        ackAssert(proofFn.includes("logProofreadOutcome('ignored empty text')"), 'empty proofread exits without drafting');
         ackAssert(!proofFn.includes('suggestDraftReplyForTextarea(ta'), 'proofread does not draft replies/comments');
     });
 
@@ -33194,10 +33194,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('_compareActive'), 'uses flag to prevent re-entry');
         ackAssert(fn.includes('parseComparePrParam()'), 'checks explicit ?pr=1234 first');
-        ackAssert(fn.includes('from URL ?pr'), 'logs URL parameter source');
+        ackAssert(fn.includes("compareDiagnostics.prSource = 'URL ?pr'"), 'records the URL parameter source');
         ackAssert(fn.includes('sessionStorage.getItem'), 'checks sessionStorage after explicit URL parameter');
         ackAssert(fn.includes('ack-compare-pr:'), 'reads namespaced sessionStorage key');
-        ackAssert(fn.includes('from sessionStorage'), 'logs sessionStorage source');
+        ackAssert(fn.includes("compareDiagnostics.prSource = 'sessionStorage'"), 'records the sessionStorage source');
         ackAssert(fn.includes('commits/pulls'), 'falls back to commits/pulls API');
         ackAssert(fn.includes('document.referrer'), 'falls back to referrer');
         ackAssert(fn.includes('baseSha'), 'captures both base and head SHAs from URL');
@@ -36208,7 +36208,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(fn.includes('maxAttempts'), 'accepts maxAttempts parameter');
         ackAssert(fn.includes('200 * attempt'), 'uses increasing delay');
-        ackAssert(fn.includes('/${maxAttempts}'), 'logs attempt count vs max');
+        ackAssert(fn.includes('attempts: maxAttempts'), 'logs the exhausted attempt budget');
         ackAssert(fn.includes('ackSleep('), 'uses ackSleep for abortable waits');
     });
 
@@ -40699,8 +40699,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const start = source.indexOf('const updateMainLabel');
         const end = source.indexOf('updateMainLabel();', start);
         const fn = source.slice(start, end);
-        ackAssert(fn.includes('compact ? `${f.emoji}` :'), 'compact shows only emoji');
-        ackAssert(fn.includes('${f.label}${COPY_ICON}'), 'non-compact shows label + icon');
+        ackAssert(fn.includes('`${f.emoji}${shiftSuffix(f)}`'), 'compact shows only the emoji');
+        ackAssert(fn.includes('${f.label}${shiftSuffix(f)}${COPY_ICON}'), 'non-compact shows label + icon');
     });
 
     ackTest('buildDiffSymbolIndex scans diff files for definitions', () => {
@@ -42940,7 +42940,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'starts file category fetch before ACK API fallback',
         );
         ackAssert(
-            fn.includes('fileCategoriesPromise.then(applyFileCategories)'),
+            fn.includes('fileCategoriesPromise.then(') && fn.includes("applyFileCategories(cats, 'API/DOM')"),
             'applies file categories as soon as they resolve',
         );
         ackAssert(
@@ -42948,9 +42948,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'does not apply the same API categories again after ACK loading',
         );
         ackAssert(
-            fn.includes(
-                'const applyVisibleFileCategories = () => applyFileCategories(visibleDiffFileCategories(document, pr))',
-            ),
+            fn.includes('const applyVisibleFileCategories = () =>') &&
+                fn.includes('applyFileCategories(visibleDiffFileCategories(document, pr)'),
             'uses repository-aware visible diff files as a fallback when the API is unavailable',
         );
         ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 1000)'), 'retries visible file detection after hydration');
