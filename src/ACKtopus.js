@@ -13709,6 +13709,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // When true, reply Comment buttons show ⏳ instead of "Start a review".
     let _ackPendingReviewActive = false;
 
+    const viewerPendingReviewSsrCache = new WeakMap();
+
     function readViewerPendingReviewFromSSR(diagnostics = null) {
         try {
             const scriptEl = document.querySelector(
@@ -13716,6 +13718,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             );
             if (diagnostics) diagnostics.scriptFound = !!scriptEl?.textContent;
             if (!scriptEl?.textContent) return null;
+            if (viewerPendingReviewSsrCache.has(scriptEl)) {
+                if (diagnostics) diagnostics.cached = true;
+                return viewerPendingReviewSsrCache.get(scriptEl);
+            }
             const data = JSON.parse(scriptEl.textContent);
             if (diagnostics) diagnostics.parsed = true;
             const stack = [data];
@@ -13726,6 +13732,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 seen.add(cur);
                 if (cur.viewerPendingReview && typeof cur.viewerPendingReview === 'object') {
                     if (diagnostics) diagnostics.field = 'viewerPendingReview';
+                    viewerPendingReviewSsrCache.set(scriptEl, cur.viewerPendingReview);
                     return cur.viewerPendingReview;
                 }
                 if (
@@ -13734,12 +13741,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     String(cur.viewerLatestReview.state || '').toUpperCase() === 'PENDING'
                 ) {
                     if (diagnostics) diagnostics.field = 'viewerLatestReview';
+                    viewerPendingReviewSsrCache.set(scriptEl, cur.viewerLatestReview);
                     return cur.viewerLatestReview;
                 }
                 for (const v of Object.values(cur)) {
                     if (v && typeof v === 'object') stack.push(v);
                 }
             }
+            viewerPendingReviewSsrCache.set(scriptEl, null);
         } catch (e) {
             if (diagnostics) diagnostics.error = e?.message || String(e);
         }
@@ -13985,7 +13994,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function addStartReviewButtons(root = document) {
         if (!isPRPage()) return;
 
-        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: true })) {
+        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: root === document })) {
             markCommentButtonsPending(root);
             addSubmitReviewButtonToConversation(document);
             return;
@@ -15437,6 +15446,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackTesting) return;
         const started = ackNow();
         // Deferred to visibility: API-heavy work + per-comment decoration.
+        autoOpenReactionPopup(container);
         expandReactionAvatars(container);
         verifyPGPSignatures(container);
         addCommitBadges(container);
@@ -15540,7 +15550,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn: makeStickyEditToolbar,
         },
         { name: 'quickActions', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: addQuickCommentActions },
-        { name: 'reactionHover', when: (ctx) => ctx.onToolbar && !ctx.onCompare, fn: autoOpenReactionPopup },
+        {
+            name: 'reactionHover',
+            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
+            fn: (root) => {
+                if (root !== document) autoOpenReactionPopup(root);
+            },
+        },
     ];
 
     const DOC_INJECTORS = [
@@ -15601,10 +15617,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     const FAST_EDITOR_AFFORDANCE_SELECTOR =
-        COMMENT_CONTAINER_SELECTOR +
-        ', ' +
-        EDIT_SCOPE_SELECTOR +
-        ', [data-testid="comment-header"], .timeline-comment-header, .review-comment-header, ' +
+        `${EDIT_FORM_SELECTOR}, .is-comment-editing, .edit-comment-hide, ` +
+        '[data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
         'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, ' +
         '[class*="Toolbar-module__toolbar"], textarea';
     const FAST_EDITOR_INJECTORS = ['detailsButtons', 'trackEditForms', 'editorErgonomics', 'quickActions'];
@@ -15887,9 +15901,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return target?.closest?.(ATTR_REFRESH_SELECTOR) || null;
     }
 
+    function attrMutationMayNeedRefresh(mutation) {
+        const target = mutation?.target;
+        if (!target || target.nodeType !== 1) return false;
+        if (mutation.attributeName === 'data-resolved') return true;
+        if (mutation.attributeName === 'open') {
+            if (target.matches?.('details[data-resolved], details.outdated-comment, details.minimized-comment'))
+                return true;
+            return target.tagName === 'DETAILS' && !!target.closest?.('.outdated-comment, .minimized-comment');
+        }
+        if (mutation.attributeName !== 'class') return false;
+        if (attrTargetMayNeedFastEditorAffordances(target)) return true;
+        return !!target.matches?.(
+            `${COMMENT_CONTAINER_SELECTOR}, ${EDIT_FORM_SELECTOR}, [data-testid="markdown-editor"], ` +
+                '[class*="MarkdownEditor-module__container"], .js-previewable-comment-form, .js-write-bucket, form, ' +
+                'details[data-resolved], .outdated-comment, .minimized-comment, ' +
+                '.js-resolvable-timeline-thread-container, [data-testid="review-thread"], .review-thread-component',
+        );
+    }
+
     function collectAttrMutationBatch(mutations) {
         let changed = false;
         for (const m of mutations) {
+            if (!attrMutationMayNeedRefresh(m)) continue;
             const root = attrRefreshRoot(m.target);
             if (!root || isAckOwnedMutationRoot(root)) continue;
             changed = true;
@@ -29962,7 +29996,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // Pipeline includes key injectors (structural)
         ackAssert(source.includes('fn: addQuickCommentActions'), 'root pipeline includes quick actions');
-        ackAssert(source.includes('fn: autoOpenReactionPopup'), 'root pipeline includes reaction hover');
+        ackAssert(source.includes("name: 'reactionHover'"), 'root pipeline includes reaction hover');
         ackAssert(source.includes('fn: queueLazyComments'), 'root pipeline includes lazy comment queue');
         ackAssert(source.includes('fn: prefillCommitHash'), 'root pipeline includes commit prefix prefill');
     });
@@ -31154,13 +31188,51 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const childBatch = sourceSection(source, 'function collectDomMutationBatch', 'function drainDomMutationBatch');
         ackAssert(
             childBatch.includes('scheduleFastEditorAffordancesForMutation(n)'),
-            'added editor/comment roots get fast refresh through the mutation gate',
+            'added editor roots get fast refresh through the mutation gate',
         );
 
         const attrBatch = sourceSection(source, 'function collectAttrMutationBatch', 'function drainAttrMutationBatch');
         ackAssert(
             attrBatch.includes('attrTargetMayNeedFastEditorAffordances(m.target)'),
             'attribute fast refresh is gated to editor/comment targets',
+        );
+    });
+
+    ackTest('fast editor and attribute gates ignore ordinary comment hydration', () => {
+        const comment = document.createElement('div');
+        comment.className = 'timeline-comment';
+        comment.innerHTML = `
+            <div class="timeline-comment-header"></div>
+            <div class="markdown-body"><span id="content">text</span></div>
+        `;
+        const editor = document.createElement('div');
+        editor.innerHTML = '<textarea></textarea>';
+        const reaction = document.createElement('details');
+        reaction.className = 'js-reaction-popover-container';
+        const resolved = document.createElement('details');
+        resolved.dataset.resolved = 'true';
+
+        ackEq(rootMayNeedFastEditorAffordances(comment), false, 'posted comments do not get a duplicate fast pass');
+        ackEq(rootMayNeedFastEditorAffordances(editor), true, 'new editors still get the fast pass');
+        ackEq(
+            attrMutationMayNeedRefresh({ target: comment.querySelector('#content'), attributeName: 'class' }),
+            false,
+            'markdown class hydration does not refresh comment controls',
+        );
+        ackEq(
+            attrMutationMayNeedRefresh({ target: comment, attributeName: 'class' }),
+            true,
+            'comment state class changes still refresh controls',
+        );
+        ackEq(
+            attrMutationMayNeedRefresh({ target: reaction, attributeName: 'open' }),
+            false,
+            'opening a reaction menu does not refresh the whole comment',
+        );
+        ackEq(
+            attrMutationMayNeedRefresh({ target: resolved, attributeName: 'open' }),
+            true,
+            'opening a resolved thread still refreshes controls',
         );
     });
 
@@ -31174,7 +31246,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(lazy.includes('lazyCommentQueue'), 'queues visible comments');
         ackAssert(lazy.includes("scheduleAckBackgroundWork(\n            'lazy-comments'"), 'processes queue in background');
         ackAssert(lazy.includes('isCanceled()'), 'checks cancellation before processing a batch');
+        ackAssert(lazy.includes('autoOpenReactionPopup(container)'), 'installs reaction hooks only near the viewport');
         ackAssert(lazy.includes('visible comment decoration was slow'), 'logs slow per-comment decoration');
+    });
+
+    ackTest('initial document injection defers reaction scans to visible comments', () => {
+        const roots = sourceSection(_ackSource, 'const ROOT_INJECTORS', 'const DOC_INJECTORS');
+        ackAssert(roots.includes("name: 'reactionHover'"), 'keeps reaction handling for added subtrees');
+        ackAssert(roots.includes('if (root !== document) autoOpenReactionPopup(root)'), 'skips the eager document-wide scan');
     });
 
     ackTest('DOM observer editor gate includes compare-page compose mode', () => {
@@ -38018,6 +38097,22 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(graphQL.includes('viewerLatestReview'), 'queries viewer latest review');
         ackAssert(graphQL.includes("review.state !== 'PENDING'"), 'keeps only pending review comments');
         ackAssert(graphQL.includes('diffHunk'), 'requests target diff hunk context');
+    });
+
+    ackTest('pending review detection caches embedded data and keeps scoped mutation checks local', () => {
+        const reader = sourceSection(
+            _ackSource,
+            'const viewerPendingReviewSsrCache',
+            'function findSubmitReviewButton',
+        );
+        ackAssert(reader.includes('new WeakMap()'), 'caches by the embedded script element');
+        ackAssert(reader.includes('viewerPendingReviewSsrCache.has(scriptEl)'), 'checks the cache before JSON parsing');
+        ackAssert(reader.includes('viewerPendingReviewSsrCache.set(scriptEl, null)'), 'also caches a missing review');
+        const startReview = sourceSection(_ackSource, 'function addStartReviewButtons', '// Detect review submission');
+        ackAssert(
+            startReview.includes('includeDocument: root === document'),
+            'ordinary mutation roots do not rescan the full embedded page data',
+        );
     });
 
     ackTest('gatherSingleCommitPatchContext copies only the viewed commit patch', () => {
