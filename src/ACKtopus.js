@@ -18038,6 +18038,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             );
             const isPRBody = isPRBodyFromPermalink(permalink);
             const container = headerContainer;
+            const isPendingComment =
+                !isPRBody && editState === 'v' && commentHasOwnPendingReviewMarker(container, root);
             const isMine =
                 (!!currentUser && !!author && author.toLowerCase() === currentUser.toLowerCase()) ||
                 container?.classList?.contains('current-user');
@@ -18072,7 +18074,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                               : author && !isPRBody && isPRPage(path)
                                 ? actions.querySelector('.ack-suggest-reply-btn')
                                 : actions.querySelector('button');
-                    if (hasExpected) continue;
+                    const hasPendingCopy = !!actions.querySelector('.ack-copy-comment-btn');
+                    if (hasExpected && hasPendingCopy === isPendingComment) continue;
                     delete header.dataset.ackQuickProcessed;
                 }
             }
@@ -18093,6 +18096,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 marginLeft: '4px',
                 verticalAlign: 'middle',
             });
+
+            // Pending drafts often have no native action menu, so expose the
+            // existing context-copy action directly in their quick-action row.
+            if (isPendingComment) {
+                const copyBtn = makeIconBtn('📎', 'Copy comment with thread/location context', (btn) => {
+                    copyCommentContext(btn, container);
+                });
+                copyBtn.classList.add('ack-copy-comment-btn');
+                actionContainer.appendChild(copyBtn);
+            }
 
             if (isMine) {
                 const isEditing = editState === 'e';
@@ -32003,8 +32016,61 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 qa.querySelector('button[title="Expected author reply"]'),
                 'missing expected-author-reply button on pending comment',
             );
+            ackAssert(
+                qa.querySelector('button[title="Copy comment with thread/location context"]'),
+                'missing copy-comment button on pending comment',
+            );
             ackAssert(qa.querySelector('button.ack-edit-post-btn'), 'missing edit button');
             ackAssert(qa.querySelector('button[title="Delete comment"]'), 'missing delete button');
+
+            pending.remove();
+            addQuickCommentActions(root);
+            ackAssert(
+                !header.querySelector('.ack-copy-comment-btn'),
+                'removes the pending-only copy button after submission',
+            );
+
+            badges.appendChild(pending);
+            addQuickCommentActions(root);
+            ackAssert(
+                header.querySelector('.ack-copy-comment-btn'),
+                'restores the copy button when a pending marker hydrates later',
+            );
+        } finally {
+            root.remove();
+        }
+    });
+
+    ackTest('pending quick-copy action stays on the draft instead of its published parent', () => {
+        const root = document.createElement('div');
+        root.id = 'acktest-qactions-pending-copy-scope';
+        Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
+        root.innerHTML = `
+            <div class="js-line-comments">
+                <div id="acktest-published-parent" class="timeline-comment current-user">
+                    <div class="timeline-comment-header"><a class="author">me</a></div>
+                    <div class="comment-body markdown-body">Published parent</div>
+                </div>
+                <div id="acktest-pending-draft" class="timeline-comment current-user js-pending-review-comment">
+                    <div class="timeline-comment-header">
+                        <a class="author">me</a>
+                        <span data-testid="pending-badge">Pending</span>
+                    </div>
+                    <div class="comment-body markdown-body">Pending reply</div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(root);
+        try {
+            addQuickCommentActions(root);
+            ackAssert(
+                !root.querySelector('#acktest-published-parent .ack-copy-comment-btn'),
+                'published parent must not inherit the draft copy action',
+            );
+            ackAssert(
+                root.querySelector('#acktest-pending-draft .ack-copy-comment-btn'),
+                'pending reply gets the copy action',
+            );
         } finally {
             root.remove();
         }
