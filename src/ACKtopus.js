@@ -2205,7 +2205,17 @@
     }
 
     function getConversationLoaderElements() {
-        const paginationBtns = [...document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR)];
+        const paginationByScope = new Map();
+        for (const button of document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR)) {
+            if (button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
+            if (button.getAttribute('data-loading') === 'true') continue;
+            const scope = button.closest(HIDDEN_CONVERSATION_SELECTOR) || button;
+            const existing = paginationByScope.get(scope);
+            if (!existing || /^load\s+more/i.test(button.textContent.trim())) {
+                paginationByScope.set(scope, button);
+            }
+        }
+        const paginationBtns = [...paginationByScope.values()];
         const timelineLoadMore = getIssueTimelineLoadMoreButtons();
         return { paginationBtns, timelineLoadMore };
     }
@@ -2237,6 +2247,7 @@
     const REVIEW_THREAD_TOGGLE_SELECTOR =
         'button[data-is-first-collapse-button="true"], ' +
         'button[data-target="review-thread-collapsible.button"]';
+    const REVEAL_MINE_BATCH_SIZE = 6;
 
     function hasAttrContaining(el, name, needle) {
         return String(el?.getAttribute?.(name) || '')
@@ -2278,10 +2289,38 @@
         });
     }
 
-    function getReviewThreadToggleItems({ root = document, mineOnly = false, login = getCurrentGitHubLogin(root) } = {}) {
+    function hiddenReviewCommentIds(scope) {
+        return String(scope?.getAttribute?.('data-hidden-comment-ids') || '')
+            .split(',')
+            .map((id) => id.trim())
+            .filter(Boolean);
+    }
+
+    function cachedReviewCommentAuthors(pr = parsePR()) {
+        const prKey = pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : '';
+        return _reviewCommitMap?.prKey === prKey ? _reviewCommitMap.authors || {} : {};
+    }
+
+    function currentUserReviewCommentIds(login, authors = cachedReviewCommentAuthors()) {
+        const normalizedLogin = String(login || '').toLowerCase();
+        return new Set(
+            Object.entries(authors)
+                .filter(([, author]) => String(author || '').toLowerCase() === normalizedLogin)
+                .map(([id]) => id),
+        );
+    }
+
+    function getReviewThreadToggleItems({
+        root = document,
+        mineOnly = false,
+        login = getCurrentGitHubLogin(root),
+        mineCommentIds = null,
+    } = {}) {
         const items = [];
         const seenControls = new Set();
         const mineAncestors = new Set();
+        const knownMineCommentIds =
+            mineOnly && login ? mineCommentIds || currentUserReviewCommentIds(login) : new Set();
         if (mineOnly) {
             for (const comment of getCurrentUserCommentContainers(root, login)) {
                 for (let node = comment; node && node !== root.parentElement; node = node.parentElement) {
@@ -2290,7 +2329,10 @@
                 }
             }
         }
-        const belongsToMine = (scope) => !mineOnly || mineAncestors.has(scope);
+        const belongsToMine = (scope) =>
+            !mineOnly ||
+            mineAncestors.has(scope) ||
+            hiddenReviewCommentIds(scope).some((id) => knownMineCommentIds.has(id));
         const push = (item) => {
             if (!item.control || seenControls.has(item.control) || !belongsToMine(item.scope)) return;
             seenControls.add(item.control);
@@ -2341,8 +2383,10 @@
         return items;
     }
 
-    function getMineRevealTargets(root = document, login = getCurrentGitHubLogin(root)) {
-        const targets = getReviewThreadToggleItems({ root, mineOnly: true, login }).filter((item) => !item.isOpen());
+    function getMineRevealTargets(root = document, login = getCurrentGitHubLogin(root), mineCommentIds = null) {
+        const targets = getReviewThreadToggleItems({ root, mineOnly: true, login, mineCommentIds }).filter(
+            (item) => !item.isOpen(),
+        );
         const seenControls = new Set(targets.map((item) => item.control));
         for (const comment of getCurrentUserCommentContainers(root, login)) {
             const minimized = comment.closest?.('.minimized-comment, .Details-content--hidden-not-important');
@@ -2361,20 +2405,108 @@
         return targets;
     }
 
-    function getRevealMineState(root = document, login = getCurrentGitHubLogin(root)) {
-        if (!login) {
-            return { hiddenCount: 0, paginationBtns: [], timelineLoadMore: [], targets: [], total: 0 };
+    function hasLoadedReviewThreadComments(scope) {
+        const body = scope?.querySelector?.('[data-target="review-thread-collapsible.body"]') || scope;
+        return !!body?.querySelector?.(
+            '.review-comment, div[id^="discussion_r"], [class*="ActivityThread"], [data-testid^="issue-comment"]',
+        );
+    }
+
+    function getUnclassifiedLazyReviewThreadItems({
+        root = document,
+        commentAuthors = cachedReviewCommentAuthors(),
+        excludedControls = new Set(),
+        checkedScopes = null,
+    } = {}) {
+        return getReviewThreadToggleItems({ root }).filter((item) => {
+            if (item.isOpen() || excludedControls.has(item.control) || checkedScopes?.has(item.scope)) return false;
+            const ids = hiddenReviewCommentIds(item.scope);
+            if (ids.length === 0 || hasLoadedReviewThreadComments(item.scope)) return false;
+            return ids.some((id) => !Object.prototype.hasOwnProperty.call(commentAuthors, id));
+        });
+    }
+
+    function hiddenCommentScopeMayContainMine(scope, commentAuthors, mineCommentIds) {
+        const ids = hiddenReviewCommentIds(scope);
+        if (ids.length === 0) return true;
+        return ids.some(
+            (id) => mineCommentIds.has(id) || !Object.prototype.hasOwnProperty.call(commentAuthors, id),
+        );
+    }
+
+    function getMineConversationLoaders(commentAuthors, mineCommentIds) {
+        const loaders = getConversationLoaderElements();
+        return {
+            ...loaders,
+            paginationBtns: loaders.paginationBtns.filter((button) => {
+                const scope =
+                    button.closest?.('[data-hidden-comment-ids]') ||
+                    button.closest?.(HIDDEN_CONVERSATION_SELECTOR) ||
+                    button;
+                return hiddenCommentScopeMayContainMine(scope, commentAuthors, mineCommentIds);
+            }),
+        };
+    }
+
+    function getMineHiddenConversationCount(commentAuthors, mineCommentIds, root = document) {
+        let total = 0;
+        const scopes = [
+            ...root.querySelectorAll(HIDDEN_CONVERSATION_SELECTOR),
+            ...[...root.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR)].filter(
+                (button) => !button.closest(HIDDEN_CONVERSATION_SELECTOR),
+            ),
+        ];
+        for (const scope of scopes) {
+            if (!hiddenCommentScopeMayContainMine(scope, commentAuthors, mineCommentIds)) continue;
+            const match = String(scope.textContent || '').match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
+            total += match ? parseInt(match[1], 10) : 1;
         }
-        const hiddenCount = root === document ? getHiddenCount() : 0;
+        return total;
+    }
+
+    function getRevealMineState(
+        root = document,
+        login = getCurrentGitHubLogin(root),
+        { commentAuthors = cachedReviewCommentAuthors(), checkedScopes = null } = {},
+    ) {
+        if (!login) {
+            return {
+                hiddenCount: 0,
+                paginationBtns: [],
+                timelineLoadMore: [],
+                targets: [],
+                unknownTargets: [],
+                total: 0,
+            };
+        }
+        const mineCommentIds = currentUserReviewCommentIds(login, commentAuthors);
         const { paginationBtns, timelineLoadMore } =
-            root === document ? getConversationLoaderElements() : { paginationBtns: [], timelineLoadMore: [] };
-        const targets = getMineRevealTargets(root, login);
+            root === document
+                ? getMineConversationLoaders(commentAuthors, mineCommentIds)
+                : { paginationBtns: [], timelineLoadMore: [] };
+        const hiddenCount =
+            root === document
+                ? getMineHiddenConversationCount(commentAuthors, mineCommentIds) + getIssueTimelineLoadMoreCount()
+                : 0;
+        const targets = getMineRevealTargets(root, login, mineCommentIds);
+        const unknownTargets = getUnclassifiedLazyReviewThreadItems({
+            root,
+            commentAuthors,
+            excludedControls: new Set(targets.map((item) => item.control)),
+            checkedScopes,
+        });
         return {
             hiddenCount,
             paginationBtns,
             timelineLoadMore,
             targets,
-            total: hiddenCount + paginationBtns.length + timelineLoadMore.length + targets.length,
+            unknownTargets,
+            total:
+                hiddenCount +
+                paginationBtns.length +
+                timelineLoadMore.length +
+                targets.length +
+                unknownTargets.length,
         };
     }
 
@@ -3679,36 +3811,56 @@
         return members;
     }
 
-    // Map review comment ID → original_commit_id (cached per PR)
-    let _reviewCommitMap = null; // { prKey, map: { commentId: commitSha } }
+    // Review comment commit and author metadata, cached per PR.
+    let _reviewCommitMap = null; // { prKey, map: { commentId: commitSha }, authors: { commentId: login } }
+    let _reviewCommitMapRequest = null; // { prKey, promise }
 
     async function fetchReviewCommentCommits(owner, repo, prNum, apiSnapshots = {}) {
         const prKey = `${owner}/${repo}#${prNum}`;
         if (_reviewCommitMap && _reviewCommitMap.prKey === prKey) return _reviewCommitMap.map;
-        const map = {};
-        try {
-            for (let page = 1; page <= 5; page++) {
-                const comments =
-                    (page === 1 && Array.isArray(apiSnapshots.inlineComments) && apiSnapshots.inlineComments) ||
-                    (await gmFetch(
-                        `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=${page}`,
-                    ));
-                if (page === 1) apiSnapshots.inlineComments = comments;
-                for (const c of comments) {
-                    if (c.id && c.original_commit_id) {
-                        map[c.id] = c.original_commit_id.slice(0, 7);
+        if (_reviewCommitMapRequest?.prKey === prKey) return _reviewCommitMapRequest.promise;
+
+        const request = { prKey, promise: null };
+        _reviewCommitMapRequest = request;
+        request.promise = (async () => {
+            const map = {};
+            const authors = {};
+            try {
+                for (let page = 1; page <= 5; page++) {
+                    const comments =
+                        (page === 1 && Array.isArray(apiSnapshots.inlineComments) && apiSnapshots.inlineComments) ||
+                        (await gmFetch(
+                            `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/comments?per_page=100&page=${page}`,
+                        ));
+                    if (page === 1) apiSnapshots.inlineComments = comments;
+                    for (const c of comments) {
+                        if (c.id && c.original_commit_id) {
+                            map[c.id] = c.original_commit_id.slice(0, 7);
+                        }
+                        if (c.id && c.user?.login) {
+                            authors[c.id] = c.user.login;
+                        }
                     }
+                    if (comments.length < 100) break;
                 }
-                if (comments.length < 100) break;
+                ackLogEvent(`review-comment commit map: ${Object.keys(map).length}`, {
+                    pullRequest: prKey,
+                    authors: Object.keys(authors).length,
+                });
+            } catch (e) {
+                if (shouldWarnOptionalGitHubApiError(e))
+                    console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
             }
-            ackLogEvent(`review-comment commit map: ${Object.keys(map).length}`, {
-                pullRequest: prKey,
-            });
-        } catch (e) {
-            if (shouldWarnOptionalGitHubApiError(e)) console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
+            if (_reviewCommitMapRequest === request) {
+                _reviewCommitMap = { prKey, map, authors };
+            }
+            return map;
+        })();
+        try {
+            return await request.promise;
+        } finally {
+            if (_reviewCommitMapRequest === request) _reviewCommitMapRequest = null;
         }
-        _reviewCommitMap = { prKey, map };
-        return map;
     }
 
     // Hardcoded maintainer list -- editable via ACKtopus config panel.
@@ -6286,6 +6438,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         // Also clear in-memory caches
         Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
+        _reviewCommitMapRequest = null;
         console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
         return count;
     }
@@ -6302,6 +6455,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
+        _reviewCommitMapRequest = null;
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
@@ -24002,6 +24156,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (btn._running) return false;
         btn._running = true;
         const login = getCurrentGitHubLogin();
+        const pr = parsePR();
         const origText = btn.textContent;
         const stopAnim = startBrailleAnimation((frame) => {
             btn.textContent = `${frame} Reveal mine...`;
@@ -24011,6 +24166,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             stopAnim();
             btn.textContent = shortMsg || msg;
             popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            ackLogEvent(`reveal mine: ${ok ? 'finished' : 'stopped'}`, { message: msg }, ok ? 'log' : 'warn');
             const restore = () => {
                 btn.textContent = origText;
                 popup.remove();
@@ -24023,12 +24179,68 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (!login) return finish('Could not identify your GitHub account', '❌', false);
         try {
+            if (pr) {
+                popup.textContent = 'Finding your review threads...';
+                await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
+            }
+            const commentAuthors = cachedReviewCommentAuthors(pr);
+            const knownMineCommentIds = currentUserReviewCommentIds(login, commentAuthors);
+            const checkedFallbackScopes = new WeakSet();
+            const pendingFallback = new Map();
+            let fallbackFailures = 0;
+            const initialState = getRevealMineState(document, login, { commentAuthors });
+            ackLogEvent('reveal mine: comment ownership ready', {
+                pullRequest: pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : null,
+                knownReviewComments: Object.keys(commentAuthors).length,
+                mine: knownMineCommentIds.size,
+                lazyThreads: document.querySelectorAll('[data-hidden-comment-ids]').length,
+                hiddenItems: initialState.hiddenCount,
+                activeLoaders: initialState.paginationBtns.length + initialState.timelineLoadMore.length,
+                matchingThreads: initialState.targets.length,
+                unclassifiedThreads: initialState.unknownTargets.length,
+            });
             let hiddenWaitRounds = 0;
             let lastTargetCount = null;
             let stalledTargetRounds = 0;
             for (let round = 0; round < 60; round++) {
-                const state = getRevealMineState(document, login);
-                if (state.total === 0) return finish('Revealed your comments and review threads', '✅', true);
+                if (pendingFallback.size > 0) {
+                    for (const [scope, pending] of [...pendingFallback]) {
+                        if (!scope.isConnected) {
+                            pendingFallback.delete(scope);
+                            continue;
+                        }
+                        const fragment = scope.querySelector?.(
+                            '[data-target="review-thread-collapsible.body"] include-fragment',
+                        );
+                        if (fragment && !fragment.classList?.contains('is-error') && pending.waitRounds++ < 20) {
+                            continue;
+                        }
+                        pendingFallback.delete(scope);
+                        if (fragment) {
+                            fallbackFailures++;
+                            continue;
+                        }
+                        if (getCurrentUserCommentContainers(scope, login).length === 0) {
+                            pending.item.setOpen(false);
+                        }
+                    }
+                    if (pendingFallback.size > 0) {
+                        popup.textContent = `Checking review threads... ${pendingFallback.size} loading`;
+                        await ackSleep(500);
+                        continue;
+                    }
+                }
+
+                const state = getRevealMineState(document, login, {
+                    commentAuthors,
+                    checkedScopes: checkedFallbackScopes,
+                });
+                if (state.total === 0) {
+                    if (fallbackFailures > 0) {
+                        return finish(`${fallbackFailures} review threads could not be checked`, '❌', false);
+                    }
+                    return finish('Revealed your comments and review threads', '✅', true);
+                }
                 if (state.paginationBtns.length + state.timelineLoadMore.length > 0) {
                     popup.textContent = `Loading hidden comments... ${state.total} remaining`;
                     state.paginationBtns.forEach((button) => button.click());
@@ -24045,16 +24257,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     await ackSleep(500);
                     continue;
                 }
-                stalledTargetRounds = state.targets.length === lastTargetCount ? stalledTargetRounds + 1 : 0;
-                lastTargetCount = state.targets.length;
-                if (stalledTargetRounds >= 8) {
-                    return finish(`${state.targets.length} review threads could not be opened`, '❌', false);
+                if (state.targets.length > 0) {
+                    stalledTargetRounds = state.targets.length === lastTargetCount ? stalledTargetRounds + 1 : 0;
+                    lastTargetCount = state.targets.length;
+                    if (stalledTargetRounds >= 8) {
+                        return finish(`${state.targets.length} review threads could not be opened`, '❌', false);
+                    }
+                    const batch = state.targets.slice(0, REVEAL_MINE_BATCH_SIZE);
+                    popup.textContent = `Opening your review threads... ${state.targets.length} remaining`;
+                    batch.forEach((item) => item.setOpen(true));
+                    await ackSleep(700);
+                    continue;
                 }
-                popup.textContent = `Opening your review threads... ${state.targets.length} remaining`;
-                state.targets.forEach((item) => item.setOpen(true));
-                await ackSleep(700);
+
+                lastTargetCount = null;
+                stalledTargetRounds = 0;
+                const batch = state.unknownTargets.slice(0, REVEAL_MINE_BATCH_SIZE);
+                popup.textContent = `Checking possible review threads... ${state.unknownTargets.length} remaining`;
+                for (const item of batch) {
+                    checkedFallbackScopes.add(item.scope);
+                    pendingFallback.set(item.scope, { item, waitRounds: 0 });
+                    item.setOpen(true);
+                }
+                await ackSleep(500);
             }
-            const remaining = getRevealMineState(document, login).total;
+            const remaining = getRevealMineState(document, login, {
+                commentAuthors,
+                checkedScopes: checkedFallbackScopes,
+            }).total;
             if (remaining === 0) return finish('Revealed your comments and review threads', '✅', true);
             return finish(`${remaining} items still appear hidden or collapsed`, '❌', false);
         } catch (e) {
@@ -33122,6 +33352,54 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('conversation loaders submit each GitHub pagination form once', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <form id="ready" class="ajax-pagination-form">
+                <button id="count" class="ajax-pagination-btn">134 hidden items</button>
+                <button id="load" class="ajax-pagination-btn">Load more...</button>
+            </form>
+            <form id="loading" class="ajax-pagination-form">
+                <button id="disabled" class="ajax-pagination-btn" disabled>Load more...</button>
+            </form>
+            <form class="ajax-pagination-form" data-hidden-comment-ids="200">
+                <button id="other" class="ajax-pagination-btn">2 hidden conversations</button>
+            </form>
+            <form class="ajax-pagination-form" data-hidden-comment-ids="201">
+                <button id="mine" class="ajax-pagination-btn">3 hidden conversations</button>
+            </form>
+            <form class="ajax-pagination-form" data-hidden-comment-ids="202">
+                <button id="unknown" class="ajax-pagination-btn">4 hidden conversations</button>
+            </form>
+            <button id="standalone" class="ajax-pagination-btn">Load more...</button>
+        `;
+        document.body.appendChild(host);
+        try {
+            const buttons = getConversationLoaderElements().paginationBtns.filter((button) => host.contains(button));
+            ackDeepEq(
+                buttons.map((button) => button.id),
+                ['load', 'other', 'mine', 'unknown', 'standalone'],
+                'prefers one Load more button per form and skips disabled loaders',
+            );
+            const mineButtons = getMineConversationLoaders(
+                { 200: 'someone', 201: 'me' },
+                new Set(['201']),
+            ).paginationBtns.filter((button) => host.contains(button));
+            ackDeepEq(
+                mineButtons.map((button) => button.id),
+                ['load', 'mine', 'unknown', 'standalone'],
+                'skips a review pagination form only when every hidden comment has another known author',
+            );
+            ackEq(
+                getMineHiddenConversationCount({ 200: 'someone', 201: 'me' }, new Set(['201']), host),
+                143,
+                'counts active and disabled loaders that Reveal mine is waiting for',
+            );
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('getLoadableElements detects React issue timeline load-more items', () => {
         const host = document.createElement('div');
         host.innerHTML = `
@@ -33232,6 +33510,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
                 <div class="ActivityThread"><a class="author">me</a></div>
             </review-thread-collapsible>
+            <review-thread-collapsible
+                id="lazy-conversation-mine"
+                class="review-thread-component js-comment-container js-resolvable-timeline-thread-container"
+                data-resolved="true"
+                data-deferred-content-url="/owner/repo/pull/1/threads/10"
+                data-hidden-comment-ids="100,101"
+            >
+                <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                <div data-target="review-thread-collapsible.body" hidden><include-fragment></include-fragment></div>
+            </review-thread-collapsible>
             <div class="timeline-comment">
                 <a class="author">me</a>
                 <div class="markdown-body">
@@ -33241,14 +33529,57 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 </div>
             </div>
         `;
-        const mine = getReviewThreadToggleItems({ root: host, mineOnly: true, login: 'me' });
+        const mine = getReviewThreadToggleItems({
+            root: host,
+            mineOnly: true,
+            login: 'me',
+            mineCommentIds: new Set(['101']),
+        });
         ackDeepEq(
             mine.map((item) => item.scope.id).sort(),
-            ['classic-mine', 'conversation-mine', 'modern-mine'],
-            'finds classic, conversation, and changes threads containing any current-user reply',
+            ['classic-mine', 'conversation-mine', 'lazy-conversation-mine', 'modern-mine'],
+            'finds loaded and lazy threads containing any current-user reply',
         );
-        ackEq(getReviewThreadToggleItems({ root: host }).length, 4, 'all mode also includes the other review thread');
-        ackEq(getRevealMineState(host, 'me').total, 3, 'reveal-mine count includes only collapsed matching threads');
+        ackEq(getReviewThreadToggleItems({ root: host }).length, 5, 'all mode also includes the other review thread');
+        ackEq(
+            getRevealMineState(host, 'me', { commentAuthors: { 100: 'someone', 101: 'me' } }).total,
+            4,
+            'reveal-mine count includes loaded and lazy matching threads',
+        );
+    });
+
+    ackTest('reveal mine classifies lazy GitHub threads without opening unrelated ones', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <review-thread-collapsible
+                id="known-other"
+                class="review-thread-component js-comment-container js-resolvable-timeline-thread-container"
+                data-resolved="true"
+                data-deferred-content-url="/owner/repo/pull/1/threads/11"
+                data-hidden-comment-ids="200"
+            >
+                <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                <div data-target="review-thread-collapsible.body" hidden><include-fragment></include-fragment></div>
+            </review-thread-collapsible>
+            <review-thread-collapsible
+                id="unknown"
+                class="review-thread-component js-comment-container js-resolvable-timeline-thread-container"
+                data-resolved="true"
+                data-deferred-content-url="/owner/repo/pull/1/threads/12"
+                data-hidden-comment-ids="201"
+            >
+                <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                <div data-target="review-thread-collapsible.body" hidden><include-fragment></include-fragment></div>
+            </review-thread-collapsible>
+        `;
+        const state = getRevealMineState(host, 'me', { commentAuthors: { 200: 'someone' } });
+        ackEq(state.targets.length, 0, 'does not treat a known other-user thread as mine');
+        ackDeepEq(
+            state.unknownTargets.map((item) => item.scope.id),
+            ['unknown'],
+            'falls back only for a lazy thread whose author is not cached',
+        );
+        ackEq(state.total, 1, 'keeps the Reveal mine action enabled for the unclassified lazy thread');
     });
 
     ackTest('review thread controls open and close classic and modern threads', () => {
@@ -33334,12 +33665,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(revealMine.includes('state.paginationBtns.forEach'), 'loads classic hidden-comment pages');
         ackAssert(revealMine.includes('state.timelineLoadMore.forEach'), 'loads modern hidden timeline pages');
         ackAssert(
-            revealMine.indexOf('await ackSleep(1800);') < revealMine.indexOf('state.targets.forEach'),
+            revealMine.indexOf('await ackSleep(1800);') < revealMine.indexOf('batch.forEach'),
             'finishes each hidden-comment loading pass before opening matching threads',
         );
         ackAssert(revealMine.includes('continue;'), 'does not open unrelated thread controls during the loader phase');
         ackAssert(revealMine.includes('hiddenWaitRounds >= 20'), 'bounds waits for a missing hidden-comment loader');
         ackAssert(revealMine.includes('stalledTargetRounds >= 8'), 'bounds retries for thread controls that do not open');
+        ackAssert(revealMine.includes('REVEAL_MINE_BATCH_SIZE'), 'opens lazy threads in bounded batches');
+        ackAssert(revealMine.includes('checkedFallbackScopes'), 'does not reopen an inspected unrelated thread');
 
         const closeThreads = sourceSection(
             _ackSource,
@@ -33989,6 +34322,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('original_commit_id'), 'extracts original_commit_id from API');
         ackAssert(fn.includes('/pulls/'), 'fetches from PR comments API');
         ackAssert(fn.includes('_reviewCommitMap'), 'caches per PR in memory');
+        ackAssert(fn.includes('_reviewCommitMapRequest'), 'shares an in-flight fetch');
+        ackAssert(fn.includes('authors[c.id] = c.user.login'), 'maps hidden comment IDs to their authors');
         ackAssert(fn.includes('page <= 5'), 'paginates up to 5 pages');
         ackAssert(fn.includes('comments.length < 100'), 'stops on last page');
         ackAssert(fn.includes('apiSnapshots.inlineComments'), 'accepts the inline-comment first page from member discovery');
@@ -33996,19 +34331,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('fetchReviewCommentCommits reuses an inline-comment snapshot without a request', async () => {
         const previousMap = _reviewCommitMap;
+        const previousRequest = _reviewCommitMapRequest;
         try {
             _reviewCommitMap = null;
+            _reviewCommitMapRequest = null;
             const map = await fetchReviewCommentCommits('ack-snapshot-test', 'demo', 81, {
                 inlineComments: [
                     {
                         id: 123,
                         original_commit_id: 'abcdef0123456789',
+                        user: { login: 'me' },
                     },
                 ],
             });
             ackDeepEq(map, { 123: 'abcdef0' }, 'builds the map from the supplied first page');
+            ackDeepEq(_reviewCommitMap.authors, { 123: 'me' }, 'keeps comment authors for lazy thread ownership');
         } finally {
             _reviewCommitMap = previousMap;
+            _reviewCommitMapRequest = previousRequest;
         }
     });
 
@@ -39875,6 +40215,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('llm_cache_timestamps'), 'clears cache timestamps');
         ackAssert(fn.includes('_orgMemberCache'), 'clears in-memory org cache');
         ackAssert(fn.includes('_reviewCommitMap'), 'clears review commit map');
+        ackAssert(fn.includes('_reviewCommitMapRequest'), 'clears an in-flight review comment request');
         ackAssert(fn.includes('GM_deleteValue'), 'actually deletes GM values');
     });
 
