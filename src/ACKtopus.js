@@ -4963,6 +4963,30 @@
         });
     }
 
+    function installLocalRepoCompareTargets(link, upstreamHref, forkHref) {
+        link.dataset.localRepoPrUpstreamHref = upstreamHref;
+        link.dataset.localRepoPrForkHref = forkHref;
+
+        const renderTarget = (useUpstream = ackShiftPressed) => {
+            const href = useUpstream ? upstreamHref : forkHref;
+            if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+        };
+        link.addEventListener(
+            'click',
+            (e) => {
+                if (!eventUsesShiftAlternate(e)) return;
+                renderTarget(true);
+                if (!ackShiftPressed) {
+                    setTimeout(() => {
+                        if (link.isConnected) renderTarget(false);
+                    }, 0);
+                }
+            },
+            true,
+        );
+        registerShiftAlternateRenderer(link, () => renderTarget());
+    }
+
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
         let rewritten = 0;
         const scanRoot = opts.root || root || document;
@@ -4983,15 +5007,8 @@
                 path: opts.path || location.pathname,
             });
             if (!rewrite) continue;
-            link.setAttribute('href', rewrite.href);
+            installLocalRepoCompareTargets(link, originalHref, rewrite.href);
             link.dataset.localRepoPrRewritten = '1';
-            link.title = `Rewritten by userscript: opens PR against ${rewrite.repoKey}:${rewrite.baseBranch}`;
-            if (!/\s🏠\s*$/.test(link.textContent || '')) {
-                const badge = document.createElement('span');
-                badge.textContent = ' 🏠';
-                badge.title = link.title;
-                link.appendChild(badge);
-            }
             ackLogEvent('fork compare link rewritten', {
                 from: originalHref,
                 to: rewrite.href,
@@ -34821,31 +34838,73 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('ack-repo-mirrors'), 'settings expose repo mirror config');
     });
 
-    ackTest('local repo compare rewrite marks modified compare buttons', () => {
+    ackTest('local repo compare rewrite preserves the button and uses upstream while Shift is held', () => {
         const host = document.createElement('div');
         host.innerHTML =
-            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>' +
+            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary" title="Open comparison">Compare & pull request</a>' +
             '<a href="/octo/demo/compare/other?expand=1">Plain compare link</a>';
-        const count = rewriteLocalRepoCompareLinks(host, {
-            currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
-            baseBranch: 'main',
-        });
-        const link = host.querySelector('a');
-        ackEq(count, 1);
-        ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
-        ackEq(link.dataset.localRepoPrRewritten, '1');
-        ackAssert(link.textContent.trim().endsWith('🏠'), 'adds emoji marker');
-        ackAssert(link.title.includes('octo/demo:main'), 'explains fork target');
-        ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
+        document.body.appendChild(host);
+        try {
+            const count = rewriteLocalRepoCompareLinks(host, {
+                currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+                baseBranch: 'main',
+            });
+            const link = host.querySelector('a');
+            ackEq(count, 1);
+            ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
+            ackEq(link.dataset.localRepoPrRewritten, '1');
+            ackEq(link.dataset.localRepoPrUpstreamHref, '/octo/demo/compare/detached537?expand=1');
+            ackEq(link.dataset.localRepoPrForkHref, '/octo/demo/compare/main...detached537?quick_pull=1');
+            ackEq(link.textContent.trim(), 'Compare & pull request', 'does not add a marker');
+            ackEq(link.title, 'Open comparison', 'preserves GitHub tooltip');
+            ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
 
-        ackEq(
+            setAckShiftPressed(true);
+            ackEq(link.getAttribute('href'), '/octo/demo/compare/detached537?expand=1');
+            setAckShiftPressed(false);
+            ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
+
+            ackEq(
+                rewriteLocalRepoCompareLinks(host, {
+                    currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+                    baseBranch: 'main',
+                }),
+                0,
+            );
+        } finally {
+            setAckShiftPressed(false);
+            host.remove();
+        }
+    });
+
+    ackTest('local repo compare rewrite honors Shift on the click event', async () => {
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>';
+        document.body.appendChild(host);
+        try {
             rewriteLocalRepoCompareLinks(host, {
                 currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
                 baseBranch: 'main',
-            }),
-            0,
-        );
-        ackEq((link.textContent.match(/🏠/g) || []).length, 1, 'does not duplicate emoji');
+            });
+            const link = host.querySelector('a');
+            link.addEventListener('click', (e) => e.preventDefault(), { once: true });
+            link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }));
+            ackEq(
+                link.getAttribute('href'),
+                '/octo/demo/compare/detached537?expand=1',
+                'uses the upstream target for Shift-click',
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(
+                link.getAttribute('href'),
+                '/octo/demo/compare/main...detached537?quick_pull=1',
+                'restores the fork target after the click',
+            );
+        } finally {
+            setAckShiftPressed(false);
+            host.remove();
+        }
     });
 
     ackTest('local repo compare rewrite handles secp fork banners without default-branch metadata', () => {
@@ -34862,7 +34921,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(count, 1);
         ackEq(link.getAttribute('href'), '/l0rinc/secp256k1/compare/master...topic/remove-foo?quick_pull=1');
         ackEq(link.dataset.localRepoPrRewritten, '1');
-        ackAssert(link.title.includes('l0rinc/secp256k1:master'), 'names the fork target');
+        ackEq(
+            link.dataset.localRepoPrUpstreamHref,
+            '/bitcoin-core/secp256k1/compare/master...l0rinc:topic/remove-foo?expand=1',
+        );
+        ackEq(link.textContent.trim(), 'Compare & pull request', 'keeps the upstream banner unchanged');
     });
 
     ackTest('local repo compare rewrite fetches missing default branch on repo pages', async () => {
