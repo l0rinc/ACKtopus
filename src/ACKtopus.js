@@ -2227,6 +2227,157 @@
         return { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs };
     }
 
+    const POSTED_COMMENT_CONTAINER_SELECTOR =
+        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], ' +
+        '[data-testid^="issue-comment"], div[id^="issuecomment-"], div[id^="discussion_r"], ' +
+        'div[id^="pullrequestreview-"]';
+    const REVIEW_THREAD_SCOPE_SELECTOR =
+        `${COMMENT_THREAD_SELECTOR}, [data-resolved="true"], ` +
+        '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]';
+    const REVIEW_THREAD_TOGGLE_SELECTOR =
+        'button[data-is-first-collapse-button="true"], ' +
+        'button[data-target="review-thread-collapsible.button"]';
+
+    function hasAttrContaining(el, name, needle) {
+        return String(el?.getAttribute?.(name) || '')
+            .toLowerCase()
+            .includes(needle);
+    }
+
+    function isSafeReviewThreadDetails(details) {
+        if (!details || details.closest?.(MARKDOWN_BODY_SELECTOR)) return false;
+        if (details.classList?.contains('details-overlay')) return false;
+        if (details.classList?.contains('js-reaction-popover-container')) return false;
+        if (details.classList?.contains('new-reactions-dropdown')) return false;
+        if (details.classList?.contains('js-comment-header-reaction-button')) return false;
+        if (details.getAttribute?.('data-target') === 'action-menu.overlay') return false;
+        const summary = [...(details.children || [])].find((child) => child.tagName === 'SUMMARY');
+        if (!summary || summary.classList?.contains('timeline-comment-action')) return false;
+        if (hasAttrContaining(summary, 'aria-haspopup', 'menu')) return false;
+        if (hasAttrContaining(summary, 'aria-label', 'reaction') || hasAttrContaining(summary, 'aria-label', 'react'))
+            return false;
+        return !!details.closest?.(
+            '.outdated-comment, .js-resolvable-timeline-thread-container, .js-line-comments, ' +
+                '.inline-comments, .review-thread-component, [data-testid="review-thread"], [data-resolved="true"]',
+        );
+    }
+
+    function getCurrentUserCommentContainers(root = document, login = getCurrentGitHubLogin(root)) {
+        if (!login) return [];
+        const normalizedLogin = login.toLowerCase();
+        return [...(root.querySelectorAll?.(POSTED_COMMENT_CONTAINER_SELECTOR) || [])].filter((container) => {
+            if (
+                container.closest?.(
+                    '#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]',
+                )
+            )
+                return false;
+            if (container.classList?.contains('current-user')) return true;
+            const author = getCommentAuthor(container);
+            return !!author && author.toLowerCase() === normalizedLogin;
+        });
+    }
+
+    function getReviewThreadToggleItems({ root = document, mineOnly = false, login = getCurrentGitHubLogin(root) } = {}) {
+        const items = [];
+        const seenControls = new Set();
+        const mineAncestors = new Set();
+        if (mineOnly) {
+            for (const comment of getCurrentUserCommentContainers(root, login)) {
+                for (let node = comment; node && node !== root.parentElement; node = node.parentElement) {
+                    mineAncestors.add(node);
+                    if (node === root) break;
+                }
+            }
+        }
+        const belongsToMine = (scope) => !mineOnly || mineAncestors.has(scope);
+        const push = (item) => {
+            if (!item.control || seenControls.has(item.control) || !belongsToMine(item.scope)) return;
+            seenControls.add(item.control);
+            items.push(item);
+        };
+        const select = (selector) => [
+            ...(root.matches?.(selector) ? [root] : []),
+            ...(root.querySelectorAll?.(selector) || []),
+        ];
+
+        for (const details of select(
+            'details[data-resolved], details.js-resolvable-timeline-thread-container, .outdated-comment details',
+        )) {
+            if (!isSafeReviewThreadDetails(details)) continue;
+            const summary = [...(details.children || [])].find((child) => child.tagName === 'SUMMARY');
+            push({
+                scope: details,
+                control: summary,
+                isOpen: () => details.hasAttribute('open'),
+                setOpen: (open) => {
+                    if (open === details.hasAttribute('open')) return;
+                    if (open) summary.click();
+                    else details.removeAttribute('open');
+                },
+            });
+        }
+
+        for (const button of select(REVIEW_THREAD_TOGGLE_SELECTOR)) {
+            const scope = button.closest?.(REVIEW_THREAD_SCOPE_SELECTOR);
+            if (!scope || (root !== document && !root.contains(scope) && scope !== root)) continue;
+            const body = scope.querySelector?.('[data-target="review-thread-collapsible.body"]');
+            const isOpen = () => {
+                const expanded = button.getAttribute('aria-expanded');
+                if (expanded === 'true' || expanded === 'false') return expanded === 'true';
+                if (button.querySelector('.octicon-chevron-down')) return true;
+                if (button.querySelector('.octicon-chevron-right')) return false;
+                return body ? !body.hasAttribute('hidden') : false;
+            };
+            push({
+                scope,
+                control: button,
+                isOpen,
+                setOpen: (open) => {
+                    if (open !== isOpen()) button.click();
+                },
+            });
+        }
+        return items;
+    }
+
+    function getMineRevealTargets(root = document, login = getCurrentGitHubLogin(root)) {
+        const targets = getReviewThreadToggleItems({ root, mineOnly: true, login }).filter((item) => !item.isOpen());
+        const seenControls = new Set(targets.map((item) => item.control));
+        for (const comment of getCurrentUserCommentContainers(root, login)) {
+            const minimized = comment.closest?.('.minimized-comment, .Details-content--hidden-not-important');
+            const control = minimized?.querySelector?.('.timeline-comment-header, summary');
+            if (!control || seenControls.has(control)) continue;
+            seenControls.add(control);
+            targets.push({
+                scope: minimized,
+                control,
+                isOpen: () =>
+                    !minimized.isConnected ||
+                    !minimized.matches('.minimized-comment, .Details-content--hidden-not-important'),
+                setOpen: () => control.click(),
+            });
+        }
+        return targets;
+    }
+
+    function getRevealMineState(root = document, login = getCurrentGitHubLogin(root)) {
+        if (!login) {
+            return { hiddenCount: 0, paginationBtns: [], timelineLoadMore: [], targets: [], total: 0 };
+        }
+        const hiddenCount = root === document ? getHiddenCount() : 0;
+        const { paginationBtns, timelineLoadMore } =
+            root === document ? getConversationLoaderElements() : { paginationBtns: [], timelineLoadMore: [] };
+        const targets = getMineRevealTargets(root, login);
+        return {
+            hiddenCount,
+            paginationBtns,
+            timelineLoadMore,
+            targets,
+            total: hiddenCount + paginationBtns.length + timelineLoadMore.length + targets.length,
+        };
+    }
+
     function getPendingReviewRevealTargets(root = document) {
         const targets = [];
         const seen = new Set();
@@ -2235,23 +2386,8 @@
             seen.add(el);
             targets.push(el);
         };
-        const hasAttrContaining = (el, name, needle) =>
-            String(el?.getAttribute?.(name) || '')
-                .toLowerCase()
-                .includes(needle);
         const isSafePendingDetails = (details) => {
-            if (!details || details.open) return false;
-            if (details.classList?.contains('details-overlay')) return false;
-            if (details.classList?.contains('js-reaction-popover-container')) return false;
-            if (details.classList?.contains('new-reactions-dropdown')) return false;
-            if (details.classList?.contains('js-comment-header-reaction-button')) return false;
-            if (details.getAttribute?.('data-target') === 'action-menu.overlay') return false;
-            const summary = [...(details.children || [])].find((child) => child.tagName === 'SUMMARY');
-            if (!summary) return false;
-            if (summary.classList?.contains('timeline-comment-action')) return false;
-            if (hasAttrContaining(summary, 'aria-haspopup', 'menu')) return false;
-            if (hasAttrContaining(summary, 'aria-label', 'reaction') || hasAttrContaining(summary, 'aria-label', 'react'))
-                return false;
+            if (!details || details.open || !isSafeReviewThreadDetails(details)) return false;
             return !!details.closest?.(
                 '.outdated-comment, .js-resolvable-timeline-thread-container, .js-line-comments, ' +
                     '.inline-comments, .review-thread-component, [data-testid="review-thread"]',
@@ -23862,6 +23998,120 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    async function revealMineContext(btn, { restoreMs = 2000 } = {}) {
+        if (btn._running) return false;
+        btn._running = true;
+        const login = getCurrentGitHubLogin();
+        const origText = btn.textContent;
+        const stopAnim = startBrailleAnimation((frame) => {
+            btn.textContent = `${frame} Reveal mine...`;
+        });
+        const popup = makeStatusPopup('Loading comments and opening your review threads...');
+        const finish = (msg, shortMsg, ok = false) => {
+            stopAnim();
+            btn.textContent = shortMsg || msg;
+            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            const restore = () => {
+                btn.textContent = origText;
+                popup.remove();
+                btn._running = false;
+            };
+            if (restoreMs <= 0) restore();
+            else setTimeout(restore, restoreMs);
+            return ok;
+        };
+
+        if (!login) return finish('Could not identify your GitHub account', '❌', false);
+        try {
+            let hiddenWaitRounds = 0;
+            let lastTargetCount = null;
+            let stalledTargetRounds = 0;
+            for (let round = 0; round < 60; round++) {
+                const state = getRevealMineState(document, login);
+                if (state.total === 0) return finish('Revealed your comments and review threads', '✅', true);
+                if (state.paginationBtns.length + state.timelineLoadMore.length > 0) {
+                    popup.textContent = `Loading hidden comments... ${state.total} remaining`;
+                    state.paginationBtns.forEach((button) => button.click());
+                    state.timelineLoadMore.forEach((button) => button.click());
+                    hiddenWaitRounds = 0;
+                    await ackSleep(1800);
+                    continue;
+                }
+                if (state.hiddenCount > 0) {
+                    if (++hiddenWaitRounds >= 20) {
+                        return finish(`${state.hiddenCount} hidden comments could not be loaded`, '❌', false);
+                    }
+                    popup.textContent = `Waiting for hidden comments... ${state.hiddenCount} remaining`;
+                    await ackSleep(500);
+                    continue;
+                }
+                stalledTargetRounds = state.targets.length === lastTargetCount ? stalledTargetRounds + 1 : 0;
+                lastTargetCount = state.targets.length;
+                if (stalledTargetRounds >= 8) {
+                    return finish(`${state.targets.length} review threads could not be opened`, '❌', false);
+                }
+                popup.textContent = `Opening your review threads... ${state.targets.length} remaining`;
+                state.targets.forEach((item) => item.setOpen(true));
+                await ackSleep(700);
+            }
+            const remaining = getRevealMineState(document, login).total;
+            if (remaining === 0) return finish('Revealed your comments and review threads', '✅', true);
+            return finish(`${remaining} items still appear hidden or collapsed`, '❌', false);
+        } catch (e) {
+            console.error('ACKtopus: reveal mine failed:', e);
+            return finish(`Error: ${e.message}`, '❌', false);
+        }
+    }
+
+    async function closeReviewThreads(btn, { mineOnly = false, restoreMs = 2000 } = {}) {
+        if (btn._running) return false;
+        btn._running = true;
+        const login = getCurrentGitHubLogin();
+        const origText = btn.textContent;
+        const label = mineOnly ? 'your review threads' : 'review threads';
+        const stopAnim = startBrailleAnimation((frame) => {
+            btn.textContent = `${frame} Closing...`;
+        });
+        const popup = makeStatusPopup(`Closing ${label}...`);
+        const finish = (msg, shortMsg, ok = false) => {
+            stopAnim();
+            btn.textContent = shortMsg || msg;
+            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            const restore = () => {
+                btn.textContent = origText;
+                popup.remove();
+                btn._running = false;
+            };
+            if (restoreMs <= 0) restore();
+            else setTimeout(restore, restoreMs);
+            return ok;
+        };
+
+        if (mineOnly && !login) return finish('Could not identify your GitHub account', '❌', false);
+        try {
+            for (let round = 0; round < 10; round++) {
+                const openItems = getReviewThreadToggleItems({ mineOnly, login }).filter((item) => item.isOpen());
+                if (openItems.length === 0) return finish(`Closed ${label}`, '✅', true);
+                popup.textContent = `Closing ${label}... ${openItems.length} remaining`;
+                openItems
+                    .map((item) => {
+                        let depth = 0;
+                        for (let el = item.scope; el; el = el.parentElement) depth++;
+                        return { item, depth };
+                    })
+                    .sort((a, b) => b.depth - a.depth)
+                    .forEach(({ item }) => item.setOpen(false));
+                await ackSleep(250);
+            }
+            const remaining = getReviewThreadToggleItems({ mineOnly, login }).filter((item) => item.isOpen()).length;
+            if (remaining === 0) return finish(`Closed ${label}`, '✅', true);
+            return finish(`${remaining} review threads still appear open`, '❌', false);
+        } catch (e) {
+            console.error(`ACKtopus: close ${mineOnly ? 'mine' : 'all'} failed:`, e);
+            return finish(`Error: ${e.message}`, '❌', false);
+        }
+    }
+
     async function revealPendingReviewComments(btn, { restoreMs = 0 } = {}) {
         if (btn._running) return false;
         btn._running = true;
@@ -24167,26 +24417,75 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             background: 'transparent',
         });
         const renderRevealItem = () => {
-            const count = getRevealAllState().total;
-            revealItem.textContent = `📂 Reveal all${count > 0 ? ` (${count})` : ''}`;
+            const closing = ackShiftPressed;
+            const count = closing
+                ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
+                : getRevealAllState().total;
+            revealItem.textContent = `${closing ? '📁 Close all' : '📂 Reveal all'}${count > 0 ? ` (${count})` : ''}`;
             revealItem.style.opacity = count > 0 ? '1' : '0.45';
             revealItem.style.cursor = count > 0 ? 'pointer' : 'default';
+            revealItem.title = closing
+                ? 'Close every open review thread'
+                : 'Reveal hidden timeline items, resolved threads, and collapsed sections before copying context';
         };
         renderRevealItem();
-        revealItem.title =
-            'Reveal hidden timeline items, resolved threads, and collapsed sections before copying context';
+        registerShiftAlternateRenderer(revealItem, renderRevealItem);
         revealItem.addEventListener('mouseenter', () => (revealItem.style.background = '#30363d'));
         revealItem.addEventListener('mouseleave', () => (revealItem.style.background = 'transparent'));
-        revealItem.addEventListener('click', () => {
-            if (getRevealAllState().total === 0) return;
+        revealItem.addEventListener('click', (e) => {
+            const closing = eventUsesShiftAlternate(e);
+            const count = closing
+                ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
+                : getRevealAllState().total;
+            if (count === 0) return;
             menu.style.display = 'none';
-            revealAllContext(mainBtn);
+            if (closing) closeReviewThreads(mainBtn);
+            else revealAllContext(mainBtn);
         });
         menu.appendChild(revealItem);
+
+        const revealMineItem = document.createElement('div');
+        revealMineItem.dataset.ackRevealMine = 'true';
+        Object.assign(revealMineItem.style, {
+            padding: '6px 12px',
+            fontSize: '12px',
+            color: '#c9d1d9',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            background: 'transparent',
+        });
+        const renderRevealMineItem = () => {
+            const closing = ackShiftPressed;
+            const count = closing
+                ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
+                : getRevealMineState().total;
+            revealMineItem.textContent = `${closing ? '👤 Close mine' : '👤 Reveal mine'}${count > 0 ? ` (${count})` : ''}`;
+            revealMineItem.style.opacity = count > 0 ? '1' : '0.45';
+            revealMineItem.style.cursor = count > 0 ? 'pointer' : 'default';
+            revealMineItem.title = closing
+                ? 'Close every open review thread that contains one of your comments'
+                : 'Load every comment and open each review thread that contains one of your comments';
+        };
+        renderRevealMineItem();
+        registerShiftAlternateRenderer(revealMineItem, renderRevealMineItem);
+        revealMineItem.addEventListener('mouseenter', () => (revealMineItem.style.background = '#30363d'));
+        revealMineItem.addEventListener('mouseleave', () => (revealMineItem.style.background = 'transparent'));
+        revealMineItem.addEventListener('click', (e) => {
+            const closing = eventUsesShiftAlternate(e);
+            const count = closing
+                ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
+                : getRevealMineState().total;
+            if (count === 0) return;
+            menu.style.display = 'none';
+            if (closing) closeReviewThreads(mainBtn, { mineOnly: true });
+            else revealMineContext(mainBtn);
+        });
+        menu.appendChild(revealMineItem);
 
         dropBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             renderRevealItem();
+            renderRevealMineItem();
             menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
         });
         group.appendChild(mainBtn);
@@ -32895,6 +33194,113 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('current-user comment discovery excludes the PR description', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div data-testid="issue-body">
+                <div class="timeline-comment current-user"><a class="author">me</a></div>
+            </div>
+            <div id="mine" class="timeline-comment"><a class="author">me</a></div>
+            <div id="mine-class" class="review-comment current-user"><a class="author">someone</a></div>
+            <div class="timeline-comment"><a class="author">someone</a></div>
+        `;
+        const mine = getCurrentUserCommentContainers(host, 'me');
+        ackDeepEq(
+            mine.map((comment) => comment.id),
+            ['mine', 'mine-class'],
+            'keeps authored/current-user comments without treating the PR body as a comment',
+        );
+    });
+
+    ackTest('review thread controls find every thread containing one of my comments', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <details id="classic-mine" data-resolved="true">
+                <summary>Resolved</summary>
+                <div class="timeline-comment"><a class="author">someone</a></div>
+                <div class="timeline-comment"><a class="author">me</a></div>
+            </details>
+            <details id="classic-other" data-resolved="true">
+                <summary>Resolved</summary>
+                <div class="timeline-comment"><a class="author">someone</a></div>
+            </details>
+            <div id="modern-mine" class="ReviewThreadContainer">
+                <button data-is-first-collapse-button="true" aria-expanded="false"></button>
+                <div class="ActivityThread"><a class="author">me</a></div>
+            </div>
+            <review-thread-collapsible id="conversation-mine" data-resolved="true">
+                <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                <div class="ActivityThread"><a class="author">me</a></div>
+            </review-thread-collapsible>
+            <div class="timeline-comment">
+                <a class="author">me</a>
+                <div class="markdown-body">
+                    <details data-resolved="true" class="details-overlay">
+                        <summary class="timeline-comment-action">Actions</summary>
+                    </details>
+                </div>
+            </div>
+        `;
+        const mine = getReviewThreadToggleItems({ root: host, mineOnly: true, login: 'me' });
+        ackDeepEq(
+            mine.map((item) => item.scope.id).sort(),
+            ['classic-mine', 'conversation-mine', 'modern-mine'],
+            'finds classic, conversation, and changes threads containing any current-user reply',
+        );
+        ackEq(getReviewThreadToggleItems({ root: host }).length, 4, 'all mode also includes the other review thread');
+        ackEq(getRevealMineState(host, 'me').total, 3, 'reveal-mine count includes only collapsed matching threads');
+    });
+
+    ackTest('review thread controls open and close classic and modern threads', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <details id="classic" data-resolved="true">
+                <summary>Resolved</summary>
+                <div class="timeline-comment"><a class="author">me</a></div>
+            </details>
+            <div id="modern" class="ReviewThreadContainer">
+                <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                <div data-target="review-thread-collapsible.body" hidden></div>
+                <div class="ActivityThread"><a class="author">me</a></div>
+            </div>
+        `;
+        const modernButton = host.querySelector('#modern button');
+        const modernBody = host.querySelector('[data-target="review-thread-collapsible.body"]');
+        modernButton.addEventListener('click', () => {
+            const open = modernButton.getAttribute('aria-expanded') !== 'true';
+            modernButton.setAttribute('aria-expanded', String(open));
+            modernBody.toggleAttribute('hidden', !open);
+        });
+        document.body.appendChild(host);
+        try {
+            const items = getReviewThreadToggleItems({ root: host, mineOnly: true, login: 'me' });
+            ackEq(items.length, 2, 'finds both controls');
+            items.forEach((item) => item.setOpen(true));
+            ackAssert(items.every((item) => item.isOpen()), 'opens both thread forms');
+            items.forEach((item) => item.setOpen(false));
+            ackAssert(items.every((item) => !item.isOpen()), 'closes both thread forms');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('reveal mine opens minimized current-user comments only', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div id="mine" class="minimized-comment">
+                <div class="timeline-comment-header"></div>
+                <div class="timeline-comment"><a class="author">me</a></div>
+            </div>
+            <div class="minimized-comment">
+                <div class="timeline-comment-header"></div>
+                <div class="timeline-comment"><a class="author">someone</a></div>
+            </div>
+        `;
+        const targets = getMineRevealTargets(host, 'me');
+        ackEq(targets.length, 1, 'finds only my minimized comment');
+        ackEq(targets[0].scope.id, 'mine', 'targets the matching minimized wrapper');
+    });
+
     ackTest('context copy dropdown includes unified reveal-all action', () => {
         const source = _ackSource;
         const group = source.slice(
@@ -32904,6 +33310,45 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(group.includes('revealAllContext'), 'context copy group exposes reveal-all action');
         ackAssert(group.includes('📂 Reveal all'), 'reveal-all item has explicit label');
         ackAssert(group.includes('getRevealAllState().total'), 'reveal-all menu item shows live remaining count');
+    });
+
+    ackTest('context copy dropdown reveals or closes all and current-user threads', () => {
+        const group = sourceSection(_ackSource, 'function buildContextCopyGroup', 'function buildRobotRecipeGroup');
+        ackAssert(group.includes("revealMineItem.dataset.ackRevealMine = 'true'"), 'adds a reveal-mine row');
+        ackAssert(
+            group.indexOf('menu.appendChild(revealItem)') < group.indexOf('menu.appendChild(revealMineItem)'),
+            'puts reveal mine below reveal all',
+        );
+        ackAssert(group.includes("'📁 Close all' : '📂 Reveal all'"), 'Shift changes reveal all to close all');
+        ackAssert(group.includes("'👤 Close mine' : '👤 Reveal mine'"), 'Shift changes reveal mine to close mine');
+        ackAssert(group.includes('if (closing) closeReviewThreads(mainBtn);'), 'Shift-click closes all review threads');
+        ackAssert(
+            group.includes('closeReviewThreads(mainBtn, { mineOnly: true })'),
+            'Shift-click closes only current-user review threads',
+        );
+        ackAssert(group.includes('else revealMineContext(mainBtn);'), 'normal click reveals current-user comments');
+    });
+
+    ackTest('reveal mine loads hidden comments before opening matching threads', () => {
+        const revealMine = sourceSection(_ackSource, 'async function revealMineContext', 'async function closeReviewThreads');
+        ackAssert(revealMine.includes('state.paginationBtns.forEach'), 'loads classic hidden-comment pages');
+        ackAssert(revealMine.includes('state.timelineLoadMore.forEach'), 'loads modern hidden timeline pages');
+        ackAssert(
+            revealMine.indexOf('await ackSleep(1800);') < revealMine.indexOf('state.targets.forEach'),
+            'finishes each hidden-comment loading pass before opening matching threads',
+        );
+        ackAssert(revealMine.includes('continue;'), 'does not open unrelated thread controls during the loader phase');
+        ackAssert(revealMine.includes('hiddenWaitRounds >= 20'), 'bounds waits for a missing hidden-comment loader');
+        ackAssert(revealMine.includes('stalledTargetRounds >= 8'), 'bounds retries for thread controls that do not open');
+
+        const closeThreads = sourceSection(
+            _ackSource,
+            'async function closeReviewThreads',
+            'async function revealPendingReviewComments',
+        );
+        ackAssert(!closeThreads.includes('paginationBtns'), 'closing never loads hidden timeline pages');
+        ackAssert(!closeThreads.includes('timelineLoadMore'), 'closing never fetches more comments');
+        ackAssert(closeThreads.includes('mineOnly'), 'one close path supports all and current-user threads');
     });
 
     ackTest('childList observer does not rebuild the toolbar for comment loaders', () => {
