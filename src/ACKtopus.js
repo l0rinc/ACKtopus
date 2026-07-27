@@ -352,10 +352,10 @@
             emoji: '👍',
             label: 'ACK',
             tip: 'Copy ACK with commit hash for review sign-off',
-            shiftTip: 'Copy only the commit hash',
-            shiftHint: '🔢',
+            alternateTip: 'Copy only the commit hash',
+            alternateHint: '🔢',
             fmt: (sha, pr) => `ACK ${sha}`,
-            shiftFmt: (sha) => sha,
+            alternateFmt: (sha) => sha,
         },
         {
             key: 'fetch',
@@ -379,10 +379,10 @@
             emoji: '⏮️',
             label: 'checkout parent',
             tip: 'Copy command to fetch and checkout the parent of the first commit in this PR',
-            shiftTip: 'Copy only the parent commit hash',
-            shiftHint: '🔢',
+            alternateTip: 'Copy only the parent commit hash',
+            alternateHint: '🔢',
             fmt: (_sha, _pr) => null,
-            shiftFmt: (_sha, pr) => getParentCommitHash(pr),
+            alternateFmt: (_sha, pr) => getParentCommitHash(pr),
         },
         {
             key: 'ghco',
@@ -390,13 +390,13 @@
             emoji: '⬇️',
             label: 'gh pr co',
             tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
-            shiftTip: 'Check out this PR without rebasing it',
-            shiftHint: '⏭️',
+            alternateTip: 'Check out this PR without rebasing it',
+            alternateHint: '⏭️',
             fmt: (sha, pr) => {
                 const base = getReviewBaseBranch();
                 return `${preferredRemoteCommand()} && gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase "$REMOTE" ${shellQuoteIfNeeded(base)}`;
             },
-            shiftFmt: (_sha, pr) =>
+            alternateFmt: (_sha, pr) =>
                 `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force`,
         },
         {
@@ -441,10 +441,10 @@
             emoji: '📤',
             label: 'pre-push range-diff',
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
-            shiftTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
-            shiftHint: '🗜️',
+            alternateTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
+            alternateHint: '🗜️',
             fmt: () => prePushRangeDiffCommand(),
-            shiftFmt: () => prePushRangeDiffCommand(true),
+            alternateFmt: () => prePushRangeDiffCommand(true),
         },
         {
             key: 'bench',
@@ -563,15 +563,15 @@
 
     const COPY_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-copy" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>`;
     const CHECK_ICON = `<svg aria-hidden="true" focusable="false" class="octicon octicon-check" viewBox="0 0 16 16" width="16" height="16" fill="#3fb950" display="inline-block" overflow="visible" style="vertical-align: text-bottom; margin-left: 4px;"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>`;
-    const SHIFT_COPY_HINT = '📋';
-    const SHIFT_REVEAL_HINT = '📂';
-    const SHIFT_VISIBLE_ONLY_HINT = '👁';
-    const SHIFT_REVERSE_HINT = '⬆';
-    const SHIFT_ALTERNATE_HINT = '⇧';
+    const ALTERNATE_COPY_HINT = '📋';
+    const ALTERNATE_REVEAL_HINT = '📂';
+    const ALTERNATE_VISIBLE_ONLY_HINT = '👁';
+    const ALTERNATE_REVERSE_HINT = '⬆';
+    const ALTERNATE_ACTION_HINT = '⌃';
     const EDIT_POST_SHORTCUT_KEY = 'e';
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
-    let ackShiftPressed = false;
-    const ackShiftAlternateRenderers = new Set();
+    let ackControlPressed = false;
+    const ackAlternateRenderers = new Set();
 
     function isMacKeyboardPlatform() {
         const platform =
@@ -618,49 +618,49 @@
         return !!e?.altKey && !!e?.shiftKey && !e.ctrlKey && !e.metaKey;
     }
 
-    function notifyShiftAlternateRenderers() {
-        for (const render of [...ackShiftAlternateRenderers]) {
-            if (render() === false) ackShiftAlternateRenderers.delete(render);
+    function notifyAlternateRenderers() {
+        for (const render of [...ackAlternateRenderers]) {
+            if (render() === false) ackAlternateRenderers.delete(render);
         }
     }
 
-    function setAckShiftPressed(next) {
+    function setAckControlPressed(next) {
         const pressed = !!next;
-        if (ackShiftPressed === pressed) return;
-        ackShiftPressed = pressed;
-        notifyShiftAlternateRenderers();
+        if (ackControlPressed === pressed) return;
+        ackControlPressed = pressed;
+        notifyAlternateRenderers();
     }
 
-    function eventUsesShiftAlternate(e) {
-        return !!e?.shiftKey || ackShiftPressed;
+    function eventUsesAlternateAction(e) {
+        return !!e?.ctrlKey || ackControlPressed;
     }
 
-    function registerShiftAlternateRenderer(owner, render) {
+    function registerAlternateRenderer(owner, render) {
         const wrapped = () => {
             if (!owner?.isConnected) return false;
             render();
             return true;
         };
-        ackShiftAlternateRenderers.add(wrapped);
+        ackAlternateRenderers.add(wrapped);
         render();
-        return () => ackShiftAlternateRenderers.delete(wrapped);
+        return () => ackAlternateRenderers.delete(wrapped);
     }
 
     document.addEventListener(
         'keydown',
         (e) => {
-            if (e.key === 'Shift') setAckShiftPressed(true);
+            if (e.key === 'Control') setAckControlPressed(true);
         },
         true,
     );
     document.addEventListener(
         'keyup',
         (e) => {
-            if (e.key === 'Shift') setAckShiftPressed(false);
+            if (e.key === 'Control') setAckControlPressed(false);
         },
         true,
     );
-    window.addEventListener('blur', () => setAckShiftPressed(false));
+    window.addEventListener('blur', () => setAckControlPressed(false));
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
@@ -1768,8 +1768,8 @@
     async function copySHA(mainBtn, updateMainLabel, event) {
         const pr = parsePR();
         const fmt = getFormat();
-        const useShiftAlternate = eventUsesShiftAlternate(event) && typeof fmt.shiftFmt === 'function';
-        const formatter = useShiftAlternate ? fmt.shiftFmt : fmt.fmt;
+        const useAlternate = eventUsesAlternateAction(event) && typeof fmt.alternateFmt === 'function';
+        const formatter = useAlternate ? fmt.alternateFmt : fmt.fmt;
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation((frame) => {
@@ -1779,7 +1779,7 @@
         try {
             let text = null;
             if (fmt.key === 'parent' && pr) {
-                text = useShiftAlternate ? await formatter('', pr) : await getParentCheckoutCommand(pr);
+                text = useAlternate ? await formatter('', pr) : await getParentCheckoutCommand(pr);
             } else if (fmt.key === 'hashes' && pr) {
                 text = await getPRCommitHashesClipboardText(pr);
             } else {
@@ -1821,20 +1821,22 @@
 
         const mainBtn = document.createElement('button');
         // Clipboard-only: the SHA copy button always copies to the clipboard.
-        const shiftSuffix = (format) =>
-            ackShiftPressed && format.shiftFmt ? ` ${format.shiftHint || SHIFT_ALTERNATE_HINT}` : '';
+        const alternateSuffix = (format) =>
+            ackControlPressed && format.alternateFmt
+                ? ` ${format.alternateHint || ALTERNATE_ACTION_HINT}`
+                : '';
         const formatTitle = (format) =>
-            format.shiftFmt ? `${format.tip}\nShift+click: ${format.shiftTip}.` : format.tip;
+            format.alternateFmt ? `${format.tip}\nCtrl+click: ${format.alternateTip}.` : format.tip;
         const updateMainLabel = () => {
             const f = getFormat();
             const compact = GM_getValue('compactToolbar', false);
             mainBtn.innerHTML = compact
-                ? `${f.emoji}${shiftSuffix(f)}`
-                : `${f.emoji} ${f.label}${shiftSuffix(f)}${COPY_ICON}`;
+                ? `${f.emoji}${alternateSuffix(f)}`
+                : `${f.emoji} ${f.label}${alternateSuffix(f)}${COPY_ICON}`;
             mainBtn.title = formatTitle(f);
         };
         updateMainLabel();
-        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
+        registerAlternateRenderer(mainBtn, updateMainLabel);
         if (buildSHAGroup._ac) buildSHAGroup._ac.abort();
         buildSHAGroup._ac = new AbortController();
         const { signal } = buildSHAGroup._ac;
@@ -1893,10 +1895,10 @@
         SHA_FORMATS.forEach((f, i) => {
             const item = document.createElement('div');
             const renderItem = () => {
-                item.textContent = `${f.emoji}  ${f.label}${shiftSuffix(f)}`;
+                item.textContent = `${f.emoji}  ${f.label}${alternateSuffix(f)}`;
             };
             renderItem();
-            registerShiftAlternateRenderer(item, renderItem);
+            registerAlternateRenderer(item, renderItem);
             item.title = formatTitle(f);
             item.dataset.ackFmtKey = f.key;
             if (f.hotkey) item.dataset.ackHotkey = f.hotkey;
@@ -2006,6 +2008,15 @@
                 menu.style.display = 'none';
             },
             { signal },
+        );
+        document.addEventListener(
+            'pointerdown',
+            (e) => {
+                if (!e.ctrlKey || (!ctrlHoldTimer && !hotkeyArmed)) return;
+                hideHotkeyHints();
+                if (!menu.contains(e.target)) menu.style.display = 'none';
+            },
+            { capture: true, signal },
         );
         document.addEventListener(
             'keydown',
@@ -4967,16 +4978,16 @@
         link.dataset.localRepoPrUpstreamHref = upstreamHref;
         link.dataset.localRepoPrForkHref = forkHref;
 
-        const renderTarget = (useUpstream = ackShiftPressed) => {
+        const renderTarget = (useUpstream = ackControlPressed) => {
             const href = useUpstream ? upstreamHref : forkHref;
             if (link.getAttribute('href') !== href) link.setAttribute('href', href);
         };
         link.addEventListener(
             'click',
             (e) => {
-                if (!eventUsesShiftAlternate(e)) return;
+                if (!eventUsesAlternateAction(e)) return;
                 renderTarget(true);
-                if (!ackShiftPressed) {
+                if (!ackControlPressed) {
                     setTimeout(() => {
                         if (link.isConnected) renderTarget(false);
                     }, 0);
@@ -4984,7 +4995,7 @@
             },
             true,
         );
-        registerShiftAlternateRenderer(link, () => renderTarget());
+        registerAlternateRenderer(link, () => renderTarget());
     }
 
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
@@ -6117,7 +6128,7 @@ Return only the corrected text. If nothing needs fixing, return the original tex
     const LLM_INSTRUCTION_KEYS = CONFIG_INSTRUCTION_DEFS.map(({ key }) => key);
     const PROMPT_RECIPE_KEYS = new Set(['reimplementation', 'suggestion_stack', 'audio_walkthrough']);
     const COPYABLE_RECIPE_KEYS = new Set([...PROMPT_RECIPE_KEYS, 'maintainer_summary']);
-    const SHIFT_COPY_ACTION_KEYS = new Set([...COPYABLE_RECIPE_KEYS, 'infographic']);
+    const ALTERNATE_COPY_ACTION_KEYS = new Set([...COPYABLE_RECIPE_KEYS, 'infographic']);
     const ROBOT_RECIPE_ACTIONS = Object.freeze([
         {
             key: 'chat',
@@ -6254,8 +6265,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return COPYABLE_RECIPE_KEYS.has(recipe);
     }
 
-    function isShiftCopyAction(action) {
-        return SHIFT_COPY_ACTION_KEYS.has(action);
+    function isAlternateCopyAction(action) {
+        return ALTERNATE_COPY_ACTION_KEYS.has(action);
     }
 
     function getRobotRecipeTitle(recipe) {
@@ -24517,26 +24528,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
         const contextModeSuffix = (action) => {
             if (!action.revealBeforeCopy) return '';
-            if (ackShiftPressed) return ` ${SHIFT_VISIBLE_ONLY_HINT}`;
-            if (action.revealBeforeCopy === 'all') return ` ${SHIFT_REVEAL_HINT}`;
+            if (ackControlPressed) return ` ${ALTERNATE_VISIBLE_ONLY_HINT}`;
+            if (action.revealBeforeCopy === 'all') return ` ${ALTERNATE_REVEAL_HINT}`;
             return '';
         };
         const contextActionTitle = (action) => {
             if (action.revealBeforeCopy === 'all') {
-                return `${action.tip}\nDefault: reveal hidden/resolved/collapsed content first, then copy.\nShift+click: copy currently open/loaded content only.`;
+                return `${action.tip}\nDefault: reveal hidden/resolved/collapsed content first, then copy.\nCtrl+click: copy currently open/loaded content only.`;
             }
             if (action.revealBeforeCopy === 'pending') {
-                return `${action.tip}\nDefault: open only pending review comments already present on the page, then copy all pending drafts available from GitHub data.\nShift+click: copy pending drafts without opening page UI.`;
+                return `${action.tip}\nDefault: open only pending review comments already present on the page, then copy all pending drafts available from GitHub data.\nCtrl+click: copy pending drafts without opening page UI.`;
             }
             return action.tip;
         };
         const runContextCopyAction = async (action, btn, e) => {
             if (!action.enabled()) return;
-            if (action.revealBeforeCopy === 'all' && !eventUsesShiftAlternate(e) && getRevealAllState().total > 0) {
+            if (action.revealBeforeCopy === 'all' && !eventUsesAlternateAction(e) && getRevealAllState().total > 0) {
                 await revealAllContext(btn, { restoreMs: 0 });
             } else if (
                 action.revealBeforeCopy === 'pending' &&
-                !eventUsesShiftAlternate(e) &&
+                !eventUsesAlternateAction(e) &&
                 getPendingReviewRevealTargets().length > 0
             ) {
                 await revealPendingReviewComments(btn, { restoreMs: 0 });
@@ -24557,7 +24568,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             mainBtn.style.cursor = enabled ? 'pointer' : 'default';
         };
         updateMainLabel();
-        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
+        registerAlternateRenderer(mainBtn, updateMainLabel);
         Object.assign(mainBtn.style, {
             padding: '4px 10px',
             fontSize: '12px',
@@ -24629,7 +24640,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 item.textContent = `${action.emoji} ${action.label}${contextModeSuffix(action)}`;
             };
             renderItem();
-            registerShiftAlternateRenderer(item, renderItem);
+            registerAlternateRenderer(item, renderItem);
             item.addEventListener('click', async (e) => {
                 if (!action.enabled()) return;
                 selectedAction = action.key;
@@ -24664,7 +24675,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             background: 'transparent',
         });
         const renderRevealItem = () => {
-            const closing = ackShiftPressed;
+            const closing = ackControlPressed;
             const count = closing
                 ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
                 : getRevealAllState().total;
@@ -24676,11 +24687,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 : 'Reveal hidden timeline items, resolved threads, and collapsed sections before copying context';
         };
         renderRevealItem();
-        registerShiftAlternateRenderer(revealItem, renderRevealItem);
+        registerAlternateRenderer(revealItem, renderRevealItem);
         revealItem.addEventListener('mouseenter', () => (revealItem.style.background = '#30363d'));
         revealItem.addEventListener('mouseleave', () => (revealItem.style.background = 'transparent'));
         revealItem.addEventListener('click', (e) => {
-            const closing = eventUsesShiftAlternate(e);
+            const closing = eventUsesAlternateAction(e);
             const count = closing
                 ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
                 : getRevealAllState().total;
@@ -24702,7 +24713,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             background: 'transparent',
         });
         const renderRevealMineItem = () => {
-            const closing = ackShiftPressed;
+            const closing = ackControlPressed;
             const count = closing
                 ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
                 : getRevealMineState().total;
@@ -24714,11 +24725,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 : 'Load every comment and open each review thread that contains one of your comments';
         };
         renderRevealMineItem();
-        registerShiftAlternateRenderer(revealMineItem, renderRevealMineItem);
+        registerAlternateRenderer(revealMineItem, renderRevealMineItem);
         revealMineItem.addEventListener('mouseenter', () => (revealMineItem.style.background = '#30363d'));
         revealMineItem.addEventListener('mouseleave', () => (revealMineItem.style.background = 'transparent'));
         revealMineItem.addEventListener('click', (e) => {
-            const closing = eventUsesShiftAlternate(e);
+            const closing = eventUsesAlternateAction(e);
             const count = closing
                 ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
                 : getRevealMineState().total;
@@ -24749,11 +24760,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const actions = ROBOT_RECIPE_ACTIONS;
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
-        const robotShiftSuffix = (action) => (ackShiftPressed && isShiftCopyAction(action.key) ? ` ${SHIFT_COPY_HINT}` : '');
-        const robotShiftTitle = (action) =>
-            `${action.tip}${isShiftCopyAction(action.key) ? '\nShift+click: copy the request or visual prompt instead of running it.' : ''}`;
+        const robotAlternateSuffix = (action) =>
+            ackControlPressed && isAlternateCopyAction(action.key) ? ` ${ALTERNATE_COPY_HINT}` : '';
+        const robotAlternateTitle = (action) =>
+            `${action.tip}${isAlternateCopyAction(action.key) ? '\nCtrl+click: copy the request or visual prompt instead of running it.' : ''}`;
         const runRobotAction = async (action, e) => {
-            const promptOnly = eventUsesShiftAlternate(e) && isShiftCopyAction(action.key);
+            const promptOnly = eventUsesAlternateAction(e) && isAlternateCopyAction(action.key);
             await runAnalysis(wrapper, action.key, { promptOnly });
         };
 
@@ -24761,12 +24773,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const updateMainLabel = () => {
             const action = getAction();
             mainBtn.innerHTML = compact
-                ? `${action.emoji}${robotShiftSuffix(action)}`
-                : `${action.emoji} ${action.label}${robotShiftSuffix(action)}`;
-            mainBtn.title = robotShiftTitle(action);
+                ? `${action.emoji}${robotAlternateSuffix(action)}`
+                : `${action.emoji} ${action.label}${robotAlternateSuffix(action)}`;
+            mainBtn.title = robotAlternateTitle(action);
         };
         updateMainLabel();
-        registerShiftAlternateRenderer(mainBtn, updateMainLabel);
+        registerAlternateRenderer(mainBtn, updateMainLabel);
         Object.assign(mainBtn.style, {
             padding: '4px 10px',
             fontSize: '12px',
@@ -24784,7 +24796,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
         mainBtn.addEventListener('click', async function (e) {
             const action = getAction();
-            const promptOnly = eventUsesShiftAlternate(e) && isShiftCopyAction(action.key);
+            const promptOnly = eventUsesAlternateAction(e) && isAlternateCopyAction(action.key);
             const existing = document.getElementById('acktopus-analysis');
             if (action.key === 'chat' && existing && !promptOnly) {
                 existing.remove();
@@ -24827,7 +24839,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         for (const action of actions) {
             const item = document.createElement('div');
-            item.title = robotShiftTitle(action);
+            item.title = robotAlternateTitle(action);
             Object.assign(item.style, {
                 padding: '6px 12px',
                 fontSize: '12px',
@@ -24841,10 +24853,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
             const renderItem = () => {
-                item.textContent = `${action.emoji} ${action.label}${robotShiftSuffix(action)}`;
+                item.textContent = `${action.emoji} ${action.label}${robotAlternateSuffix(action)}`;
             };
             renderItem();
-            registerShiftAlternateRenderer(item, renderItem);
+            registerAlternateRenderer(item, renderItem);
             item.addEventListener('click', async (e) => {
                 selectedAction = action.key;
                 GM_setValue('robotRecipeAction', action.key);
@@ -25160,20 +25172,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // --- 💬 Comment navigator ---
         const commentNavLabel = compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments';
         const commentNavTitle = onCompare
-            ? 'Navigate visible compare files top-to-bottom (Shift reverses) [Ctrl+N]'
-            : 'Navigate posted comments by date (newest first; Shift reverses) [Ctrl+N]';
+            ? 'Navigate visible compare files top-to-bottom (Ctrl+click reverses) [Ctrl+N]'
+            : 'Navigate posted comments by date (newest first; Ctrl+click reverses) [Ctrl+N]';
         const commentNavBtn = createBtn(
             commentNavLabel,
             function (e) {
-                navigatePrimaryReviewTarget(eventUsesShiftAlternate(e) ? 1 : -1);
+                navigatePrimaryReviewTarget(eventUsesAlternateAction(e) ? 1 : -1);
             },
             commentNavTitle,
         );
         const updateCommentNavLabel = () => {
-            commentNavBtn.textContent = `${commentNavLabel}${ackShiftPressed ? ` ${SHIFT_REVERSE_HINT}` : ''}`;
-            commentNavBtn.title = `${commentNavTitle}\nShift+click: reverse direction.`;
+            commentNavBtn.textContent = `${commentNavLabel}${ackControlPressed ? ` ${ALTERNATE_REVERSE_HINT}` : ''}`;
+            commentNavBtn.title = `${commentNavTitle}\nCtrl+click: reverse direction.`;
         };
-        registerShiftAlternateRenderer(commentNavBtn, updateCommentNavLabel);
+        registerAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
         toolbar.appendChild(commentNavBtn);
 
@@ -26913,7 +26925,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('ack format produces correct output', () => {
         const ack = SHA_FORMATS.find((f) => f.key === 'ack');
         ackEq(ack.fmt('abc123', {}), 'ACK abc123');
-        ackEq(ack.shiftFmt('abc123', {}), 'abc123', 'Shift copies only the hash');
+        ackEq(ack.alternateFmt('abc123', {}), 'abc123', 'Control copies only the hash');
     });
 
     ackTest('fetch format produces correct output', () => {
@@ -26958,9 +26970,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('ghco Shift format checks out without rebasing', () => {
+    ackTest('ghco alternate format checks out without rebasing', () => {
         const ghco = SHA_FORMATS.find((format) => format.key === 'ghco');
-        const result = ghco.shiftFmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+        const result = ghco.alternateFmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
         ackEq(result, 'gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force');
         ackAssert(!result.includes('git pull'), 'does not pull after checkout');
         ackAssert(!result.includes('rebase'), 'does not rebase');
@@ -27556,13 +27568,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('pushrdiff Shift command compares collapsed stack effects', () => {
+    ackTest('pushrdiff alternate command compares collapsed stack effects', () => {
         const f = SHA_FORMATS.find((format) => format.key === 'pushrdiff');
         const origBase = getReviewBaseBranch;
         try {
             getReviewBaseBranch = () => 'main';
-            ackAssert(typeof f.shiftFmt === 'function', 'provides a Shift alternate command');
-            const cmd = f.shiftFmt();
+            ackAssert(typeof f.alternateFmt === 'function', 'provides an alternate command');
+            const cmd = f.alternateFmt();
             ackAssert(cmd.includes('OLD_BASE=$(git merge-base "$BASE" \'@{u}\')'), 'finds the pushed stack base');
             ackAssert(cmd.includes('NEW_BASE=$(git merge-base "$BASE" HEAD)'), 'finds the local stack base');
             ackAssert(
@@ -27584,14 +27596,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('SHA copy uses Shift alternate formats without changing the selection', () => {
+    ackTest('SHA copy uses Control alternate formats without changing the selection', () => {
         const copy = sourceSection(_ackSource, 'async function copySHA', 'function buildSHAGroup');
-        ackAssert(copy.includes('eventUsesShiftAlternate(event)'), 'checks the click modifier');
-        ackAssert(copy.includes('useShiftAlternate ? fmt.shiftFmt : fmt.fmt'), 'selects the alternate formatter');
+        ackAssert(copy.includes('eventUsesAlternateAction(event)'), 'checks the click modifier');
+        ackAssert(copy.includes('useAlternate ? fmt.alternateFmt : fmt.fmt'), 'selects the alternate formatter');
         const group = sourceSection(_ackSource, 'function buildSHAGroup', '// --- Show Hidden');
-        ackAssert(group.includes('registerShiftAlternateRenderer(mainBtn'), 'updates the main label while Shift is held');
-        ackAssert(group.includes('format.shiftHint || SHIFT_ALTERNATE_HINT'), 'shows each format-specific Shift hint');
+        ackAssert(group.includes('registerAlternateRenderer(mainBtn'), 'updates the main label while Control is held');
+        ackAssert(
+            group.includes('format.alternateHint || ALTERNATE_ACTION_HINT'),
+            'shows each format-specific alternate hint',
+        );
         ackAssert(group.includes('copySHA(mainBtn, updateMainLabel, e)'), 'passes click modifiers to the copy helper');
+    });
+
+    ackTest('alternate toolbar actions use Control and ignore Shift', () => {
+        try {
+            setAckControlPressed(false);
+            ackEq(eventUsesAlternateAction({ ctrlKey: true }), true, 'Ctrl-click selects the alternate action');
+            ackEq(eventUsesAlternateAction({ shiftKey: true }), false, 'Shift-click keeps the normal action');
+            setAckControlPressed(true);
+            ackEq(eventUsesAlternateAction({}), true, 'holding Control selects the alternate action');
+        } finally {
+            setAckControlPressed(false);
+        }
     });
 
     ackTest('tidydiff command uses clang-tidy-diff with the selected remote and isolated build path', () => {
@@ -30780,6 +30807,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.includes("e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta'"),
             'Shift/Alt/Meta cancel timer',
         );
+        ackAssert(source.includes("'pointerdown'"), 'pointer actions can cancel the shortcut menu');
+        ackAssert(source.includes('if (!e.ctrlKey || (!ctrlHoldTimer && !hotkeyArmed)) return'), 'Ctrl-click cancels hints');
+        ackAssert(source.includes('if (!menu.contains(e.target))'), 'Ctrl-click keeps a clicked menu item available');
         // Window blur also cancels (screenshot steals focus)
         ackAssert(sourceIncludesLoose(source, "window.addEventListener('blur'"), 'blur event cancels hints');
     });
@@ -30794,7 +30824,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.includes('/Mac|iPhone|iPad|iPod/i.test(platform)'),
             'platform regex matches MacIntel/macOS without word boundaries',
         );
-        const matcher = sourceSection(source, 'function matchesPostActionShortcut', 'function notifyShiftAlternateRenderers');
+        const matcher = sourceSection(source, 'function matchesPostActionShortcut', 'function notifyAlternateRenderers');
         ackAssert(matcher.includes('isMacKeyboardPlatform()'), 'has platform-specific shortcut matcher');
         ackAssert(matcher.includes('eventCode === `key${letter}`'), 'matches physical key code for Option-modified mac keys');
         ackAssert(matcher.includes('!!e?.metaKey') && matcher.includes('!e.shiftKey'), 'macOS shortcut uses Command+Option without Shift');
@@ -33667,12 +33697,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             group.indexOf('menu.appendChild(revealItem)') < group.indexOf('menu.appendChild(revealMineItem)'),
             'puts reveal mine below reveal all',
         );
-        ackAssert(group.includes("'📁 Close all' : '📂 Reveal all'"), 'Shift changes reveal all to close all');
-        ackAssert(group.includes("'👤 Close mine' : '👤 Reveal mine'"), 'Shift changes reveal mine to close mine');
-        ackAssert(group.includes('if (closing) closeReviewThreads(mainBtn);'), 'Shift-click closes all review threads');
+        ackAssert(group.includes("'📁 Close all' : '📂 Reveal all'"), 'Control changes reveal all to close all');
+        ackAssert(group.includes("'👤 Close mine' : '👤 Reveal mine'"), 'Control changes reveal mine to close mine');
+        ackAssert(group.includes('if (closing) closeReviewThreads(mainBtn);'), 'Ctrl-click closes all review threads');
         ackAssert(
             group.includes('closeReviewThreads(mainBtn, { mineOnly: true })'),
-            'Shift-click closes only current-user review threads',
+            'Ctrl-click closes only current-user review threads',
         );
         ackAssert(group.includes('else revealMineContext(mainBtn);'), 'normal click reveals current-user comments');
     });
@@ -34511,15 +34541,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('parent Shift format copies only the resolved parent hash', async () => {
+    ackTest('parent alternate format copies only the resolved parent hash', async () => {
         const parent = SHA_FORMATS.find((format) => format.key === 'parent');
         const origCheckoutMeta = getRecipeCheckoutMeta;
         const parentSha = 'a'.repeat(40);
         try {
             getRecipeCheckoutMeta = async () => ({ baseSha: parentSha });
-            ackEq(await parent.shiftFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), parentSha);
+            ackEq(await parent.alternateFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), parentSha);
             getRecipeCheckoutMeta = async () => ({ baseSha: 'not-a-hash' });
-            ackEq(await parent.shiftFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), null);
+            ackEq(await parent.alternateFmt('', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }), null);
         } finally {
             getRecipeCheckoutMeta = origCheckoutMeta;
         }
@@ -34838,13 +34868,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('ack-repo-mirrors'), 'settings expose repo mirror config');
     });
 
-    ackTest('local repo compare rewrite preserves the button and uses upstream while Shift is held', () => {
+    ackTest('local repo compare rewrite preserves the button and uses upstream while Control is held', () => {
         const host = document.createElement('div');
         host.innerHTML =
             '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary" title="Open comparison">Compare & pull request</a>' +
             '<a href="/octo/demo/compare/other?expand=1">Plain compare link</a>';
         document.body.appendChild(host);
         try {
+            setAckControlPressed(false);
             const count = rewriteLocalRepoCompareLinks(host, {
                 currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
                 baseBranch: 'main',
@@ -34859,9 +34890,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(link.title, 'Open comparison', 'preserves GitHub tooltip');
             ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
 
-            setAckShiftPressed(true);
+            setAckControlPressed(true);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/detached537?expand=1');
-            setAckShiftPressed(false);
+            setAckControlPressed(false);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
 
             ackEq(
@@ -34872,28 +34903,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 0,
             );
         } finally {
-            setAckShiftPressed(false);
+            setAckControlPressed(false);
             host.remove();
         }
     });
 
-    ackTest('local repo compare rewrite honors Shift on the click event', async () => {
+    ackTest('local repo compare rewrite honors Control on the click event', async () => {
         const host = document.createElement('div');
         host.innerHTML =
             '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>';
         document.body.appendChild(host);
         try {
+            setAckControlPressed(false);
             rewriteLocalRepoCompareLinks(host, {
                 currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
                 baseBranch: 'main',
             });
             const link = host.querySelector('a');
-            link.addEventListener('click', (e) => e.preventDefault(), { once: true });
+            link.addEventListener('click', (e) => e.preventDefault());
             link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }));
             ackEq(
                 link.getAttribute('href'),
+                '/octo/demo/compare/main...detached537?quick_pull=1',
+                'ignores Shift-click',
+            );
+            link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
+            ackEq(
+                link.getAttribute('href'),
                 '/octo/demo/compare/detached537?expand=1',
-                'uses the upstream target for Shift-click',
+                'uses the upstream target for Ctrl-click',
             );
             await new Promise((resolve) => setTimeout(resolve, 0));
             ackEq(
@@ -34902,7 +34940,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'restores the fork target after the click',
             );
         } finally {
-            setAckShiftPressed(false);
+            setAckControlPressed(false);
             host.remove();
         }
     });
@@ -39441,16 +39479,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(group.includes("label: 'Comments'"), 'comments-only action is present');
         ackAssert(group.includes('runContextCopyAction'), 'context split group routes clicks through one runner');
-        ackAssert(group.includes('eventUsesShiftAlternate(e)'), 'context copy checks Shift-click');
+        ackAssert(group.includes('eventUsesAlternateAction(e)'), 'context copy checks Ctrl-click');
         ackAssert(
             group.includes("revealBeforeCopy: 'all'"),
             'broad context actions reveal all by default',
         );
         ackAssert(
-            group.includes("!eventUsesShiftAlternate(e) && getRevealAllState().total > 0"),
+            group.includes("!eventUsesAlternateAction(e) && getRevealAllState().total > 0"),
             'default context copy reveals all before copying',
         );
-        ackAssert(group.includes('SHIFT_VISIBLE_ONLY_HINT'), 'Shift context-copy mode shows visible-only hint');
+        ackAssert(group.includes('ALTERNATE_VISIBLE_ONLY_HINT'), 'alternate context-copy mode shows visible-only hint');
         ackAssert(
             group.includes("revealItem.dataset.ackRevealAll = 'true'"),
             'reveal-all item is rendered as a menu-only action',
@@ -39522,7 +39560,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(group.includes('copyPendingReviewCommentsContext'), 'pending action copies pending comments');
         ackAssert(group.includes("revealBeforeCopy: 'pending'"), 'pending action opens only pending comments by default');
         ackAssert(group.includes('revealPendingReviewComments'), 'pending action uses targeted pending reveal');
-        ackAssert(group.includes('copy pending drafts without opening page UI'), 'Shift skips page opening for pending copy');
+        ackAssert(group.includes('copy pending drafts without opening page UI'), 'Control skips page opening for pending copy');
     });
 
     ackTest('gatherPatchContext omits comments but keeps patch content', () => {
@@ -41998,9 +42036,9 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
         ackAssert(fn.includes('runRobotAction(action, e)'), 'dispatches selected recipe through the shared runner');
-        ackAssert(fn.includes('eventUsesShiftAlternate(e)'), 'robot recipe group checks Shift-click');
-        ackAssert(fn.includes('isShiftCopyAction(action.key)'), 'Shift-copy applies to prompt and visual actions');
-        ackAssert(fn.includes('SHIFT_COPY_HINT'), 'Shift prompt-copy mode shows clipboard hint');
+        ackAssert(fn.includes('eventUsesAlternateAction(e)'), 'robot recipe group checks Ctrl-click');
+        ackAssert(fn.includes('isAlternateCopyAction(action.key)'), 'alternate copy applies to prompt and visual actions');
+        ackAssert(fn.includes('ALTERNATE_COPY_HINT'), 'alternate prompt-copy mode shows clipboard hint');
     });
 
     ackTest('infographic recipe uses OpenAI image API with PR-head or commit cache', () => {
@@ -42135,8 +42173,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(runner.includes('gatherInfographicContext(target'), 'gathers PR or commit context');
         ackAssert(runner.includes('buildInfographicImagePrompt(fullContext, target.prUrl, target)'), 'passes PR URL and target to image prompt builder');
         ackAssert(runner.includes("let prompt = ''"), 'keeps image prompt available for error fallback');
-        ackAssert(runner.includes('await card.resolvePrompt(cached.prompt'), 'Shift-copy can reuse cached infographic prompt');
-        ackAssert(runner.includes('await card.resolvePrompt(prompt)'), 'Shift-copy copies the visual prompt before image generation');
+        ackAssert(runner.includes('await card.resolvePrompt(cached.prompt'), 'alternate copy can reuse cached infographic prompt');
+        ackAssert(runner.includes('await card.resolvePrompt(prompt)'), 'alternate copy returns the visual prompt before image generation');
         ackAssert(runner.includes('callOpenAIImage(prompt)'), 'generates image from the visual prompt');
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
         ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
@@ -42672,7 +42710,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('Do not route this through a separate local coding agent'), 'recipe removes local-agent hop');
         ackAssert(fn.includes('if it is pasted into a local coding agent'), 'recipe keeps local-agent fallback');
         ackAssert(fn.includes('respond only with the exact OK-only gate'), 'audio prompt waits to start audio mode');
-        ackAssert(fn.includes('promptOnlyPrompt: () => buildAudioGuideBriefingPrompt'), 'shift-copy uses local briefing prompt');
+        ackAssert(fn.includes('promptOnlyPrompt: () => buildAudioGuideBriefingPrompt'), 'alternate copy uses local briefing prompt');
         ackAssert(fn.includes("sourceContextLabel: 'FULL PR CONTEXT SOURCE MATERIAL (PATCH ATTACHED AFTER GENERATED PROMPT)'"), 'audio guide source label explains patch attachment');
         ackAssert(fn.includes('includePatch: false'), 'audio guide source context omits the patch before LLM generation');
         ackAssert(fn.includes('appendPatchAttachment: true'), 'audio guide recipe requests deterministic patch attachment');
@@ -42716,7 +42754,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(patchAttachment.includes('```patch'), 'patch attachment uses a patch code fence');
     });
 
-    ackTest('audio guide shift prompt builds a local briefing task without ACKtopus wording', () => {
+    ackTest('audio guide alternate prompt builds a local briefing task without ACKtopus wording', () => {
         const prompt = buildAudioGuideBriefingPrompt(
             { owner: 'bitcoin', repo: 'bitcoin', pr: '24423' },
             'https://github.com/bitcoin/bitcoin/issues/24423',
@@ -42746,8 +42784,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const start = source.indexOf('const updateMainLabel');
         const end = source.indexOf('updateMainLabel();', start);
         const fn = source.slice(start, end);
-        ackAssert(fn.includes('`${f.emoji}${shiftSuffix(f)}`'), 'compact shows only the emoji');
-        ackAssert(fn.includes('${f.label}${shiftSuffix(f)}${COPY_ICON}'), 'non-compact shows label + icon');
+        ackAssert(fn.includes('`${f.emoji}${alternateSuffix(f)}`'), 'compact shows only the emoji');
+        ackAssert(fn.includes('${f.label}${alternateSuffix(f)}${COPY_ICON}'), 'non-compact shows label + icon');
     });
 
     ackTest('buildDiffSymbolIndex scans diff files for definitions', () => {
@@ -43431,11 +43469,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'toolbar has primary navigation button',
         );
         ackAssert(
-            inject.includes('navigatePrimaryReviewTarget(eventUsesShiftAlternate(e) ? 1 : -1)'),
-            'button navigates with Shift-reverse support',
+            inject.includes('navigatePrimaryReviewTarget(eventUsesAlternateAction(e) ? 1 : -1)'),
+            'button navigates with alternate-direction support',
         );
-        ackAssert(inject.includes('SHIFT_REVERSE_HINT'), 'button shows reverse-direction hint while Shift is held');
-        ackAssert(inject.includes('registerShiftAlternateRenderer(commentNavBtn'), 'button updates when Shift state changes');
+        ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'button shows reverse-direction hint while Control is held');
+        ackAssert(inject.includes('registerAlternateRenderer(commentNavBtn'), 'button updates when modifier state changes');
     });
 
     ackTest('Ctrl+N shortcut uses primary navigation target', () => {
