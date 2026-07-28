@@ -572,6 +572,10 @@
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
     let ackControlPressed = false;
     const ackAlternateRenderers = new Set();
+    const ackAlternateOwners = new WeakSet();
+    const ackAlternateLastClick = new WeakMap();
+    const ackAlternateSuppressClickUntil = new WeakMap();
+    let ackDispatchingControlContextClick = false;
 
     function isMacKeyboardPlatform() {
         const platform =
@@ -641,11 +645,61 @@
             render();
             return true;
         };
+        ackAlternateOwners.add(owner);
         ackAlternateRenderers.add(wrapped);
         render();
-        return () => ackAlternateRenderers.delete(wrapped);
+        return () => {
+            ackAlternateOwners.delete(owner);
+            ackAlternateRenderers.delete(wrapped);
+        };
     }
 
+    function findAlternateActionOwner(event) {
+        for (const candidate of event?.composedPath?.() || []) {
+            if (ackAlternateOwners.has(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    document.addEventListener(
+        'click',
+        (e) => {
+            const owner = findAlternateActionOwner(e);
+            if (!owner || !eventUsesAlternateAction(e)) return;
+            const now = Date.now();
+            if (!ackDispatchingControlContextClick && now < (ackAlternateSuppressClickUntil.get(owner) || 0)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                return;
+            }
+            ackAlternateLastClick.set(owner, now);
+        },
+        true,
+    );
+    document.addEventListener(
+        'contextmenu',
+        (e) => {
+            if (!e.ctrlKey) return;
+            const owner = findAlternateActionOwner(e);
+            if (!owner) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            const now = Date.now();
+            if (now - (ackAlternateLastClick.get(owner) || 0) < 250) return;
+
+            const restoreControlState = !ackControlPressed;
+            if (restoreControlState) setAckControlPressed(true);
+            ackDispatchingControlContextClick = true;
+            try {
+                owner.click();
+                ackAlternateSuppressClickUntil.set(owner, now + 250);
+            } finally {
+                ackDispatchingControlContextClick = false;
+                if (restoreControlState) setTimeout(() => setAckControlPressed(false), 0);
+            }
+        },
+        true,
+    );
     document.addEventListener(
         'keydown',
         (e) => {
@@ -27621,6 +27675,39 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('macOS Ctrl-click activates an alternate action without opening a context menu', async () => {
+        const button = document.createElement('button');
+        document.body.appendChild(button);
+        let clicks = 0;
+        const unregister = registerAlternateRenderer(button, () => {});
+        button.addEventListener('click', () => clicks++);
+        try {
+            setAckControlPressed(false);
+            const menuEvent = new MouseEvent('contextmenu', {
+                bubbles: true,
+                cancelable: true,
+                ctrlKey: true,
+            });
+            button.dispatchEvent(menuEvent);
+            ackEq(menuEvent.defaultPrevented, true, 'suppresses the macOS context menu');
+            ackEq(clicks, 1, 'routes the gesture through the button click');
+
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
+            ackEq(clicks, 1, 'suppresses a duplicate native click from the same gesture');
+
+            const plainMenuEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+            button.dispatchEvent(plainMenuEvent);
+            ackEq(plainMenuEvent.defaultPrevented, false, 'leaves a normal context menu alone');
+            ackEq(clicks, 1, 'does not activate on a normal context menu');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(eventUsesAlternateAction({}), false, 'restores modifier state after synthetic activation');
+        } finally {
+            unregister();
+            setAckControlPressed(false);
+            button.remove();
+        }
+    });
+
     ackTest('tidydiff command uses clang-tidy-diff with the selected remote and isolated build path', () => {
         const f = SHA_FORMATS.find((f) => f.key === 'tidydiff');
         const prev = prFileCategories;
@@ -34938,6 +35025,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 link.getAttribute('href'),
                 '/octo/demo/compare/main...detached537?quick_pull=1',
                 'restores the fork target after the click',
+            );
+        } finally {
+            setAckControlPressed(false);
+            host.remove();
+        }
+    });
+
+    ackTest('local repo compare rewrite handles the macOS Ctrl-click context-menu event', async () => {
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>';
+        document.body.appendChild(host);
+        try {
+            setAckControlPressed(false);
+            rewriteLocalRepoCompareLinks(host, {
+                currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+                baseBranch: 'main',
+            });
+            const link = host.querySelector('a');
+            link.addEventListener('click', (e) => e.preventDefault());
+            const menuEvent = new MouseEvent('contextmenu', {
+                bubbles: true,
+                cancelable: true,
+                ctrlKey: true,
+            });
+            link.dispatchEvent(menuEvent);
+            ackEq(menuEvent.defaultPrevented, true, 'suppresses the macOS context menu');
+            ackEq(
+                link.getAttribute('href'),
+                '/octo/demo/compare/detached537?expand=1',
+                'activates the upstream target',
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(
+                link.getAttribute('href'),
+                '/octo/demo/compare/main...detached537?quick_pull=1',
+                'restores the fork target',
             );
         } finally {
             setAckControlPressed(false);
