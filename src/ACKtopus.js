@@ -3362,12 +3362,21 @@
         return match ? match[1] : '';
     }
 
+    function visibleReviewCommentHashTarget(target) {
+        const closedDetails = target?.closest?.('details:not([open])');
+        if (closedDetails && isSafeReviewThreadDetails(closedDetails)) {
+            return [...closedDetails.children].find((child) => child.tagName === 'SUMMARY') || closedDetails;
+        }
+        const hiddenBody = target?.closest?.('[data-target="review-thread-collapsible.body"][hidden]');
+        return hiddenBody?.closest?.(REVIEW_THREAD_SCOPE_SELECTOR) || target;
+    }
+
     function findReviewCommentHashTarget(id) {
         const target =
             document.getElementById(`discussion_r${id}`) ||
             document.getElementById(`r${id}`) ||
             document.getElementById(`pullrequestreviewcomment-${id}`);
-        if (target) return target;
+        if (target) return visibleReviewCommentHashTarget(target);
         const anchor = document.querySelector(
             [
                 `a[href="#discussion_r${id}"]`,
@@ -3376,17 +3385,21 @@
                 `a[href$="#r${id}"]`,
             ].join(','),
         );
-        return anchor?.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || anchor || null;
+        if (anchor) {
+            return visibleReviewCommentHashTarget(anchor.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || anchor);
+        }
+        return (
+            [...document.querySelectorAll('[data-hidden-comment-ids]')].find(
+                (scope) =>
+                    hiddenReviewCommentIds(scope).includes(id) &&
+                    scope.querySelector?.(REVIEW_THREAD_TOGGLE_SELECTOR),
+            ) || null
+        );
     }
 
     function navigateToReviewCommentHashTarget(id) {
         const target = findReviewCommentHashTarget(id);
         if (!target) return null;
-        let parent = target.closest?.('details:not([open])');
-        while (parent) {
-            parent.setAttribute('open', '');
-            parent = parent.parentElement?.closest?.('details:not([open])');
-        }
         scrollToAndHighlight(target);
         return target;
     }
@@ -3395,8 +3408,16 @@
         return `${location.pathname}${location.search}${location.hash}`;
     }
 
-    function getReviewCommentRevealState() {
+    function getReviewCommentRevealState(id = '') {
         const { paginationBtns, timelineLoadMore } = getConversationLoaderElements();
+        const targetLoaderIndex = id
+            ? paginationBtns.findIndex((button) =>
+                  hiddenReviewCommentIds(button.closest?.('[data-hidden-comment-ids]')).includes(id),
+              )
+            : -1;
+        if (targetLoaderIndex > 0) {
+            paginationBtns.unshift(...paginationBtns.splice(targetLoaderIndex, 1));
+        }
         if (paginationBtns.length || timelineLoadMore.length) {
             return {
                 paginationBtns,
@@ -3480,12 +3501,12 @@
                 const target = navigateToReviewCommentHashTarget(id);
                 if (target) {
                     reviewCommentHashNavigationCompletedKey = key;
-                    if (popup) popup.textContent = 'Opened linked review comment';
+                    if (popup) popup.textContent = 'Found linked review comment';
                     if (popup) setTimeout(() => popup.remove(), 1200);
                     return true;
                 }
 
-                state ||= getReviewCommentRevealState();
+                state ||= getReviewCommentRevealState(id);
                 if (state.total === 0) {
                     if (!popup) popup = makeStatusPopup('Waiting for GitHub to render linked review comment...');
                     popup.textContent = 'Waiting for GitHub to render linked review comment...';
@@ -3505,7 +3526,7 @@
             const finalTarget = navigateToReviewCommentHashTarget(id);
             if (finalTarget) {
                 reviewCommentHashNavigationCompletedKey = key;
-                if (popup) popup.textContent = 'Opened linked review comment';
+                if (popup) popup.textContent = 'Found linked review comment';
                 if (popup) setTimeout(() => popup.remove(), 1200);
                 return true;
             }
@@ -30030,7 +30051,89 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(hash, '#issuecomment-123', 'hash extracted correctly');
     });
 
-    ackTest('review comment hash navigation expands conversation content in place', () => {
+    ackTest('review comment hash navigation stops at a matching closed thread header', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <review-thread-collapsible
+                id="closed-review-thread"
+                class="review-thread-component js-comment-container js-resolvable-timeline-thread-container"
+                data-resolved="true"
+                data-hidden-comment-ids="9918503001,9918503002"
+            >
+                <div class="review-thread-header">
+                    <button data-target="review-thread-collapsible.button" aria-expanded="false"></button>
+                </div>
+                <div data-target="review-thread-collapsible.body" hidden>
+                    <div id="discussion_r9918503002"></div>
+                </div>
+            </review-thread-collapsible>
+        `;
+        const button = host.querySelector('button');
+        let clicks = 0;
+        button.addEventListener('click', () => clicks++);
+        document.body.appendChild(host);
+        try {
+            const thread = host.querySelector('#closed-review-thread');
+            ackEq(findReviewCommentHashTarget('9918503001'), thread, 'matches an unloaded comment from header metadata');
+            ackEq(
+                findReviewCommentHashTarget('9918503002'),
+                thread,
+                'uses the visible header when the exact comment is inside a hidden body',
+            );
+            ackEq(navigateToReviewCommentHashTarget('9918503001'), thread, 'jumps to the closed thread');
+            ackEq(clicks, 0, 'does not open the matching thread');
+            ackEq(button.getAttribute('aria-expanded'), 'false', 'leaves the matching thread collapsed');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('review comment hash navigation leaves classic resolved threads closed', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <details id="classic-review-thread" class="js-resolvable-timeline-thread-container" data-resolved="true">
+                <summary id="classic-review-header">Resolved thread</summary>
+                <div id="discussion_r9918503010"></div>
+            </details>
+        `;
+        document.body.appendChild(host);
+        try {
+            const details = host.querySelector('details');
+            const summary = host.querySelector('summary');
+            ackEq(findReviewCommentHashTarget('9918503010'), summary, 'uses the visible details summary');
+            ackEq(navigateToReviewCommentHashTarget('9918503010'), summary, 'jumps to the details summary');
+            ackAssert(!details.open, 'does not open the resolved details');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('review comment hash navigation prioritizes the matching hidden conversation loader', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <form class="ajax-pagination-form" data-hidden-comment-ids="9918503020">
+                <button id="unrelated-loader" class="ajax-pagination-btn">Load more...</button>
+            </form>
+            <form class="ajax-pagination-form" data-hidden-comment-ids="9918503021,9918503022">
+                <button id="target-loader" class="ajax-pagination-btn">Load more...</button>
+            </form>
+        `;
+        document.body.appendChild(host);
+        try {
+            const localLoaders = getReviewCommentRevealState('9918503022').paginationBtns.filter((button) =>
+                host.contains(button),
+            );
+            ackDeepEq(
+                localLoaders.map((button) => button.id),
+                ['target-loader', 'unrelated-loader'],
+                'loads the conversation containing the target first',
+            );
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('review comment hash navigation uses bounded fallback work in place', () => {
         ackEq(reviewCommentDiscussionHashId('#discussion_r1854105033'), '1854105033');
         ackEq(reviewCommentDiscussionHashId('#r1854105033'), '');
         const source = _ackSource;
@@ -30038,11 +30141,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('async function handleReviewCommentHashNavigation'),
             source.indexOf('\n    function findUserAcks'),
         );
-        ackAssert(helper.includes('getReviewCommentRevealState()'), 'uses local reveal state');
+        ackAssert(helper.includes('getReviewCommentRevealState(id)'), 'uses target-aware local reveal state');
         ackAssert(
             helper.includes('openReviewCommentRevealState(state, attempted)'),
             'opens collapsed content incrementally in the current view',
         );
+        const navigation = sourceSection(
+            source,
+            'function navigateToReviewCommentHashTarget',
+            'function currentReviewCommentHashNavigationKey',
+        );
+        ackAssert(!navigation.includes("setAttribute('open'"), 'does not open a closed matching thread');
         ackAssert(!helper.includes('location.assign'), 'does not switch to the changes/files view');
         ackAssert(!helper.includes('buildReviewCommentChangesUrl'), 'does not build a redirect URL');
         ackAssert(!helper.includes('scrollToReviewCommentRevealWork'), 'does not move the viewport to loader controls');
@@ -30073,7 +30182,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(helper.includes('reviewCommentHashNavigationCompletedKey === key'), 'completed hash key blocks repeated handler runs');
         ackAssert(
             helper.includes('reviewCommentHashNavigationCompletedKey = key') &&
-                helper.indexOf('reviewCommentHashNavigationCompletedKey = key') < helper.indexOf("popup.textContent = 'Opened linked review comment'"),
+                helper.indexOf('reviewCommentHashNavigationCompletedKey = key') < helper.indexOf("popup.textContent = 'Found linked review comment'"),
             'successful target reveal marks the hash as completed',
         );
         ackAssert(
