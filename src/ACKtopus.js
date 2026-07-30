@@ -12428,6 +12428,101 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }));
     }
 
+    function diffTextEdits(baseText, changedText) {
+        const edits = [];
+        let baseOffset = 0;
+        let pending = null;
+        const flush = () => {
+            if (pending) edits.push(pending);
+            pending = null;
+        };
+        for (const part of Diff.diffChars(String(baseText || ''), String(changedText || ''))) {
+            if (!part.added && !part.removed) {
+                flush();
+                baseOffset += part.value.length;
+                continue;
+            }
+            pending ||= { start: baseOffset, end: baseOffset, text: '' };
+            if (part.removed) {
+                pending.end += part.value.length;
+                baseOffset += part.value.length;
+            } else {
+                pending.text += part.value;
+            }
+        }
+        flush();
+        return edits;
+    }
+
+    function textEditsOverlap(a, b) {
+        const aInserts = a.start === a.end;
+        const bInserts = b.start === b.end;
+        if (aInserts && bInserts) return a.start === b.start;
+        if (aInserts) return a.start >= b.start && a.start <= b.end;
+        if (bInserts) return b.start >= a.start && b.start <= a.end;
+        return a.start < b.end && b.start < a.end;
+    }
+
+    function mapTextOffsetThroughEdits(edits, offset, bias = 'right') {
+        let delta = 0;
+        for (const edit of edits) {
+            const removedLength = edit.end - edit.start;
+            const addedLength = edit.text.length;
+            if (offset < edit.start) break;
+            if (removedLength === 0) {
+                if (offset === edit.start) {
+                    return edit.start + delta + (bias === 'right' ? addedLength : 0);
+                }
+                delta += addedLength;
+                continue;
+            }
+            if (offset >= edit.end) {
+                delta += addedLength - removedLength;
+                continue;
+            }
+            return edit.start + delta + (bias === 'right' ? addedLength : 0);
+        }
+        return offset + delta;
+    }
+
+    function mapTextRange(baseText, changedText, start, end) {
+        const edits = diffTextEdits(baseText, changedText);
+        return {
+            start: mapTextOffsetThroughEdits(edits, start, 'left'),
+            end: mapTextOffsetThroughEdits(edits, end, 'right'),
+        };
+    }
+
+    function rebaseTextChanges(baseText, suggestedText, latestText) {
+        const base = String(baseText || '');
+        const suggested = String(suggestedText || '');
+        const latest = String(latestText || '');
+        const suggestionEdits = diffTextEdits(base, suggested);
+        if (!suggestionEdits.length) return { text: latest, applied: 0, conflicts: 0 };
+        if (latest === base) {
+            return { text: suggested, applied: suggestionEdits.length, conflicts: 0 };
+        }
+
+        const latestEdits = diffTextEdits(base, latest);
+        const applicable = suggestionEdits.filter(
+            (suggestionEdit) => !latestEdits.some((latestEdit) => textEditsOverlap(suggestionEdit, latestEdit)),
+        );
+        const mapped = applicable.map((edit) => ({
+            start: mapTextOffsetThroughEdits(latestEdits, edit.start, 'right'),
+            end: mapTextOffsetThroughEdits(latestEdits, edit.end, 'left'),
+            text: edit.text,
+        }));
+        let text = latest;
+        for (const edit of mapped.sort((a, b) => b.start - a.start || b.end - a.end)) {
+            text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
+        }
+        return {
+            text,
+            applied: applicable.length,
+            conflicts: suggestionEdits.length - applicable.length,
+        };
+    }
+
     function countDiffLines(oldText, newText) {
         const countLines = (text) => {
             const normalized = String(text || '').replace(/\r\n/g, '\n');
@@ -13500,12 +13595,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             if (ta) {
                 // EDIT MODE: proofread in-place with diff preview.
-                // Captures selection range BEFORE LLM call -- the replacement must only
-                // touch exactly those characters, nothing else in the textarea.
+                // Capture the request input, then rebase the suggestion onto the latest
+                // textarea value before showing or applying it.
+                const textareaValueAtStart = ta.value;
                 const selStart = ta.selectionStart,
                     selEnd = ta.selectionEnd;
                 const hasSelection = selStart !== selEnd;
-                const textToProofread = hasSelection ? ta.value.slice(selStart, selEnd) : ta.value;
+                const textToProofread = hasSelection
+                    ? textareaValueAtStart.slice(selStart, selEnd)
+                    : textareaValueAtStart;
                 if (!textToProofread.trim()) {
                     logProofreadOutcome('ignored empty text');
                     stopSpin();
@@ -13526,7 +13624,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     let strippedOriginal = stripGitHubMeta(textForProofread);
                     let result = stripGitHubMeta(textForProofread);
                     const localProofreadContext = hasSelection
-                        ? buildSurroundingProofreadContext(ta.value, selStart, selEnd)
+                        ? buildSurroundingProofreadContext(textareaValueAtStart, selStart, selEnd)
                         : '';
                     const { system, user, parsed, noOp } = makePrompt(textForProofread, localProofreadContext);
                     if (noOp) {
@@ -13569,15 +13667,58 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             result = postProcessProofreadMarkdown(parsed.fromXML(llmClean));
                         }
                     }
+                    // Rebase proofread changes onto the latest textarea value.
+                    const finalUrlRewrite = rewriteProofreadCommitDiffUrls(result);
+                    result = finalUrlRewrite.text;
+                    linkRewriteCount = Math.max(linkRewriteCount, finalUrlRewrite.count);
                     ta.style.borderColor = oldBorder;
                     stopSpin(linkRewriteCount ? '🔗' : '✅');
                     showLinkRewriteMarker(linkRewriteCount);
 
-                    // Compare stripped original vs LLM result (footer removal is transparent)
+                    const beforeDialogContext = resolveLiveTextareaContext(
+                        container,
+                        taContainer,
+                        taSelector,
+                        ta,
+                    );
+                    const beforeDialogTa = beforeDialogContext.textarea || ta;
+                    const latestTextBeforeDialog = beforeDialogTa.value;
+                    let latestSelectionRange = null;
+                    let dialogOriginal = latestTextBeforeDialog;
+                    let rebasedBeforeDialog;
+                    if (hasSelection) {
+                        latestSelectionRange = mapTextRange(
+                            textareaValueAtStart,
+                            latestTextBeforeDialog,
+                            selStart,
+                            selEnd,
+                        );
+                        dialogOriginal = latestTextBeforeDialog.slice(
+                            latestSelectionRange.start,
+                            latestSelectionRange.end,
+                        );
+                        rebasedBeforeDialog = rebaseTextChanges(
+                            textToProofread,
+                            result,
+                            dialogOriginal,
+                        );
+                    } else {
+                        rebasedBeforeDialog = rebaseTextChanges(
+                            textareaValueAtStart,
+                            result,
+                            latestTextBeforeDialog,
+                        );
+                    }
+                    const dialogCorrected = rebasedBeforeDialog.text;
+                    proofreadDiagnostics.concurrentEdits = {
+                        beforeDialog: latestTextBeforeDialog !== textareaValueAtStart,
+                        beforeDialogConflicts: rebasedBeforeDialog.conflicts,
+                    };
+
                     const { action: accepted, text: finalText } = await showDiffDialog(
-                        strippedOriginal,
-                        result,
-                        getTextareaDiffDialogOptions(taContainer, ta),
+                        dialogOriginal,
+                        dialogCorrected,
+                        getTextareaDiffDialogOptions(beforeDialogContext.container, beforeDialogTa),
                     );
                     proofreadDiagnostics.diffDialog = { accepted, finalLength: (finalText || '').length };
                     if (accepted === 'unchanged') {
@@ -13597,36 +13738,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         return;
                     }
 
-                    const finalUrlRewrite = rewriteProofreadCommitDiffUrls(finalText);
-                    const textToApply = finalUrlRewrite.text;
-                    linkRewriteCount = Math.max(linkRewriteCount, finalUrlRewrite.count);
-
-                    // Apply the corrected text via React-compatible setTextareaValue helper
-                    // Re-query textarea: React may have replaced the DOM element during the async diff dialog
-                    const liveTextArea = resolveLiveTextareaContext(container, taContainer, taSelector, ta);
+                    const acceptedFullText = hasSelection
+                        ? latestTextBeforeDialog.slice(0, latestSelectionRange.start) +
+                          finalText +
+                          latestTextBeforeDialog.slice(latestSelectionRange.end)
+                        : finalText;
+                    // React or another page update may replace or change the textarea
+                    // while the dialog is open, so merge once more before writing.
+                    const liveTextArea = resolveLiveTextareaContext(
+                        beforeDialogContext.container,
+                        taContainer,
+                        taSelector,
+                        beforeDialogTa,
+                    );
                     const freshTa = liveTextArea.textarea || ta;
+                    const rebasedAfterDialog = rebaseTextChanges(
+                        latestTextBeforeDialog,
+                        acceptedFullText,
+                        freshTa.value,
+                    );
+                    proofreadDiagnostics.concurrentEdits.afterDialog =
+                        freshTa.value !== latestTextBeforeDialog;
+                    proofreadDiagnostics.concurrentEdits.afterDialogConflicts =
+                        rebasedAfterDialog.conflicts;
                     freshTa.focus();
-                    if (hasSelection) {
-                        // Verify the captured text still matches -- abort if user typed during async LLM call
-                        if (freshTa.value.slice(selStart, selEnd) !== textToProofread) {
-                            proofreadDiagnostics.selectionDrifted = true;
-                            await setTextareaValueRobust(
-                                liveTextArea.container,
-                                freshTa,
-                                freshTa.value.replace(textToProofread, textToApply),
-                                taSelector,
-                            );
-                        } else {
-                            await setTextareaValueRobust(
-                                liveTextArea.container,
-                                freshTa,
-                                freshTa.value.slice(0, selStart) + textToApply + freshTa.value.slice(selEnd),
-                                taSelector,
-                            );
-                        }
-                    } else {
-                        await setTextareaValueRobust(liveTextArea.container, freshTa, textToApply, taSelector);
-                    }
+                    await setTextareaValueRobust(
+                        liveTextArea.container,
+                        freshTa,
+                        rebasedAfterDialog.text,
+                        taSelector,
+                    );
 
                     // Restore button text, keep the textarea open for user to review.
                     if (linkRewriteCount) {
@@ -28554,6 +28695,60 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('rebaseTextChanges keeps concurrent edits outside proofreading changes', () => {
+        const base = 'The   stack has 9 commits.';
+        const suggested = 'The stack has 9 commits.';
+        const latest = 'The   stack has 9 commits.\n\nAlso retested.';
+        const rebased = rebaseTextChanges(base, suggested, latest);
+        ackEq(rebased.text, 'The stack has 9 commits.\n\nAlso retested.');
+        ackEq(rebased.conflicts, 0);
+    });
+
+    ackTest('rebaseTextChanges preserves concurrent edits on the same line', () => {
+        const base = 'alpha beta gamma';
+        const suggested = 'alpha BETA gamma';
+        const latest = 'start alpha beta gamma end';
+        const rebased = rebaseTextChanges(base, suggested, latest);
+        ackEq(rebased.text, 'start alpha BETA gamma end');
+        ackEq(rebased.conflicts, 0);
+    });
+
+    ackTest('rebaseTextChanges lets overlapping user edits win', () => {
+        const base = 'The stack has 9 commits.';
+        const suggested = 'The stack has nine commits.';
+        const latest = 'The stack has 10 commits.';
+        const rebased = rebaseTextChanges(base, suggested, latest);
+        ackEq(rebased.text, latest);
+        ackEq(rebased.conflicts, 1);
+    });
+
+    ackTest('rebaseTextChanges still applies non-conflicting proofreading edits', () => {
+        const base = 'Teh stack has 9 commits.';
+        const suggested = 'The stack has nine commits.';
+        const latest = 'Teh stack has 10 commits.';
+        const rebased = rebaseTextChanges(base, suggested, latest);
+        ackEq(rebased.text, 'The stack has 10 commits.');
+        ackEq(rebased.conflicts, 1);
+    });
+
+    ackTest('mapTextRange follows concurrent edits inside a proofread selection', () => {
+        const base = 'before target after';
+        const latest = 'new before targEDITet after';
+        const start = base.indexOf('target');
+        const range = mapTextRange(base, latest, start, start + 'target'.length);
+        ackEq(latest.slice(range.start, range.end), 'targEDITet');
+    });
+
+    ackTest('rebaseTextChanges keeps edits made after the diff dialog opens', () => {
+        const dialogBaseline = 'The   stack has 9 commits.';
+        const accepted = 'The stack has 9 commits.';
+        const latest = 'The   stack has 9 commits. Retested.';
+        ackEq(
+            rebaseTextChanges(dialogBaseline, accepted, latest).text,
+            'The stack has 9 commits. Retested.',
+        );
+    });
+
     // ============================================================================
     // renderMarkdown -- extended edge cases
     // ============================================================================
@@ -29558,7 +29753,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('proofread falls back when LLM omits <sN> tags', () => {
         const fn = _ackSource.slice(
             _ackSource.indexOf("proofreadDiagnostics.mode = 'LLM'"),
-            _ackSource.indexOf('// Compare stripped original vs LLM result'),
+            _ackSource.indexOf('// Rebase proofread changes onto the latest textarea value'),
         );
         ackAssert(fn.includes('tagCount === 0'), 'detects missing section tags');
         ackAssert(fn.includes('parsed.mutableCount === 1'), 'uses safe single-segment fallback gate');
@@ -30684,7 +30879,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const proofreadSection = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         const setterCalls = (proofreadSection.match(/setTextareaValue(Robust)?\(/g) || []).length;
-        ackAssert(setterCalls >= 3, 'proofread uses setTextareaValueRobust for full and selection edits (' + setterCalls + ' calls)');
+        ackAssert(setterCalls >= 1, 'proofread uses setTextareaValueRobust for merged edits (' + setterCalls + ' calls)');
         ackAssert(proofreadSection.includes('setTextareaValueRobust'), 'proofread uses the robust textarea setter');
         // Must NOT use raw nativeSetter or execCommand
         const stripComments = (s) => s.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
@@ -30698,9 +30893,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const proofFn = sourceSection(source, 'async function runProofreadOnComment', '// --- Start a review');
         ackAssert(proofFn.includes('freshTa'), 'EDIT MODE re-queries textarea as freshTa');
         ackAssert(
-            proofFn.includes('resolveLiveTextareaContext(container, taContainer, taSelector, ta)'),
-            're-queries live textarea context after async diff dialog',
+            (proofFn.match(/resolveLiveTextareaContext\(/g) || []).length >= 2,
+            're-queries live textarea before and after the async diff dialog',
         );
+        ackAssert(proofFn.includes('latestTextBeforeDialog'), 'uses the latest textarea value as the diff baseline');
+        ackAssert(proofFn.includes('rebasedAfterDialog'), 'rebases accepted changes after the diff dialog');
     });
 
     ackTest('EDIT MODE proofread uses setTextareaValueRobust', () => {
@@ -42027,7 +42224,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
-    ackTest('proofread URL rewrite is applied before prompting, diffing, and replacement', () => {
+    ackTest('proofread URL rewrite is applied before prompting and latest-text merging', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
         ackAssert(fn.includes('initialUrlRewrite'), 'rewrites commit diff URLs before prompt creation');
@@ -42037,9 +42234,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(
             fn.includes('let strippedOriginal = stripGitHubMeta(textForProofread)'),
-            'uses rewritten text as diff baseline',
+            'uses rewritten text as the LLM baseline',
         );
-        ackAssert(fn.includes('finalUrlRewrite'), 'rewrites commit diff URLs before textarea replacement');
+        ackAssert(fn.includes('finalUrlRewrite'), 'rewrites commit diff URLs before merging the suggestion');
+        ackAssert(fn.includes('rebaseTextChanges'), 'merges rewritten output with the latest textarea value');
         ackAssert(fn.includes("stopSpin(linkRewriteCount ? '🔗' : '✅')"), 'marks proofread button when URLs changed');
     });
 
@@ -44204,11 +44402,20 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(teardown.includes('ack-config-overlay'), 'cleans up config overlay');
     });
 
-    ackTest('selection drift guard exists in EDIT proofread path', () => {
+    ackTest('editable proofread rebases onto current text without locking the textarea', () => {
         const source = _ackSource;
-        // 1 drift guard: EDIT proofread only (VIEW mode removed)
-        const driftGuards = (source.match(/selection drifted/g) || []).length;
-        ackEq(driftGuards, 1, 'exactly 1 drift guard in EDIT proofread path');
+        const fn = source.slice(source.indexOf('EDIT MODE: proofread'), source.indexOf('// --- Start a review'));
+        ackAssert(fn.includes('textareaValueAtStart'), 'keeps the request input as the merge base');
+        ackAssert(fn.includes('latestTextBeforeDialog'), 'reads the current text before showing the diff');
+        ackAssert(fn.includes('dialogOriginal = latestTextBeforeDialog'), 'diffs against the current full text');
+        ackAssert(fn.includes('mapTextRange'), 'maps selected text through concurrent edits');
+        ackAssert(
+            sourceIncludesLoose(fn, 'rebaseTextChanges(textToProofread, result, dialogOriginal)'),
+            'limits selected-text merging to the mapped live selection',
+        );
+        ackAssert(fn.includes('rebasedAfterDialog'), 'preserves changes made while the diff dialog is open');
+        ackAssert(!fn.includes('ta.disabled = true'), 'does not disable the textarea while proofreading');
+        ackAssert(!fn.includes('ta.readOnly = true'), 'does not make the textarea read-only while proofreading');
     });
 
     ackTest('safeImgSrc exists and is used for image rendering', () => {
