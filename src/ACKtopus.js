@@ -5855,6 +5855,9 @@
     const PROOFREAD_SANITY_RULE =
         'Do a lightweight fact and sanity check against the supplied text and context. Fix obvious objective errors and internal contradictions, including stale or wrong identifiers, file paths, counts, before/after direction, behavior descriptions, or claims the diff disproves. Remove accidental duplicates, including repeated words, phrases, sentences, and points already made nearby. These are required corrections when clearly supported; do not return the original unchanged while an obvious error or duplicate remains. Keep opinions and uncertain claims unchanged unless the context clearly disproves them; do not invent missing facts or broaden the rewrite.';
 
+    const PROOFREAD_NATURAL_PROSE_RULE =
+        'Use natural, specific prose. Remove canned agreement and empty introductions such as "you are right to push back", "honestly", "worth noting", "one caveat", or "one wrinkle" when they add no meaning. Avoid formulaic negative contrasts such as "not X, but Y", "X, not Y", or "not just X, but Y"; state the claim directly unless the contrast resolves a real ambiguity. Replace vague or metaphorical uses of "shape", "shaped", "load-bearing", "does the work", "doing the work", "heavy lifting", "friction", "blast radius", and "land" or "landing" with the concrete behavior, dependency, cost, risk, or result. Preserve any of these words when they are literal, established technical terms, or the clearest precise wording. Let sentence length follow the content: keep connected cause and effect together, and avoid runs of short emphatic sentences. Do not add generic praise, claims of candor, dramatic metaphors, or a closing sentence that only restates the point.';
+
     const PROOFREAD_SENTENCE_PER_LINE_RULE =
         'After reflowing prose, keep each complete sentence on one physical line when practical, without adding blank lines between related sentences.';
 
@@ -5862,7 +5865,10 @@
 - Use concise, plain, concrete language. Keep only details that change reviewer understanding.
 - Lead with the reviewer-visible behavior, problem, or reason before implementation details.
 - Keep related context and consequences together. Do not make concise prose choppy.
-- Avoid formulaic contrasts such as "not X, but Y". State the positive claim directly and mention a non-goal only when it matters.
+- Avoid canned agreement, generic praise, claims of candor, and stock introductions when they add no meaning.
+- Avoid formulaic contrasts such as "not X, but Y", "X, not Y", or "not just X, but Y". State the positive claim directly and mention a non-goal only when it matters.
+- Avoid vague or metaphorical uses of "shape", "load-bearing", "does the work", or "heavy lifting". Name the concrete type, dependency, behavior, cost, or risk instead, while preserving literal or established technical uses.
+- Let sentence length follow the content. Avoid runs of short emphatic sentences and conclusions that merely restate the previous point.
 - Avoid abstract words such as "boundary", "invariant", "hardening", or "contract" unless the text names the concrete API, lifetime, call path, or behavior.
 - When writing a PR description or commit message, keep each complete sentence on one physical line when practical. Do not hard-wrap inside a sentence or add blank lines between related sentences.
 - Use \`backticks\` for code symbols, paths, commands, options, and other code-like names.
@@ -6160,6 +6166,7 @@ Under each section, keep bullets short and high signal.`,
         proofread: `Use American English.
 ${PROOFREAD_MECHANICAL_RULE}
 ${PROOFREAD_SANITY_RULE}
+${PROOFREAD_NATURAL_PROSE_RULE}
 Fix grammar, spelling, and clarity with minimal edits. Preserve the author's tone and intent.
 Prefer simple, plain language. Do not add jargon, abstract reviewer-speak, or more formal wording unless the original technical meaning requires it.
 Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement.
@@ -6185,7 +6192,11 @@ Return only the corrected text. If nothing needs fixing, return the original tex
     function getProofreadInstructions(configured) {
         const custom = String(configured || '').trim();
         const instructions = custom || DEFAULT_INSTRUCTIONS.proofread;
-        const missingRequiredRules = [PROOFREAD_MECHANICAL_RULE, PROOFREAD_SANITY_RULE].filter(
+        const missingRequiredRules = [
+            PROOFREAD_MECHANICAL_RULE,
+            PROOFREAD_SANITY_RULE,
+            PROOFREAD_NATURAL_PROSE_RULE,
+        ].filter(
             (rule) => !instructions.includes(rule),
         );
         return missingRequiredRules.length ? `${missingRequiredRules.join('\n')}\n${instructions}` : instructions;
@@ -18274,7 +18285,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const system = generateTitle
                 ? `You are drafting a GitHub Pull Request title.\n\n${getReviewPRTitleRules()}\n\nRULES (MUST FOLLOW):\n- Output exactly one short line: the PR title only.\n- Summarize the fix, not the review process.\n- Preserve technical terms, code identifiers, filenames, and casing.\n- If a subsystem/component prefix is clearly supported by the context, use it.\n- Prefer the specific change over vague wording.\n- Do NOT add quotes, markdown, explanations, or multiple alternatives.\n- If the context is incomplete, stay conservative and avoid inventing details.`
-                : `You are proofreading a GitHub Pull Request title.\n\n${getReviewPRTitleRules()}\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- ${PROOFREAD_SANITY_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, and filenames.\n- Preserve the component choice and colon, but correct the component prefix to lowercase.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
+                : `You are proofreading a GitHub Pull Request title.\n\n${getReviewPRTitleRules()}\n\nRULES (MUST FOLLOW):\n- ${PROOFREAD_MECHANICAL_RULE}\n- ${PROOFREAD_SANITY_RULE}\n- ${PROOFREAD_NATURAL_PROSE_RULE}\n- Make the smallest possible change to improve grammar/spelling/punctuation/clarity.\n- Do NOT change the meaning or topic.\n- Preserve technical terms, code identifiers, and filenames.\n- Preserve the component choice and colon, but correct the component prefix to lowercase.\n- Do NOT copy a different PR title from the context (the context may contain unrelated PR titles).\n- If you're not confident, output the original title unchanged.\n- Output MUST be a single line: the corrected title only. No quotes, no markdown, no extra text.`;
             const user = generateTitle
                 ? `PR title is empty. Propose a concise title from the context below.${ctxBlock}`
                 : `Original title:\n${original}${ctxBlock}`;
@@ -23390,7 +23401,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ].join('\n');
             } else if (mode === 'proofread') {
                 systemExtra =
-                    `${PROOFREAD_MECHANICAL_RULE}\n${PROOFREAD_SANITY_RULE}\nProofread the selection. Prefer simple, plain language and do not add jargon. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, parentheses, or sentence breaks; preserve command-line flags such as \`--connect\`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).`;
+                    `${PROOFREAD_MECHANICAL_RULE}\n${PROOFREAD_SANITY_RULE}\n${PROOFREAD_NATURAL_PROSE_RULE}\nProofread the selection. Prefer simple, plain language and do not add jargon. Remove accidental manual wrapping and leading indentation in normal prose paragraphs; GitHub comments do not need 72-column-style hard wrapping. Join wrapped prose with one normal space, but join a line break that split one code-like token, inline-code span, quoted string, shell assignment, URL, long hash, or other single expression without adding a space inside that token. Replace bare double-hyphen punctuation in prose with commas, parentheses, or sentence breaks; preserve command-line flags such as \`--connect\`, links, code, meaningful blank lines, and intentional indentation. Preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. If the selection contains fenced code blocks, check whether each language hint gives useful GitHub highlighting for that block. Add, remove, or change the hint when another GitHub-supported hint would make the visible content easier to read; the hint does not have to be the exact real language. Do not choose boring \`\`\`text for runnable shell scripts. If a block contains shell syntax such as variables, loops, pipes, redirects, command substitutions, \`&&\`, or runnable commands, keep or choose \`\`\`bash or \`\`\`sh even when the block is long or also includes command output. Use no hint or a plain-output hint only for non-runnable output, logs, or stack traces. Reformat fenced code blocks using whitespace-only edits when that makes them easier to read. Long single-line shell commands should usually be split across lines with continuation backslashes and indentation. Also fix accidental line breaks inside code-like tokens, quoted strings, shell assignments, URLs, or long hashes by joining the split token without adding a space. Do not change tokens, quoting, variable expansion, arguments, operators, comments, or command order. If the selection is code, do not rewrite it beyond whitespace-only formatting or obvious typos inside comments/strings. Keep the original sentence structure unless separating clauses clearly improves clarity, such as when the clauses are only loosely connected or when they mix a question with a statement. Return ONLY the corrected text (no commentary).`;
             } else {
                 systemExtra =
                     'Explain what the selected line(s) do in this commit, and why they matter. Focus on the selection; do not restate the whole diff. 1-3 short sentences max.';
@@ -29026,10 +29037,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('custom proofread instructions retain required mechanical and sanity checks', () => {
+    ackTest('custom proofread instructions retain all required checks', () => {
         const instructions = getProofreadInstructions('Keep domain-specific wording.');
         ackAssert(instructions.includes(PROOFREAD_MECHANICAL_RULE), 'adds required mechanical rule');
         ackAssert(instructions.includes(PROOFREAD_SANITY_RULE), 'adds required sanity rule');
+        ackAssert(instructions.includes(PROOFREAD_NATURAL_PROSE_RULE), 'adds required natural-prose rule');
         ackAssert(instructions.includes('Keep domain-specific wording.'), 'keeps custom instructions');
         ackEq(
             getProofreadInstructions(DEFAULT_INSTRUCTIONS.proofread),
@@ -29058,6 +29070,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('abstract reviewer-speak'), 'mentions avoiding jargon');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('Remove accidental duplicates'), 'removes duplication');
         ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes('surrounding text'), 'uses surrounding text');
+    });
+
+    ackTest('proofread instructions avoid stock AI prose patterns', () => {
+        ackAssert(DEFAULT_INSTRUCTIONS.proofread.includes(PROOFREAD_NATURAL_PROSE_RULE), 'includes shared prose rule');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('canned agreement'), 'removes canned agreement');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('not just X, but Y'), 'rejects negative parallelism');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('load-bearing'), 'rejects stock structural metaphors');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('literal'), 'preserves precise literal uses');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('sentence length follow'), 'varies sentence length naturally');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('short emphatic sentences'), 'avoids staged cadence');
+        ackAssert(PROOFREAD_NATURAL_PROSE_RULE.includes('only restates the point'), 'removes empty conclusions');
     });
 
     ackTest('proofread instructions require lightweight fact and sanity checks', () => {
@@ -29103,6 +29126,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('reviewer-visible behavior'), 'leads with behavior');
         ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('Do not hard-wrap inside a sentence'), 'avoids hard wraps');
         ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('not X, but Y'), 'rejects formulaic contrasts');
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('canned agreement'), 'rejects canned agreement');
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('sentence length follow'), 'keeps natural cadence');
+        ackAssert(BITCOIN_CORE_REVIEW_PROSE_RULES.includes('literal or established technical uses'), 'keeps precise terms');
         ackAssert(BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('**Problem:** Text'), 'uses inline Problem prefix');
         ackAssert(
             BITCOIN_CORE_PR_DESCRIPTION_RULES.includes('Preserve meaningful existing headings'),
@@ -29901,6 +29927,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'applies title rules to generated and existing titles',
         );
         ackAssert(runFn.includes('${PROOFREAD_SANITY_RULE}'), 'title proofreading includes the sanity check');
+        ackAssert(runFn.includes('${PROOFREAD_NATURAL_PROSE_RULE}'), 'title proofreading avoids stock prose');
     });
 
     ackTest('parseCommitsFromPage falls back to SSR commits on compare pages', () => {
@@ -37419,6 +37446,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('Do not change tokens'), 'selection proofread forbids code-token changes during formatting');
         ackAssert(fn.includes('${PROOFREAD_MECHANICAL_RULE}'), 'selection proofread includes required mechanical checks');
         ackAssert(fn.includes('${PROOFREAD_SANITY_RULE}'), 'selection proofread includes required sanity checks');
+        ackAssert(fn.includes('${PROOFREAD_NATURAL_PROSE_RULE}'), 'selection proofread avoids stock prose');
         ackAssert(fn.includes('const outputRule ='), 'selection actions use a mode-specific output contract');
         ackAssert(
             fn.includes('Return only the corrected text with no commentary or code fence.'),
