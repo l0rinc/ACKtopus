@@ -716,13 +716,16 @@
     );
     window.addEventListener('blur', () => setAckControlPressed(false));
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
-    const COMMENT_CONTAINER_SELECTOR =
-        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], [class*="ReviewThreadContainer"]';
+    const COMMENT_CONTAINER_BASE_SELECTOR =
+        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"]';
+    const COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_BASE_SELECTOR + ', [class*="ReviewThreadContainer"]';
     const EDIT_FORM_SELECTOR =
         'form.js-comment-update, [data-testid="edit-comment-form"], form.js-issue-update, ' +
         'form[action*="/reviews/"][action*="/update"]';
     const EDIT_BODY_TEXTAREA_SELECTOR =
         'textarea[name="issue[body]"], textarea[name="pull_request[body]"], textarea#issue_body, textarea#pull_request_body';
+    const EDIT_TA_SELECTOR =
+        '.is-comment-editing textarea, form.js-comment-update textarea, [data-testid="edit-comment-form"] textarea';
     const EDIT_SCOPE_SELECTOR =
         EDIT_FORM_SELECTOR +
         ', .is-comment-editing, .edit-comment-hide, [data-testid="markdown-editor"], ' +
@@ -2303,7 +2306,7 @@
     }
 
     const POSTED_COMMENT_CONTAINER_SELECTOR =
-        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], ' +
+        COMMENT_CONTAINER_BASE_SELECTOR + ', ' +
         '[data-testid^="issue-comment"], div[id^="issuecomment-"], div[id^="discussion_r"], ' +
         'div[id^="pullrequestreview-"]';
     const REVIEW_THREAD_SCOPE_SELECTOR =
@@ -5090,7 +5093,7 @@
                 currentUser: opts.currentUser,
                 baseBranch,
                 root: scanRoot,
-                path: opts.path || location.pathname,
+                path: branchPath,
             });
             if (!rewrite) continue;
             installLocalRepoCompareTargets(link, originalHref, rewrite.href);
@@ -6033,7 +6036,7 @@ Produce a prompt for the step after the no-peek local reproducer exists and the 
 - Verify every suggestion against the live PR, comments, tests, and branch shape before committing it. If evidence undercuts the premise, drop the suggestion instead of defending it or preserving a stack count.
 - The generated prompt should tell the target agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading. Encourage the agent to cover every angle a proofreader might check (correctness, safety, idiom, repetition, naming, typos, commit-message accuracy, test coverage, edge cases) rather than self-filtering to what it personally considers most important.
 - One commit equals one issue equals one PR comment. Each suggestion commit covers a single concrete point the agent would write as one inline review comment, and its patch is the smallest possible change that satisfies that single point. If the agent finds two issues, even in the same hunk, that becomes two commits. Never bundle them.
-- Suggestion commit messages must be phrased like actual PR code review comments: one concrete problem sentence followed by one short \`Could we...?\` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence.
+- Each suggestion commit message must read like one actual PR code review comment: one concrete problem sentence followed by one short \`Could we...?\` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence.
 - When the original PR's solution is clearly better than the local one, the target agent must report that in prose instead of manufacturing an empty, forced, or invalid suggestion commit. "Clearly better" is the only exclusion; ties and ambiguous cases still produce a commit.
 
 # Constraints
@@ -13507,8 +13510,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Check if we're already in edit mode.
             // Important: avoid matching reply-form textareas that can be present in the
             // thread even when this comment itself is not being edited.
-            const EDIT_TA_SELECTOR =
-                '.is-comment-editing textarea, form.js-comment-update textarea, [data-testid="edit-comment-form"] textarea';
             const isToolbarProofreadBtn = commentEl.classList?.contains('ack-toolbar-proofread');
             let taSelector = EDIT_TA_SELECTOR;
             let ta = null;
@@ -14790,14 +14791,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function addStartReviewButtons(root = document) {
         if (!isPRPage()) return;
+        const replyForms = getReplyReviewForms(root);
+        if (!replyForms.length) return;
 
-        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: root === document })) {
+        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: true })) {
             markCommentButtonsPending(root);
             addSubmitReviewButtonToConversation(document);
             return;
         }
 
-        for (const form of getReplyReviewForms(root)) {
+        for (const form of replyForms) {
             if (form.dataset.ackStartReviewInjected) continue;
 
             // If GitHub already shows review actions, don't add anything.
@@ -18434,8 +18437,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
 
         const processedContainers = new Set();
-        const EDIT_TA_SELECTOR =
-            '.is-comment-editing textarea, form.js-comment-update textarea, [data-testid="edit-comment-form"] textarea';
 
         const getEditState = (container) => {
             const editTa = container.querySelector(EDIT_TA_SELECTOR);
@@ -20768,7 +20769,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 .filter((entry) => entry.permalink)
                 .map((entry) => commentPermalinkIdentity(entry.permalink)),
         );
-        const visible = gatherVisiblePRReplyEntries(apiIdentities);
+        const visiblePr = parsePR();
+        const visibleMatchesRequestedPr =
+            visiblePr &&
+            String(visiblePr.owner).toLowerCase() === String(pr.owner).toLowerCase() &&
+            String(visiblePr.repo).toLowerCase() === String(pr.repo).toLowerCase() &&
+            String(visiblePr.pr) === String(pr.pr);
+        const visible = visibleMatchesRequestedPr ? gatherVisiblePRReplyEntries(apiIdentities) : [];
         const conversationComments = mergeUnique(
             conversationRows,
             visible.filter((entry) => entry.source === 'visible conversation comment'),
@@ -26371,7 +26378,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return /\/[^/]+\/[^/]+\/commit\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path);
     }
 
-    function isPRCreationPage(path = location.pathname, root = document) {
+    function isPRCreationPage(
+        path = location.pathname,
+        root = String(path || '') === location.pathname ? document : null,
+    ) {
         if (!/\/compare\/[^?]+\.{2,3}[^?]+/.test(path)) return false;
         return !!root?.querySelector?.(
             'input[name="pull_request[title]"], textarea[name="pull_request[body]"], ' +
@@ -26379,7 +26389,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
-    function isComparePage(path = location.pathname, root = document) {
+    function isComparePage(
+        path = location.pathname,
+        root = String(path || '') === location.pathname ? document : null,
+    ) {
         if (!/\/compare\/[^/]+\.\.\.?[^/]+/.test(path)) return false;
         return !isPRCreationPage(path, root);
     }
@@ -26746,20 +26759,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Script source for structural tests (availability depends on userscript manager).
     function stripSelfTestsFromSource(fullSrc) {
         if (!fullSrc) return '';
-        const startNeedle = '\n    // ' + 'In-browser test suite';
-        const start = fullSrc.indexOf(startNeedle);
-        if (start === -1) return fullSrc;
+        const startMatch = /(?:^|\r?\n)[\t ]*\/\/[\t ]*In-browser test suite\b/.exec(fullSrc);
+        if (!startMatch) return fullSrc;
+        const start = startMatch.index;
         // Keep the runtime code that comes after the test suite, but remove the
         // self-test definitions themselves. Structural tests inspect _ackSource as
         // a string; including the tests causes self-referential false failures
         // (eg, searching for a substring that appears in the tests themselves).
-        const endNeedle1 = '\n    // ' + 'Track URL changes for commit nav updates';
-        const endNeedle2 = '\n    // ' + 'Track URL changes';
-        const end =
-            fullSrc.indexOf(endNeedle1, start) !== -1
-                ? fullSrc.indexOf(endNeedle1, start)
-                : fullSrc.indexOf(endNeedle2, start);
-        if (end === -1) return fullSrc.slice(0, start);
+        const afterStart = fullSrc.slice(start + startMatch[0].length);
+        const endMatch = /(?:^|\r?\n)[\t ]*\/\/[\t ]*Track URL changes(?: for commit nav updates)?\b/.exec(afterStart);
+        if (!endMatch) return fullSrc.slice(0, start);
+        const end = start + startMatch[0].length + endMatch.index;
         return (
             fullSrc.slice(0, start) +
             '\n\n/* [ACKtopus self-tests stripped for structural tests] */\n\n' +
@@ -26846,6 +26856,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             threw = true;
         }
         ackAssert(threw, 'missing end anchor should fail instead of slicing to EOF');
+    });
+
+    ackTest('stripSelfTestsFromSource handles userscript-manager indentation and line endings', () => {
+        const fixtures = [
+            'before\n// In-browser test suite -- tests\nackTest("x", fn);\n// Track URL changes\nafter',
+            'before\r\n\t// In-browser test suite -- tests\r\nackTest("x", fn);\r\n  // Track URL changes for commit nav updates\r\nafter',
+        ];
+        for (const fixture of fixtures) {
+            const stripped = stripSelfTestsFromSource(fixture);
+            ackAssert(stripped.includes('before'), 'keeps runtime source before tests');
+            ackAssert(stripped.includes('after'), 'keeps runtime source after tests');
+            ackAssert(!stripped.includes('ackTest("x"'), 'removes the test body');
+        }
     });
 
     ackTest('parses standard PR URL', () => {
@@ -28041,8 +28064,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const refs = (_ackSource.match(/COMMENT_CONTAINER_SELECTOR/g) || []).length;
         ackAssert(refs >= 4, `expected at least 4 references to COMMENT_CONTAINER_SELECTOR, found ${refs}`);
-        // The literal ".timeline-comment, .review-comment, .js-comment-container" should only appear once (in the definition)
-        const literal = '.timeline-comment, .review-comment, .js-comment-container';
+        // Build the prefix in parts so an unstripped test body cannot satisfy its own assertion.
+        const literal = ['.timeline-comment', '.review-comment', '.js-comment-container'].join(', ');
         const literalCount = (_ackSource.match(new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || [])
             .length;
         ackEq(literalCount, 1, `expected literal selector only in definition, found ${literalCount} times`);
@@ -29845,7 +29868,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('// --- Start a review ---'),
         );
         ackAssert(
-            proofFn.includes('getTextareaDiffDialogOptions(taContainer, ta)'),
+            proofFn.includes('getTextareaDiffDialogOptions(beforeDialogContext.container, beforeDialogTa)'),
             'proofread passes the textarea dialog mount into showDiffDialog',
         );
     });
@@ -30880,15 +30903,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('attribute observer re-runs editor injectors on changed roots only', () => {
         const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('new MutationObserver((mutations) => {'),
-            source.indexOf('}).observe(document.body, {\n        attributes: true'),
-        );
+        const fn = sourceSection(source, '// Attribute observer:', '// --- Auto-prefill commit hash');
         ackAssert(fn.includes('collectAttrMutationBatch(mutations)'), 'attribute observer collects changed roots');
         ackAssert(fn.includes('drainAttrMutationBatch(isCanceled)'), 'attribute observer drains targeted roots');
         ackAssert(!fn.includes('runRootInjectors(document, ctx)'), 'attribute observer does not rescan document');
         ackAssert(!fn.includes('runDocInjectors(ctx)'), 'attribute observer does not run doc injectors');
-        const drainFn = source.slice(source.indexOf('function drainAttrMutationBatch'), source.indexOf('new MutationObserver((mutations) => {', source.indexOf('function drainAttrMutationBatch')));
+        const drainFn = sourceSection(fn, 'function drainAttrMutationBatch', 'new MutationObserver((mutations) => {');
         ackAssert(drainFn.includes('runRootInjectorsForNames'), 'attribute refresh uses named root injectors');
         ackAssert(drainFn.includes('compactMutationRoots'), 'coalesces nested attribute roots');
         ackAssert(drainFn.includes('roots: roots.length'), 'logs targeted root count');
@@ -31432,10 +31452,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
 
         // MutationObserver uses the shared injector runner (root-scoped + guarded doc injectors)
-        const drainFn = source.slice(
-            source.indexOf('function drainDomMutationBatch'),
-            source.indexOf('new MutationObserver((mutations)'),
-        );
+        const drainFn = sourceSection(source, 'function drainDomMutationBatch', '// Attribute observer:');
         ackAssert(
             drainFn.includes('runRootInjectors(root, ctx)'),
             'MutationObserver runs root injectors for added subtrees',
@@ -32294,8 +32311,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('fetchPRReplyHistory fetches every PR comment kind and filters the viewer replies', async () => {
         const origGmFetch = gmFetch;
+        const origParsePR = parsePR;
         const calls = [];
         try {
+            // Keep unrelated comments from the live test page out of this API fixture.
+            parsePR = () => null;
             gmFetch = async (url) => {
                 calls.push(url);
                 if (url.includes('/issues/7/comments')) {
@@ -32325,6 +32345,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(history.inlineComments[0].inReplyTo, '9', 'keeps inline thread relationship');
         } finally {
             gmFetch = origGmFetch;
+            parsePR = origParsePR;
         }
     });
 
@@ -32600,10 +32621,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('MutationObserver caps root processing per drain', () => {
         const source = _ackSource;
-        const drainFn = source.slice(
-            source.indexOf('function drainDomMutationBatch'),
-            source.indexOf('new MutationObserver((mutations)'),
-        );
+        const drainFn = sourceSection(source, 'function drainDomMutationBatch', '// Attribute observer:');
         ackAssert(source.includes('const ACK_MUTATION_ROOT_BATCH_SIZE = 16'), 'defines a per-drain root budget');
         ackAssert(drainFn.includes('processedThisRun'), 'tracks roots handled by one drain');
         ackAssert(drainFn.includes('ACK_MUTATION_ROOT_BATCH_SIZE'), 'uses the root budget while draining');
@@ -32616,10 +32634,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('MutationObserver scheduling is lifetime-aware and interaction-aware', () => {
         const source = _ackSource;
-        const obsSection = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
-            source.indexOf('Auto-prefill commit hash'),
-        );
+        const obsSection = sourceSection(source, 'function collectDomMutationBatch', '// Attribute observer:');
         ackAssert(obsSection.includes("ensureAckLifetime('dom-observer')"), 'ties observer to page lifetime');
         ackAssert(obsSection.includes('lt.onAbort'), 'registers abort cleanup');
         ackAssert(obsSection.includes('mutationPending = false'), 'resets pending flag on abort');
@@ -32751,10 +32766,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function tryInject'),
         );
         ackAssert(helper.includes('isPRCreationPage()'), 'editor injector gate includes compare/new-PR page');
-        const obsSection = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
-            source.indexOf('// Attribute observer'),
-        );
+        const obsSection = sourceSection(source, 'function collectDomMutationBatch', '// Attribute observer:');
         ackAssert(obsSection.includes('shouldRunEditorInjectors()'), 'DOM observer uses editor injector gate');
     });
 
@@ -33465,8 +33477,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('quick comment actions batch layout reads before DOM writes', () => {
         const fn = sourceSection(_ackSource, 'function addQuickCommentActions', 'function getCommentMenuRoots');
         const visibilityRead = fn.indexOf('visibleContainers.set(container, isVisible(container))');
-        const actionWrite = fn.indexOf('header.appendChild(actions)');
+        const actionWrites = [
+            'classicActions.insertBefore(actionContainer',
+            'classicActions.appendChild(actionContainer',
+            'badgesGroup.after(actionContainer',
+            'badgesDiv.before(actionContainer',
+            'kebab.parentElement.insertBefore(actionContainer',
+            'header.appendChild(actionContainer',
+        ]
+            .map((needle) => fn.indexOf(needle))
+            .filter((index) => index >= 0);
+        const actionWrite = Math.min(...actionWrites);
         ackAssert(visibilityRead >= 0, 'precomputes comment visibility');
+        ackAssert(actionWrites.length > 0, 'finds live-DOM action insertion');
         ackAssert(actionWrite > visibilityRead, 'finishes geometry reads before inserting action buttons');
         ackAssert(
             fn.slice(visibilityRead, actionWrite).includes('visibleContainers.get(headerContainer)'),
@@ -34459,10 +34482,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(pvFn.includes('verifyPGPSignatures'), 'processVisibleComment calls verifyPGPSignatures');
         // NOT in eager MutationObserver
-        const obsSection = source.slice(
-            source.indexOf('new MutationObserver((mutations)'),
-            source.indexOf('Auto-prefill commit hash'),
-        );
+        const obsSection = sourceSection(source, 'function collectDomMutationBatch', '// Attribute observer:');
         ackAssert(!obsSection.includes('verifyPGPSignatures'), 'NOT called eagerly in MutationObserver');
     });
 
@@ -36445,10 +36465,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function shouldRunDocInjectorsAfterMutation'),
             source.indexOf('function requeueDomMutationBatch'),
         );
-        const drainFn = source.slice(
-            source.indexOf('function drainDomMutationBatch'),
-            source.indexOf('new MutationObserver((mutations)'),
-        );
+        const drainFn = sourceSection(source, 'function drainDomMutationBatch', '// Attribute observer:');
         ackAssert(helper.includes('ctx.onPR && isPullRequestBulkDiffPage()'), 'bulk PR diff pages are gated');
         ackAssert(helper.includes('return false'), 'bulk PR diff mutation batches skip doc injectors');
         ackAssert(
@@ -36771,7 +36788,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(helper.includes('!isGithubRateLimitedError(err)'), 'optional API failures stay quiet after shared rate-limit warning');
         const acks = sourceSection(source, 'async function parseAcksFromAPI', 'function navigateToFragment');
         ackAssert(acks.includes('shouldWarnOptionalGitHubApiError(e)'), 'ACK API fallback uses shared optional warning guard');
-        const members = sourceSection(source, 'async function fetchRepoMembers', '// Map review comment ID');
+        const members = sourceSection(
+            source,
+            'async function fetchRepoMembers',
+            'async function fetchReviewCommentCommits',
+        );
         ackAssert(members.includes('shouldWarnOptionalGitHubApiError(e)'), 'member supplement fetches use shared optional warning guard');
         const reviewCommits = sourceSection(source, 'async function fetchReviewCommentCommits', '// Hardcoded maintainer list');
         ackAssert(reviewCommits.includes('shouldWarnOptionalGitHubApiError(e)'), 'review-comment map uses shared optional warning guard');
@@ -37404,7 +37425,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'renders inline proofread diff/result for selections',
         );
         ackAssert(fn.includes('simple, plain language'), 'selection proofread prefers plain language');
-        ackAssert(fn.includes('accidental duplicate'), 'selection proofread removes duplicate wording');
+        ackAssert(
+            PROOFREAD_SANITY_RULE.includes('Remove accidental duplicates'),
+            'selection proofread removes duplicate wording',
+        );
         ackAssert(fn.includes('Remove accidental manual wrapping'), 'selection proofread removes accidental prose wrapping');
         ackAssert(fn.includes('Join wrapped prose with one normal space'), 'selection proofread joins prose with one space');
         ackAssert(
@@ -44438,7 +44462,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('dialogOriginal = latestTextBeforeDialog'), 'diffs against the current full text');
         ackAssert(fn.includes('mapTextRange'), 'maps selected text through concurrent edits');
         ackAssert(
-            sourceIncludesLoose(fn, 'rebaseTextChanges(textToProofread, result, dialogOriginal)'),
+            /rebaseTextChanges\(\s*textToProofread,\s*result,\s*dialogOriginal,?\s*\)/.test(fn),
             'limits selected-text merging to the mapped live selection',
         );
         ackAssert(fn.includes('rebasedAfterDialog'), 'preserves changes made while the diff dialog is open');
@@ -44471,11 +44495,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     });
 
     ackTest('schedulePostEditRefresh searches from document not stale container', () => {
-        const fn = _ackSource.slice(
-            _ackSource.indexOf('function schedulePostEditRefresh'),
-            _ackSource.indexOf('// Capture-phase listeners'),
+        const resolver = sourceSection(
+            _ackSource,
+            'function resolvePostEditRefreshRoot',
+            'function refreshQuickCommentActionsInRoot',
         );
-        ackAssert(fn.includes('document.querySelectorAll'), 'uses document-level search');
+        const fn = sourceSection(_ackSource, 'function schedulePostEditRefresh', '// Capture-phase listeners');
+        ackAssert(fn.includes('resolvePostEditRefreshRoot(locator, container)'), 'resolves a replacement from document');
+        ackAssert(resolver.includes('qsa(document,'), 'uses targeted document-level identity searches');
         ackAssert(!fn.includes('container.querySelector'), 'does NOT use stale container ref');
     });
 
