@@ -6036,7 +6036,7 @@ Produce a prompt for the step after the no-peek local reproducer exists and the 
 - Verify every suggestion against the live PR, comments, tests, and branch shape before committing it. If evidence undercuts the premise, drop the suggestion instead of defending it or preserving a stack count.
 - The generated prompt should tell the target agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading. Encourage the agent to cover every angle a proofreader might check (correctness, safety, idiom, repetition, naming, typos, commit-message accuracy, test coverage, edge cases) rather than self-filtering to what it personally considers most important.
 - One commit equals one issue equals one PR comment. Each suggestion commit covers a single concrete point the agent would write as one inline review comment, and its patch is the smallest possible change that satisfies that single point. If the agent finds two issues, even in the same hunk, that becomes two commits. Never bundle them.
-- Each suggestion commit message must read like one actual PR code review comment: one concrete problem sentence followed by one short \`Could we...?\` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence.
+- Suggestion commit messages must read like actual PR code review comments: each has one concrete problem sentence followed by one short \`Could we...?\` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence.
 - When the original PR's solution is clearly better than the local one, the target agent must report that in prose instead of manufacturing an empty, forced, or invalid suggestion commit. "Clearly better" is the only exclusion; ties and ambiguous cases still produce a commit.
 
 # Constraints
@@ -11685,7 +11685,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     fullPRContext: true,
                     promptDetailsTitle: 'Generated suggestion-stack prompt',
                     finalTask:
-                        'Now write one outcome-focused follow-up prompt for a target local coding agent. This prompt is for after the no-peek local reproducer exists and the user has approved inspecting the actual PR. Require separate, explicit user approval before splitting or otherwise rewriting the actual PR history; without it, preserve the submitted author stack and compare against it read-only. When splitting is approved and useful, produce a reviewable author stack and prove that the author-only split squashes back to the submitted PR. Compare or replay the local rediscovery work against that author baseline, then append every retained local-vs-PR difference and every plausible PR-code review nit as its own focused suggestion commit after the complete author stack. Never place suggestion commits between author commits. One commit equals one issue equals one PR comment. Never bundle two suggestions, even when they touch the same file or hunk; two issues require two commits. Each commit\'s patch must be the smallest possible change that satisfies that single suggestion. A "plausible alternative" is enough for inclusion; nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations all become commits. Ask the agent to read the PR\'s newly added code as a reviewer and propose separate small commits for each plausible improvement: inverting contrived `if` conditions, swapping a custom helper for a simpler existing method, fixing typos in new code or new commit messages, choosing more idiomatic C++ or Python constructs, deduplicating repetitive new code, tightening naming, and adding test coverage for newly introduced code. Coming up with a new commit later costs the user far more than skipping a proposed one, so when in doubt the agent should commit. It must still verify every suggestion against the live PR, comments, tests, and branch shape; if evidence undercuts the premise, drop the suggestion rather than preserving a stack count. Only "the PR is clearly better here" cases stay out of the stack and go into the report as prose. Tell the agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading, so it should cover every angle a proofreader might check rather than self-filtering. Each suggestion commit message must contain one concrete problem sentence followed by one short `Could we...?` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence. Before finalizing, verify that the generated prompt is grounded in the source context, asks for required branch inputs when missing, requires explicit approval before rewriting author history, preserves a contiguous author baseline, requires author-only split/squash equivalence when applicable, asks for both divergence-based and PR-code-review-style suggestion commits with the "plausible alternative" bar and one-issue-per-commit discipline, mentions the downstream LLM proofreading handoff, uses evidence-backed GitHub URLs where useful, and keeps all changes local.',
+                        'Now write one outcome-focused follow-up prompt for a target local coding agent. This prompt is for after the no-peek local reproducer exists and the user has approved inspecting the actual PR. Require separate, explicit user approval before splitting or otherwise rewriting the actual PR history; without it, preserve the submitted author stack and compare against it read-only. When splitting is approved and useful, produce a reviewable author stack and prove that the author-only split squashes back to the submitted PR. Compare or replay the local rediscovery work against that author baseline, then append every retained local-vs-PR difference and every plausible PR-code review nit as its own focused suggestion commit after the complete author stack. Never place suggestion commits between author commits. One commit equals one issue equals one PR comment. Never bundle two suggestions, even when they touch the same file or hunk; two issues require two commits. Each commit\'s patch must be the smallest possible change that satisfies that single suggestion. A "plausible alternative" is enough for inclusion; nits, stylistic deltas, variable-naming choices, helper-shape differences, and equivalent-but-different formulations all become commits. Ask the agent to read the PR\'s newly added code as a reviewer and propose separate small commits for each plausible improvement: inverting contrived `if` conditions, swapping a custom helper for a simpler existing method, fixing typos in new code or new commit messages, choosing more idiomatic C++ or Python constructs, deduplicating repetitive new code, tightening naming, and adding test coverage for newly introduced code. Coming up with a new commit later costs the user far more than skipping a proposed one, so when in doubt the agent should commit. It must still verify every suggestion against the live PR, comments, tests, and branch shape; if evidence undercuts the premise, drop the suggestion rather than preserving a stack count. Only "the PR is clearly better here" cases stay out of the stack and go into the report as prose. Tell the agent that the final suggestion stack and report will be handed off to another capable LLM for proofreading, so it should cover every angle a proofreader might check rather than self-filtering. Suggestion commit messages must read like actual PR code review comments: each has one concrete problem sentence followed by one short `Could we...?` question. Include an exact GitHub code or review URL when it materially supports the claim; do not force a link that adds no evidence. Before finalizing, verify that the generated prompt is grounded in the source context, asks for required branch inputs when missing, requires explicit approval before rewriting author history, preserves a contiguous author baseline, requires author-only split/squash equivalence when applicable, asks for both divergence-based and PR-code-review-style suggestion commits with the "plausible alternative" bar and one-issue-per-commit discipline, mentions the downstream LLM proofreading handoff, uses evidence-backed GitHub URLs where useful, and keeps all changes local.',
                 },
                 audio_walkthrough: {
                     label: 'Audio guide',
@@ -14597,11 +14597,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    function hasPendingReviewDomMarkers(root = document) {
+        if (root?.querySelector?.('.js-pending-review-comment')) return true;
+        return hasPendingCommentMarkers(root);
+    }
+
     function hasPendingReviewChanges(root = document) {
         const pending = root === document ? readViewerPendingReviewFromSSR() : null;
         if (Array.isArray(pending?.comments) && pending.comments.length > 0) return true;
-        if (root?.querySelector?.('.js-pending-review-comment')) return true;
-        if (hasPendingCommentMarkers(root)) return true;
+        if (hasPendingReviewDomMarkers(root)) return true;
         const submitReviewBtn = findSubmitReviewButton(root);
         const counterText =
             submitReviewBtn?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
@@ -14792,9 +14796,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function addStartReviewButtons(root = document) {
         if (!isPRPage()) return;
         const replyForms = getReplyReviewForms(root);
-        if (!replyForms.length) return;
+        if (!replyForms.length && !getReplyActionContainers(root).length) return;
 
-        if (_ackPendingReviewActive || syncPendingReviewState(root, { includeDocument: true })) {
+        const pendingReviewActive =
+            _ackPendingReviewActive ||
+            syncPendingReviewState(root, { includeDocument: root === document }) ||
+            (root !== document && hasPendingReviewDomMarkers(document));
+        if (pendingReviewActive) {
+            _ackPendingReviewActive = true;
             markCommentButtonsPending(root);
             addSubmitReviewButtonToConversation(document);
             return;
