@@ -567,15 +567,13 @@
     const ALTERNATE_REVEAL_HINT = '📂';
     const ALTERNATE_VISIBLE_ONLY_HINT = '👁';
     const ALTERNATE_REVERSE_HINT = '⬆';
-    const ALTERNATE_ACTION_HINT = '⌃';
+    const ALTERNATE_ACTION_HINT = '⇧';
+    const ALTERNATE_MODE_TOGGLE_HINT = 'Tap Shift on the page to switch toolbar modes.';
     const EDIT_POST_SHORTCUT_KEY = 'e';
     const PROOFREAD_POST_SHORTCUT_KEY = 'p';
-    let ackControlPressed = false;
+    let ackAlternateMode = false;
+    let ackShiftToggleCandidate = false;
     const ackAlternateRenderers = new Set();
-    const ackAlternateOwners = new WeakSet();
-    const ackAlternateLastClick = new WeakMap();
-    const ackAlternateSuppressClickUntil = new WeakMap();
-    let ackDispatchingControlContextClick = false;
 
     function isMacKeyboardPlatform() {
         const platform =
@@ -628,15 +626,15 @@
         }
     }
 
-    function setAckControlPressed(next) {
-        const pressed = !!next;
-        if (ackControlPressed === pressed) return;
-        ackControlPressed = pressed;
+    function setAckAlternateMode(next) {
+        const active = !!next;
+        if (ackAlternateMode === active) return;
+        ackAlternateMode = active;
         notifyAlternateRenderers();
     }
 
-    function eventUsesAlternateAction(e) {
-        return !!e?.ctrlKey || ackControlPressed;
+    function usesAlternateToolbarMode() {
+        return ackAlternateMode;
     }
 
     function registerAlternateRenderer(owner, render) {
@@ -645,76 +643,64 @@
             render();
             return true;
         };
-        ackAlternateOwners.add(owner);
         ackAlternateRenderers.add(wrapped);
         render();
         return () => {
-            ackAlternateOwners.delete(owner);
             ackAlternateRenderers.delete(wrapped);
         };
     }
 
-    function findAlternateActionOwner(event) {
-        for (const candidate of event?.composedPath?.() || []) {
-            if (ackAlternateOwners.has(candidate)) return candidate;
+    function isToolbarModeShortcutTarget(target) {
+        const el = target?.nodeType === 1 ? target : target?.parentElement;
+        if (!el) return true;
+        return !el.closest(
+            'input, textarea, select, [role="textbox"], [contenteditable]:not([contenteditable="false"]), ' +
+                '#acktopus-analysis, #acktopus-queue, .ack-config-overlay',
+        );
+    }
+
+    function cancelAlternateModeShiftTap() {
+        ackShiftToggleCandidate = false;
+    }
+
+    function handleAlternateModeKeydown(e) {
+        if (e.key !== 'Shift') {
+            cancelAlternateModeShiftTap();
+            return;
         }
-        return null;
+        ackShiftToggleCandidate = !!(
+            !e.repeat &&
+            !e.ctrlKey &&
+            !e.altKey &&
+            !e.metaKey &&
+            isToolbarModeShortcutTarget(e.target)
+        );
+    }
+
+    function handleAlternateModeKeyup(e) {
+        if (e.key !== 'Shift') return;
+        const shouldToggle =
+            ackShiftToggleCandidate &&
+            !e.ctrlKey &&
+            !e.altKey &&
+            !e.metaKey &&
+            isToolbarModeShortcutTarget(e.target);
+        cancelAlternateModeShiftTap();
+        if (shouldToggle) setAckAlternateMode(!ackAlternateMode);
     }
 
     document.addEventListener(
-        'click',
-        (e) => {
-            const owner = findAlternateActionOwner(e);
-            if (!owner || !eventUsesAlternateAction(e)) return;
-            const now = Date.now();
-            if (!ackDispatchingControlContextClick && now < (ackAlternateSuppressClickUntil.get(owner) || 0)) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                return;
-            }
-            ackAlternateLastClick.set(owner, now);
-        },
-        true,
-    );
-    document.addEventListener(
-        'contextmenu',
-        (e) => {
-            if (!e.ctrlKey) return;
-            const owner = findAlternateActionOwner(e);
-            if (!owner) return;
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            const now = Date.now();
-            if (now - (ackAlternateLastClick.get(owner) || 0) < 250) return;
-
-            const restoreControlState = !ackControlPressed;
-            if (restoreControlState) setAckControlPressed(true);
-            ackDispatchingControlContextClick = true;
-            try {
-                owner.click();
-                ackAlternateSuppressClickUntil.set(owner, now + 250);
-            } finally {
-                ackDispatchingControlContextClick = false;
-                if (restoreControlState) setTimeout(() => setAckControlPressed(false), 0);
-            }
-        },
-        true,
-    );
-    document.addEventListener(
         'keydown',
-        (e) => {
-            if (e.key === 'Control') setAckControlPressed(true);
-        },
+        handleAlternateModeKeydown,
         true,
     );
+    document.addEventListener('pointerdown', cancelAlternateModeShiftTap, true);
     document.addEventListener(
         'keyup',
-        (e) => {
-            if (e.key === 'Control') setAckControlPressed(false);
-        },
+        handleAlternateModeKeyup,
         true,
     );
-    window.addEventListener('blur', () => setAckControlPressed(false));
+    window.addEventListener('blur', cancelAlternateModeShiftTap);
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_CONTAINER_BASE_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"]';
@@ -1822,10 +1808,10 @@
         return true;
     }
 
-    async function copySHA(mainBtn, updateMainLabel, event) {
+    async function copySHA(mainBtn, updateMainLabel) {
         const pr = parsePR();
         const fmt = getFormat();
-        const useAlternate = eventUsesAlternateAction(event) && typeof fmt.alternateFmt === 'function';
+        const useAlternate = usesAlternateToolbarMode() && typeof fmt.alternateFmt === 'function';
         const formatter = useAlternate ? fmt.alternateFmt : fmt.fmt;
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
@@ -1879,11 +1865,13 @@
         const mainBtn = document.createElement('button');
         // Clipboard-only: the SHA copy button always copies to the clipboard.
         const alternateSuffix = (format) =>
-            ackControlPressed && format.alternateFmt
+            ackAlternateMode && format.alternateFmt
                 ? ` ${format.alternateHint || ALTERNATE_ACTION_HINT}`
                 : '';
         const formatTitle = (format) =>
-            format.alternateFmt ? `${format.tip}\nCtrl+click: ${format.alternateTip}.` : format.tip;
+            format.alternateFmt
+                ? `${format.tip}\nAlternate mode: ${format.alternateTip}.\n${ALTERNATE_MODE_TOGGLE_HINT}`
+                : format.tip;
         const updateMainLabel = () => {
             const f = getFormat();
             const compact = GM_getValue('compactToolbar', false);
@@ -1912,7 +1900,7 @@
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', (e) => copySHA(mainBtn, updateMainLabel, e));
+        mainBtn.addEventListener('click', () => copySHA(mainBtn, updateMainLabel));
 
         const dropBtn = document.createElement('button');
         dropBtn.textContent = '▾';
@@ -1979,14 +1967,14 @@
             item.addEventListener('mouseleave', () => {
                 item.style.background = f.key === selectedFormat ? '#30363d' : 'transparent';
             });
-            item.addEventListener('click', (e) => {
+            item.addEventListener('click', () => {
                 selectedFormat = f.key;
                 GM_setValue('shaFormat', f.key);
                 updateMainLabel();
                 menu.style.display = 'none';
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
-                copySHA(mainBtn, updateMainLabel, e);
+                copySHA(mainBtn, updateMainLabel);
             });
             menu.appendChild(item);
         });
@@ -2018,6 +2006,10 @@
             // Add navigation shortcuts that aren't SHA formats
             if (!menu.querySelector('[data-ack-nav-hint]')) {
                 const compareNav = isComparePage();
+                const alternateNav = usesAlternateToolbarMode();
+                const navLabel = compareNav
+                    ? `${alternateNav ? 'Prev' : 'Next'} file`
+                    : `${alternateNav ? 'Next' : 'Prev'} comment`;
                 const sep = document.createElement('div');
                 Object.assign(sep.style, { borderTop: '1px solid #30363d', margin: '4px 0' });
                 sep.dataset.ackNavHint = 'true';
@@ -2028,7 +2020,7 @@
                     { key: 'D', emoji: '📝', label: 'Review dialog' },
                     { key: 'J', emoji: '◀', label: 'Prev commit' },
                     { key: 'K', emoji: '▶', label: 'Next commit' },
-                    { key: 'N', emoji: compareNav ? '🗂️' : '💬', label: compareNav ? 'Next file' : 'Prev comment' },
+                    { key: 'N', emoji: compareNav ? '🗂️' : '💬', label: navLabel },
                 ]) {
                     const item = document.createElement('div');
                     item.textContent = `[${key}]  ${emoji} ${label}`;
@@ -2149,7 +2141,7 @@
                     e.preventDefault();
                     hideHotkeyHints();
                     menu.style.display = 'none';
-                    navigatePrimaryReviewTarget(-1);
+                    navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1);
                     return;
                 }
 
@@ -5056,23 +5048,10 @@
         link.dataset.localRepoPrUpstreamHref = upstreamHref;
         link.dataset.localRepoPrForkHref = forkHref;
 
-        const renderTarget = (useUpstream = ackControlPressed) => {
+        const renderTarget = (useUpstream = ackAlternateMode) => {
             const href = useUpstream ? upstreamHref : forkHref;
             if (link.getAttribute('href') !== href) link.setAttribute('href', href);
         };
-        link.addEventListener(
-            'click',
-            (e) => {
-                if (!eventUsesAlternateAction(e)) return;
-                renderTarget(true);
-                if (!ackControlPressed) {
-                    setTimeout(() => {
-                        if (link.isConnected) renderTarget(false);
-                    }, 0);
-                }
-            },
-            true,
-        );
         registerAlternateRenderer(link, () => renderTarget());
     }
 
@@ -24774,26 +24753,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
         const contextModeSuffix = (action) => {
             if (!action.revealBeforeCopy) return '';
-            if (ackControlPressed) return ` ${ALTERNATE_VISIBLE_ONLY_HINT}`;
+            if (ackAlternateMode) return ` ${ALTERNATE_VISIBLE_ONLY_HINT}`;
             if (action.revealBeforeCopy === 'all') return ` ${ALTERNATE_REVEAL_HINT}`;
             return '';
         };
         const contextActionTitle = (action) => {
             if (action.revealBeforeCopy === 'all') {
-                return `${action.tip}\nDefault: reveal hidden/resolved/collapsed content first, then copy.\nCtrl+click: copy currently open/loaded content only.`;
+                return `${action.tip}\nDefault mode: reveal hidden/resolved/collapsed content first, then copy.\nAlternate mode: copy currently open/loaded content only.\n${ALTERNATE_MODE_TOGGLE_HINT}`;
             }
             if (action.revealBeforeCopy === 'pending') {
-                return `${action.tip}\nDefault: open only pending review comments already present on the page, then copy all pending drafts available from GitHub data.\nCtrl+click: copy pending drafts without opening page UI.`;
+                return `${action.tip}\nDefault mode: open only pending review comments already present on the page, then copy all pending drafts available from GitHub data.\nAlternate mode: copy pending drafts without opening page UI.\n${ALTERNATE_MODE_TOGGLE_HINT}`;
             }
             return action.tip;
         };
-        const runContextCopyAction = async (action, btn, e) => {
+        const runContextCopyAction = async (action, btn) => {
             if (!action.enabled()) return;
-            if (action.revealBeforeCopy === 'all' && !eventUsesAlternateAction(e) && getRevealAllState().total > 0) {
+            if (action.revealBeforeCopy === 'all' && !usesAlternateToolbarMode() && getRevealAllState().total > 0) {
                 await revealAllContext(btn, { restoreMs: 0 });
             } else if (
                 action.revealBeforeCopy === 'pending' &&
-                !eventUsesAlternateAction(e) &&
+                !usesAlternateToolbarMode() &&
                 getPendingReviewRevealTargets().length > 0
             ) {
                 await revealPendingReviewComments(btn, { restoreMs: 0 });
@@ -24830,9 +24809,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', async function (e) {
+        mainBtn.addEventListener('click', async function () {
             const action = getAction();
-            await runContextCopyAction(action, this, e);
+            await runContextCopyAction(action, this);
         });
 
         const dropBtn = document.createElement('button');
@@ -24887,7 +24866,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             renderItem();
             registerAlternateRenderer(item, renderItem);
-            item.addEventListener('click', async (e) => {
+            item.addEventListener('click', async () => {
                 if (!action.enabled()) return;
                 selectedAction = action.key;
                 GM_setValue('contextCopyAction', action.key);
@@ -24895,7 +24874,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
                 menu.style.display = 'none';
-                await runContextCopyAction(action, mainBtn, e);
+                await runContextCopyAction(action, mainBtn);
             });
             const renderItemState = () => {
                 const enabled = action.enabled();
@@ -24921,7 +24900,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             background: 'transparent',
         });
         const renderRevealItem = () => {
-            const closing = ackControlPressed;
+            const closing = ackAlternateMode;
             const count = closing
                 ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
                 : getRevealAllState().total;
@@ -24936,8 +24915,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         registerAlternateRenderer(revealItem, renderRevealItem);
         revealItem.addEventListener('mouseenter', () => (revealItem.style.background = '#30363d'));
         revealItem.addEventListener('mouseleave', () => (revealItem.style.background = 'transparent'));
-        revealItem.addEventListener('click', (e) => {
-            const closing = eventUsesAlternateAction(e);
+        revealItem.addEventListener('click', () => {
+            const closing = usesAlternateToolbarMode();
             const count = closing
                 ? getReviewThreadToggleItems().filter((item) => item.isOpen()).length
                 : getRevealAllState().total;
@@ -24959,7 +24938,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             background: 'transparent',
         });
         const renderRevealMineItem = () => {
-            const closing = ackControlPressed;
+            const closing = ackAlternateMode;
             const count = closing
                 ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
                 : getRevealMineState().total;
@@ -24974,8 +24953,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         registerAlternateRenderer(revealMineItem, renderRevealMineItem);
         revealMineItem.addEventListener('mouseenter', () => (revealMineItem.style.background = '#30363d'));
         revealMineItem.addEventListener('mouseleave', () => (revealMineItem.style.background = 'transparent'));
-        revealMineItem.addEventListener('click', (e) => {
-            const closing = eventUsesAlternateAction(e);
+        revealMineItem.addEventListener('click', () => {
+            const closing = usesAlternateToolbarMode();
             const count = closing
                 ? getReviewThreadToggleItems({ mineOnly: true }).filter((item) => item.isOpen()).length
                 : getRevealMineState().total;
@@ -25007,11 +24986,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
         const robotAlternateSuffix = (action) =>
-            ackControlPressed && isAlternateCopyAction(action.key) ? ` ${ALTERNATE_COPY_HINT}` : '';
+            ackAlternateMode && isAlternateCopyAction(action.key) ? ` ${ALTERNATE_COPY_HINT}` : '';
         const robotAlternateTitle = (action) =>
-            `${action.tip}${isAlternateCopyAction(action.key) ? '\nCtrl+click: copy the request or visual prompt instead of running it.' : ''}`;
-        const runRobotAction = async (action, e) => {
-            const promptOnly = eventUsesAlternateAction(e) && isAlternateCopyAction(action.key);
+            `${action.tip}${isAlternateCopyAction(action.key) ? `\nAlternate mode: copy the request or visual prompt instead of running it.\n${ALTERNATE_MODE_TOGGLE_HINT}` : ''}`;
+        const runRobotAction = async (action) => {
+            const promptOnly = usesAlternateToolbarMode() && isAlternateCopyAction(action.key);
             await runAnalysis(wrapper, action.key, { promptOnly });
         };
 
@@ -25040,15 +25019,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         mainBtn.addEventListener('mouseenter', () => (mainBtn.style.background = '#30363d'));
         mainBtn.addEventListener('mouseleave', () => (mainBtn.style.background = '#21262d'));
-        mainBtn.addEventListener('click', async function (e) {
+        mainBtn.addEventListener('click', async function () {
             const action = getAction();
-            const promptOnly = eventUsesAlternateAction(e) && isAlternateCopyAction(action.key);
+            const promptOnly = usesAlternateToolbarMode() && isAlternateCopyAction(action.key);
             const existing = document.getElementById('acktopus-analysis');
             if (action.key === 'chat' && existing && !promptOnly) {
                 existing.remove();
                 return;
             }
-            await runRobotAction(action, e);
+            await runRobotAction(action);
         });
 
         const dropBtn = document.createElement('button');
@@ -25103,14 +25082,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             renderItem();
             registerAlternateRenderer(item, renderItem);
-            item.addEventListener('click', async (e) => {
+            item.addEventListener('click', async () => {
                 selectedAction = action.key;
                 GM_setValue('robotRecipeAction', action.key);
                 updateMainLabel();
                 [...menu.children].forEach((c) => (c.style.background = 'transparent'));
                 item.style.background = '#30363d';
                 menu.style.display = 'none';
-                await runRobotAction(action, e);
+                await runRobotAction(action);
             });
             menu.appendChild(item);
         }
@@ -25418,18 +25397,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // --- 💬 Comment navigator ---
         const commentNavLabel = compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments';
         const commentNavTitle = onCompare
-            ? 'Navigate visible compare files top-to-bottom (Ctrl+click reverses) [Ctrl+N]'
-            : 'Navigate posted comments by date (newest first; Ctrl+click reverses) [Ctrl+N]';
+            ? 'Navigate visible compare files top-to-bottom [Ctrl+N]'
+            : 'Navigate posted comments by date (newest first) [Ctrl+N]';
         const commentNavBtn = createBtn(
             commentNavLabel,
-            function (e) {
-                navigatePrimaryReviewTarget(eventUsesAlternateAction(e) ? 1 : -1);
+            function () {
+                navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1);
             },
             commentNavTitle,
         );
         const updateCommentNavLabel = () => {
-            commentNavBtn.textContent = `${commentNavLabel}${ackControlPressed ? ` ${ALTERNATE_REVERSE_HINT}` : ''}`;
-            commentNavBtn.title = `${commentNavTitle}\nCtrl+click: reverse direction.`;
+            commentNavBtn.textContent = `${commentNavLabel}${ackAlternateMode ? ` ${ALTERNATE_REVERSE_HINT}` : ''}`;
+            commentNavBtn.title = `${commentNavTitle}\nAlternate mode: reverse direction.\n${ALTERNATE_MODE_TOGGLE_HINT}`;
         };
         registerAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
@@ -25573,7 +25552,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             inject();
         });
         toolbar.style.cursor = 'pointer';
-        toolbar.title = 'Click background to toggle compact mode';
+        registerAlternateRenderer(toolbar, () => {
+            toolbar.dataset.ackAlternateMode = ackAlternateMode ? 'true' : 'false';
+            toolbar.style.borderColor = ackAlternateMode ? '#d29922' : '#30363d';
+            toolbar.title = ackAlternateMode
+                ? `Alternate toolbar mode is active. ${ALTERNATE_MODE_TOGGLE_HINT}`
+                : `Click background to toggle compact mode. ${ALTERNATE_MODE_TOGGLE_HINT}`;
+        });
 
         try {
             if (sessionStorage.getItem('ack_reopen_robot_panel') === '1') {
@@ -27187,7 +27172,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('ack format produces correct output', () => {
         const ack = SHA_FORMATS.find((f) => f.key === 'ack');
         ackEq(ack.fmt('abc123', {}), 'ACK abc123');
-        ackEq(ack.alternateFmt('abc123', {}), 'abc123', 'Control copies only the hash');
+        ackEq(ack.alternateFmt('abc123', {}), 'abc123', 'alternate mode copies only the hash');
     });
 
     ackTest('fetch format produces correct output', () => {
@@ -27858,61 +27843,76 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('SHA copy uses Control alternate formats without changing the selection', () => {
+    ackTest('SHA copy uses the latched alternate toolbar mode', () => {
         const copy = sourceSection(_ackSource, 'async function copySHA', 'function buildSHAGroup');
-        ackAssert(copy.includes('eventUsesAlternateAction(event)'), 'checks the click modifier');
+        ackAssert(copy.includes('usesAlternateToolbarMode()'), 'checks the shared toolbar mode');
         ackAssert(copy.includes('useAlternate ? fmt.alternateFmt : fmt.fmt'), 'selects the alternate formatter');
         const group = sourceSection(_ackSource, 'function buildSHAGroup', '// --- Show Hidden');
-        ackAssert(group.includes('registerAlternateRenderer(mainBtn'), 'updates the main label while Control is held');
+        ackAssert(group.includes('registerAlternateRenderer(mainBtn'), 'updates the main label when the mode changes');
         ackAssert(
             group.includes('format.alternateHint || ALTERNATE_ACTION_HINT'),
             'shows each format-specific alternate hint',
         );
-        ackAssert(group.includes('copySHA(mainBtn, updateMainLabel, e)'), 'passes click modifiers to the copy helper');
+        ackAssert(group.includes('ALTERNATE_MODE_TOGGLE_HINT'), 'explains how to switch modes');
+        ackAssert(group.includes('copySHA(mainBtn, updateMainLabel)'), 'uses the current mode when copying');
     });
 
-    ackTest('alternate toolbar actions use Control and ignore Shift', () => {
+    ackTest('standalone Shift release toggles the whole toolbar mode', () => {
+        const wiring = sourceSection(
+            _ackSource,
+            'function isToolbarModeShortcutTarget',
+            'const COMMENT_TA_SELECTOR',
+        );
+        ackAssert(
+            wiring.includes("document.addEventListener('pointerdown', cancelAlternateModeShiftTap, true)"),
+            'pointer input cancels the Shift tap',
+        );
+        ackAssert(wiring.includes('handleAlternateModeKeydown'), 'registers the Shift keydown handler');
+        ackAssert(wiring.includes('handleAlternateModeKeyup'), 'registers the Shift keyup handler');
         try {
-            setAckControlPressed(false);
-            ackEq(eventUsesAlternateAction({ ctrlKey: true }), true, 'Ctrl-click selects the alternate action');
-            ackEq(eventUsesAlternateAction({ shiftKey: true }), false, 'Shift-click keeps the normal action');
-            setAckControlPressed(true);
-            ackEq(eventUsesAlternateAction({}), true, 'holding Control selects the alternate action');
+            setAckAlternateMode(false);
+            handleAlternateModeKeydown({ key: 'Shift', target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'waits for Shift release');
+            handleAlternateModeKeyup({ key: 'Shift', target: document.body });
+            ackEq(usesAlternateToolbarMode(), true, 'first Shift tap enables alternate mode');
+            handleAlternateModeKeydown({ key: 'Shift', target: document.body });
+            handleAlternateModeKeyup({ key: 'Shift', target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'second Shift tap restores normal mode');
         } finally {
-            setAckControlPressed(false);
+            cancelAlternateModeShiftTap();
+            setAckAlternateMode(false);
         }
     });
 
-    ackTest('macOS Ctrl-click activates an alternate action without opening a context menu', async () => {
-        const button = document.createElement('button');
-        document.body.appendChild(button);
-        let clicks = 0;
-        const unregister = registerAlternateRenderer(button, () => {});
-        button.addEventListener('click', () => clicks++);
+    ackTest('Shift toolbar mode ignores modified, combined, pointer, and editor input', () => {
+        const textarea = document.createElement('textarea');
+        document.body.appendChild(textarea);
         try {
-            setAckControlPressed(false);
-            const menuEvent = new MouseEvent('contextmenu', {
-                bubbles: true,
-                cancelable: true,
-                ctrlKey: true,
-            });
-            button.dispatchEvent(menuEvent);
-            ackEq(menuEvent.defaultPrevented, true, 'suppresses the macOS context menu');
-            ackEq(clicks, 1, 'routes the gesture through the button click');
+            setAckAlternateMode(false);
+            handleAlternateModeKeydown({ key: 'Shift', ctrlKey: true, target: document.body });
+            handleAlternateModeKeyup({ key: 'Shift', ctrlKey: true, target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'ignores modified Shift');
 
-            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
-            ackEq(clicks, 1, 'suppresses a duplicate native click from the same gesture');
+            handleAlternateModeKeydown({ key: 'Shift', target: document.body });
+            handleAlternateModeKeydown({ key: 'A', shiftKey: true, target: document.body });
+            handleAlternateModeKeyup({ key: 'Shift', target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'ignores Shift used with another key');
 
-            const plainMenuEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
-            button.dispatchEvent(plainMenuEvent);
-            ackEq(plainMenuEvent.defaultPrevented, false, 'leaves a normal context menu alone');
-            ackEq(clicks, 1, 'does not activate on a normal context menu');
-            await new Promise((resolve) => setTimeout(resolve, 0));
-            ackEq(eventUsesAlternateAction({}), false, 'restores modifier state after synthetic activation');
+            handleAlternateModeKeydown({ key: 'Shift', target: document.body });
+            cancelAlternateModeShiftTap();
+            handleAlternateModeKeyup({ key: 'Shift', target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'ignores Shift held during a pointer action');
+
+            handleAlternateModeKeydown({ key: 'Shift', target: textarea });
+            handleAlternateModeKeyup({ key: 'Shift', target: textarea });
+            ackEq(usesAlternateToolbarMode(), false, 'ignores Shift in text editors');
+
+            handleAlternateModeKeydown({ key: 'Control', ctrlKey: true, target: document.body });
+            ackEq(usesAlternateToolbarMode(), false, 'Control remains available for the delayed chooser');
         } finally {
-            unregister();
-            setAckControlPressed(false);
-            button.remove();
+            cancelAlternateModeShiftTap();
+            setAckAlternateMode(false);
+            textarea.remove();
         }
     });
 
@@ -34166,12 +34166,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             group.indexOf('menu.appendChild(revealItem)') < group.indexOf('menu.appendChild(revealMineItem)'),
             'puts reveal mine below reveal all',
         );
-        ackAssert(group.includes("'📁 Close all' : '📂 Reveal all'"), 'Control changes reveal all to close all');
-        ackAssert(group.includes("'👤 Close mine' : '👤 Reveal mine'"), 'Control changes reveal mine to close mine');
-        ackAssert(group.includes('if (closing) closeReviewThreads(mainBtn);'), 'Ctrl-click closes all review threads');
+        ackAssert(group.includes("'📁 Close all' : '📂 Reveal all'"), 'alternate mode changes reveal all to close all');
+        ackAssert(group.includes("'👤 Close mine' : '👤 Reveal mine'"), 'alternate mode changes reveal mine to close mine');
+        ackAssert(group.includes('if (closing) closeReviewThreads(mainBtn);'), 'alternate mode closes all review threads');
         ackAssert(
             group.includes('closeReviewThreads(mainBtn, { mineOnly: true })'),
-            'Ctrl-click closes only current-user review threads',
+            'alternate mode closes only current-user review threads',
         );
         ackAssert(group.includes('else revealMineContext(mainBtn);'), 'normal click reveals current-user comments');
     });
@@ -35334,14 +35334,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('ack-repo-mirrors'), 'settings expose repo mirror config');
     });
 
-    ackTest('local repo compare rewrite preserves the button and uses upstream while Control is held', () => {
+    ackTest('local repo compare rewrite preserves the button and follows alternate toolbar mode', () => {
         const host = document.createElement('div');
         host.innerHTML =
             '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary" title="Open comparison">Compare & pull request</a>' +
             '<a href="/octo/demo/compare/other?expand=1">Plain compare link</a>';
         document.body.appendChild(host);
         try {
-            setAckControlPressed(false);
+            setAckAlternateMode(false);
             const count = rewriteLocalRepoCompareLinks(host, {
                 currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
                 baseBranch: 'main',
@@ -35356,9 +35356,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(link.title, 'Open comparison', 'preserves GitHub tooltip');
             ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
 
-            setAckControlPressed(true);
+            setAckAlternateMode(true);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/detached537?expand=1');
-            setAckControlPressed(false);
+            setAckAlternateMode(false);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
 
             ackEq(
@@ -35369,18 +35369,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 0,
             );
         } finally {
-            setAckControlPressed(false);
+            setAckAlternateMode(false);
             host.remove();
         }
     });
 
-    ackTest('local repo compare rewrite honors Control on the click event', async () => {
+    ackTest('local repo compare rewrite ignores click modifiers', () => {
         const host = document.createElement('div');
         host.innerHTML =
             '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>';
         document.body.appendChild(host);
         try {
-            setAckControlPressed(false);
+            setAckAlternateMode(false);
             rewriteLocalRepoCompareLinks(host, {
                 currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
                 baseBranch: 'main',
@@ -35391,59 +35391,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(
                 link.getAttribute('href'),
                 '/octo/demo/compare/main...detached537?quick_pull=1',
-                'ignores Shift-click',
+                'Shift-click does not switch modes',
             );
             link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
             ackEq(
                 link.getAttribute('href'),
-                '/octo/demo/compare/detached537?expand=1',
-                'uses the upstream target for Ctrl-click',
-            );
-            await new Promise((resolve) => setTimeout(resolve, 0));
-            ackEq(
-                link.getAttribute('href'),
                 '/octo/demo/compare/main...detached537?quick_pull=1',
-                'restores the fork target after the click',
+                'Ctrl-click does not switch modes',
             );
-        } finally {
-            setAckControlPressed(false);
-            host.remove();
-        }
-    });
-
-    ackTest('local repo compare rewrite handles the macOS Ctrl-click context-menu event', async () => {
-        const host = document.createElement('div');
-        host.innerHTML =
-            '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary">Compare & pull request</a>';
-        document.body.appendChild(host);
-        try {
-            setAckControlPressed(false);
-            rewriteLocalRepoCompareLinks(host, {
-                currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
-                baseBranch: 'main',
-            });
-            const link = host.querySelector('a');
-            link.addEventListener('click', (e) => e.preventDefault());
             const menuEvent = new MouseEvent('contextmenu', {
                 bubbles: true,
                 cancelable: true,
                 ctrlKey: true,
             });
             link.dispatchEvent(menuEvent);
-            ackEq(menuEvent.defaultPrevented, true, 'suppresses the macOS context menu');
-            ackEq(
-                link.getAttribute('href'),
-                '/octo/demo/compare/detached537?expand=1',
-                'activates the upstream target',
-            );
-            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(menuEvent.defaultPrevented, false, 'leaves the native context menu alone');
             ackEq(
                 link.getAttribute('href'),
                 '/octo/demo/compare/main...detached537?quick_pull=1',
-                'restores the fork target',
+                'keeps the normal target after the context menu',
             );
         } finally {
-            setAckControlPressed(false);
+            setAckAlternateMode(false);
             host.remove();
         }
     });
@@ -39990,13 +39959,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(group.includes("label: 'Comments'"), 'comments-only action is present');
         ackAssert(group.includes('runContextCopyAction'), 'context split group routes clicks through one runner');
-        ackAssert(group.includes('eventUsesAlternateAction(e)'), 'context copy checks Ctrl-click');
+        ackAssert(group.includes('usesAlternateToolbarMode()'), 'context copy checks the shared toolbar mode');
         ackAssert(
             group.includes("revealBeforeCopy: 'all'"),
             'broad context actions reveal all by default',
         );
         ackAssert(
-            group.includes("!eventUsesAlternateAction(e) && getRevealAllState().total > 0"),
+            group.includes("!usesAlternateToolbarMode() && getRevealAllState().total > 0"),
             'default context copy reveals all before copying',
         );
         ackAssert(group.includes('ALTERNATE_VISIBLE_ONLY_HINT'), 'alternate context-copy mode shows visible-only hint');
@@ -40071,7 +40040,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(group.includes('copyPendingReviewCommentsContext'), 'pending action copies pending comments');
         ackAssert(group.includes("revealBeforeCopy: 'pending'"), 'pending action opens only pending comments by default');
         ackAssert(group.includes('revealPendingReviewComments'), 'pending action uses targeted pending reveal');
-        ackAssert(group.includes('copy pending drafts without opening page UI'), 'Control skips page opening for pending copy');
+        ackAssert(group.includes('copy pending drafts without opening page UI'), 'alternate mode skips page opening for pending copy');
     });
 
     ackTest('gatherPatchContext omits comments but keeps patch content', () => {
@@ -42547,8 +42516,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
-        ackAssert(fn.includes('runRobotAction(action, e)'), 'dispatches selected recipe through the shared runner');
-        ackAssert(fn.includes('eventUsesAlternateAction(e)'), 'robot recipe group checks Ctrl-click');
+        ackAssert(fn.includes('runRobotAction(action)'), 'dispatches selected recipe through the shared runner');
+        ackAssert(fn.includes('usesAlternateToolbarMode()'), 'robot recipe group checks the shared toolbar mode');
         ackAssert(fn.includes('isAlternateCopyAction(action.key)'), 'alternate copy applies to prompt and visual actions');
         ackAssert(fn.includes('ALTERNATE_COPY_HINT'), 'alternate prompt-copy mode shows clipboard hint');
     });
@@ -43981,18 +43950,35 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'toolbar has primary navigation button',
         );
         ackAssert(
-            inject.includes('navigatePrimaryReviewTarget(eventUsesAlternateAction(e) ? 1 : -1)'),
+            inject.includes('navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1)'),
             'button navigates with alternate-direction support',
         );
-        ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'button shows reverse-direction hint while Control is held');
+        ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'button shows reverse-direction hint in alternate mode');
         ackAssert(inject.includes('registerAlternateRenderer(commentNavBtn'), 'button updates when modifier state changes');
     });
 
-    ackTest('Ctrl+N shortcut uses primary navigation target', () => {
+    ackTest('toolbar visibly marks alternate mode', () => {
+        const inject = sourceSection(_ackSource, 'function inject()', '// Load ACK panel + force-push data async');
+        ackAssert(
+            inject.includes("toolbar.dataset.ackAlternateMode = ackAlternateMode ? 'true' : 'false'"),
+            'exposes the current mode',
+        );
+        ackAssert(
+            inject.includes("toolbar.style.borderColor = ackAlternateMode ? '#d29922' : '#30363d'"),
+            'highlights alternate mode',
+        );
+        ackAssert(inject.includes('registerAlternateRenderer(toolbar'), 'updates the toolbar when the mode changes');
+    });
+
+    ackTest('Ctrl+N shortcut follows the current toolbar mode', () => {
         const source = _ackSource;
         ackAssert(source.includes("letter === 'n'"), 'has N key handler');
-        ackAssert(source.includes('navigatePrimaryReviewTarget(-1)'), 'N key uses shared navigation helper');
+        ackAssert(
+            source.includes('navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1)'),
+            'N key uses the current toolbar direction',
+        );
         ackAssert(source.includes("compareNav ? '🗂️' : '💬'"), 'N key hint adapts to compare pages');
+        ackAssert(source.includes("`${alternateNav ? 'Prev' : 'Next'} file`"), 'N key hint reflects alternate mode');
     });
 
     ackTest('primary navigation state resets on PR teardown', () => {
