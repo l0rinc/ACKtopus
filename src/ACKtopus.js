@@ -17997,6 +17997,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     );
 
     // --- PR Title Proofread ---
+    const PR_TITLE_MUTATION_SELECTOR =
+        '#partial-discussion-header, .gh-header, .gh-header-show, .js-discussion-header, ' +
+        '[data-component="PH_Actions"], [data-testid*="issue-viewer-header" i], ' +
+        '[data-testid*="pull-request-header" i], [data-testid*="issue-header" i], ' +
+        'input[name="pull_request[title]"], input#pull_request_title, input[id*="pull_request_title"], ' +
+        '.js-issue-title, [data-testid="issue-title"], [data-testid*="issue-title" i], ' +
+        '[data-testid*="pull-request-title" i], .markdown-title';
+
+    function rootMayAffectPRTitle(root) {
+        if (!root || root === document) return true;
+        if (root.nodeType !== 1) return false;
+        return !!(
+            root.matches?.(PR_TITLE_MUTATION_SELECTOR) ||
+            root.closest?.(PR_TITLE_MUTATION_SELECTOR) ||
+            root.querySelector?.(PR_TITLE_MUTATION_SELECTOR)
+        );
+    }
+
     function findPRTitleDom() {
         if (!isPRPage()) return { headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null };
         const draftInput = document.querySelector(
@@ -18087,8 +18105,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function addPRTitleProofreadButton(root = document) {
         if (!isPRPage()) return;
-        // Ignore root parameter: PR header is unique; searching document is more robust
-        // across GitHub re-renders and mutation subtrees.
+        if (!rootMayAffectPRTitle(root)) return;
+        // Once the changed subtree intersects the header, search the document so
+        // replacement action groups and title nodes are handled together.
         const { titleHost, titleTextEl, titleInputEl } = findPRTitleDom();
         if (!titleHost) return;
 
@@ -29901,6 +29920,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(proofFn.includes("logProofreadOutcome('ignored empty text')"), 'empty proofread exits without drafting');
         ackAssert(!proofFn.includes('suggestDraftReplyForTextarea(ta'), 'proofread does not draft replies/comments');
+    });
+
+    ackTest('PR title proofread ignores unrelated mutation roots', () => {
+        const header = document.createElement('div');
+        header.className = 'gh-header';
+        const title = document.createElement('span');
+        title.className = 'js-issue-title';
+        header.appendChild(title);
+        const wrapper = document.createElement('main');
+        wrapper.appendChild(header);
+        const unrelated = document.createElement('div');
+
+        ackEq(rootMayAffectPRTitle(document), true, 'full document scans remain available');
+        ackEq(rootMayAffectPRTitle(wrapper), true, 'detects a header inside a changed subtree');
+        ackEq(rootMayAffectPRTitle(title), true, 'detects a changed node inside the header');
+        ackEq(rootMayAffectPRTitle(unrelated), false, 'skips unrelated comment mutations');
+        ackEq(rootMayAffectPRTitle(document.createTextNode('title')), false, 'skips non-element roots');
+
+        const addFn = sourceSection(
+            _ackSource,
+            'function addPRTitleProofreadButton',
+            'async function applyPRTitleEdit',
+        );
+        ackAssert(
+            addFn.indexOf('rootMayAffectPRTitle(root)') < addFn.indexOf('findPRTitleDom()'),
+            'checks the mutation root before scanning the page header',
+        );
     });
 
     ackTest('PR title proofread stays off compare-page draft forms', () => {
