@@ -20023,7 +20023,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommentReactors(owner, repo, prNumber, meta) {
-        const key = `${meta.type}:${meta.id || 'body'}`;
+        const key = `${owner}/${repo}#${prNumber}:${meta.type}:${meta.id || 'body'}`;
         if (reactorCache.has(key)) return reactorCache.get(key);
 
         let url;
@@ -20050,7 +20050,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             reactorCache.set(key, result);
             return result;
         } catch {
-            reactorCache.set(key, {});
             return {};
         }
     }
@@ -31724,6 +31723,52 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(calls, 1, 'second call should hit cache and not re-fetch');
             ackDeepEq(first, {}, 'empty reactor list returns empty map');
             ackDeepEq(second, {}, 'cached result is returned');
+        } finally {
+            gmFetchText = orig;
+            reactorCache.clear();
+        }
+    });
+
+    ackTest('fetchCommentReactors scopes PR-body cache entries to their PR', async () => {
+        const orig = gmFetchText;
+        let calls = 0;
+        try {
+            reactorCache.clear();
+            gmFetchText = async (_url) => {
+                calls++;
+                return '[]';
+            };
+            await fetchCommentReactors('bitcoin', 'bitcoin', '99', { type: 'pr_body' });
+            await fetchCommentReactors('bitcoin', 'bitcoin', '100', { type: 'pr_body' });
+            ackEq(calls, 2, 'different PR bodies do not share reactor results');
+        } finally {
+            gmFetchText = orig;
+            reactorCache.clear();
+        }
+    });
+
+    ackTest('fetchCommentReactors retries after a transient failure', async () => {
+        const orig = gmFetchText;
+        let calls = 0;
+        try {
+            reactorCache.clear();
+            gmFetchText = async (_url) => {
+                calls++;
+                if (calls === 1) throw new Error('temporary failure');
+                return '[]';
+            };
+            const meta = { type: 'issue', id: '123' };
+            ackDeepEq(
+                await fetchCommentReactors('bitcoin', 'bitcoin', '99', meta),
+                {},
+                'failure returns empty result',
+            );
+            ackDeepEq(
+                await fetchCommentReactors('bitcoin', 'bitcoin', '99', meta),
+                {},
+                'retry can succeed',
+            );
+            ackEq(calls, 2, 'failed reactor requests are not cached');
         } finally {
             gmFetchText = orig;
             reactorCache.clear();
