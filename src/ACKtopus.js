@@ -1937,7 +1937,7 @@
             padding: '4px 0',
         });
 
-        SHA_FORMATS.forEach((f, i) => {
+        SHA_FORMATS.forEach((f) => {
             const item = document.createElement('div');
             const renderItem = () => {
                 item.textContent = `${f.emoji}  ${f.label}${alternateSuffix(f)}`;
@@ -2227,18 +2227,6 @@
             if (m) total += parseInt(m[1], 10);
         });
         return total;
-    }
-
-    function getHiddenActionCount() {
-        const hiddenCount = getHiddenCount();
-        if (hiddenCount > 0) return hiddenCount;
-        const { paginationBtns, timelineLoadMore } = getLoadableElements();
-        return paginationBtns.length + timelineLoadMore.length;
-    }
-
-    function getCollapsedSectionCount() {
-        const { minimized, outdated, loadDiffs } = getLoadableElements();
-        return minimized.length + outdated.length + loadDiffs.length;
     }
 
     function getRevealAllState() {
@@ -7237,7 +7225,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     testDetails.appendChild(line);
                 }
             })
-                .then(({ passed, failed, total, skipped }) => {
+                .then(({ failed, skipped }) => {
                     if (failed === 0) {
                         testStatus.textContent = skipped ? `✅ all passed (skipped ${skipped})` : `✅ all passed`;
                         testStatus.style.color = '#3fb950';
@@ -16962,15 +16950,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             try {
                 const wasActive = document.activeElement === ta;
-                let selStart = null;
-                let selEnd = null;
-                if (wasActive) {
-                    try {
-                        selStart = ta.selectionStart;
-                        selEnd = ta.selectionEnd;
-                    } catch (_) {}
-                }
-
                 // Textarea is empty (checked above) — set the prefix.
                 // Set marker first to avoid recursion via input/change events.
                 ta.dataset.ackPrefilled = 'true';
@@ -21725,14 +21704,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
-    function gatherDiffFiles(root = document) {
-        return qsa(root, DIFF_FILE_SELECTOR).filter((file) => {
-            if (!isVisible(file)) return false;
-            if (file.closest?.(`#${BUTTON_CONTAINER_ID}, #acktopus-analysis, .ack-config-overlay`)) return false;
-            return !!file.querySelector?.(DIFF_FILE_HEADER_SELECTOR);
-        });
-    }
-
     function findDiffFileToggle(file, header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR)) {
         if (!file || !header) return null;
         const candidates = [
@@ -22650,7 +22621,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let _diffSelectionOneLinerEl = null;
     let _diffSelectionCtxKey = '';
     let _diffSelectionOneLinerReqId = 0;
-    let _diffSelectionOneLinerKey = '';
     let _diffSelectionOneLinerTimer = null;
     let _diffSelectionOneLinerStopAnim = null;
     let _diffSelectionActionReqId = 0;
@@ -22710,7 +22680,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _diffSelectionOneLinerStopAnim = null;
         }
         _diffSelectionOneLinerReqId++;
-        _diffSelectionOneLinerKey = '';
     }
 
     function readDiffSelectionOutputTextForChat() {
@@ -23298,18 +23267,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
 
-        const title =
-            mode === 'simplify'
-                ? 'Simplify selection'
-                : mode === 'proofread'
-                  ? 'Proofread selection'
-                  : mode === 'factcheck'
-                    ? 'Fact check selection'
-                    : 'Explain selection';
         const reqId = ++_diffSelectionActionReqId;
         // Render into the selection popup's bottom text area (not a separate tooltip).
         cancelDiffSelectionOneLiner();
-        const bar = ensureDiffSelectionToolbar();
+        ensureDiffSelectionToolbar();
         const outEl = _diffSelectionOneLinerEl;
         if (!outEl) return;
         setDiffSelectionOutputPresentation('action');
