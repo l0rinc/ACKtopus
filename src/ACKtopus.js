@@ -574,7 +574,7 @@
     let ackAlternateMode = false;
     let ackShiftToggleCandidate = false;
     const ackAlternateRenderers = new Set();
-    let ackAlternateRendererPruneTimer = null;
+    let ackAlternateRendererPruneScheduled = false;
 
     function isMacKeyboardPlatform() {
         const platform =
@@ -632,15 +632,16 @@
     }
 
     function pruneAlternateRenderers() {
-        ackAlternateRendererPruneTimer = null;
+        ackAlternateRendererPruneScheduled = false;
         for (const entry of [...ackAlternateRenderers]) {
             if (!entry.owner?.isConnected) ackAlternateRenderers.delete(entry);
         }
     }
 
     function scheduleAlternateRendererPrune() {
-        if (ackAlternateRendererPruneTimer) return;
-        ackAlternateRendererPruneTimer = ackSetTimeout(pruneAlternateRenderers, 0);
+        if (ackAlternateRendererPruneScheduled) return;
+        ackAlternateRendererPruneScheduled = true;
+        Promise.resolve().then(pruneAlternateRenderers);
     }
 
     function setAckAlternateMode(next) {
@@ -27894,7 +27895,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('alternate toolbar renderers release detached owners', () => {
+    ackTest('alternate toolbar renderers release detached owners', async () => {
         const fixture = document.createElement('div');
         const stale = document.createElement('button');
         const current = document.createElement('button');
@@ -27908,7 +27909,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'tracks a connected renderer owner',
             );
             stale.remove();
-            pruneAlternateRenderers();
+            await Promise.resolve();
             ackAssert(
                 ![...ackAlternateRenderers].some((entry) => entry.owner === stale),
                 'drops the detached renderer owner',
@@ -27917,6 +27918,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 [...ackAlternateRenderers].some((entry) => entry.owner === current),
                 'keeps the connected renderer owner',
             );
+            const scheduler = sourceSection(
+                _ackSource,
+                'function scheduleAlternateRendererPrune',
+                'function setAckAlternateMode',
+            );
+            ackAssert(scheduler.includes('Promise.resolve()'), 'pruning survives navigation timer cancellation');
+            ackAssert(!scheduler.includes('ackSetTimeout'), 'does not use the navigation-scoped timer');
         } finally {
             unregisterStale();
             unregisterCurrent();
