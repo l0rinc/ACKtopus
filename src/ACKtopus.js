@@ -354,7 +354,7 @@
             tip: 'Copy ACK with commit hash for review sign-off',
             alternateTip: 'Copy only the commit hash',
             alternateHint: '🔢',
-            fmt: (sha, pr) => `ACK ${sha}`,
+            fmt: (sha, _pr) => `ACK ${sha}`,
             alternateFmt: (sha) => sha,
         },
         {
@@ -363,7 +363,7 @@
             emoji: '🔀',
             label: 'git fetch & switch',
             tip: 'Copy command to fetch and checkout this PR locally',
-            fmt: (sha, pr) => `git fetch origin ${sha} && git switch --detach FETCH_HEAD`,
+            fmt: (sha, _pr) => `git fetch origin ${sha} && git switch --detach FETCH_HEAD`,
         },
         {
             key: 'hashes',
@@ -392,7 +392,7 @@
             tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
             alternateTip: 'Check out this PR without rebasing it',
             alternateHint: '⏭️',
-            fmt: (sha, pr) => {
+            fmt: (_sha, pr) => {
                 const base = getReviewBaseBranch();
                 return `${preferredRemoteCommand()} && gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase "$REMOTE" ${shellQuoteIfNeeded(base)}`;
             },
@@ -1744,6 +1744,23 @@
         return ta?.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
             ? `textarea#${CSS.escape(ta.id)}`
             : fallback;
+    }
+
+    function findElementByIdWithin(root, id) {
+        if (!id) return null;
+        const value = String(id);
+        if (root?.querySelector) {
+            try {
+                if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+                    const local = root.querySelector(`#${CSS.escape(value)}`);
+                    return local || document.getElementById(value);
+                }
+            } catch (_) {}
+            for (const candidate of root.querySelectorAll?.('[id]') || []) {
+                if (candidate.id === value) return candidate;
+            }
+        }
+        return document.getElementById(value);
     }
 
     function resolveLiveTextareaContext(container, taContainer, taSelector, taFallback) {
@@ -5697,7 +5714,7 @@
                 'Content-Type': 'application/json',
                 'x-goog-api-key': key,
             }),
-            body: (model, system, userContent, { maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) => ({
+            body: (_model, system, userContent, { maxTokens = LLM_DEFAULT_MAX_TOKENS } = {}) => ({
                 systemInstruction: { parts: [{ text: system }] },
                 contents: [{ role: 'user', parts: [{ text: userContent }] }],
                 generationConfig: { maxOutputTokens: maxTokens || LLM_DEFAULT_MAX_TOKENS },
@@ -13511,23 +13528,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ) ||
                     toolbar?.parentElement ||
                     container;
-                const tryById = (id) => {
-                    if (!id) return null;
-                    try {
-                        if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                            return editorRoot?.querySelector?.(`#${CSS.escape(id)}`) || document.getElementById(id);
-                        }
-                    } catch (_) {}
-                    return editorRoot?.querySelector?.(`#${id}`) || document.getElementById(id);
-                };
                 // 1) markdown-toolbar[for] → textarea#id
                 if (toolbar?.tagName === 'MARKDOWN-TOOLBAR') {
-                    ta = tryById(toolbar.getAttribute('for'));
+                    ta = findElementByIdWithin(editorRoot, toolbar.getAttribute('for'));
                 }
                 // 2) Find nearby markdown-toolbar[for] within the same editor root
                 if (!ta) {
                     const md = editorRoot?.querySelector?.('markdown-toolbar[for]');
-                    ta = tryById(md?.getAttribute?.('for'));
+                    ta = findElementByIdWithin(editorRoot, md?.getAttribute?.('for'));
                 }
                 // 3) Fallback: pick a textarea inside the editor root
                 if (!ta) {
@@ -20232,21 +20240,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function getToolbarTextarea(toolbar) {
         const editorRoot = getToolbarEditorRoot(toolbar);
         if (!editorRoot) return null;
-        const tryById = (id) => {
-            if (!id) return null;
-            try {
-                if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                    return editorRoot?.querySelector?.(`#${CSS.escape(id)}`) || document.getElementById(id);
-                }
-            } catch (_) {}
-            return editorRoot?.querySelector?.(`#${id}`) || document.getElementById(id);
-        };
         if (toolbar?.tagName === 'MARKDOWN-TOOLBAR') {
-            const direct = tryById(toolbar.getAttribute('for'));
+            const direct = findElementByIdWithin(editorRoot, toolbar.getAttribute('for'));
             if (direct) return direct;
         }
         const md = editorRoot?.querySelector?.('markdown-toolbar[for]');
-        const byFor = tryById(md?.getAttribute?.('for'));
+        const byFor = findElementByIdWithin(editorRoot, md?.getAttribute?.('for'));
         if (byFor) return byFor;
         const candidates = [...(editorRoot?.querySelectorAll?.('textarea') || [])];
         return (
@@ -22759,7 +22758,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // a double-click while the pointer is still down for selection extension.
         document.addEventListener(
             'mouseup',
-            (e) => {
+            () => {
                 if (_diffSelectionUiMouseDown) {
                     _diffSelectionUiMouseDown = false;
                     return;
@@ -27360,6 +27359,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!!document.createElement('div').querySelector(selector) === false, 'stays a valid selector');
         ackEq(textareaIdSelector(document.createElement('textarea')), 'textarea', 'falls back without an id');
         ackEq(textareaIdSelector(null, EDIT_TA_SELECTOR), EDIT_TA_SELECTOR, 'keeps a caller-supplied fallback');
+    });
+
+    ackTest('findElementByIdWithin prefers the requested editor root', () => {
+        const outside = document.createElement('textarea');
+        const root = document.createElement('form');
+        const local = document.createElement('textarea');
+        outside.id = 'reply:body.1';
+        local.id = outside.id;
+        root.appendChild(local);
+        document.body.append(outside, root);
+        try {
+            ackEq(findElementByIdWithin(root, local.id), local, 'finds CSS-significant ids inside the editor');
+            ackEq(findElementByIdWithin(root, 'missing'), null, 'returns null when the id is absent');
+            ackEq(findElementByIdWithin(root, ''), null, 'ignores empty ids');
+        } finally {
+            outside.remove();
+            root.remove();
+        }
     });
 
     // --- Edge cases / regression tests ---
