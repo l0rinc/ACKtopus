@@ -574,6 +574,7 @@
     let ackAlternateMode = false;
     let ackShiftToggleCandidate = false;
     const ackAlternateRenderers = new Set();
+    let ackAlternateRendererPruneTimer = null;
 
     function isMacKeyboardPlatform() {
         const platform =
@@ -621,9 +622,25 @@
     }
 
     function notifyAlternateRenderers() {
-        for (const render of [...ackAlternateRenderers]) {
-            if (render() === false) ackAlternateRenderers.delete(render);
+        for (const entry of [...ackAlternateRenderers]) {
+            if (!entry.owner?.isConnected) {
+                ackAlternateRenderers.delete(entry);
+                continue;
+            }
+            entry.render();
         }
+    }
+
+    function pruneAlternateRenderers() {
+        ackAlternateRendererPruneTimer = null;
+        for (const entry of [...ackAlternateRenderers]) {
+            if (!entry.owner?.isConnected) ackAlternateRenderers.delete(entry);
+        }
+    }
+
+    function scheduleAlternateRendererPrune() {
+        if (ackAlternateRendererPruneTimer) return;
+        ackAlternateRendererPruneTimer = ackSetTimeout(pruneAlternateRenderers, 0);
     }
 
     function setAckAlternateMode(next) {
@@ -638,15 +655,12 @@
     }
 
     function registerAlternateRenderer(owner, render) {
-        const wrapped = () => {
-            if (!owner?.isConnected) return false;
-            render();
-            return true;
-        };
-        ackAlternateRenderers.add(wrapped);
+        const entry = { owner, render };
+        ackAlternateRenderers.add(entry);
         render();
+        scheduleAlternateRendererPrune();
         return () => {
-            ackAlternateRenderers.delete(wrapped);
+            ackAlternateRenderers.delete(entry);
         };
     }
 
@@ -27842,6 +27856,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             cancelAlternateModeShiftTap();
             setAckAlternateMode(false);
+        }
+    });
+
+    ackTest('alternate toolbar renderers release detached owners', () => {
+        const fixture = document.createElement('div');
+        const stale = document.createElement('button');
+        const current = document.createElement('button');
+        fixture.append(stale, current);
+        document.body.appendChild(fixture);
+        const unregisterStale = registerAlternateRenderer(stale, () => {});
+        const unregisterCurrent = registerAlternateRenderer(current, () => {});
+        try {
+            ackAssert(
+                [...ackAlternateRenderers].some((entry) => entry.owner === stale),
+                'tracks a connected renderer owner',
+            );
+            stale.remove();
+            pruneAlternateRenderers();
+            ackAssert(
+                ![...ackAlternateRenderers].some((entry) => entry.owner === stale),
+                'drops the detached renderer owner',
+            );
+            ackAssert(
+                [...ackAlternateRenderers].some((entry) => entry.owner === current),
+                'keeps the connected renderer owner',
+            );
+        } finally {
+            unregisterStale();
+            unregisterCurrent();
+            fixture.remove();
         }
     });
 
