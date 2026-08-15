@@ -5064,15 +5064,33 @@
         });
     }
 
+    function renderLocalRepoCompareTargets(link, upstreamHref, forkHref) {
+        const useUpstream = ackAlternateMode;
+        const primaryHref = useUpstream ? upstreamHref : forkHref;
+        if (link.getAttribute('href') !== primaryHref) link.setAttribute('href', primaryHref);
+
+        let alternate = link.nextElementSibling;
+        if (!alternate?.classList?.contains('ack-local-repo-pr-alternate')) {
+            alternate = document.createElement('a');
+            alternate.className = 'ack-local-repo-pr-alternate btn btn-sm';
+            alternate.style.marginLeft = '6px';
+            alternate.style.whiteSpace = 'nowrap';
+            link.insertAdjacentElement('afterend', alternate);
+        }
+        alternate.setAttribute('href', useUpstream ? forkHref : upstreamHref);
+        alternate.textContent = useUpstream ? 'Open fork' : 'Open upstream';
+        alternate.setAttribute(
+            'title',
+            useUpstream
+                ? 'Open the pull request in your fork'
+                : 'Open the pull request in the upstream repository',
+        );
+    }
+
     function installLocalRepoCompareTargets(link, upstreamHref, forkHref) {
         link.dataset.localRepoPrUpstreamHref = upstreamHref;
         link.dataset.localRepoPrForkHref = forkHref;
-
-        const renderTarget = (useUpstream = ackAlternateMode) => {
-            const href = useUpstream ? upstreamHref : forkHref;
-            if (link.getAttribute('href') !== href) link.setAttribute('href', href);
-        };
-        registerAlternateRenderer(link, () => renderTarget());
+        registerAlternateRenderer(link, () => renderLocalRepoCompareTargets(link, upstreamHref, forkHref));
     }
 
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
@@ -5084,7 +5102,12 @@
         const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, branchPath));
         if (!currentRepo) return rewritten;
         for (const link of qsa(root, 'a[href*="/compare/"]')) {
-            if (link.dataset.localRepoPrRewritten === '1') continue;
+            if (link.dataset.localRepoPrRewritten === '1') {
+                const upstreamHref = link.dataset.localRepoPrUpstreamHref;
+                const forkHref = link.dataset.localRepoPrForkHref;
+                if (upstreamHref && forkHref) renderLocalRepoCompareTargets(link, upstreamHref, forkHref);
+                continue;
+            }
             if (!isComparePullRequestButton(link)) continue;
             const originalHref = link.getAttribute('href') || '';
             const rewrite = rewriteLocalRepoCompareHref(originalHref, {
@@ -35475,12 +35498,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(link.dataset.localRepoPrForkHref, '/octo/demo/compare/main...detached537?quick_pull=1');
             ackEq(link.textContent.trim(), 'Compare & pull request', 'does not add a marker');
             ackEq(link.title, 'Open comparison', 'preserves GitHub tooltip');
-            ackEq(host.querySelectorAll('a')[1].dataset.localRepoPrRewritten, undefined);
+            const alternate = host.querySelector('.ack-local-repo-pr-alternate');
+            ackEq(alternate.textContent, 'Open upstream', 'offers the upstream repository explicitly');
+            ackEq(alternate.getAttribute('href'), '/octo/demo/compare/detached537?expand=1');
+            ackEq(host.querySelector('a[href*="/other"]')?.dataset.localRepoPrRewritten, undefined);
 
             setAckAlternateMode(true);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/detached537?expand=1');
+            ackEq(alternate.textContent, 'Open fork', 'offers the safe fork target in alternate mode');
+            ackEq(alternate.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
             setAckAlternateMode(false);
             ackEq(link.getAttribute('href'), '/octo/demo/compare/main...detached537?quick_pull=1');
+            ackEq(alternate.textContent, 'Open upstream');
+
+            alternate.remove();
 
             ackEq(
                 rewriteLocalRepoCompareLinks(host, {
@@ -35488,6 +35519,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     baseBranch: 'main',
                 }),
                 0,
+            );
+            ackEq(
+                host.querySelectorAll('.ack-local-repo-pr-alternate').length,
+                1,
+                'restores one upstream link after a banner rerender',
             );
         } finally {
             setAckAlternateMode(false);
@@ -35557,6 +35593,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '/bitcoin-core/secp256k1/compare/master...l0rinc:topic/remove-foo?expand=1',
         );
         ackEq(link.textContent.trim(), 'Compare & pull request', 'keeps the upstream banner unchanged');
+        const alternate = host.querySelector('.ack-local-repo-pr-alternate');
+        ackEq(alternate.textContent, 'Open upstream');
+        ackEq(
+            alternate.getAttribute('href'),
+            '/bitcoin-core/secp256k1/compare/master...l0rinc:topic/remove-foo?expand=1',
+        );
     });
 
     ackTest('local repo compare rewrite fetches missing default branch on repo pages', async () => {
