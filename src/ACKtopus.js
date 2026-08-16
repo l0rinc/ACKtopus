@@ -8268,9 +8268,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     function visibleDiffFileCategories(root = document, context = null) {
         const paths = visibleDiffFilePaths(root);
         if (paths.length === 0) return null;
-        const cats = categorizePRFiles(paths, context);
-        delete cats.benchFiles;
-        return cats;
+        return categorizePRFiles(paths, context);
     }
 
     function extractBenchmarkNames(source) {
@@ -8281,8 +8279,54 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return [...new Set(names)].sort();
     }
 
+    const _rawFileCache = new Map();
+    const RAW_FILE_CACHE_MAX = 32;
+
     function fetchRawFile(url) {
-        return gmFetchText(url).catch(() => '');
+        const cached = _rawFileCache.get(url);
+        if (cached) return cached;
+        const request = gmFetchText(url).catch(() => {
+            _rawFileCache.delete(url);
+            return '';
+        });
+        _rawFileCache.set(url, request);
+        if (_rawFileCache.size > RAW_FILE_CACHE_MAX) _rawFileCache.delete(_rawFileCache.keys().next().value);
+        return request;
+    }
+
+    function benchmarkRawFileUrl(pr, path, revision) {
+        if (!pr || !path || !/^[0-9a-f]{7,40}$/i.test(revision || '')) return '';
+        const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+        return (
+            `https://raw.githubusercontent.com/${encodeURIComponent(pr.owner)}/` +
+            `${encodeURIComponent(pr.repo)}/${revision}/${encodedPath}`
+        );
+    }
+
+    async function resolveBenchmarkNames(
+        cats,
+        files,
+        pr,
+        revision = pathCommitSha() || getImmediatePRHeadSHA(),
+        fetchSource = fetchRawFile,
+    ) {
+        if (!cats?.benchFiles?.length) return cats;
+        const apiFiles = new Map((files || []).map((file) => [file.filename, file]));
+        const sources = await Promise.all(
+            cats.benchFiles.map(async (path) => {
+                const urls = [
+                    benchmarkRawFileUrl(pr, path, revision),
+                    apiFiles.get(path)?.raw_url || '',
+                ].filter((url, index, all) => url && all.indexOf(url) === index);
+                for (const url of urls) {
+                    const source = await fetchSource(url);
+                    if (source) return source;
+                }
+                return '';
+            }),
+        );
+        cats.bench = [...new Set([...cats.bench, ...sources.flatMap(extractBenchmarkNames)])].sort();
+        return cats;
     }
 
     async function fetchPRFileCategories(pr) {
@@ -8301,21 +8345,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             } while (batch.length === 100 && page <= 30); // up to 3000 files (GitHub API listing cap)
             const cats = mergeFileCategories(categorizePRFiles(files.map((f) => f.filename), pr), visibleCats);
 
-            // For bench files, fetch raw content to extract BENCHMARK() names
-            if (cats.benchFiles.length > 0) {
-                const rawUrls = cats.benchFiles
-                    .map((path) => {
-                        const f = files.find((f) => f.filename === path);
-                        return f?.raw_url;
-                    })
-                    .filter(Boolean);
-                const sources = await Promise.all(rawUrls.map(fetchRawFile));
-                cats.bench = sources.flatMap(extractBenchmarkNames);
-                cats.bench = [...new Set(cats.bench)].sort();
-            }
+            await resolveBenchmarkNames(cats, files, pr);
             delete cats.benchFiles;
             return cats;
         } catch {
+            await resolveBenchmarkNames(visibleCats, [], pr);
+            if (visibleCats) delete visibleCats.benchFiles;
             return visibleCats;
         }
     }
@@ -25197,8 +25232,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         const fileCategoriesPromise = pr ? fetchPRFileCategories(pr) : Promise.resolve(null);
         fileCategoriesPromise.then((cats) => applyFileCategories(cats, 'API/DOM')).catch(() => {});
-        const applyVisibleFileCategories = () =>
-            applyFileCategories(visibleDiffFileCategories(document, pr), 'visible diff');
+        const applyVisibleFileCategories = async () => {
+            const cats = visibleDiffFileCategories(document, pr);
+            await resolveBenchmarkNames(cats, [], pr);
+            applyFileCategories(cats, 'visible diff');
+        };
         ackSetTimeout(applyVisibleFileCategories, 1000);
         ackSetTimeout(applyVisibleFileCategories, 3000);
         let acks = parseAcksFromPage();
@@ -28384,6 +28422,56 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('returns empty for source without benchmarks', () => {
         ackDeepEq(extractBenchmarkNames('#include <bench.h>\nint main() {}'), []);
+    });
+
+    ackTest('visible diff categories keep benchmark paths for source inspection', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-file" data-path="src/bench/block_assemble.cpp"></div>';
+        try {
+            const cats = visibleDiffFileCategories(host, { owner: 'bitcoin', repo: 'bitcoin' });
+            ackDeepEq(cats.benchFiles, ['src/bench/block_assemble.cpp']);
+        } finally {
+            host.textContent = '';
+        }
+    });
+
+    ackTest('resolves visible benchmark names from the current commit source', async () => {
+        const sha = '8ebb32e69f8a4959e4d73481c64d7c1282fc9e33';
+        const cats = categorizePRFiles(['src/bench/block_assemble.cpp']);
+        const fetched = [];
+        await resolveBenchmarkNames(
+            cats,
+            [],
+            { owner: 'bitcoin', repo: 'bitcoin' },
+            sha,
+            async (url) => {
+                fetched.push(url);
+                return 'BENCHMARK(AssembleBlock);\nBENCHMARK(BlockAssemblerAddPackageTxns);';
+            },
+        );
+        ackDeepEq(fetched, [
+            `https://raw.githubusercontent.com/bitcoin/bitcoin/${sha}/src/bench/block_assemble.cpp`,
+        ]);
+        ackDeepEq(cats.bench, ['AssembleBlock', 'BlockAssemblerAddPackageTxns']);
+    });
+
+    ackTest('falls back to the PR file raw URL when no commit revision is available', async () => {
+        const path = 'src/bench/block_assemble.cpp';
+        const rawUrl = `https://raw.githubusercontent.com/bitcoin/bitcoin/head/${path}`;
+        const cats = categorizePRFiles([path]);
+        const fetched = [];
+        await resolveBenchmarkNames(
+            cats,
+            [{ filename: path, raw_url: rawUrl }],
+            { owner: 'bitcoin', repo: 'bitcoin' },
+            '',
+            async (url) => {
+                fetched.push(url);
+                return 'BENCHMARK(AssembleBlock);';
+            },
+        );
+        ackDeepEq(fetched, [rawUrl]);
+        ackDeepEq(cats.bench, ['AssembleBlock']);
     });
 
     ackTest('extracts BENCHMARK names best-effort (commented-out macros also match)', () => {
@@ -45783,9 +45871,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'does not apply the same API categories again after ACK loading',
         );
         ackAssert(
-            fn.includes('const applyVisibleFileCategories = () =>') &&
-                fn.includes('applyFileCategories(visibleDiffFileCategories(document, pr)'),
-            'uses repository-aware visible diff files as a fallback when the API is unavailable',
+            fn.includes('const applyVisibleFileCategories = async () =>') &&
+                fn.includes('const cats = visibleDiffFileCategories(document, pr)') &&
+                fn.includes('await resolveBenchmarkNames(cats, [], pr)') &&
+                fn.includes("applyFileCategories(cats, 'visible diff')"),
+            'uses repository-aware visible diff files and benchmark sources when the API is unavailable',
         );
         ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 1000)'), 'retries visible file detection after hydration');
         ackAssert(fn.includes('ackSetTimeout(applyVisibleFileCategories, 3000)'), 'keeps watching for lazy-loaded file headers');
