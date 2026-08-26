@@ -146,7 +146,7 @@ These buttons always **copy to your clipboard** (they never insert text into a c
 
 Tip: hold **Ctrl** for ~0.5s to show the hotkey chooser. Press the letter to copy that format, or press **Enter** to copy the currently selected format (the one shown on the main SHA button).
 
-Tap **Shift** while focus is on the page to switch the entire toolbar between normal and alternate mode. Release Shift before clicking. The toolbar border and action hints change while alternate mode is active. Press Shift again to return to normal mode. Shift combinations, Shift-clicks, pointer actions, and Shift in text editors do not switch modes.
+Tap **Shift** while focus is on the page to switch the entire toolbar between normal and alternate mode. Release Shift before clicking. The toolbar border, action labels, and hints change while alternate mode is active. Press Shift again to return to normal mode. Shift combinations, Shift-clicks, pointer actions, and Shift in text editors do not switch modes.
 
 If the PR changes C/C++ files, additional per-PR helpers appear:
 

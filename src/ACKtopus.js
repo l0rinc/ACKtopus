@@ -351,6 +351,7 @@
             hotkey: 'a',
             emoji: '👍',
             label: 'ACK',
+            alternateLabel: 'commit hash',
             tip: 'Copy ACK with commit hash for review sign-off',
             alternateTip: 'Copy only the commit hash',
             alternateHint: '🔢',
@@ -378,6 +379,7 @@
             hotkey: 'p',
             emoji: '⏮️',
             label: 'checkout parent',
+            alternateLabel: 'parent hash',
             tip: 'Copy command to fetch and checkout the parent of the first commit in this PR',
             alternateTip: 'Copy only the parent commit hash',
             alternateHint: '🔢',
@@ -389,6 +391,7 @@
             hotkey: 'g',
             emoji: '⬇️',
             label: 'gh pr co',
+            alternateLabel: 'gh pr co (no rebase)',
             tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
             alternateTip: 'Check out this PR without rebasing it',
             alternateHint: '⏭️',
@@ -440,6 +443,7 @@
             key: 'pushrdiff',
             emoji: '📤',
             label: 'pre-push range-diff',
+            alternateLabel: 'collapsed range-diff',
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
             alternateTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
             alternateHint: '🗜️',
@@ -1900,6 +1904,8 @@
             ackAlternateMode && format.alternateFmt
                 ? ` ${format.alternateHint || ALTERNATE_ACTION_HINT}`
                 : '';
+        const formatLabel = (format) =>
+            ackAlternateMode && format.alternateLabel ? format.alternateLabel : format.label;
         const formatTitle = (format) =>
             format.alternateFmt
                 ? `${format.tip}\nAlternate mode: ${format.alternateTip}.\n${ALTERNATE_MODE_TOGGLE_HINT}`
@@ -1909,7 +1915,7 @@
             const compact = GM_getValue('compactToolbar', false);
             mainBtn.innerHTML = compact
                 ? `${f.emoji}${alternateSuffix(f)}`
-                : `${f.emoji} ${f.label}${alternateSuffix(f)}${COPY_ICON}`;
+                : `${f.emoji} ${formatLabel(f)}${alternateSuffix(f)}${COPY_ICON}`;
             mainBtn.title = formatTitle(f);
         };
         updateMainLabel();
@@ -1972,7 +1978,7 @@
         SHA_FORMATS.forEach((f) => {
             const item = document.createElement('div');
             const renderItem = () => {
-                item.textContent = `${f.emoji}  ${f.label}${alternateSuffix(f)}`;
+                item.textContent = `${f.emoji}  ${formatLabel(f)}${alternateSuffix(f)}`;
             };
             renderItem();
             registerAlternateRenderer(item, renderItem);
@@ -6254,30 +6260,35 @@ Return only the corrected text. If nothing needs fixing, return the original tex
             key: 'reimplementation',
             emoji: '🧬',
             label: 'Reproducer',
+            alternateLabel: 'Reproducer prompt',
             tip: 'Generate a no-peek local agent prompt for independent reimplementation only',
         },
         {
             key: 'suggestion_stack',
             emoji: '🧩',
             label: 'Suggestions',
+            alternateLabel: 'Suggestion prompt',
             tip: 'Generate the follow-up prompt for PR splitting, rebase, and suggestion commits',
         },
         {
             key: 'audio_walkthrough',
             emoji: '🎧',
             label: 'Audio guide',
+            alternateLabel: 'Audio briefing',
             tip: 'Generate a direct audio-agent prompt for investigating the PR before spoken discussion',
         },
         {
             key: 'maintainer_summary',
             emoji: '🧭',
             label: 'Maintainer view',
+            alternateLabel: 'Maintainer prompt',
             tip: 'Generate a compact maintainer-facing status summary with unresolved items and reviewer positions',
         },
         {
             key: 'infographic',
             emoji: '🖼️',
             label: 'Infographic',
+            alternateLabel: 'Infographic prompt',
             tip: 'Generate a visual PR overview with OpenAI image generation',
         },
     ]);
@@ -24773,6 +24784,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 key: 'comments',
                 emoji: '💬',
                 label: 'Comments',
+                alternateLabel: 'Visible comments',
                 tip:
                     getAnalysisMode() === ANALYSIS_MODES.commit
                         ? 'Copy PR description and visible comments for the currently viewed commit, without any patch'
@@ -24794,6 +24806,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 key: 'full',
                 emoji: '📎',
                 label: 'Full',
+                alternateLabel: 'Visible context',
                 tip: 'Copy full PR context to clipboard (URL, title, description, commits, patch, comments)',
                 revealBeforeCopy: 'all',
                 enabled: () => !isCompare,
@@ -24802,6 +24815,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ];
         let selectedAction = isCompare ? 'patch' : GM_getValue('contextCopyAction', 'patch');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
+        const contextLabel = (action) =>
+            ackAlternateMode && action.alternateLabel ? action.alternateLabel : action.label;
         const contextModeSuffix = (action) => {
             if (!action.revealBeforeCopy) return '';
             if (ackAlternateMode) return ` ${ALTERNATE_VISIBLE_ONLY_HINT}`;
@@ -24836,7 +24851,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const action = getAction();
             mainBtn.innerHTML = compact
                 ? `${action.emoji}${contextModeSuffix(action)}`
-                : `${action.emoji} ${action.label}${contextModeSuffix(action)}`;
+                : `${action.emoji} ${contextLabel(action)}${contextModeSuffix(action)}`;
             mainBtn.title = contextActionTitle(action);
             const enabled = action.enabled();
             mainBtn.disabled = !enabled;
@@ -24913,7 +24928,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
             const renderItem = () => {
-                item.textContent = `${action.emoji} ${action.label}${contextModeSuffix(action)}`;
+                item.textContent = `${action.emoji} ${contextLabel(action)}${contextModeSuffix(action)}`;
             };
             renderItem();
             registerAlternateRenderer(item, renderItem);
@@ -25036,6 +25051,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const actions = ROBOT_RECIPE_ACTIONS;
         let selectedAction = GM_getValue('robotRecipeAction', 'chat');
         const getAction = () => actions.find((a) => a.key === selectedAction) || actions[0];
+        const robotActionLabel = (action) =>
+            ackAlternateMode && action.alternateLabel ? action.alternateLabel : action.label;
         const robotAlternateSuffix = (action) =>
             ackAlternateMode && isAlternateCopyAction(action.key) ? ` ${ALTERNATE_COPY_HINT}` : '';
         const robotAlternateTitle = (action) =>
@@ -25050,7 +25067,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const action = getAction();
             mainBtn.innerHTML = compact
                 ? `${action.emoji}${robotAlternateSuffix(action)}`
-                : `${action.emoji} ${action.label}${robotAlternateSuffix(action)}`;
+                : `${action.emoji} ${robotActionLabel(action)}${robotAlternateSuffix(action)}`;
             mainBtn.title = robotAlternateTitle(action);
         };
         updateMainLabel();
@@ -25129,7 +25146,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 item.style.background = action.key === selectedAction ? '#30363d' : 'transparent';
             });
             const renderItem = () => {
-                item.textContent = `${action.emoji} ${action.label}${robotAlternateSuffix(action)}`;
+                item.textContent = `${action.emoji} ${robotActionLabel(action)}${robotAlternateSuffix(action)}`;
             };
             renderItem();
             registerAlternateRenderer(item, renderItem);
@@ -25449,20 +25466,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
 
         // --- 💬 Comment navigator ---
-        const commentNavLabel = compact ? (onCompare ? '🗂️' : '💬') : onCompare ? '🗂️ Files' : '💬 Comments';
-        const commentNavTitle = onCompare
-            ? 'Navigate visible compare files top-to-bottom [Ctrl+N]'
-            : 'Navigate posted comments by date (newest first) [Ctrl+N]';
+        const commentNavLabel = () => {
+            if (compact) return `${onCompare ? '🗂️' : '💬'}${ackAlternateMode ? ` ${ALTERNATE_REVERSE_HINT}` : ''}`;
+            if (onCompare) return ackAlternateMode ? '🗂️ Previous file' : '🗂️ Next file';
+            return ackAlternateMode ? '💬 Newer comments' : '💬 Older comments';
+        };
+        const commentNavTitle = () =>
+            onCompare
+                ? `Navigate visible compare files ${ackAlternateMode ? 'bottom-to-top' : 'top-to-bottom'} [Ctrl+N]`
+                : `Navigate posted comments by date (${ackAlternateMode ? 'oldest first' : 'newest first'}) [Ctrl+N]`;
         const commentNavBtn = createBtn(
-            commentNavLabel,
+            commentNavLabel(),
             function () {
                 navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1);
             },
-            commentNavTitle,
+            commentNavTitle(),
         );
         const updateCommentNavLabel = () => {
-            commentNavBtn.textContent = `${commentNavLabel}${ackAlternateMode ? ` ${ALTERNATE_REVERSE_HINT}` : ''}`;
-            commentNavBtn.title = `${commentNavTitle}\nAlternate mode: reverse direction.\n${ALTERNATE_MODE_TOGGLE_HINT}`;
+            commentNavBtn.textContent = commentNavLabel();
+            commentNavBtn.title = `${commentNavTitle()}\n${ALTERNATE_MODE_TOGGLE_HINT}`;
         };
         registerAlternateRenderer(commentNavBtn, updateCommentNavLabel);
         if (compact) commentNavBtn.style.padding = '4px 8px';
@@ -27925,6 +27947,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             group.includes('format.alternateHint || ALTERNATE_ACTION_HINT'),
             'shows each format-specific alternate hint',
         );
+        ackAssert(group.includes('format.alternateLabel'), 'shows each format-specific alternate label');
+        ackEq(SHA_FORMATS.find((format) => format.key === 'ack').alternateLabel, 'commit hash');
+        ackEq(SHA_FORMATS.find((format) => format.key === 'parent').alternateLabel, 'parent hash');
+        ackEq(SHA_FORMATS.find((format) => format.key === 'ghco').alternateLabel, 'gh pr co (no rebase)');
+        ackEq(SHA_FORMATS.find((format) => format.key === 'pushrdiff').alternateLabel, 'collapsed range-diff');
         ackAssert(group.includes('ALTERNATE_MODE_TOGGLE_HINT'), 'explains how to switch modes');
         ackAssert(group.includes('copySHA(mainBtn, updateMainLabel)'), 'uses the current mode when copying');
     });
@@ -40209,6 +40236,9 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'commit-page patch action says it copies only the viewed commit patch',
         );
         ackAssert(group.includes("label: 'Comments'"), 'comments-only action is present');
+        ackAssert(group.includes("alternateLabel: 'Visible comments'"), 'labels visible-only comments explicitly');
+        ackAssert(group.includes("alternateLabel: 'Visible context'"), 'labels visible-only full context explicitly');
+        ackAssert(group.includes('contextLabel(action)'), 'renders the current context-copy label');
         ackAssert(group.includes('runContextCopyAction'), 'context split group routes clicks through one runner');
         ackAssert(group.includes('usesAlternateToolbarMode()'), 'context copy checks the shared toolbar mode');
         ackAssert(
@@ -42759,6 +42789,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(actions.includes("key: 'chat'"), 'has chat action');
         ackAssert(actions.includes("key: 'reimplementation'"), 'has reimplementation action');
         ackAssert(actions.includes("label: 'Reproducer'"), 'reimplementation action is labeled as reproducer');
+        ackAssert(actions.includes("alternateLabel: 'Reproducer prompt'"), 'alternate mode labels the prompt action');
         ackAssert(actions.includes("key: 'suggestion_stack'"), 'has suggestion stack action');
         ackAssert(actions.includes("label: 'Suggestions'"), 'suggestion stack action is labeled');
         ackAssert(actions.includes("key: 'audio_walkthrough'"), 'has audio guide action');
@@ -42766,10 +42797,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(actions.includes('direct audio-agent prompt'), 'audio guide tooltip describes direct workflow');
         ackAssert(actions.includes("key: 'maintainer_summary'"), 'has maintainer summary action');
         ackAssert(actions.includes("key: 'infographic'"), 'has infographic action');
+        ackAssert(actions.includes("alternateLabel: 'Audio briefing'"), 'alternate audio action is labeled as a briefing');
+        ackAssert(actions.includes("alternateLabel: 'Infographic prompt'"), 'alternate image action is labeled as a prompt');
         ackAssert(fn.includes("GM_setValue('robotRecipeAction'"), 'persists selected robot recipe');
         ackAssert(fn.includes('runRobotAction(action)'), 'dispatches selected recipe through the shared runner');
         ackAssert(fn.includes('usesAlternateToolbarMode()'), 'robot recipe group checks the shared toolbar mode');
         ackAssert(fn.includes('isAlternateCopyAction(action.key)'), 'alternate copy applies to prompt and visual actions');
+        ackAssert(fn.includes('robotActionLabel(action)'), 'renders the current recipe label');
         ackAssert(fn.includes('ALTERNATE_COPY_HINT'), 'alternate prompt-copy mode shows clipboard hint');
     });
 
@@ -44193,18 +44227,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('primary navigator button added to toolbar', () => {
         const source = _ackSource;
         const inject = source.slice(
-            source.indexOf('const commentNavBtn = createBtn'),
+            source.indexOf('const commentNavLabel = () =>'),
             source.indexOf('toolbar.appendChild(commentNavBtn);'),
         );
-        ackAssert(
-            source.includes("'💬 Comments'") || source.includes("'🗂️ Files'"),
-            'toolbar has primary navigation button',
-        );
+        ackAssert(inject.includes("'💬 Newer comments' : '💬 Older comments'"), 'comment label reflects direction');
+        ackAssert(inject.includes("'🗂️ Previous file' : '🗂️ Next file'"), 'file label reflects direction');
         ackAssert(
             inject.includes('navigatePrimaryReviewTarget(usesAlternateToolbarMode() ? 1 : -1)'),
             'button navigates with alternate-direction support',
         );
-        ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'button shows reverse-direction hint in alternate mode');
+        ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'compact button shows reverse-direction hint');
         ackAssert(inject.includes('registerAlternateRenderer(commentNavBtn'), 'button updates when modifier state changes');
     });
 
