@@ -25939,7 +25939,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const commits = await fetchCommitList(owner, repo, prNum);
         if (gen !== commitNavGeneration) return;
         if (commits.length === 0) return;
-        const hasJumpMenu = commits.length > 0;
 
         let prevCommit = null,
             nextCommit = null,
@@ -25973,7 +25972,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             boxShadow: '0 2px 12px rgba(0,0,0,0.5)',
             alignItems: 'center',
             maxWidth: 'calc(100vw - 24px)',
-            overflow: hasJumpMenu ? 'visible' : 'hidden',
+            overflow: 'visible',
         });
 
         const truncMsg = (msg, max = 40) => {
@@ -26042,397 +26041,383 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             : `Jump to any of ${commits.length} commits`;
 
         if (prevCommit) bar.appendChild(makeNavBtn(prevCommit, false));
-        if (hasJumpMenu) {
-            const jumpWrap = document.createElement('div');
-            Object.assign(jumpWrap.style, {
-                position: 'relative',
-                display: 'flex',
-                gap: '6px',
-                alignItems: 'center',
-                flex: '0 1 auto',
-                minWidth: '0',
-                overflow: 'visible',
-            });
-            const currentPill = document.createElement('button');
-            currentPill.type = 'button';
-            currentPill.textContent = currentLabel;
-            currentPill.title = `${currentTitle}\nClick to search and jump to any commit`;
-            currentPill.setAttribute('aria-haspopup', 'listbox');
+        const jumpWrap = document.createElement('div');
+        Object.assign(jumpWrap.style, {
+            position: 'relative',
+            display: 'flex',
+            gap: '6px',
+            alignItems: 'center',
+            flex: '0 1 auto',
+            minWidth: '0',
+            overflow: 'visible',
+        });
+        const currentPill = document.createElement('button');
+        currentPill.type = 'button';
+        currentPill.textContent = currentLabel;
+        currentPill.title = `${currentTitle}\nClick to search and jump to any commit`;
+        currentPill.setAttribute('aria-haspopup', 'listbox');
+        currentPill.setAttribute('aria-expanded', 'false');
+        Object.assign(currentPill.style, {
+            padding: '4px 10px',
+            fontSize: '11px',
+            color: '#adbac7',
+            background: '#0d1117',
+            border: '1px solid #57606a',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            minWidth: '90px',
+            maxWidth: 'min(360px, 42vw)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            textAlign: 'left',
+            flex: '0 1 auto',
+        });
+        currentPill.addEventListener('mouseenter', () => {
+            currentPill.style.background = '#161b22';
+            currentPill.style.borderColor = '#8b949e';
+        });
+        currentPill.addEventListener('mouseleave', () => {
+            currentPill.style.background = '#0d1117';
+            currentPill.style.borderColor = '#57606a';
+        });
+        const jumpMenu = document.createElement('div');
+        Object.assign(jumpMenu.style, {
+            position: 'absolute',
+            left: '50%',
+            bottom: 'calc(100% + 8px)',
+            transform: 'translateX(-50%)',
+            display: 'none',
+            background: '#161b22',
+            border: '1px solid #30363d',
+            borderRadius: '8px',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+            minWidth: '420px',
+            maxWidth: 'min(92vw, 620px)',
+            maxHeight: '320px',
+            overflow: 'auto',
+            padding: '6px',
+            zIndex: '99999',
+        });
+        const jumpHeader = document.createElement('div');
+        Object.assign(jumpHeader.style, {
+            position: 'sticky',
+            top: '0',
+            zIndex: '2',
+            background: '#161b22',
+            padding: '0 0 6px',
+        });
+        const jumpSearch = document.createElement('input');
+        jumpSearch.type = 'search';
+        jumpSearch.placeholder = 'Search commits, hashes, or diffs...';
+        jumpSearch.setAttribute('aria-label', 'Search commits');
+        Object.assign(jumpSearch.style, {
+            display: 'block',
+            width: '100%',
+            maxWidth: 'none',
+            minWidth: '0',
+            boxSizing: 'border-box',
+            padding: '6px 8px',
+            fontSize: '12px',
+            color: '#c9d1d9',
+            background: '#0d1117',
+            border: '1px solid #57606a',
+            borderRadius: '6px',
+            outline: 'none',
+        });
+        const jumpDiffStatus = document.createElement('div');
+        Object.assign(jumpDiffStatus.style, {
+            display: 'none',
+            margin: '6px 0 0',
+            padding: '0 2px',
+            color: '#8b949e',
+            fontSize: '11px',
+            background: '#161b22',
+        });
+        const emptyJumpSearch = document.createElement('div');
+        emptyJumpSearch.textContent = 'No matching commits';
+        Object.assign(emptyJumpSearch.style, {
+            display: 'none',
+            padding: '8px',
+            color: '#8b949e',
+            fontSize: '12px',
+            textAlign: 'center',
+        });
+        const jumpItems = [];
+        let activeJumpIdx = -1;
+        let jumpDiffSearchTimer = null;
+        let jumpDiffSearchToken = 0;
+        let jumpDiffSearchRunning = false;
+        let jumpDiffSearchQuery = '';
+        const commitDiffSearchText = new Map(); // sha -> lowercased commit patch
+        const visibleJumpItems = () => jumpItems.filter((item) => item.style.display !== 'none');
+        const commitForJumpItem = (item) => commits[Number(item.dataset.ackIndex || '-1')];
+        const itemDiffMatches = (item, query) => {
+            if (!query) return false;
+            const commit = commitForJumpItem(item);
+            if (!commit) return false;
+            return (commitDiffSearchText.get(commit.sha) || '').includes(query);
+        };
+        const loadedDiffCount = () => commits.filter((commit) => commitDiffSearchText.has(commit.sha)).length;
+        const updateJumpDiffStatus = (query, loaded = loadedDiffCount()) => {
+            if (!query) {
+                jumpDiffStatus.style.display = 'none';
+                jumpDiffStatus.textContent = '';
+                return;
+            }
+            const diffMatches = jumpItems.filter((item) => itemDiffMatches(item, query)).length;
+            jumpDiffStatus.style.display = 'block';
+            jumpDiffStatus.textContent = jumpDiffSearchRunning
+                ? `Searching diffs ${loaded}/${commits.length}${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
+                : loaded === commits.length
+                  ? `Diff search complete${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
+                  : 'Type to search commit diffs';
+        };
+        const paintJumpItem = (item) => {
+            const idx = Number(item.dataset.ackIndex || '-1');
+            const isCurrent = idx === currentIdx;
+            const isActive = idx === activeJumpIdx;
+            item.style.background = isActive ? '#30363d' : isCurrent ? '#1f2937' : 'transparent';
+            item.style.fontWeight = isCurrent || isActive ? '600' : '400';
+            item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        };
+        const setActiveJumpItem = (idx, { scroll = false } = {}) => {
+            activeJumpIdx = idx;
+            for (const item of jumpItems) paintJumpItem(item);
+            const active = jumpItems.find((item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx);
+            if (scroll && active) active.scrollIntoView({ block: 'nearest' });
+        };
+        const moveActiveJumpItem = (dir) => {
+            const visible = visibleJumpItems();
+            if (!visible.length) return;
+            const curVisibleIdx = visible.findIndex(
+                (item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+            );
+            const nextVisibleIdx =
+                curVisibleIdx === -1 ? (dir > 0 ? 0 : visible.length - 1) : (curVisibleIdx + dir + visible.length) % visible.length;
+            setActiveJumpItem(Number(visible[nextVisibleIdx].dataset.ackIndex || '-1'), { scroll: true });
+        };
+        const openActiveJumpItem = () => {
+            const active = jumpItems.find(
+                (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+            );
+            if (active) active.click();
+        };
+        const applyJumpFilter = () => {
+            const query = jumpSearch.value.trim().toLowerCase();
+            let visible = 0;
+            for (const item of jumpItems) {
+                const textMatches = !query || item.dataset.ackSearch.includes(query);
+                const diffMatches = itemDiffMatches(item, query);
+                const matches = textMatches || diffMatches;
+                item.style.display = matches ? 'block' : 'none';
+                if (item._ackDiffBadge) item._ackDiffBadge.style.display = diffMatches ? 'inline-block' : 'none';
+                if (matches) visible++;
+                paintJumpItem(item);
+            }
+            emptyJumpSearch.textContent = jumpDiffSearchRunning
+                ? 'No matching commits yet, still searching diffs'
+                : 'No matching commits';
+            emptyJumpSearch.style.display = visible ? 'none' : 'block';
+            updateJumpDiffStatus(query);
+            const activeStillVisible = jumpItems.some(
+                (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
+            );
+            if (!activeStillVisible) {
+                const firstVisible = visibleJumpItems()[0] || null;
+                setActiveJumpItem(firstVisible ? Number(firstVisible.dataset.ackIndex || '-1') : -1);
+            }
+        };
+        const closeJumpMenu = () => {
+            jumpMenu.style.display = 'none';
             currentPill.setAttribute('aria-expanded', 'false');
-            Object.assign(currentPill.style, {
-                padding: '4px 10px',
-                fontSize: '11px',
-                color: '#adbac7',
-                background: '#0d1117',
-                border: '1px solid #57606a',
+            removeJumpCloseListeners();
+        };
+        const openJumpMenu = ({ clear = false, focusSearch = false, select = false } = {}) => {
+            if (clear) jumpSearch.value = '';
+            if (jumpMenu.style.display !== 'block') {
+                jumpMenu.style.display = 'block';
+                jumpMenu.scrollTop = 0;
+                currentPill.setAttribute('aria-expanded', 'true');
+                document.addEventListener('pointerdown', onJumpOutsidePointer, true);
+                document.addEventListener('keydown', onJumpKeydown, true);
+            }
+            applyJumpFilter();
+            if (focusSearch) jumpSearch.focus();
+            if (select) jumpSearch.select();
+        };
+        const runJumpDiffSearch = async (query, token) => {
+            const pending = commits.filter((commit) => !commitDiffSearchText.has(commit.sha));
+            if (!pending.length) {
+                applyJumpFilter();
+                return;
+            }
+            jumpDiffSearchRunning = true;
+            updateJumpDiffStatus(query);
+            let loaded = loadedDiffCount();
+            const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
+                while (pending.length && token === jumpDiffSearchToken) {
+                    const commit = pending.shift();
+                    try {
+                        const patch = await fetchCommitPatch(pr, commit.sha);
+                        commitDiffSearchText.set(commit.sha, String(patch || '').toLowerCase());
+                    } catch (_) {
+                        commitDiffSearchText.set(commit.sha, '');
+                    }
+                    loaded++;
+                    if (token !== jumpDiffSearchToken) return;
+                    applyJumpFilter();
+                    updateJumpDiffStatus(query, loaded);
+                }
+            });
+            await Promise.all(workers);
+            if (token !== jumpDiffSearchToken) return;
+            jumpDiffSearchRunning = false;
+            applyJumpFilter();
+        };
+        const scheduleJumpDiffSearch = () => {
+            const query = jumpSearch.value.trim().toLowerCase();
+            if (jumpDiffSearchTimer) clearTimeout(jumpDiffSearchTimer);
+            if (!query) {
+                jumpDiffSearchToken++;
+                jumpDiffSearchRunning = false;
+                jumpDiffSearchQuery = '';
+                applyJumpFilter();
+                return;
+            }
+            if (loadedDiffCount() === commits.length) {
+                applyJumpFilter();
+                return;
+            }
+            jumpDiffSearchTimer = window.setTimeout(() => {
+                const latest = jumpSearch.value.trim().toLowerCase();
+                if (!latest || latest === jumpDiffSearchQuery) return;
+                jumpDiffSearchQuery = latest;
+                const token = ++jumpDiffSearchToken;
+                runJumpDiffSearch(latest, token);
+            }, 250);
+        };
+        const filterJumpItems = () => {
+            openJumpMenu();
+            applyJumpFilter();
+            scheduleJumpDiffSearch();
+        };
+        jumpSearch.addEventListener('focus', () => {
+            jumpSearch.style.borderColor = '#58a6ff';
+            openJumpMenu({ select: true });
+        });
+        jumpSearch.addEventListener('blur', () => {
+            jumpSearch.style.borderColor = '#57606a';
+        });
+        jumpSearch.addEventListener('click', () => {
+            openJumpMenu();
+        });
+        currentPill.addEventListener('click', () => {
+            openJumpMenu({ clear: true, focusSearch: true, select: true });
+            setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0, { scroll: currentIdx >= 0 });
+        });
+        jumpSearch.addEventListener('input', filterJumpItems);
+        jumpSearch.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                moveActiveJumpItem(1);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                moveActiveJumpItem(-1);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                openActiveJumpItem();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                closeJumpMenu();
+                jumpSearch.blur();
+            }
+        });
+        commits.forEach((commit, idx) => {
+            const item = document.createElement('a');
+            item.href = commitHref(commit);
+            item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
+            const diffBadge = document.createElement('span');
+            diffBadge.className = 'ack-commit-diff-hit';
+            diffBadge.textContent = 'diff';
+            Object.assign(diffBadge.style, {
+                display: 'none',
+                marginLeft: '8px',
+                padding: '1px 4px',
+                borderRadius: '4px',
+                background: '#1f6feb',
+                color: '#fff',
+                fontSize: '10px',
+                fontWeight: '600',
+            });
+            item.appendChild(diffBadge);
+            item._ackDiffBadge = diffBadge;
+            item.dataset.ackSearch =
+                `${commit.sha} ${idx + 1}/${commits.length} ${commitLine(commit)}`.toLowerCase();
+            item.dataset.ackIndex = String(idx);
+            item.setAttribute('role', 'option');
+            Object.assign(item.style, {
+                display: 'block',
+                padding: '6px 8px',
                 borderRadius: '6px',
-                cursor: 'pointer',
+                textDecoration: 'none',
                 whiteSpace: 'nowrap',
-                minWidth: '90px',
-                maxWidth: 'min(360px, 42vw)',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
-                textAlign: 'left',
-                flex: '0 1 auto',
+                background: idx === currentIdx ? '#1f2937' : 'transparent',
+                fontWeight: idx === currentIdx ? '600' : '400',
             });
-            currentPill.addEventListener('mouseenter', () => {
-                currentPill.style.background = '#161b22';
-                currentPill.style.borderColor = '#8b949e';
+            item.addEventListener('mouseenter', () => {
+                setActiveJumpItem(idx);
             });
-            currentPill.addEventListener('mouseleave', () => {
-                currentPill.style.background = '#0d1117';
-                currentPill.style.borderColor = '#57606a';
+            item.addEventListener('mouseleave', () => {
+                paintJumpItem(item);
             });
-            const jumpMenu = document.createElement('div');
-            Object.assign(jumpMenu.style, {
-                position: 'absolute',
-                left: '50%',
-                bottom: 'calc(100% + 8px)',
-                transform: 'translateX(-50%)',
-                display: 'none',
-                background: '#161b22',
-                border: '1px solid #30363d',
-                borderRadius: '8px',
-                boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
-                minWidth: '420px',
-                maxWidth: 'min(92vw, 620px)',
-                maxHeight: '320px',
-                overflow: 'auto',
-                padding: '6px',
-                zIndex: '99999',
-            });
-            const jumpHeader = document.createElement('div');
-            Object.assign(jumpHeader.style, {
-                position: 'sticky',
-                top: '0',
-                zIndex: '2',
-                background: '#161b22',
-                padding: '0 0 6px',
-            });
-            const jumpSearch = document.createElement('input');
-            jumpSearch.type = 'search';
-            jumpSearch.placeholder = 'Search commits, hashes, or diffs...';
-            jumpSearch.setAttribute('aria-label', 'Search commits');
-            Object.assign(jumpSearch.style, {
-                display: 'block',
-                width: '100%',
-                maxWidth: 'none',
-                minWidth: '0',
-                boxSizing: 'border-box',
-                padding: '6px 8px',
-                fontSize: '12px',
-                color: '#c9d1d9',
-                background: '#0d1117',
-                border: '1px solid #57606a',
-                borderRadius: '6px',
-                outline: 'none',
-            });
-            const jumpDiffStatus = document.createElement('div');
-            Object.assign(jumpDiffStatus.style, {
-                display: 'none',
-                margin: '6px 0 0',
-                padding: '0 2px',
-                color: '#8b949e',
-                fontSize: '11px',
-                background: '#161b22',
-            });
-            const emptyJumpSearch = document.createElement('div');
-            emptyJumpSearch.textContent = 'No matching commits';
-            Object.assign(emptyJumpSearch.style, {
-                display: 'none',
-                padding: '8px',
-                color: '#8b949e',
-                fontSize: '12px',
-                textAlign: 'center',
-            });
-            const jumpItems = [];
-            let activeJumpIdx = -1;
-            let jumpDiffSearchTimer = null;
-            let jumpDiffSearchToken = 0;
-            let jumpDiffSearchRunning = false;
-            let jumpDiffSearchQuery = '';
-            const commitDiffSearchText = new Map(); // sha -> lowercased commit patch
-            const visibleJumpItems = () => jumpItems.filter((item) => item.style.display !== 'none');
-            const commitForJumpItem = (item) => commits[Number(item.dataset.ackIndex || '-1')];
-            const itemDiffMatches = (item, query) => {
-                if (!query) return false;
-                const commit = commitForJumpItem(item);
-                if (!commit) return false;
-                return (commitDiffSearchText.get(commit.sha) || '').includes(query);
-            };
-            const loadedDiffCount = () => commits.filter((commit) => commitDiffSearchText.has(commit.sha)).length;
-            const updateJumpDiffStatus = (query, loaded = loadedDiffCount()) => {
-                if (!query) {
-                    jumpDiffStatus.style.display = 'none';
-                    jumpDiffStatus.textContent = '';
-                    return;
-                }
-                const diffMatches = jumpItems.filter((item) => itemDiffMatches(item, query)).length;
-                jumpDiffStatus.style.display = 'block';
-                jumpDiffStatus.textContent = jumpDiffSearchRunning
-                    ? `Searching diffs ${loaded}/${commits.length}${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
-                    : loaded === commits.length
-                      ? `Diff search complete${diffMatches ? `, ${diffMatches} hit${diffMatches === 1 ? '' : 's'}` : ''}`
-                      : 'Type to search commit diffs';
-            };
-            const paintJumpItem = (item) => {
-                const idx = Number(item.dataset.ackIndex || '-1');
-                const isCurrent = idx === currentIdx;
-                const isActive = idx === activeJumpIdx;
-                item.style.background = isActive ? '#30363d' : isCurrent ? '#1f2937' : 'transparent';
-                item.style.fontWeight = isCurrent || isActive ? '600' : '400';
-                item.setAttribute('aria-selected', isActive ? 'true' : 'false');
-            };
-            const setActiveJumpItem = (idx, { scroll = false } = {}) => {
-                activeJumpIdx = idx;
-                for (const item of jumpItems) paintJumpItem(item);
-                const active = jumpItems.find((item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx);
-                if (scroll && active) active.scrollIntoView({ block: 'nearest' });
-            };
-            const moveActiveJumpItem = (dir) => {
-                const visible = visibleJumpItems();
-                if (!visible.length) return;
-                const curVisibleIdx = visible.findIndex(
-                    (item) => Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
-                );
-                const nextVisibleIdx =
-                    curVisibleIdx === -1 ? (dir > 0 ? 0 : visible.length - 1) : (curVisibleIdx + dir + visible.length) % visible.length;
-                setActiveJumpItem(Number(visible[nextVisibleIdx].dataset.ackIndex || '-1'), { scroll: true });
-            };
-            const openActiveJumpItem = () => {
-                const active = jumpItems.find(
-                    (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
-                );
-                if (active) active.click();
-            };
-            const applyJumpFilter = () => {
-                const query = jumpSearch.value.trim().toLowerCase();
-                let visible = 0;
-                for (const item of jumpItems) {
-                    const textMatches = !query || item.dataset.ackSearch.includes(query);
-                    const diffMatches = itemDiffMatches(item, query);
-                    const matches = textMatches || diffMatches;
-                    item.style.display = matches ? 'block' : 'none';
-                    if (item._ackDiffBadge) item._ackDiffBadge.style.display = diffMatches ? 'inline-block' : 'none';
-                    if (matches) visible++;
-                    paintJumpItem(item);
-                }
-                emptyJumpSearch.textContent = jumpDiffSearchRunning
-                    ? 'No matching commits yet, still searching diffs'
-                    : 'No matching commits';
-                emptyJumpSearch.style.display = visible ? 'none' : 'block';
-                updateJumpDiffStatus(query);
-                const activeStillVisible = jumpItems.some(
-                    (item) => item.style.display !== 'none' && Number(item.dataset.ackIndex || '-1') === activeJumpIdx,
-                );
-                if (!activeStillVisible) {
-                    const firstVisible = visibleJumpItems()[0] || null;
-                    setActiveJumpItem(firstVisible ? Number(firstVisible.dataset.ackIndex || '-1') : -1);
-                }
-            };
-            const closeJumpMenu = () => {
-                jumpMenu.style.display = 'none';
-                currentPill.setAttribute('aria-expanded', 'false');
-                removeJumpCloseListeners();
-            };
-            const openJumpMenu = ({ clear = false, focusSearch = false, select = false } = {}) => {
-                if (clear) jumpSearch.value = '';
-                if (jumpMenu.style.display !== 'block') {
-                    jumpMenu.style.display = 'block';
-                    jumpMenu.scrollTop = 0;
-                    currentPill.setAttribute('aria-expanded', 'true');
-                    document.addEventListener('pointerdown', onJumpOutsidePointer, true);
-                    document.addEventListener('keydown', onJumpKeydown, true);
-                }
-                applyJumpFilter();
-                if (focusSearch) jumpSearch.focus();
-                if (select) jumpSearch.select();
-            };
-            const runJumpDiffSearch = async (query, token) => {
-                const pending = commits.filter((commit) => !commitDiffSearchText.has(commit.sha));
-                if (!pending.length) {
-                    applyJumpFilter();
-                    return;
-                }
-                jumpDiffSearchRunning = true;
-                updateJumpDiffStatus(query);
-                let loaded = loadedDiffCount();
-                const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
-                    while (pending.length && token === jumpDiffSearchToken) {
-                        const commit = pending.shift();
-                        try {
-                            const patch = await fetchCommitPatch(pr, commit.sha);
-                            commitDiffSearchText.set(commit.sha, String(patch || '').toLowerCase());
-                        } catch (_) {
-                            commitDiffSearchText.set(commit.sha, '');
-                        }
-                        loaded++;
-                        if (token !== jumpDiffSearchToken) return;
-                        applyJumpFilter();
-                        updateJumpDiffStatus(query, loaded);
-                    }
-                });
-                await Promise.all(workers);
-                if (token !== jumpDiffSearchToken) return;
-                jumpDiffSearchRunning = false;
-                applyJumpFilter();
-            };
-            const scheduleJumpDiffSearch = () => {
-                const query = jumpSearch.value.trim().toLowerCase();
-                if (jumpDiffSearchTimer) clearTimeout(jumpDiffSearchTimer);
-                if (!query) {
-                    jumpDiffSearchToken++;
-                    jumpDiffSearchRunning = false;
-                    jumpDiffSearchQuery = '';
-                    applyJumpFilter();
-                    return;
-                }
-                if (loadedDiffCount() === commits.length) {
-                    applyJumpFilter();
-                    return;
-                }
-                jumpDiffSearchTimer = window.setTimeout(() => {
-                    const latest = jumpSearch.value.trim().toLowerCase();
-                    if (!latest || latest === jumpDiffSearchQuery) return;
-                    jumpDiffSearchQuery = latest;
-                    const token = ++jumpDiffSearchToken;
-                    runJumpDiffSearch(latest, token);
-                }, 250);
-            };
-            const filterJumpItems = () => {
-                openJumpMenu();
-                applyJumpFilter();
-                scheduleJumpDiffSearch();
-            };
-            jumpSearch.addEventListener('focus', () => {
-                jumpSearch.style.borderColor = '#58a6ff';
-                openJumpMenu({ select: true });
-            });
-            jumpSearch.addEventListener('blur', () => {
-                jumpSearch.style.borderColor = '#57606a';
-            });
-            jumpSearch.addEventListener('click', () => {
-                openJumpMenu();
-            });
-            currentPill.addEventListener('click', () => {
-                openJumpMenu({ clear: true, focusSearch: true, select: true });
-                setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0, { scroll: currentIdx >= 0 });
-            });
-            jumpSearch.addEventListener('input', filterJumpItems);
-            jumpSearch.addEventListener('keydown', (e) => {
-                if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    moveActiveJumpItem(1);
-                } else if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    moveActiveJumpItem(-1);
-                } else if (e.key === 'Enter') {
-                    e.preventDefault();
-                    openActiveJumpItem();
-                } else if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeJumpMenu();
-                    jumpSearch.blur();
-                }
-            });
-            commits.forEach((commit, idx) => {
-                const item = document.createElement('a');
-                item.href = commitHref(commit);
-                item.innerHTML = `<span style="font-family:monospace;color:#58a6ff">${commit.sha.slice(0, 8)}</span><span style="color:#8b949e;margin:0 6px 0 8px">${idx + 1}/${commits.length}</span><span style="color:#c9d1d9">${escapeHTML(truncMsg(commitLine(commit), 80))}</span>`;
-                const diffBadge = document.createElement('span');
-                diffBadge.className = 'ack-commit-diff-hit';
-                diffBadge.textContent = 'diff';
-                Object.assign(diffBadge.style, {
-                    display: 'none',
-                    marginLeft: '8px',
-                    padding: '1px 4px',
-                    borderRadius: '4px',
-                    background: '#1f6feb',
-                    color: '#fff',
-                    fontSize: '10px',
-                    fontWeight: '600',
-                });
-                item.appendChild(diffBadge);
-                item._ackDiffBadge = diffBadge;
-                item.dataset.ackSearch =
-                    `${commit.sha} ${idx + 1}/${commits.length} ${commitLine(commit)}`.toLowerCase();
-                item.dataset.ackIndex = String(idx);
-                item.setAttribute('role', 'option');
-                Object.assign(item.style, {
-                    display: 'block',
-                    padding: '6px 8px',
-                    borderRadius: '6px',
-                    textDecoration: 'none',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    background: idx === currentIdx ? '#1f2937' : 'transparent',
-                    fontWeight: idx === currentIdx ? '600' : '400',
-                });
-                item.addEventListener('mouseenter', () => {
-                    setActiveJumpItem(idx);
-                });
-                item.addEventListener('mouseleave', () => {
-                    paintJumpItem(item);
-                });
-                item.addEventListener('click', (e) => {
-                    const query = jumpSearch.value.trim();
-                    // Only schedule a diff-line jump when the query can actually
-                    // appear in this commit's diff: a message/SHA-only match would
-                    // make the target page rescan every diff cell 32 times for
-                    // text that is not there.
-                    const patchText = commitDiffSearchText.get(commit.sha);
-                    const jumpable =
-                        !!query && (!patchText || patchText.includes(normalizeCommitSearchQuery(query)));
-                    if (jumpable) storeCommitSearchJump(pr, commit, query);
-                    closeJumpMenu();
-                    if (query && currentSha && commitShaMatches(commit.sha, currentSha)) {
-                        e.preventDefault();
-                        if (jumpable) schedulePendingCommitSearchJump('commit-nav-current-click');
-                        return;
-                    }
-                    if (!query && isCommitsList && focusCommitEntry(commit, idx)) {
-                        e.preventDefault();
-                    }
-                });
-                jumpItems.push(item);
-                jumpMenu.appendChild(item);
-            });
-            jumpMenu.setAttribute('role', 'listbox');
-            jumpHeader.appendChild(jumpSearch);
-            jumpHeader.appendChild(jumpDiffStatus);
-            jumpMenu.prepend(jumpHeader);
-            jumpMenu.appendChild(emptyJumpSearch);
-            const onJumpOutsidePointer = (e) => {
-                if (!jumpWrap.contains(e.target)) closeJumpMenu();
-            };
-            const onJumpKeydown = (e) => {
-                if (e.key !== 'Escape') return;
-                e.preventDefault();
-                e.stopPropagation();
+            item.addEventListener('click', (e) => {
+                const query = jumpSearch.value.trim();
+                // Only schedule a diff-line jump when the query can actually
+                // appear in this commit's diff: a message/SHA-only match would
+                // make the target page rescan every diff cell 32 times for
+                // text that is not there.
+                const patchText = commitDiffSearchText.get(commit.sha);
+                const jumpable =
+                    !!query && (!patchText || patchText.includes(normalizeCommitSearchQuery(query)));
+                if (jumpable) storeCommitSearchJump(pr, commit, query);
                 closeJumpMenu();
-            };
-            const removeJumpCloseListeners = () => {
-                document.removeEventListener('pointerdown', onJumpOutsidePointer, true);
-                document.removeEventListener('keydown', onJumpKeydown, true);
-            };
-            setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0);
-            jumpWrap.appendChild(currentPill);
-            jumpWrap.appendChild(jumpMenu);
-            bar.appendChild(jumpWrap);
-        } else {
-            const pos = document.createElement('span');
-            pos.textContent = currentLabel;
-            pos.title = currentTitle;
-            Object.assign(pos.style, {
-                fontSize: '11px',
-                color: '#484f58',
-                minWidth: '30px',
-                textAlign: 'center',
-                flex: '0 0 auto',
+                if (query && currentSha && commitShaMatches(commit.sha, currentSha)) {
+                    e.preventDefault();
+                    if (jumpable) schedulePendingCommitSearchJump('commit-nav-current-click');
+                    return;
+                }
+                if (!query && isCommitsList && focusCommitEntry(commit, idx)) {
+                    e.preventDefault();
+                }
             });
-            bar.appendChild(pos);
-        }
+            jumpItems.push(item);
+            jumpMenu.appendChild(item);
+        });
+        jumpMenu.setAttribute('role', 'listbox');
+        jumpHeader.appendChild(jumpSearch);
+        jumpHeader.appendChild(jumpDiffStatus);
+        jumpMenu.prepend(jumpHeader);
+        jumpMenu.appendChild(emptyJumpSearch);
+        const onJumpOutsidePointer = (e) => {
+            if (!jumpWrap.contains(e.target)) closeJumpMenu();
+        };
+        const onJumpKeydown = (e) => {
+            if (e.key !== 'Escape') return;
+            e.preventDefault();
+            e.stopPropagation();
+            closeJumpMenu();
+        };
+        const removeJumpCloseListeners = () => {
+            document.removeEventListener('pointerdown', onJumpOutsidePointer, true);
+            document.removeEventListener('keydown', onJumpKeydown, true);
+        };
+        setActiveJumpItem(currentIdx >= 0 ? currentIdx : 0);
+        jumpWrap.appendChild(currentPill);
+        jumpWrap.appendChild(jumpMenu);
+        bar.appendChild(jumpWrap);
         if (nextCommit) bar.appendChild(makeNavBtn(nextCommit, true));
 
         if (gen !== commitNavGeneration) return;
@@ -44812,10 +44797,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function isPRPage'),
         );
         ackAssert(navFn.includes("maxWidth: 'calc(100vw - 24px)'"), 'bar width is clamped to viewport');
-        ackAssert(
-            navFn.includes("overflow: hasJumpMenu ? 'visible' : 'hidden'"),
-            'bar allows dropdown overflow only when jump menu is present',
-        );
+        ackAssert(navFn.includes("overflow: 'visible'"), 'bar lets the jump chooser dropdown overflow');
         const btnFn = source.slice(source.indexOf('const makeNavBtn'), source.indexOf('const currentCommit ='));
         ackAssert(
             btnFn.includes("maxWidth: 'min(300px, calc(50vw - 70px))'"),
@@ -44833,13 +44815,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function _addFloatingCommitNavInner'),
             source.indexOf('function isPRPage'),
         );
+        ackAssert(!fn.includes('hasJumpMenu'), 'shows the jump chooser for every non-empty commit list');
         ackAssert(
-            fn.includes('const hasJumpMenu = commits.length > 0;'),
-            'shows jump search for every non-empty commit list',
-        );
-        ackAssert(
-            fn.indexOf('const commits = await fetchCommitList') < fn.indexOf('const hasJumpMenu = commits.length > 0;'),
-            'computes hasJumpMenu only after commits are loaded',
+            fn.indexOf('if (commits.length === 0) return;') < fn.indexOf("const jumpWrap = document.createElement('div')"),
+            'builds the jump chooser only after commits are loaded',
         );
         ackAssert(fn.includes('const currentCommit = currentIdx >= 0'), 'tracks the currently viewed commit');
         ackAssert(fn.includes('currentCommitPrefix'), 'builds a current commit message prefix');
@@ -44864,8 +44843,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('commits.forEach((commit, idx) => {'), 'builds dropdown items from all commits');
         ackAssert(fn.includes('Jump to any of ${commits.length} commits'), 'middle section is explicitly a commit jump control');
         ackAssert(
-            fn.includes("const pos = document.createElement('span')"),
-            'keeps a simple middle indicator when the jump menu is disabled',
+            !fn.includes("const pos = document.createElement('span')"),
+            'has no unreachable plain-label fallback for the middle section',
         );
     });
 
