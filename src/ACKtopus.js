@@ -4301,6 +4301,17 @@
 
         // Strategy 1: scan all visible comment bodies by this user for "ACK <sha>"
         const ackShaRe = /\b(?:ACK|tACK|Concept ACK|Approach ACK|Stale ACK)\s+([0-9a-f]{7,40})\b/i;
+        // ACK text usually carries a short hash; prefer the full hash from a
+        // linked commit URL in the same body when it matches.
+        const ackShaFromBody = (bodyEl) => {
+            const m = bodyEl?.textContent?.match(ackShaRe);
+            if (!m) return '';
+            const linkedFullSha = [...(bodyEl.querySelectorAll('a[href*="/commit/"], a[href*="/commits/"]') || [])]
+                .map((a) => a.getAttribute('href') || '')
+                .map((href) => href.match(/\/commits?\/([0-9a-f]{40})(?:[/?#]|$)/i)?.[1] || '')
+                .find((full) => full && (full.startsWith(m[1]) || m[1].startsWith(full)));
+            return linkedFullSha || m[1];
+        };
         const bodies = document.querySelectorAll(COMMENT_CONTAINER_SELECTOR);
         let foundSha = null;
         for (const container of bodies) {
@@ -4309,16 +4320,8 @@
             );
             const author = authorEl?.textContent?.trim();
             if (author !== currentUser) continue;
-            const bodyEl = container.querySelector(MARKDOWN_BODY_SELECTOR);
-            if (!bodyEl) continue;
-            const m = bodyEl.textContent.match(ackShaRe);
-            if (m) {
-                const linkedFullSha = [...bodyEl.querySelectorAll('a[href*="/commit/"], a[href*="/commits/"]')]
-                    .map((a) => a.getAttribute('href') || '')
-                    .map((href) => href.match(/\/commits?\/([0-9a-f]{40})(?:[/?#]|$)/i)?.[1] || '')
-                    .find((full) => full && (full.startsWith(m[1]) || m[1].startsWith(full)));
-                foundSha = linkedFullSha || m[1]; // keep scanning -- last one wins (chronological)
-            }
+            const sha = ackShaFromBody(container.querySelector(MARKDOWN_BODY_SELECTOR));
+            if (sha) foundSha = sha; // keep scanning -- last one wins (chronological)
         }
         if (foundSha) {
             console.log('ACKtopus: found user ACK SHA from page:', foundSha);
@@ -4332,17 +4335,10 @@
                 const el = document.getElementById(hash) || document.querySelector(`[id="${cssEscape(hash)}"]`);
                 if (el) {
                     const container = el.closest(COMMENT_CONTAINER_SELECTOR) || el.parentElement;
-                    const bodyEl = container?.querySelector(MARKDOWN_BODY_SELECTOR);
-                    const m = bodyEl?.textContent?.match(ackShaRe);
-                    if (m) {
-                        const linkedFullSha = [
-                            ...(bodyEl?.querySelectorAll?.('a[href*="/commit/"], a[href*="/commits/"]') || []),
-                        ]
-                            .map((a) => a.getAttribute('href') || '')
-                            .map((href) => href.match(/\/commits?\/([0-9a-f]{40})(?:[/?#]|$)/i)?.[1] || '')
-                            .find((full) => full && (full.startsWith(m[1]) || m[1].startsWith(full)));
-                        console.log('ACKtopus: found user ACK SHA from fragment:', linkedFullSha || m[1]);
-                        return linkedFullSha || m[1];
+                    const sha = ackShaFromBody(container?.querySelector(MARKDOWN_BODY_SELECTOR));
+                    if (sha) {
+                        console.log('ACKtopus: found user ACK SHA from fragment:', sha);
+                        return sha;
                     }
                 }
             }
@@ -35115,10 +35111,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('[0-9a-f]{7,40}'), 'matches SHA patterns');
         ackAssert(fn.includes('COMMENT_CONTAINER_SELECTOR'), 'scans comment containers');
         ackAssert(fn.includes('.author'), 'filters by author');
-        ackAssert(
-            fn.includes('foundSha = linkedFullSha || m[1]'),
-            'takes last match while preferring linked full commit SHAs',
-        );
+        ackAssert(fn.includes('if (sha) foundSha = sha;'), 'takes the last matching ACK comment');
+        ackAssert(fn.includes('return linkedFullSha || m[1];'), 'prefers linked full commit SHAs');
         ackAssert(fn.includes('cssEscape('), 'safely handles fragment navigation');
         ackAssert(
             fn.includes('a[href*="/commit/"], a[href*="/commits/"]'),
