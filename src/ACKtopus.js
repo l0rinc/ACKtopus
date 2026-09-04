@@ -7656,6 +7656,15 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         }
     }
 
+    // One SSE event block: feed its joined data: lines to the provider parser.
+    function parseLLMStreamBlock(provider, block, state) {
+        const dataLines = block
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart());
+        if (dataLines.length) parseLLMStreamEvent(provider, dataLines.join('\n'), state);
+    }
+
     function consumeLLMStreamText(provider, responseText, state, { final = false } = {}) {
         const full = String(responseText || '');
         const chunk = full.slice(state.offset);
@@ -7666,20 +7675,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const block = state.buffer.slice(0, sep);
             const separator = state.buffer.match(/\r?\n\r?\n/)[0];
             state.buffer = state.buffer.slice(sep + separator.length);
-            const dataLines = block
-                .split(/\r?\n/)
-                .filter((line) => line.startsWith('data:'))
-                .map((line) => line.slice(5).trimStart());
-            if (dataLines.length) parseLLMStreamEvent(provider, dataLines.join('\n'), state);
+            parseLLMStreamBlock(provider, block, state);
             sep = state.buffer.search(/\r?\n\r?\n/);
         }
         if (final && state.buffer.trim()) {
-            const dataLines = state.buffer
-                .split(/\r?\n/)
-                .filter((line) => line.startsWith('data:'))
-                .map((line) => line.slice(5).trimStart());
+            const block = state.buffer;
             state.buffer = '';
-            if (dataLines.length) parseLLMStreamEvent(provider, dataLines.join('\n'), state);
+            parseLLMStreamBlock(provider, block, state);
         }
         return state;
     }
