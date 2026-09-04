@@ -8554,11 +8554,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const parts = [];
 
         // PR title + description from page
-        const prTitle = isPRPage()
-            ? getPRTitleText()
-            : document
-                  .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
-                  ?.textContent?.trim() || '';
+        const prTitle = getPRTitle();
         if (prTitle) parts.push(`PR Title: ${prTitle}`);
 
         const prBodyEl =
@@ -10190,12 +10186,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             description = pageData.body || '';
         } catch (_) {
             // Fallback to page (title + rendered description)
-            if (isPRPage()) prTitle = getPRTitleText();
-            if (!prTitle)
-                prTitle =
-                    document
-                        .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
-                        ?.textContent?.trim() || '';
+            prTitle = getPRTitle();
             const bodyEl = document.querySelector('#issue-body, [data-testid="markdown-body"], .comment-body');
             description = bodyEl?.innerText?.trim() || '';
         }
@@ -10332,12 +10323,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 prTitle = prData.title || '';
                 description = prData.body || '';
             } catch (_) {
-                prTitle =
-                    getPRTitleText() ||
-                    document
-                        .querySelector('.js-issue-title, [data-testid="issue-title"], .markdown-title')
-                        ?.textContent?.trim() ||
-                    '';
+                prTitle = getPRTitle();
                 const bodyEl =
                     document.querySelector('#issue-body, [data-testid="issue-body"]') ||
                     document.querySelector('.js-discussion [id^="issue-"] .comment-body'); // classic PR pages
