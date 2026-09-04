@@ -26496,16 +26496,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pushes = parseForcePushesFromPage();
         const sig = forcePushSignature(pushes);
         if (!sig) return false;
-        if (!lastForcePushSignature) {
-            lastForcePushSignature = sig;
-            lastForcePush = pushes[pushes.length - 1] || null;
-            lastForcePushRange = getForcePushRange(pushes);
-            return false;
-        }
         if (sig === lastForcePushSignature) return false;
+        // The first signature seen on a page only seeds the state; a later,
+        // different signature means a new force-push landed live.
+        const seeding = !lastForcePushSignature;
         lastForcePushSignature = sig;
         lastForcePush = pushes[pushes.length - 1] || null;
         lastForcePushRange = getForcePushRange(pushes);
+        if (seeding) return false;
         refreshToolbarForLiveUpdate('force-push');
         return true;
     }
