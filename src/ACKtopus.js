@@ -25409,17 +25409,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // --- ACK toggle button (PR only) ---
         if (onPR) {
-            const ackToggleBtn = createBtn(
-                '👥',
-                function () {
-                    const ackPanel = wrapper.querySelector('#' + ACK_PANEL_ID);
-                    if (!ackPanel) return;
-                    const isHidden = ackPanel.style.display === 'none';
-                    ackPanel.style.display = isHidden ? '' : 'none';
-                    GM_setValue('ackPanelVisible', isHidden);
-                },
-                'Toggle ACK panel [Ctrl+Q]',
-            );
+            const ackToggleBtn = createBtn('👥', toggleAckPanel, 'Toggle ACK panel [Ctrl+Q]');
             ackToggleBtn.dataset.ackToolbarDropdownTrigger = 'ack-panel';
             ackToggleBtn.style.padding = '4px 6px';
             ackToggleBtn.disabled = true;
