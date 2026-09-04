@@ -17401,7 +17401,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const result = await callLLM(provider, system, user);
             if (isPRBody && prForBody) {
-                const overviewKey = `llm_pr_overview_${prForBody.owner}_${prForBody.repo}_${prForBody.pr}_${provider}`;
+                const overviewKey = prOverviewCacheKey(prForBody, provider);
                 GM_setValue(overviewKey, result.trim());
                 recordCacheTimestamp(overviewKey);
             }
@@ -22389,6 +22389,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return `llm_explain_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_commits`;
     }
 
+    function commitReviewAidCacheKey(pr, provider) {
+        return `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+    }
+
+    function prOverviewCacheKey(pr, provider) {
+        return `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+    }
+
     function lightbulbAutoOpenKey(pr, provider, mode) {
         return `llm_lightbulb_autoopen_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${mode}`;
     }
@@ -22418,7 +22426,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ? [preferredProvider, ...Object.keys(PROVIDER_META).filter((p) => p !== preferredProvider)]
             : Object.keys(PROVIDER_META);
         for (const prov of providers) {
-            const k = `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`;
+            const k = prOverviewCacheKey(pr, prov);
             const txt = GM_getValue(k, '');
             if (typeof txt === 'string' && txt.trim()) {
                 return { provider: prov, text: txt.trim() };
@@ -22593,7 +22601,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const forceRefresh = !!opts.forceRefresh;
         const extraContextRaw = typeof opts.extraContext === 'string' ? opts.extraContext : '';
         const extraContext = extraContextRaw.trim();
-        const ck = `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+        const ck = commitReviewAidCacheKey(pr, provider);
         if (!forceRefresh) {
             const cached = GM_getValue(ck, null);
             if (cached) return cached;
@@ -22651,7 +22659,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         const job = (async () => {
             const commitExplainKey = commitExplainCacheKey(pr, provider);
-            const reviewAidKey = `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+            const reviewAidKey = commitReviewAidCacheKey(pr, provider);
             const hasCommitExplain = !!GM_getValue(commitExplainKey, null);
             const hasReviewAid = !!GM_getValue(reviewAidKey, null);
             if (hasCommitExplain && hasReviewAid) {
@@ -23326,7 +23334,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!pr || !sha) return null;
         const sha8 = sha.slice(0, 8);
         for (const prov of Object.keys(PROVIDER_META)) {
-            const ck = `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`;
+            const ck = commitReviewAidCacheKey(pr, prov);
             const map = GM_getValue(ck, null);
             if (!map) continue;
             const data = map[sha8] || map[sha.slice(0, 7)] || map[sha];
@@ -23957,7 +23965,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!pr) return;
             const sha = pathCommitSha();
             if (!sha) return;
-            const preCached = GM_getValue(`llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`, null);
+            const preCached = GM_getValue(commitReviewAidCacheKey(pr, provider), null);
             if (!preCached && !isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
                 return;
@@ -23977,7 +23985,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     msg: c.commit?.message?.split('\n')[0] || '',
                 }));
 
-                const ck = `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+                const ck = commitReviewAidCacheKey(pr, provider);
                 let explanations = preCached || GM_getValue(ck, null);
 
                 if (!explanations) {
@@ -24097,7 +24105,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = parsePR();
         if (pr) {
             const provider = getActiveProvider();
-            const ck = `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+            const ck = commitReviewAidCacheKey(pr, provider);
             const shouldReopen = !!GM_getValue('lightbulb_open', false);
             const shouldAutoOpen = consumeLightbulbAutoOpen(pr, provider, 'commit');
             if ((shouldReopen || shouldAutoOpen) && GM_getValue(ck, null)) btn.click();
@@ -25348,8 +25356,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     for (const prov of Object.keys(PROVIDER_META)) {
                         const ck = commitExplainCacheKey(pr, prov);
                         GM_deleteValue(ck);
-                        GM_deleteValue(`llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
-                        GM_deleteValue(`llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${prov}`);
+                        GM_deleteValue(commitReviewAidCacheKey(pr, prov));
+                        GM_deleteValue(prOverviewCacheKey(pr, prov));
                         GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commits'));
                         GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commit'));
                     }
@@ -36161,8 +36169,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(injectSection.includes('invalidatePRContext'), 'invalidated on force push detection');
         ackAssert(injectSection.includes('commitListCache.clear()'), 'commitListCache cleared on force push');
         ackAssert(injectSection.includes('commitExplainCacheKey'), 'commit explain caches cleared on force push');
-        ackAssert(injectSection.includes('llm_lightbulb_'), 'lightbulb caches cleared on force push');
-        ackAssert(injectSection.includes('llm_pr_overview_'), 'PR overview cache cleared on force push');
+        ackAssert(injectSection.includes('commitReviewAidCacheKey'), 'lightbulb caches cleared on force push');
+        ackAssert(injectSection.includes('prOverviewCacheKey'), 'PR overview cache cleared on force push');
         ackAssert(injectSection.includes('lightbulbAutoOpenKey'), 'auto-open lightbulb flags cleared on force push');
         // PR navigation teardown
         const teardown = source.slice(
@@ -37851,7 +37859,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function getCachedCommitReviewAid'),
             source.indexOf('function formatCommitReviewAidForPrompt'),
         );
-        ackAssert(fn.includes('llm_lightbulb_'), 'reads lightbulb cache key');
+        ackAssert(fn.includes('commitReviewAidCacheKey('), 'reads lightbulb cache key');
     });
 
     ackTest('prefillCommitHash uses setTextareaValue (React-safe) and avoids execCommand', () => {
@@ -44009,7 +44017,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(fn.includes("GM_getValue('lightbulb_open'"), 'checks lightbulb_open state');
         ackAssert(fn.includes('btn.click()'), 'auto-clicks button when cached data available');
-        ackAssert(fn.includes('llm_lightbulb_'), 'checks lightbulb cache before auto-click');
+        ackAssert(fn.includes('commitReviewAidCacheKey('), 'checks lightbulb cache before auto-click');
         ackAssert(
             fn.includes("consumeLightbulbAutoOpen(pr, provider, 'commit')"),
             'also auto-opens from precompute flag',
@@ -44022,7 +44030,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function explainComment'),
             source.indexOf('function schedulePostEditRefresh'),
         );
-        ackAssert(fn.includes('llm_pr_overview_'), 'stores PR overview under dedicated cache key');
+        ackAssert(fn.includes('prOverviewCacheKey('), 'stores PR overview under dedicated cache key');
         ackAssert(
             fn.includes('precomputeLightbulbCachesFromPRBody'),
             'kicks off background precompute from PR body explain',
@@ -44685,7 +44693,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('// --- Co-authored-by'),
         );
         ackAssert(fn.includes('fetchCommitList'), 'fetches full commit list');
-        ackAssert(fn.includes('llm_lightbulb_'), 'uses lightbulb cache key');
+        ackAssert(fn.includes('commitReviewAidCacheKey('), 'uses lightbulb cache key');
         ackAssert(fn.includes('fetchBatchCommitReviewAids'), 'fills cache through shared batch helper');
         ackAssert(fn.includes('if (!explanations) return;'), 'bails out cleanly if batch helper returns nothing');
         ackAssert(fn.includes('buildLightbulbPanel'), 'renders structured panel');
