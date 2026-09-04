@@ -25289,6 +25289,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 Object.assign(ackToggleBtn.style, { opacity: '', cursor: '' });
             }
             const memberLogins = pr ? await fetchRepoMembers(pr.owner, pr.repo, pr.pr, apiSnapshots) : new Set();
+            if (!wrapper.isConnected) return;
             const maintainerLogins = getMaintainerLogins();
             const ackUsers = acks.map((a) => a.user);
             const boldUsers = ackUsers.filter((u) => memberLogins.has(u) || maintainerLogins.has(u));
@@ -25321,6 +25322,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const commit = await gmFetch(
                         `https://api.github.com/repos/${pr.owner}/${pr.repo}/commits/${userAckSha}`,
                     );
+                    if (!wrapper.isConnected) return;
                     if (commit?.sha) userAckSha = commit.sha;
                 } catch (_) {}
             }
@@ -25375,6 +25377,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (pr) {
             await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr, apiSnapshots);
+            if (!wrapper.isConnected) return;
             scheduleAckBackgroundWork('commit-badges-after-api', () => addCommitBadges(document), {
                 delayMs: 120,
                 reason: 'review-comment-commit-map',
@@ -34831,6 +34834,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('PGP verified'), 'valid tooltip says verified');
         ackAssert(fn.includes('INVALID'), 'invalid tooltip says INVALID');
+    });
+
+    ackTest('late member discovery cannot replace the next page ACK panel', async () => {
+        const previousAcks = parseAcksFromPage;
+        const previousMembers = fetchRepoMembers;
+        const previousParse = parsePR;
+        const previousFiles = fetchPRFileCategories;
+        const previousTimer = ackSetTimeout;
+        const previousGetById = document.getElementById;
+        const host = document.createElement('div');
+        const wrapper = document.createElement('div');
+        const toolbar = document.createElement('div');
+        const replacement = document.createElement('div');
+        replacement.id = ACK_PANEL_ID;
+        wrapper.appendChild(toolbar);
+        host.appendChild(wrapper);
+        document.body.appendChild(host);
+        let finishMembers;
+        try {
+            parsePR = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            fetchPRFileCategories = async () => null;
+            ackSetTimeout = () => 0;
+            document.getElementById = (id) => id === ACK_PANEL_ID
+                ? host.querySelector(`#${ACK_PANEL_ID}`) : previousGetById.call(document, id);
+            parseAcksFromPage = () => [{ type: 'ACK', user: 'octo', url: '#issuecomment-1' }];
+            fetchRepoMembers = () => new Promise((resolve) => { finishMembers = resolve; });
+            const pending = loadAsyncPRData(wrapper, toolbar);
+            wrapper.remove();
+            host.appendChild(replacement);
+            finishMembers(new Set());
+            await pending;
+            ackEq(document.getElementById(ACK_PANEL_ID), replacement, 'preserves the new page panel');
+        } finally {
+            parseAcksFromPage = previousAcks;
+            fetchRepoMembers = previousMembers;
+            parsePR = previousParse;
+            fetchPRFileCategories = previousFiles;
+            ackSetTimeout = previousTimer;
+            document.getElementById = previousGetById;
+            host.remove();
+        }
     });
 
     ackTest('ACK panel calls updateAckPanelPGPOverlays after panel is appended', () => {
