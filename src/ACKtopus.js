@@ -46905,10 +46905,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         if (_ackTesting) return;
         if (pending || location.href === lastUrl) return;
         pending = true;
-        ackSetTimeout(() => {
+        Promise.resolve().then(() => {
             pending = false;
             checkUrlChange();
-        }, 0);
+        });
     }).observe(document.body, { childList: true, subtree: true });
 
     let liveRefreshPending = false;
