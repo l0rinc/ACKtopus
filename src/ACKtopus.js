@@ -1853,6 +1853,7 @@
         const fmt = getFormat();
         const useAlternate = usesAlternateToolbarMode() && typeof fmt.alternateFmt === 'function';
         const formatter = useAlternate ? fmt.alternateFmt : fmt.fmt;
+        const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
         const stopSpin = startBrailleAnimation((frame) => {
@@ -1868,7 +1869,6 @@
             } else {
                 const immediateSha = getImmediatePRHeadSHA();
                 const sha = immediateSha || (await fetchSHA());
-                const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
                 if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
                     userAckSha = await resolveFullCommitSha(pr, userAckSha);
                 }
@@ -1879,7 +1879,7 @@
                 // Clipboard-only: never auto-insert into any active text field.
                 GM_setClipboard(text);
                 mainBtn.innerHTML = `${CHECK_ICON}`;
-            } else if (fmt.key === 'rdiff') {
+            } else if (compareFmt) {
                 mainBtn.textContent = '✗ no force-push';
             } else if (fmt.key === 'hashes') {
                 mainBtn.textContent = '✗ no commits';
