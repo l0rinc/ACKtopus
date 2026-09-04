@@ -24245,6 +24245,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    // Wrap-up for the reveal/close toolbar actions: stop the spinner, show the
+    // outcome on the button and popup, then restore both after restoreMs.
+    function makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim = null, stopCompactSpin = null, onFinish = null } = {}) {
+        return (msg, shortMsg, ok = false) => {
+            if (stopAnim) stopAnim();
+            if (stopCompactSpin) stopCompactSpin(shortMsg || msg);
+            else btn.textContent = shortMsg || msg;
+            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
+            onFinish?.(msg, ok);
+            const restore = () => {
+                btn.textContent = origText;
+                popup.remove();
+                btn._running = false;
+            };
+            if (restoreMs <= 0) restore();
+            else setTimeout(restore, restoreMs);
+            return ok;
+        };
+    }
+
     async function revealAllContext(btn, { restoreMs = 2000 } = {}) {
         if (btn._running) return;
         btn._running = true;
@@ -24258,20 +24278,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                   btn.textContent = `${frame} ${remaining > 0 ? remaining + ' remaining...' : 'finishing...'}`;
               });
         const popup = makeStatusPopup('Revealing hidden timeline items, resolved threads, and collapsed sections...');
-        const finish = (msg, shortMsg, ok = false) => {
-            if (stopAnim) stopAnim();
-            if (stopCompactSpin) stopCompactSpin(shortMsg || msg);
-            else btn.textContent = shortMsg || msg;
-            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
-            const restore = () => {
-                btn.textContent = origText;
-                popup.remove();
-                btn._running = false;
-            };
-            if (restoreMs <= 0) restore();
-            else setTimeout(restore, restoreMs);
-            return ok;
-        };
+        const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim, stopCompactSpin });
 
         try {
             let openedCount = 0;
@@ -24341,20 +24348,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.textContent = `${frame} Reveal mine...`;
         });
         const popup = makeStatusPopup('Loading comments and opening your review threads...');
-        const finish = (msg, shortMsg, ok = false) => {
-            stopAnim();
-            btn.textContent = shortMsg || msg;
-            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
-            ackLogEvent(`reveal mine: ${ok ? 'finished' : 'stopped'}`, { message: msg }, ok ? 'log' : 'warn');
-            const restore = () => {
-                btn.textContent = origText;
-                popup.remove();
-                btn._running = false;
-            };
-            if (restoreMs <= 0) restore();
-            else setTimeout(restore, restoreMs);
-            return ok;
-        };
+        const finish = makeRevealFinisher(btn, popup, origText, restoreMs, {
+            stopAnim,
+            onFinish: (msg, ok) =>
+                ackLogEvent(`reveal mine: ${ok ? 'finished' : 'stopped'}`, { message: msg }, ok ? 'log' : 'warn'),
+        });
 
         if (!login) return finish('Could not identify your GitHub account', '❌', false);
         try {
@@ -24482,19 +24480,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.textContent = `${frame} Closing...`;
         });
         const popup = makeStatusPopup(`Closing ${label}...`);
-        const finish = (msg, shortMsg, ok = false) => {
-            stopAnim();
-            btn.textContent = shortMsg || msg;
-            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
-            const restore = () => {
-                btn.textContent = origText;
-                popup.remove();
-                btn._running = false;
-            };
-            if (restoreMs <= 0) restore();
-            else setTimeout(restore, restoreMs);
-            return ok;
-        };
+        const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim });
 
         if (mineOnly && !login) return finish('Could not identify your GitHub account', '❌', false);
         try {
@@ -24530,19 +24516,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.textContent = `${frame} ${remaining > 0 ? remaining + ' pending...' : 'finishing...'}`;
         });
         const popup = makeStatusPopup('Opening pending review comments only...');
-        const finish = (msg, shortMsg, ok = false) => {
-            stopAnim();
-            btn.textContent = shortMsg || msg;
-            popup.textContent = `${shortMsg === '✅' ? '✅' : shortMsg === '❌' ? '❌' : ''} ${msg}`.trim();
-            const restore = () => {
-                btn.textContent = origText;
-                popup.remove();
-                btn._running = false;
-            };
-            if (restoreMs <= 0) restore();
-            else setTimeout(restore, restoreMs);
-            return ok;
-        };
+        const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim });
 
         try {
             for (let round = 0; round < 10; round++) {
