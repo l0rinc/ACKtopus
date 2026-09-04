@@ -22325,6 +22325,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
     }
 
+    // Batch results are keyed by 8-char SHA prefixes, but older caches and some
+    // model answers use 7-char or full hashes; fall back to a 6-char prefix.
+    function findCommitEntryBySha(map, sha) {
+        if (!map || !sha) return undefined;
+        const short = sha.slice(0, 8);
+        const direct = map[short] || map[sha.slice(0, 7)] || map[sha];
+        if (direct) return direct;
+        const key = Object.keys(map).find((k) => k.startsWith(short.slice(0, 6)));
+        return key ? map[key] : undefined;
+    }
+
     function prOverviewCacheKey(pr, provider) {
         return `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
     }
@@ -23255,12 +23266,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function getCachedCommitReviewAid(pr, sha) {
         if (!pr || !sha) return null;
-        const sha8 = sha.slice(0, 8);
         for (const prov of Object.keys(PROVIDER_META)) {
-            const ck = commitReviewAidCacheKey(pr, prov);
-            const map = GM_getValue(ck, null);
-            if (!map) continue;
-            const data = map[sha8] || map[sha.slice(0, 7)] || map[sha];
+            const data = findCommitEntryBySha(GM_getValue(commitReviewAidCacheKey(pr, prov), null), sha);
             if (data) return { provider: prov, data };
         }
         return null;
@@ -23747,13 +23754,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const provMeta = PROVIDER_META[provider];
                     for (const cc of commits) {
                         if (cc.el.querySelector('.ack-commit-explain-panel')) continue;
-                        const shortSha = cc.sha.slice(0, 8);
-                        let explanation =
-                            explanations[shortSha] || explanations[cc.sha.slice(0, 7)] || explanations[cc.sha];
-                        if (!explanation) {
-                            const key = Object.keys(explanations).find((k) => k.startsWith(shortSha.slice(0, 6)));
-                            if (key) explanation = explanations[key];
-                        }
+                        const explanation = findCommitEntryBySha(explanations, cc.sha);
                         if (!explanation) continue;
 
                         const panel = document.createElement('div');
@@ -23919,13 +23920,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 btn.textContent = origText;
                 if (!explanations) return;
 
-                // Find review aid for this SHA
-                const shortSha = sha.slice(0, 8);
-                let data = explanations[shortSha] || explanations[sha.slice(0, 7)] || explanations[sha];
-                if (!data) {
-                    const key = Object.keys(explanations).find((k) => k.startsWith(shortSha.slice(0, 6)));
-                    if (key) data = explanations[key];
-                }
+                let data = findCommitEntryBySha(explanations, sha);
 
                 if (!data) {
                     btn.textContent = '❓';
