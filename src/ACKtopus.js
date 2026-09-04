@@ -16473,23 +16473,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function runRootInjectors(root, ctx = currentInjectContext()) {
-        for (const inj of ROOT_INJECTORS) {
-            if (inj.when && !inj.when(ctx)) continue;
-            try {
-                inj.fn(root);
-            } catch (e) {
-                if (!_ackTesting) console.warn(`ACKtopus: injector failed (${inj.name})`, e);
-            }
-        }
+        runInjectors(ROOT_INJECTORS, ctx, root);
     }
 
     function runRootInjectorsForNames(root, names, ctx = currentInjectContext()) {
         const wanted = new Set(names);
-        for (const inj of ROOT_INJECTORS) {
-            if (!wanted.has(inj.name)) continue;
+        runInjectors(ROOT_INJECTORS.filter((inj) => wanted.has(inj.name)), ctx, root);
+    }
+
+    // Shared runner: one failing injector must not block the rest of the pass.
+    function runInjectors(injectors, ctx, ...args) {
+        for (const inj of injectors) {
             if (inj.when && !inj.when(ctx)) continue;
             try {
-                inj.fn(root);
+                inj.fn(...args);
             } catch (e) {
                 if (!_ackTesting) console.warn(`ACKtopus: injector failed (${inj.name})`, e);
             }
@@ -16557,14 +16554,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function runDocInjectors(ctx = currentInjectContext()) {
-        for (const inj of DOC_INJECTORS) {
-            if (inj.when && !inj.when(ctx)) continue;
-            try {
-                inj.fn();
-            } catch (e) {
-                if (!_ackTesting) console.warn(`ACKtopus: injector failed (${inj.name})`, e);
-            }
-        }
+        runInjectors(DOC_INJECTORS, ctx);
     }
 
     // Watch for dynamically added elements. Batches are coalesced and run in
