@@ -7338,7 +7338,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         saveBtn.addEventListener('click', () => {
             panel.querySelectorAll('input[data-provider]').forEach((el) => {
-                GM_setValue(`llm_${el.dataset.provider}_key`, el.value);
+                GM_setValue(providerKeyStorageKey(el.dataset.provider), el.value);
             });
             panel.querySelectorAll('textarea[data-instr-key]').forEach((el) => {
                 const val = el.value.trim() === (el.dataset.instrDefault || '').trim() ? '' : el.value;
