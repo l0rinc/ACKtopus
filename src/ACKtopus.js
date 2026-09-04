@@ -6587,12 +6587,15 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 count++;
             }
         });
-        // Also clear in-memory caches
+        resetInMemoryCaches();
+        console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
+        return count;
+    }
+
+    function resetInMemoryCaches() {
         Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
         _reviewCommitMapRequest = null;
-        console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
-        return count;
     }
 
     function factoryReset() {
@@ -6605,9 +6608,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 count++;
             }
         });
-        Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
-        _reviewCommitMap = null;
-        _reviewCommitMapRequest = null;
+        resetInMemoryCaches();
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
@@ -41085,9 +41086,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('GITHUB_HTTP_CACHE_PREFIX'), 'clears cached GitHub responses');
         ackAssert(fn.includes('GITHUB_HTTP_CACHE_INDEX_KEY'), 'clears the GitHub response cache index');
         ackAssert(fn.includes('llm_cache_timestamps'), 'clears cache timestamps');
-        ackAssert(fn.includes('_orgMemberCache'), 'clears in-memory org cache');
-        ackAssert(fn.includes('_reviewCommitMap'), 'clears review commit map');
-        ackAssert(fn.includes('_reviewCommitMapRequest'), 'clears an in-flight review comment request');
+        ackAssert(fn.includes('resetInMemoryCaches()'), 'clears in-memory caches');
+        const reset = sourceSection(source, 'function resetInMemoryCaches', 'function factoryReset');
+        ackAssert(reset.includes('_orgMemberCache'), 'clears in-memory org cache');
+        ackAssert(reset.includes('_reviewCommitMap'), 'clears review commit map');
+        ackAssert(reset.includes('_reviewCommitMapRequest'), 'clears an in-flight review comment request');
         ackAssert(fn.includes('GM_deleteValue'), 'actually deletes GM values');
     });
 
