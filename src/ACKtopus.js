@@ -1671,10 +1671,9 @@
         });
     }
 
-    // Click a button found by selector, retrying once if the DOM changed.
+    // Click a button found by selector, retrying a few times if the DOM changed.
     // Logs failures for debugging race conditions with React re-renders.
-    // Safety: verifies the button is a <button> or has role="button" and is
-    // inside the same github.com page (no navigation links).
+    // Safety: refuses to click links that would navigate away from the page.
     async function clickWithRetry(container, selectorOrFinder, label, maxAttempts = 4) {
         const lt = ensureAckLifetime('clickWithRetry');
         const find =
