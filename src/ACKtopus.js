@@ -785,6 +785,11 @@
             .replace(/'/g, '&#39;');
     }
 
+    // Every supported browser ships CSS.escape; keep selector escaping in one helper.
+    function cssEscape(value) {
+        return CSS.escape(String(value));
+    }
+
     function safeHref(href) {
         try {
             const u = new URL(String(href), location.href);
@@ -1755,9 +1760,7 @@
     }
 
     function textareaIdSelector(ta, fallback = 'textarea') {
-        return ta?.id && typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-            ? `textarea#${CSS.escape(ta.id)}`
-            : fallback;
+        return ta?.id ? `textarea#${cssEscape(ta.id)}` : fallback;
     }
 
     function findElementByIdWithin(root, id) {
@@ -1765,10 +1768,8 @@
         const value = String(id);
         if (root?.querySelector) {
             try {
-                if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-                    const local = root.querySelector(`#${CSS.escape(value)}`);
-                    return local || document.getElementById(value);
-                }
+                const local = root.querySelector(`#${cssEscape(value)}`);
+                return local || document.getElementById(value);
             } catch (_) {}
             for (const candidate of root.querySelectorAll?.('[id]') || []) {
                 if (candidate.id === value) return candidate;
@@ -1778,18 +1779,14 @@
     }
 
     function resolveLiveTextareaContext(container, taContainer, taSelector, taFallback) {
-        const escapeCss = (value) =>
-            typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-                ? CSS.escape(String(value))
-                : String(value).replace(/["\\]/g, '\\$&');
         const selector = taSelector || `${COMMENT_TA_SELECTOR}, textarea`;
         const selectors = [];
         const addSelector = (value) => {
             if (value && !selectors.includes(value)) selectors.push(value);
         };
         addSelector(taSelector && taSelector !== 'textarea' ? taSelector : '');
-        addSelector(taFallback?.id ? `textarea#${escapeCss(taFallback.id)}` : '');
-        addSelector(taFallback?.name ? `textarea[name="${escapeCss(taFallback.name)}"]` : '');
+        addSelector(taFallback?.id ? `textarea#${cssEscape(taFallback.id)}` : '');
+        addSelector(taFallback?.name ? `textarea[name="${cssEscape(taFallback.name)}"]` : '');
         addSelector(selector);
         const liveContainer = container && document.body.contains(container) ? container : null;
         const liveTaContainer = taContainer && document.body.contains(taContainer) ? taContainer : null;
@@ -3320,7 +3317,7 @@
         const hash = new URL(url, location.href).hash;
         if (!hash) return null;
         const id = hash.slice(1);
-        let el = document.getElementById(id) || document.querySelector(`[id="${CSS.escape(id)}"]`);
+        let el = document.getElementById(id) || document.querySelector(`[id="${cssEscape(id)}"]`);
         if (!el) return null;
         // Expand any collapsed parent details
         let parent = el.closest('details:not([open])');
@@ -4324,7 +4321,7 @@
         if (userAck.url) {
             const hash = userAck.url.includes('#') ? userAck.url.split('#')[1] : null;
             if (hash) {
-                const el = document.getElementById(hash) || document.querySelector(`[id="${CSS.escape(hash)}"]`);
+                const el = document.getElementById(hash) || document.querySelector(`[id="${cssEscape(hash)}"]`);
                 if (el) {
                     const container = el.closest(COMMENT_CONTAINER_SELECTOR) || el.parentElement;
                     const bodyEl = container?.querySelector(MARKDOWN_BODY_SELECTOR);
@@ -5508,7 +5505,7 @@
                 return;
             }
             const rules = [...collapsedPaths].map((p) => {
-                const escaped = CSS.escape(p);
+                const escaped = cssEscape(p);
                 return `[data-tagsearch-path="${escaped}"] { display: none !important; }`;
             });
             styleEl.textContent = rules.join('\n');
@@ -15645,11 +15642,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const id = decodeURIComponent(hash.slice(1));
         const byId = document.getElementById(id);
         if (byId && item.contains(byId)) return true;
-        if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-            const target = document.querySelector(`[name="${CSS.escape(id)}"]`);
-            if (target && item.contains(target)) return true;
-        }
-        return false;
+        const target = document.querySelector(`[name="${cssEscape(id)}"]`);
+        return !!target && item.contains(target);
     }
 
     function timelineFilterShouldShowItem(item, mode, pinned = timelineFilterPinnedItem(item)) {
@@ -18903,8 +18897,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (menuControlsId) push(document.getElementById(menuControlsId));
         if (popoverTargetId) push(document.getElementById(popoverTargetId));
-        if (triggerId && typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-            const id = CSS.escape(triggerId);
+        if (triggerId) {
+            const id = cssEscape(triggerId);
             pushAll(document.querySelectorAll(`[role="menu"][aria-labelledby="${id}"], [popover][aria-labelledby="${id}"]`));
         }
 
@@ -35213,7 +35207,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('foundSha = linkedFullSha || m[1]'),
             'takes last match while preferring linked full commit SHAs',
         );
-        ackAssert(fn.includes('CSS.escape'), 'safely handles fragment navigation');
+        ackAssert(fn.includes('cssEscape('), 'safely handles fragment navigation');
         ackAssert(
             fn.includes('a[href*="/commit/"], a[href*="/commits/"]'),
             'prefers full linked commit SHAs when present in ACK comment body',
@@ -35808,7 +35802,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('showComparePrMissingStatus'), 'shows a visible missing-PR warning');
         ackAssert(fn.includes('Compare: PR not detected'), 'warning title is explicit');
         ackAssert(fn.includes('Add ?pr=1234 to the URL'), 'warning explains manual recovery');
-        ackAssert(fn.includes('CSS.escape'), 'escapes paths for CSS attribute selectors');
+        ackAssert(fn.includes('cssEscape('), 'escapes paths for CSS attribute selectors');
         ackAssert(fn.includes('display: none !important'), 'hides diff content via CSS');
     });
 
@@ -36354,7 +36348,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('// --- LLM Config'),
         );
         ackAssert(fn.includes('ack-compare-collapse'), 'injects style element with known ID');
-        ackAssert(fn.includes('CSS.escape'), 'escapes paths for CSS selectors');
+        ackAssert(fn.includes('cssEscape('), 'escapes paths for CSS selectors');
         ackAssert(fn.includes('display: none !important'), 'hides unrelated files');
         ackAssert(!fn.includes('toggle.click'), 'does NOT use toggle clicks');
         ackAssert(fn.includes('updateCollapseCSS'), 'has CSS update function');
