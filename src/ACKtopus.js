@@ -11150,17 +11150,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const ctx = await fetchPRContext(pr);
                     if (!ctx?.diff) return result;
                     const max = 200000;
-                    let diffText = ctx.diff;
-                    let truncated = false;
-                    if (diffText.length > max) {
-                        truncated = true;
-                        const headLen = Math.floor(max * 0.7);
-                        const tailLen = max - headLen;
-                        const head = diffText.slice(0, headLen);
-                        const tail = diffText.slice(-tailLen);
-                        diffText =
-                            head + `\n\n...[TRUNCATED ${ctx.diff.length - headLen - tailLen} chars]...\n\n` + tail;
-                    }
+                    const diffText = clampLLMContext(ctx.diff, max);
+                    const truncated = ctx.diff.length > max;
                     result =
                         `\n\n---\n\nPR diff (${ctx.diff.length} chars${truncated ? `, truncated to ~${max}` : ''}):\n` +
                         '```diff\n' +
@@ -23447,15 +23438,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 !ctx.isPRDescription && prCtx?.description
                     ? `PR description:\n${prCtx.description.slice(0, 8000)}`
                     : '';
-            let patchText = patch || '';
-            if (patchText.length > 260000) {
-                const headLen = Math.floor(260000 * 0.7);
-                const tailLen = 260000 - headLen;
-                patchText =
-                    patchText.slice(0, headLen) +
-                    `\n\n...[TRUNCATED ${patch.length - headLen - tailLen} chars]...\n\n` +
-                    patchText.slice(-tailLen);
-            }
+            const patchText = clampLLMContext(patch, 260000);
             const patchBlock = patchText ? `Commit patch (${patch.length} chars):\n${patchText}` : '';
 
             let systemExtra = '';
