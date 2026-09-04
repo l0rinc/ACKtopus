@@ -14616,6 +14616,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     }
 
+    // React UI: the Submit review button carries a ButtonCounter with the
+    // number of pending review comments.
+    function hasPendingSubmitReviewCounter(root = document) {
+        const counterText =
+            findSubmitReviewButton(root)?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
+        const counter = parseInt(counterText, 10);
+        return Number.isFinite(counter) && counter > 0;
+    }
+
     // Detect an existing pending review from DOM and embedded SSR data.
     function detectPendingReview(root = document) {
         // Primary: SSR JSON in the React app - works on both Conversation and
@@ -14632,13 +14641,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         )
             return true;
         if (hasPendingCommentMarkers(root)) return true;
-        // React UI fallback: Submit review button with ButtonCounter
-        const submitReviewBtn = findSubmitReviewButton(root);
-        const counterText =
-            submitReviewBtn?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
-        const counter = parseInt(counterText, 10);
-        if (Number.isFinite(counter) && counter > 0) return true;
-        return false;
+        return hasPendingSubmitReviewCounter(root);
     }
 
     function hasPendingCommentMarkers(root = document) {
@@ -14663,11 +14666,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pending = root === document ? readViewerPendingReviewFromSSR() : null;
         if (Array.isArray(pending?.comments) && pending.comments.length > 0) return true;
         if (hasPendingReviewDomMarkers(root)) return true;
-        const submitReviewBtn = findSubmitReviewButton(root);
-        const counterText =
-            submitReviewBtn?.querySelector('[data-component="ButtonCounter"]')?.textContent?.trim() || '';
-        const counter = parseInt(counterText, 10);
-        return Number.isFinite(counter) && counter > 0;
+        return hasPendingSubmitReviewCounter(root);
     }
 
     function buttonBaseLabel(btn) {
