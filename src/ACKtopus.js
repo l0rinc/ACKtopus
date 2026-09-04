@@ -16021,7 +16021,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const _pgpStored = GM_getValue('pgp_key_store', {});
     for (const [k, v] of Object.entries(_pgpStored)) pgpKeyCache.set(k, Promise.resolve(v));
 
-    const pgpResultCache = new Map(); // commentId -> { status, reason?, keyId?, fingerprint? }
+    const pgpResultCache = new Map(); // cleartextArmored -> { status, reason?, keyId?, fingerprint? }
     const pgpUserResults = new Map(); // username -> { status, reason?, fingerprint? }
 
     function getCommentAuthor(el) {
@@ -16110,12 +16110,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return text.slice(start, end + '-----END PGP SIGNATURE-----'.length);
     }
 
-    function getCommentId(container) {
-        // Try various ID patterns GitHub uses for comments
-        const idEl = container.closest('[id]');
-        return idEl?.id || null;
-    }
-
     async function verifyPGPSignature(cleartextArmored) {
         if (typeof openpgp === 'undefined') return { status: 'error', reason: 'openpgp.js not loaded' };
         try {
@@ -16190,9 +16184,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!cleartext) continue;
 
             // Check cache
-            const commentId = getCommentId(details);
-            if (commentId && pgpResultCache.has(commentId)) {
-                const cached = pgpResultCache.get(commentId);
+            if (pgpResultCache.has(cleartext)) {
+                const cached = pgpResultCache.get(cleartext);
                 applyPGPBadge(summary, cached);
                 continue;
             }
@@ -16213,7 +16206,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const author = getCommentAuthor(details);
             verifyPGPSignature(cleartext).then((result) => {
                 // Don't cache transient errors so a failed key fetch can recover on the next scan.
-                if (commentId && result.status !== 'error') pgpResultCache.set(commentId, result);
+                if (result.status !== 'error') pgpResultCache.set(cleartext, result);
                 applyPGPBadge(summary, result);
                 if (author) {
                     pgpUserResults.set(author, result);
