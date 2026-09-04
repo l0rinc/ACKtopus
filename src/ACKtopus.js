@@ -20128,8 +20128,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             url = `https://api.github.com/repos/${owner}/${repo}/issues/comments/${meta.id}/reactions`;
         }
 
-        const parse = (text) => {
-            const reactions = JSON.parse(text);
+        const groupByContent = (reactions) => {
             const byContent = {};
             for (const r of reactions) {
                 if (!byContent[r.content]) byContent[r.content] = [];
@@ -20139,7 +20138,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         try {
-            const result = parse(await gmFetchText(`${url}?per_page=100`));
+            const result = groupByContent(await gmFetch(`${url}?per_page=100`));
             reactorCache.set(key, result);
             return result;
         } catch {
@@ -31896,15 +31895,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('fetchCommentReactors'), 'API fallback exists');
     });
 
-    ackTest('fetchCommentReactors uses gmFetchText, no CORS-triggering fetch()', async () => {
-        // Behavioral: ensure fetchCommentReactors actually calls gmFetchText and caches results.
-        const orig = gmFetchText;
+    ackTest('fetchCommentReactors uses gmFetch, no CORS-triggering fetch()', async () => {
+        // Behavioral: ensure fetchCommentReactors goes through the shared GitHub JSON reader and caches results.
+        const orig = gmFetch;
         let calls = 0;
         try {
             reactorCache.clear();
-            gmFetchText = async (_url) => {
+            gmFetch = async (_url) => {
                 calls++;
-                return '[]';
+                return [];
             };
             const meta = { type: 'issue', id: '123' };
             const first = await fetchCommentReactors('bitcoin', 'bitcoin', '99', meta);
@@ -31913,38 +31912,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackDeepEq(first, {}, 'empty reactor list returns empty map');
             ackDeepEq(second, {}, 'cached result is returned');
         } finally {
-            gmFetchText = orig;
+            gmFetch = orig;
             reactorCache.clear();
         }
     });
 
     ackTest('fetchCommentReactors scopes PR-body cache entries to their PR', async () => {
-        const orig = gmFetchText;
+        const orig = gmFetch;
         let calls = 0;
         try {
             reactorCache.clear();
-            gmFetchText = async (_url) => {
+            gmFetch = async (_url) => {
                 calls++;
-                return '[]';
+                return [];
             };
             await fetchCommentReactors('bitcoin', 'bitcoin', '99', { type: 'pr_body' });
             await fetchCommentReactors('bitcoin', 'bitcoin', '100', { type: 'pr_body' });
             ackEq(calls, 2, 'different PR bodies do not share reactor results');
         } finally {
-            gmFetchText = orig;
+            gmFetch = orig;
             reactorCache.clear();
         }
     });
 
     ackTest('fetchCommentReactors retries after a transient failure', async () => {
-        const orig = gmFetchText;
+        const orig = gmFetch;
         let calls = 0;
         try {
             reactorCache.clear();
-            gmFetchText = async (_url) => {
+            gmFetch = async (_url) => {
                 calls++;
                 if (calls === 1) throw new Error('temporary failure');
-                return '[]';
+                return [];
             };
             const meta = { type: 'issue', id: '123' };
             ackDeepEq(
@@ -31959,7 +31958,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             );
             ackEq(calls, 2, 'failed reactor requests are not cached');
         } finally {
-            gmFetchText = orig;
+            gmFetch = orig;
             reactorCache.clear();
         }
     });
@@ -31989,13 +31988,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('fetchCommentReactors uses correct API endpoints for each comment type', async () => {
-        const orig = gmFetchText;
+        const orig = gmFetch;
         const seen = [];
         try {
             reactorCache.clear();
-            gmFetchText = async (url) => {
+            gmFetch = async (url) => {
                 seen.push(String(url));
-                return '[]';
+                return [];
             };
 
             reactorCache.clear();
@@ -32012,7 +32011,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'PR body endpoint uses /issues/:pr/reactions',
             );
         } finally {
-            gmFetchText = orig;
+            gmFetch = orig;
             reactorCache.clear();
         }
     });
