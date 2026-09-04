@@ -16691,7 +16691,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     changed = true;
                     pendingMutationReviewUiChanged = true;
                 }
-                if (isAckOwnedMutationRoot(n)) continue;
             }
         }
         return changed;
