@@ -16791,12 +16791,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         if (mutation.attributeName !== 'class') return false;
         if (attrTargetMayNeedFastEditorAffordances(target)) return true;
-        return !!target.matches?.(
-            `${COMMENT_CONTAINER_SELECTOR}, ${EDIT_FORM_SELECTOR}, [data-testid="markdown-editor"], ` +
-                '[class*="MarkdownEditor-module__container"], .js-previewable-comment-form, .js-write-bucket, form, ' +
-                'details[data-resolved], .outdated-comment, .minimized-comment, ' +
-                '.js-resolvable-timeline-thread-container, [data-testid="review-thread"], .review-thread-component',
-        );
+        return !!target.matches?.(ATTR_REFRESH_SELECTOR);
     }
 
     function collectAttrMutationBatch(mutations) {
