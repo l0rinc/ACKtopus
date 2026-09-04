@@ -8114,25 +8114,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     let _prContextKey = '';
     let _prContextGeneration = 0;
 
-    async function fetchPRContext(pr) {
-        if (!pr)
-            return {
-                diff: '',
-                commitMessages: '',
-                description: '',
-                title: '',
-                headSha: '',
-                state: '',
-                mergedAt: '',
-                closedAt: '',
-                draft: false,
-            };
-        // Check cache first (keyed on owner/repo/pr - invalidated on force-push/submit)
-        const baseKey = `${pr.owner}/${pr.repo}/${pr.pr}`;
-        if (_prContextCache && _prContextKey.startsWith(baseKey + ':')) return _prContextCache;
-        const generation = _prContextGeneration;
-        let complete = false;
-        const ctx = {
+    function emptyPRContext() {
+        return {
             diff: '',
             commitMessages: '',
             description: '',
@@ -8143,6 +8126,16 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             closedAt: '',
             draft: false,
         };
+    }
+
+    async function fetchPRContext(pr) {
+        if (!pr) return emptyPRContext();
+        // Check cache first (keyed on owner/repo/pr - invalidated on force-push/submit)
+        const baseKey = `${pr.owner}/${pr.repo}/${pr.pr}`;
+        if (_prContextCache && _prContextKey.startsWith(baseKey + ':')) return _prContextCache;
+        const generation = _prContextGeneration;
+        let complete = false;
+        const ctx = emptyPRContext();
         try {
             const [patchResp, commitsResp, prResp] = await Promise.allSettled([
                 fetchPatch(pr),
