@@ -13134,83 +13134,40 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 paddingTop: '12px',
             });
 
+            const makeDialogButton = (label, style) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = label;
+                Object.assign(btn.style, { padding: '6px 20px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }, style);
+                return btn;
+            };
+            const secondaryStyle = { background: '#21262d', color: '#c9d1d9', border: '1px solid #30363d' };
             if (readOnly) {
-                const closeBtn = document.createElement('button');
-                closeBtn.type = 'button';
+                const closeBtn = makeDialogButton(opts.closeLabel || 'Close', secondaryStyle);
                 closeBtn.className = 'ack-diff-close';
-                closeBtn.textContent = opts.closeLabel || 'Close';
-                Object.assign(closeBtn.style, {
-                    padding: '6px 20px',
-                    background: '#21262d',
-                    color: '#c9d1d9',
-                    border: '1px solid #30363d',
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    fontSize: '12px',
-                });
-                closeBtn.addEventListener('click', () => {
-                    settle('close', corrected);
-                });
+                // Read-only: Close resolves with the corrected text, like clicking outside.
+                closeBtn.addEventListener('click', rejectDialog);
                 btnRow.appendChild(closeBtn);
-                dialog.appendChild(btnRow);
-                overlay.appendChild(dialog);
-                overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
-                overlay.addEventListener('mousedown', (e) => e.stopPropagation());
-                overlay.addEventListener('mouseup', (e) => e.stopPropagation());
-                overlay.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    if (e.target === overlay) {
-                        settle('close', corrected);
-                    }
+            } else {
+                const rejectBtn = makeDialogButton(opts.rejectLabel || 'Reject', secondaryStyle);
+                rejectBtn.addEventListener('click', rejectDialog);
+                const acceptBtn = makeDialogButton(opts.acceptLabel || 'Accept', {
+                    background: '#238636',
+                    color: '#fff',
+                    border: 'none',
                 });
-                mount.appendChild(overlay);
-                focusDialogAtTop();
-                return;
+                acceptBtn.title = opts.acceptTitle || 'Apply changes to the textarea (you can review before submitting)';
+                acceptBtn.addEventListener('click', acceptDialog);
+                btnRow.append(rejectBtn, acceptBtn);
             }
-
-            const rejectBtn = document.createElement('button');
-            rejectBtn.textContent = opts.rejectLabel || 'Reject';
-            Object.assign(rejectBtn.style, {
-                padding: '6px 20px',
-                background: '#21262d',
-                color: '#c9d1d9',
-                border: '1px solid #30363d',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                fontSize: '12px',
-            });
-            rejectBtn.addEventListener('click', () => {
-                rejectDialog();
-            });
-
-            const acceptBtn = document.createElement('button');
-            acceptBtn.textContent = opts.acceptLabel || 'Accept';
-            acceptBtn.title = opts.acceptTitle || 'Apply changes to the textarea (you can review before submitting)';
-            Object.assign(acceptBtn.style, {
-                padding: '6px 20px',
-                background: '#238636',
-                color: '#fff',
-                border: 'none',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                fontSize: '12px',
-            });
-            acceptBtn.addEventListener('click', () => {
-                acceptDialog();
-            });
-
-            btnRow.appendChild(rejectBtn);
-            btnRow.appendChild(acceptBtn);
             dialog.appendChild(btnRow);
             overlay.appendChild(dialog);
-            overlay.addEventListener('pointerdown', (e) => e.stopPropagation());
-            overlay.addEventListener('mousedown', (e) => e.stopPropagation());
-            overlay.addEventListener('mouseup', (e) => e.stopPropagation());
+            for (const eventName of ['pointerdown', 'mousedown', 'mouseup']) {
+                overlay.addEventListener(eventName, stopDialogEvent);
+            }
             overlay.addEventListener('click', (e) => {
                 e.stopPropagation();
-                if (e.target === overlay) {
-                    rejectDialog();
-                }
+                if (e.target === overlay) rejectDialog();
             });
             mount.appendChild(overlay);
             focusDialogAtTop();
@@ -29532,7 +29489,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes("'Accept'"), 'has Accept button');
         const fn = sourceSection(source, 'function showDiffDialog', 'async function runProofreadOnComment');
         ackAssert(fn.includes('const readOnly = !!opts.readOnly'), 'supports read-only mode');
-        ackAssert(fn.includes("settle('close', corrected)"), 'read-only close returns corrected text');
+        ackAssert(
+            fn.includes("settle(readOnly ? 'close' : false, readOnly ? corrected : original)"),
+            'read-only close returns corrected text',
+        );
+        ackAssert(fn.includes("closeBtn.addEventListener('click', rejectDialog)"), 'Close and click-outside share one path');
         ackAssert(
             fn.includes("settle(readOnly ? 'close' : 'edit', buildText())"),
             'Accept resolves with action edit (close in read-only)',
