@@ -1058,6 +1058,7 @@
                 return;
             }
             _ackBackgroundJobs.delete(job.label);
+            job.signal.removeEventListener('abort', job.onAbort);
             const started = ackNow();
             ackBackgroundLog('background work start', {
                 label: job.label,
@@ -1093,6 +1094,7 @@
     }
 
     function scheduleAckBackgroundWork(label, fn, opts = {}) {
+        const lifetime = ensureAckLifetime('background-work');
         const job =
             _ackBackgroundJobs.get(label) ||
             {
@@ -1104,6 +1106,14 @@
                 timeoutMs: ACK_BACKGROUND_IDLE_TIMEOUT_MS,
                 fn,
             };
+        if (!job.onAbort) {
+            job.signal = lifetime.signal;
+            job.onAbort = () => {
+                clearAckBackgroundJobTimer(job);
+                if (_ackBackgroundJobs.get(label) === job) _ackBackgroundJobs.delete(label);
+            };
+            job.signal.addEventListener('abort', job.onAbort, { once: true });
+        }
         job.fn = fn;
         job.delayMs = opts.delayMs ?? job.delayMs ?? ACK_BACKGROUND_MIN_DELAY_MS;
         job.timeoutMs = opts.timeoutMs ?? job.timeoutMs ?? ACK_BACKGROUND_IDLE_TIMEOUT_MS;
@@ -16971,7 +16981,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                   : root?.parentElement || document;
         if (target !== document && target.tagName !== 'TEXTAREA' && !target.querySelector?.('textarea')) return;
         _fastCommitPrefillRoots.add(target);
-        if (_fastCommitPrefillTimer) return;
+        if (_fastCommitPrefillTimer && ensureAckLifetime('commit-prefill').timers.has(_fastCommitPrefillTimer)) return;
         _fastCommitPrefillTimer = ackSetTimeout(() => {
             _fastCommitPrefillTimer = null;
             const roots = [..._fastCommitPrefillRoots];
@@ -21933,7 +21943,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let _outOfViewMenuCloserInstalled = false;
     let _outOfViewMenuCloseTimer = null;
     function scheduleCloseOutOfViewMenus() {
-        if (_ackTesting || _outOfViewMenuCloseTimer) return;
+        if (_ackTesting) return;
+        if (_outOfViewMenuCloseTimer && ensureAckLifetime('menu-closer').timers.has(_outOfViewMenuCloseTimer)) return;
         _outOfViewMenuCloseTimer = ackSetTimeout(() => {
             _outOfViewMenuCloseTimer = null;
             closeOutOfViewMenus();
@@ -25914,7 +25925,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function schedulePendingCommitSearchJump(reason = 'commit-search-jump', attempt = 0) {
-        if (commitSearchJumpTimer) return;
+        if (commitSearchJumpTimer && ensureAckLifetime('commit-search-jump').timers.has(commitSearchJumpTimer)) return;
         commitSearchJumpTimer = ackSetTimeout(() => {
             commitSearchJumpTimer = null;
             runPendingCommitSearchJump(reason, attempt);
@@ -30943,6 +30954,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('!ackDebugLoggingEnabled()'), 'background logs check expanded-mode gate');
         ackAssert(fn.includes('ackLogEvent(message, details)'), 'background details use collapsed logging');
         ackAssert(source.includes("GM_getValue('compactToolbar', false)"), 'debug gate reads compact toolbar mode');
+    });
+
+    ackTest('page cancellation removes queued background work', () => {
+        const label = 'acktest-background-cancellation';
+        try {
+            scheduleAckBackgroundWork(label, () => {}, { delayMs: 1000 });
+            abortAckLifetime('test navigation');
+            ackEq(_ackBackgroundJobs.has(label), false, 'old work cannot be restarted by activity on the new page');
+        } finally {
+            const job = _ackBackgroundJobs.get(label);
+            if (job) clearAckBackgroundJobTimer(job);
+            _ackBackgroundJobs.delete(label);
+        }
     });
 
     ackTest('ackLogEvent collapses details and suppresses routine self-test output', () => {
