@@ -177,7 +177,7 @@ Copies page context to your clipboard for sharing or pasting into an LLM. The dr
 - **Full**: URL, title, description, commits, patch, and visible comments
 - **Reveal all**: walks through hidden conversations, issue timeline items, resolved threads, collapsed sections, and deferred diffs before copying
 
-In normal mode, **Patch**, **Comments**, and **Full** reveal hidden, resolved, or collapsed content before copying. Alternate mode copies only currently open and loaded content, indicated by 👁. The menu’s **Reveal all** and **Reveal mine** actions become **Close all** and **Close mine** in alternate mode.
+In normal mode, **Comments** and **Full** reveal hidden, resolved, or collapsed content before copying. Alternate mode copies only currently open and loaded content, indicated by 👁. **Patch** copies without opening comment threads in either mode. The menu’s **Reveal all** and **Reveal mine** actions become **Close all** and **Close mine** in alternate mode.
 
 On single-commit pages like `/changes/<sha>`, `/commits/<sha>`, and standalone commit URLs like `/commit/<sha>`, the same button copies **commit-only** context instead: the parent PR metadata/description when available, the current commit patch, and visible comments tied to that commit.
 

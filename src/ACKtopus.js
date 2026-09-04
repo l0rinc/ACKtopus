@@ -24781,7 +24781,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         : getAnalysisMode() === ANALYSIS_MODES.commit
                         ? 'Copy only the patch of the currently viewed commit to clipboard'
                         : 'Copy PR description, commits, and full patch to clipboard',
-                revealBeforeCopy: isCompare ? null : 'all',
+                revealBeforeCopy: null,
                 enabled: () => isCompare || !isIssue,
                 run: (btn) => copyPatchContext(btn),
             },
@@ -44342,6 +44342,38 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'compact button shows reverse-direction hint');
         ackAssert(inject.includes('registerAlternateRenderer(commentNavBtn'), 'button updates when modifier state changes');
+    });
+
+    ackTest('patch copying does not reveal comment threads', async () => {
+        const originalRevealState = getRevealAllState;
+        const originalReveal = revealAllContext;
+        const originalCopy = copyPatchContext;
+        const originalKind = pageKind;
+        const originalMode = ackAlternateMode;
+        let group;
+        let revealed = 0;
+        let copied = 0;
+        try {
+            pageKind = () => 'pull';
+            setAckAlternateMode(false);
+            getRevealAllState = () => ({ total: 1 });
+            revealAllContext = async () => { revealed++; };
+            copyPatchContext = async () => { copied++; };
+            group = buildContextCopyGroup();
+            document.body.appendChild(group);
+            group.firstElementChild.click();
+            await Promise.resolve();
+            await Promise.resolve();
+            ackEq(copied, 1, 'copies the requested patch');
+            ackEq(revealed, 0, 'does not open unrelated hidden threads');
+        } finally {
+            group?.remove();
+            getRevealAllState = originalRevealState;
+            revealAllContext = originalReveal;
+            copyPatchContext = originalCopy;
+            pageKind = originalKind;
+            setAckAlternateMode(originalMode);
+        }
     });
 
     ackTest('toolbar visibly marks alternate mode', () => {
