@@ -16069,23 +16069,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 summary.dataset.ackPgpChecked = 'true';
                 // Extract trusted comment line for display
                 const trustedMatch = textContent.match(/trusted comment:\s*(.+)/);
-                const trustedComment = trustedMatch ? trustedMatch[1].trim() : '';
-                const badge = document.createElement('span');
-                badge.className = 'ack-pgp-badge';
-                Object.assign(badge.style, {
-                    marginLeft: '6px',
-                    fontSize: '12px',
-                    verticalAlign: 'middle',
-                    cursor: 'help',
-                });
-                badge.textContent = '🔑';
-                badge.title = `Minisign signature detected${trustedComment ? '\n' + trustedComment : ''}\n(Verification requires the signer's public key)`;
-                summary.appendChild(badge);
+                const result = { status: 'minisign', reason: trustedMatch ? trustedMatch[1].trim() : '' };
+                applyPGPBadge(summary, result);
 
                 // Register as recognized for ACK panel overlay
                 const author = getCommentAuthor(details);
                 if (author) {
-                    pgpUserResults.set(author, { status: 'minisign', reason: trustedComment });
+                    pgpUserResults.set(author, result);
                     updateAckPanelPGPOverlays();
                 }
                 continue;
@@ -16109,16 +16099,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             // Show pending indicator
-            const badge = document.createElement('span');
-            badge.className = 'ack-pgp-badge';
-            Object.assign(badge.style, {
-                marginLeft: '6px',
-                fontSize: '12px',
-                verticalAlign: 'middle',
-            });
+            const badge = ensurePGPBadge(summary);
             badge.textContent = '⏳';
             badge.title = 'Verifying PGP signature...';
-            summary.appendChild(badge);
 
             // Verify async
             const author = getCommentAuthor(details);
@@ -16134,7 +16117,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function applyPGPBadge(summary, result) {
+    // The signature <summary> carries one badge span; reuse it across status updates.
+    function ensurePGPBadge(summary) {
         let badge = summary.querySelector('.ack-pgp-badge');
         if (!badge) {
             badge = document.createElement('span');
@@ -16146,25 +16130,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             summary.appendChild(badge);
         }
+        return badge;
+    }
+
+    function applyPGPBadge(summary, result) {
+        const badge = ensurePGPBadge(summary);
+        badge.style.cursor = 'help';
         if (result.status === 'valid') {
             badge.textContent = '✅';
             const fp = result.fingerprint || '';
             const fpFmt = fp.replace(/(.{4})/g, '$1 ').trim();
             badge.title = `Valid PGP signature\nKey: ${fpFmt}`;
-            badge.style.cursor = 'help';
         } else if (result.status === 'minisign') {
             badge.textContent = '🔑';
-            badge.title = `Minisign signature${result.reason ? '\n' + result.reason : ''}`;
-            badge.style.cursor = 'help';
+            badge.title = `Minisign signature detected${result.reason ? '\n' + result.reason : ''}\n(Verification requires the signer's public key)`;
         } else if (result.status === 'invalid') {
             badge.textContent = '❌';
             badge.title = `Invalid PGP signature: ${result.reason}`;
-            badge.style.cursor = 'help';
             Object.assign(badge.style, { fontSize: '14px', animation: 'none' });
         } else {
             badge.textContent = '⚠️';
             badge.title = `PGP verification failed: ${result.reason}`;
-            badge.style.cursor = 'help';
         }
     }
 
@@ -34608,8 +34594,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("fontSize: '14px'"), 'invalid uses larger font');
         // Error: warning
         ackAssert(fn.includes("badge.textContent = '\u26A0"), 'error shows warning emoji');
-        // All have cursor: help for tooltip
-        ackAssert((fn.match(/\.cursor = 'help'/g) || []).length >= 3, 'all states use help cursor for tooltip');
+        // All states share the help cursor for the tooltip
+        ackAssert(fn.indexOf(".cursor = 'help'") < fn.indexOf("result.status === 'valid'"), 'help cursor is set before any status branch');
     });
 
     ackTest('PGP verification runs lazily in processVisibleComment', () => {
@@ -40091,7 +40077,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function applyPGPBadge'),
         );
         ackAssert(fn.includes('untrusted comment: signature from minisign'), 'detects minisign signatures');
-        ackAssert(fn.includes("'🔑'"), 'shows key badge for minisign');
+        ackAssert(fn.includes('applyPGPBadge(summary, result)'), 'shows the key badge through applyPGPBadge');
         ackAssert(fn.includes('trusted comment:'), 'extracts trusted comment');
         ackAssert(fn.includes("status: 'minisign'"), 'sets minisign status');
     });
