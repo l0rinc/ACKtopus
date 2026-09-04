@@ -20249,6 +20249,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const FOLD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5.25 4.75 8 2l2.75 2.75"/><path d="M5.25 11.25 8 14l2.75-2.75"/><path d="M2 8h12"/></svg>`;
     const PROOFREAD_ICON = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M5 2.25h4.25L12 5v7.25a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z"/><path d="M9.25 2.25V5H12"/><path d="m5.9 9 1.25 1.25L10.1 7.3"/></svg>`;
     const _toolbarControlPressBound = new WeakSet();
+    const INLINE_TOOLBAR_BUTTON_STYLE = Object.freeze({
+        background: 'none',
+        border: 'none',
+        cursor: 'pointer',
+        padding: '2px 5px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: '14px',
+        opacity: '0.6',
+        lineHeight: '1',
+        color: 'inherit',
+    });
+
+    // Bare toolbar control with the shared hover fade; callers add layout styles.
+    function createToolbarButton(className, html, title) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = className;
+        btn.innerHTML = html;
+        btn.title = title;
+        btn.addEventListener('mouseenter', () => {
+            btn.style.opacity = '1';
+        });
+        btn.addEventListener('mouseleave', () => {
+            btn.style.opacity = '0.6';
+        });
+        return btn;
+    }
 
     function getToolbarEditorRoot(toolbar) {
         if (toolbar?.classList?.contains('ack-toolbar-actions')) {
@@ -21257,39 +21286,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (isActionBarToolbar) toolbar.classList.add('ack-compact-md-toolbar');
 
             const makeToolbarBtn = (className, html, title, handler) => {
-                const btn = document.createElement('button');
-                btn.className = className;
-                btn.innerHTML = html;
-                btn.title = title;
-                btn.type = 'button';
+                const btn = createToolbarButton(className, html, title);
                 if (isActionBarToolbar) {
                     btn.className = `Button Button--iconOnly Button--invisible Button--medium ${className}`;
-                    const icon = btn.querySelector('svg');
-                    if (icon) icon.classList.add('Button-visual');
-                    Object.assign(btn.style, {
-                        padding: '0 1px',
-                    });
+                    btn.querySelector('svg')?.classList.add('Button-visual');
+                    btn.style.padding = '0 1px';
                 } else {
-                    Object.assign(btn.style, {
-                        background: 'none',
-                        border: 'none',
-                        cursor: 'pointer',
-                        padding: '2px 5px',
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontSize: '14px',
-                        opacity: '0.6',
-                        lineHeight: '1',
-                        color: 'inherit',
-                    });
+                    Object.assign(btn.style, INLINE_TOOLBAR_BUTTON_STYLE);
                 }
-                btn.addEventListener('mouseenter', () => {
-                    btn.style.opacity = '1';
-                });
-                btn.addEventListener('mouseleave', () => {
-                    btn.style.opacity = '0.6';
-                });
                 bindToolbarControlPress(btn, handler);
                 return btn;
             };
@@ -21403,30 +21407,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     bindToolbarControlPress(btn, handler);
                     return btn;
                 }
-                btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = className;
-                btn.innerHTML = html;
-                btn.title = title;
-                Object.assign(btn.style, {
-                    background: 'none',
-                    border: 'none',
-                    cursor: 'pointer',
-                    padding: '2px 5px',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '14px',
-                    opacity: '0.6',
-                    lineHeight: '1',
-                    color: 'inherit',
-                });
-                btn.addEventListener('mouseenter', () => {
-                    btn.style.opacity = '1';
-                });
-                btn.addEventListener('mouseleave', () => {
-                    btn.style.opacity = '0.6';
-                });
+                btn = createToolbarButton(className, html, title);
+                Object.assign(btn.style, INLINE_TOOLBAR_BUTTON_STYLE);
                 bindToolbarControlPress(btn, handler);
                 row.appendChild(btn);
                 return btn;
