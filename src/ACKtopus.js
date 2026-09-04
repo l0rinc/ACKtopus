@@ -33384,6 +33384,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         flex.className = 'd-flex flex-row-reverse';
         const actions = document.createElement('div');
         actions.className = 'timeline-comment-actions';
+        actions.textContent = '…';
         const badges = document.createElement('div');
         badges.className = 'd-none d-sm-flex';
         flex.appendChild(actions);
@@ -39859,7 +39860,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         host.innerHTML = `
             <div class="js-line-comments">
                 <a href="/bitcoin/bitcoin/pull/34124/files/8bd49123#diff-deadbeefR760" class="text-mono Link--primary">src/txmempool.cpp</a>
-                <table class="diff-table">
+                <table class="diff-table" style="white-space: pre">
                     <tbody>
                         <tr>
                             <td data-line-number="760">760</td>
@@ -43551,7 +43552,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const end = source.indexOf('updateMainLabel();', start);
         const fn = source.slice(start, end);
         ackAssert(fn.includes('`${f.emoji}${alternateSuffix(f)}`'), 'compact shows only the emoji');
-        ackAssert(fn.includes('${f.label}${alternateSuffix(f)}${COPY_ICON}'), 'non-compact shows label + icon');
+        ackAssert(fn.includes('${formatLabel(f)}${alternateSuffix(f)}${COPY_ICON}'), 'non-compact shows current label + icon');
     });
 
     ackTest('buildDiffSymbolIndex scans diff files for definitions', () => {
