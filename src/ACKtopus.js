@@ -10155,15 +10155,17 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     // Gathers everything about a PR into a single markdown document.
     // onProgress(msg) is called with status updates for the UI.
     // opts.includePatch: include full .patch content (default true)
-    // opts.includeComments: include visible comments (default true)
+    // opts.includeComments: include comments (default true)
     // opts.includeCommits: include commit list/messages (default true)
     // opts.includeCommentCodeContext: include nearby copied code context in comments (default true)
+    // opts.visibleOnly: use loaded issue comments instead of fetching all issue comments (default false)
     async function gatherFullPRContext(onProgress = () => {}, opts = {}) {
         const {
             includePatch = true,
             includeComments = true,
             includeCommits = true,
             includeCommentCodeContext = true,
+            visibleOnly = false,
         } = opts;
         const pr = parsePageContext();
         if (!pr) return '';
@@ -10236,7 +10238,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         // 6. Visible comments
         if (includeComments) {
             onProgress('Gathering comments...');
-            const comments = isIssue ? await fetchIssueCommentsForContext(pr) : gatherVisibleComments();
+            const comments = isIssue && !visibleOnly ? await fetchIssueCommentsForContext(pr) : gatherVisibleComments();
             if (comments.length > 0) {
                 if (isIssue) {
                     const commentParts = comments.map((c) => {
@@ -10411,8 +10413,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return gatherFullPRContext(onProgress, { includePatch: true, includeComments: false });
     }
 
-    async function gatherCommentsContext(onProgress = () => {}) {
-        return gatherFullPRContext(onProgress, { includePatch: false, includeComments: true, includeCommits: false });
+    async function gatherCommentsContext(onProgress = () => {}, { visibleOnly = false } = {}) {
+        return gatherFullPRContext(onProgress, { includePatch: false, includeComments: true, includeCommits: false, visibleOnly });
     }
 
     async function gatherSingleCommitCommentsContext(onProgress = () => {}) {
@@ -24357,8 +24359,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function copyPRContext(btn) {
         const mode = getAnalysisMode();
         const isCommitPage = mode === ANALYSIS_MODES.commit;
+        const visibleOnly = usesAlternateToolbarMode();
         return copyContextWith(btn, {
-            gather: isCommitPage ? gatherSingleCommitContext : gatherFullPRContext,
+            gather: isCommitPage ? gatherSingleCommitContext : (progress) => gatherFullPRContext(progress, { visibleOnly }),
             initialStatus: isCommitPage
                 ? 'Gathering commit context...'
                 : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} context...`,
@@ -24384,8 +24387,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function copyCommentsContext(btn) {
         const mode = getAnalysisMode();
         const isCommitPage = mode === ANALYSIS_MODES.commit;
+        const visibleOnly = usesAlternateToolbarMode();
         return copyContextWith(btn, {
-            gather: isCommitPage ? gatherSingleCommitCommentsContext : gatherCommentsContext,
+            gather: isCommitPage ? gatherSingleCommitCommentsContext : (progress) => gatherCommentsContext(progress, { visibleOnly }),
             initialStatus: isCommitPage
                 ? 'Gathering commit comments context...'
                 : `Gathering ${pageKind() === 'issue' ? 'issue' : 'PR'} comments context...`,
@@ -44510,6 +44514,44 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(inject.includes('ALTERNATE_REVERSE_HINT'), 'compact button shows reverse-direction hint');
         ackAssert(inject.includes('registerAlternateRenderer(commentNavBtn'), 'button updates when modifier state changes');
+    });
+
+    ackTest('alternate issue context copies only loaded comments', async () => {
+        const originalKind = pageKind;
+        const originalPage = parsePageContext;
+        const originalMode = getAnalysisMode;
+        const originalFetch = gmFetch;
+        const originalComments = fetchIssueCommentsForContext;
+        const originalVisible = gatherVisibleComments;
+        const originalCopy = copyContextWith;
+        const originalAlternate = ackAlternateMode;
+        try {
+            pageKind = () => 'issue';
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            getAnalysisMode = () => ANALYSIS_MODES.pr;
+            gmFetch = async () => ({ title: 'Issue' });
+            const visible = { author: 'octo', markdown: 'Loaded comment' };
+            fetchIssueCommentsForContext = async () => [visible, { author: 'octo', markdown: 'Unloaded comment' }];
+            gatherVisibleComments = () => [visible];
+            copyContextWith = async (_button, { gather }) => gather();
+            for (const copy of [copyPRContext, copyCommentsContext]) {
+                setAckAlternateMode(false);
+                ackAssert((await copy(null)).includes('Unloaded comment'), 'normal mode includes all issue comments');
+                setAckAlternateMode(true);
+                const result = await copy(null);
+                ackAssert(result.includes('Loaded comment'), 'alternate mode includes loaded comments');
+                ackAssert(!result.includes('Unloaded comment'), 'alternate mode excludes unloaded comments');
+            }
+        } finally {
+            pageKind = originalKind;
+            parsePageContext = originalPage;
+            getAnalysisMode = originalMode;
+            gmFetch = originalFetch;
+            fetchIssueCommentsForContext = originalComments;
+            gatherVisibleComments = originalVisible;
+            copyContextWith = originalCopy;
+            setAckAlternateMode(originalAlternate);
+        }
     });
 
     ackTest('patch copying does not reveal comment threads', async () => {
