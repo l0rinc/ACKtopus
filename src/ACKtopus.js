@@ -858,6 +858,14 @@
         throw lastErr || new Error(`${label} failed`);
     }
 
+    // Reject when `promise` has not settled within `ms`; the underlying work keeps running.
+    function withTimeout(promise, ms) {
+        return Promise.race([
+            promise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+        ]);
+    }
+
     // Scoped querySelectorAll: returns matching descendants + root itself if it matches.
     function qsa(root, selector) {
         const results = [...root.querySelectorAll(selector)];
@@ -5277,12 +5285,7 @@
         };
 
         // Helper: gmFetch with timeout (old force-push SHAs can hang)
-        function gmFetchTimeout(url, ms = 10000) {
-            return Promise.race([
-                gmFetch(url),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
-            ]);
-        }
+        const gmFetchTimeout = (url, ms = 10000) => withTimeout(gmFetch(url), ms);
 
         // Find the PR this commit belongs to.
         // Strategy 1: explicit ?pr=1234 URL parameter.
@@ -5312,10 +5315,7 @@
             for (const sha of [headSha, baseSha]) {
                 if (prNum) break;
                 try {
-                    const prs = await Promise.race([
-                        fetchCommitPullRequests(owner, repo, sha),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
-                    ]);
+                    const prs = await withTimeout(fetchCommitPullRequests(owner, repo, sha), 10000);
                     if (prs.length > 0) {
                         prNum = prs[0].number;
                         compareDiagnostics.prSource = `commits/pulls ${sha.slice(0, 8)}`;
@@ -5614,16 +5614,7 @@
         };
         const stopWatching = (reason) => {
             if (!_compareObserver) return;
-            _compareObserver.disconnect();
-            _compareObserver = null;
-            if (_compareWatchdogTimer) {
-                clearInterval(_compareWatchdogTimer);
-                _compareWatchdogTimer = null;
-            }
-            if (_compareDebounceTimer) {
-                clearTimeout(_compareDebounceTimer);
-                _compareDebounceTimer = null;
-            }
+            clearCompareWatcher();
             const elapsedS = Math.round((Date.now() - startedAt) / 1000);
             logCompareOutcome('watch stopped', {
                 reason,
