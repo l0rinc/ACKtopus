@@ -26639,6 +26639,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             teardownDiffSelectionUI();
             document.querySelector('.ack-config-overlay')?.remove();
             document.querySelector('.ack-submit-review-wrap')?.remove();
+            lastForcePush = null;
             lastForcePushRange = null;
             lastForcePushSignature = '';
             clearCommitPatchCache();
