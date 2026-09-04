@@ -19175,7 +19175,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (root.id) ids.add(root.id);
         }
 
-        let match = '';
         const findId = (re) => {
             for (const id of ids) {
                 const m = id.match(re);
@@ -19194,92 +19193,49 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             container?.querySelector?.('[data-testid="issue-body-header-link"][href*="#issue-"], a[id$="-permalink"][href*="#issue-"]')
         );
 
+        // Main issue/PR-body editing now often comes from React UI. Synthesizing
+        // `/issues/.../edit_form` URLs when GitHub has not rendered a native
+        // fragment just produces noisy 403s, so only reuse an existing fragment.
+        const issueBodyRequest = (issueId) => {
+            const frag =
+                findLocalFragment(`/issues/${ctx.pr}/edit_form`, `textarea_id=issue-${issueId}-body`) ||
+                document.querySelector(
+                    `include-fragment[src*="/issues/${ctx.pr}/edit_form"][src*="textarea_id=issue-${issueId}-body"]`,
+                );
+            const url = fragmentHref(frag);
+            return { frag: url ? frag : null, url, roots };
+        };
+
         if (isIssueBodyScope) {
-            match = findId(/issue-(\d+)/);
-            if (match) {
-                const frag =
-                    findLocalFragment(`/issues/${ctx.pr}/edit_form`, `textarea_id=issue-${match}-body`) ||
-                    document.querySelector(
-                        `include-fragment[src*="/issues/${ctx.pr}/edit_form"][src*="textarea_id=issue-${match}-body"]`,
-                    );
-                // Main issue/PR-body editing now often comes from React UI. Synthesizing
-                // `/issues/.../edit_form` URLs when GitHub has not rendered a native
-                // fragment just produces noisy 403s, so only reuse an existing fragment.
-                const url = fragmentHref(frag);
-                return { frag: url ? frag : null, url, roots };
-            }
-            return { frag: null, url: '', roots };
+            const issueId = findId(/issue-(\d+)/);
+            return issueId ? issueBodyRequest(issueId) : { frag: null, url: '', roots };
         }
 
-        match = findId(/discussion_r(\d+)/);
-        if (!match) match = findId(/^r(\d+)$/);
-        if (match) {
-            const frag =
-                findLocalFragment(`/review_comment/${match}/edit_form`) ||
-                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = fragmentHref(frag)
-                ? fragmentHref(frag)
-                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=discussion_r${match}-body&comment_context=discussion`;
+        // Comment kinds with a native edit_form endpoint, in lookup priority order.
+        // `kind` is also the textarea id prefix GitHub uses for that comment type.
+        const prBase = `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}`;
+        const repoBase = `${location.origin}/${ctx.owner}/${ctx.repo}`;
+        const reviewCommentPath = (id) => `/review_comment/${id}/edit_form`;
+        const editTargets = [
+            { kind: 'discussion_r', patterns: [/discussion_r(\d+)/, /^r(\d+)$/], path: reviewCommentPath, base: prBase, context: 'discussion' },
+            { kind: 'pullrequest-', patterns: [/pullrequest-(\d+)/], path: reviewCommentPath, base: prBase, context: 'discussion' },
+            { kind: 'pullrequestreviewcomment-', patterns: [/pullrequestreviewcomment-(\d+)/], path: reviewCommentPath, base: prBase, context: 'discussion' },
+            { kind: 'issuecomment-', patterns: [/issuecomment-(\d+)/], path: (id) => `/issue_comments/${id}/edit_form`, base: repoBase, context: '' },
+            { kind: 'pullrequestreview-', patterns: [/pullrequestreview-(\d+)/], path: (id) => `/reviews/${id}/update/edit_form`, base: prBase, context: 'discussion' },
+        ];
+        for (const target of editTargets) {
+            const id = target.patterns.map(findId).find(Boolean) || '';
+            if (!id) continue;
+            const path = target.path(id);
+            const frag = findLocalFragment(path) || document.querySelector(`include-fragment[src*="${path}"]`);
+            const url =
+                fragmentHref(frag) ||
+                `${target.base}${path}?textarea_id=${target.kind}${id}-body&comment_context=${target.context}`;
             return { frag, url, roots };
         }
 
-        match = findId(/pullrequest-(\d+)/);
-        if (match) {
-            const frag =
-                findLocalFragment(`/review_comment/${match}/edit_form`) ||
-                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = fragmentHref(frag)
-                ? fragmentHref(frag)
-                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequest-${match}-body&comment_context=discussion`;
-            return { frag, url, roots };
-        }
-
-        match = findId(/pullrequestreviewcomment-(\d+)/);
-        if (match) {
-            const frag =
-                findLocalFragment(`/review_comment/${match}/edit_form`) ||
-                document.querySelector(`include-fragment[src*="/review_comment/${match}/edit_form"]`);
-            const url = fragmentHref(frag)
-                ? fragmentHref(frag)
-                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/review_comment/${match}/edit_form?textarea_id=pullrequestreviewcomment-${match}-body&comment_context=discussion`;
-            return { frag, url, roots };
-        }
-
-        match = findId(/issuecomment-(\d+)/);
-        if (match) {
-            const frag =
-                findLocalFragment(`/issue_comments/${match}/edit_form`) ||
-                document.querySelector(`include-fragment[src*="/issue_comments/${match}/edit_form"]`);
-            const url = fragmentHref(frag)
-                ? fragmentHref(frag)
-                : `${location.origin}/${ctx.owner}/${ctx.repo}/issue_comments/${match}/edit_form?textarea_id=issuecomment-${match}-body&comment_context=`;
-            return { frag, url, roots };
-        }
-
-        match = findId(/pullrequestreview-(\d+)/);
-        if (match) {
-            const frag =
-                findLocalFragment(`/reviews/${match}/update/edit_form`) ||
-                document.querySelector(`include-fragment[src*="/reviews/${match}/update/edit_form"]`);
-            const url = fragmentHref(frag)
-                ? fragmentHref(frag)
-                : `${location.origin}/${ctx.owner}/${ctx.repo}/pull/${ctx.pr}/reviews/${match}/update/edit_form?textarea_id=pullrequestreview-${match}-body&comment_context=discussion`;
-            return { frag, url, roots };
-        }
-
-        match = findId(/issue-(\d+)/);
-        if (match) {
-            const frag = document.querySelector(
-                `include-fragment[src*="/issues/${ctx.pr}/edit_form"][src*="textarea_id=issue-${match}-body"]`,
-            );
-            // Main issue/PR-body editing now often comes from React UI. Synthesizing
-            // `/issues/.../edit_form` URLs when GitHub has not rendered a native
-            // fragment just produces noisy 403s, so only reuse an existing fragment.
-            const src = frag?.getAttribute?.('src') || '';
-            const url = src ? new URL(src, location.origin).href : '';
-            return { frag: src ? frag : null, url, roots };
-        }
-
+        const issueId = findId(/issue-(\d+)/);
+        if (issueId) return issueBodyRequest(issueId);
         return existingFragmentRequest();
     }
 
