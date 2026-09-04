@@ -3266,7 +3266,8 @@
                         }
                         if ((r.status === 401 || r.status === 403) && attempt === 0 && tryHeaders[attempt].Authorization) {
                             rememberGithubBadPat(r);
-                            run(++attempt);
+                            attempt++;
+                            run();
                             return;
                         }
                         reject(githubHttpError(r, url));
