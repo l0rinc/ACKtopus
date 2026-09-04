@@ -26721,7 +26721,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function suppressUnsavedCommentWarningOnce(ms = 5000) {
         _ackSuppressUnsavedCommentWarning = true;
-        ackSetTimeout(() => {
+        setTimeout(() => {
             _ackSuppressUnsavedCommentWarning = false;
         }, ms);
     }
@@ -39034,6 +39034,18 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('200 * attempt'), 'uses increasing delay');
         ackAssert(fn.includes('attempts: maxAttempts'), 'logs the exhausted attempt budget');
         ackAssert(fn.includes('ackSleep('), 'uses ackSleep for abortable waits');
+    });
+
+    ackTest('unsaved-comment warnings resume after navigation cancels page timers', async () => {
+        const previous = _ackSuppressUnsavedCommentWarning;
+        try {
+            suppressUnsavedCommentWarningOnce(5);
+            abortAckLifetime('test navigation');
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            ackEq(_ackSuppressUnsavedCommentWarning, false, 'suppression still expires after navigation');
+        } finally {
+            _ackSuppressUnsavedCommentWarning = previous;
+        }
     });
 
     ackTest('async waits are lifetime-aware (no raw await setTimeout Promises)', () => {
