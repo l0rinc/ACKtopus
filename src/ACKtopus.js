@@ -5090,6 +5090,11 @@
     function installLocalRepoCompareTargets(link, upstreamHref, forkHref) {
         link.dataset.localRepoPrUpstreamHref = upstreamHref;
         link.dataset.localRepoPrForkHref = forkHref;
+        if (link._ackCompareRendererBound) {
+            renderLocalRepoCompareTargets(link, upstreamHref, forkHref);
+            return;
+        }
+        link._ackCompareRendererBound = true;
         registerAlternateRenderer(link, () => renderLocalRepoCompareTargets(link, upstreamHref, forkHref));
     }
 
@@ -5105,7 +5110,7 @@
             if (link.dataset.localRepoPrRewritten === '1') {
                 const upstreamHref = link.dataset.localRepoPrUpstreamHref;
                 const forkHref = link.dataset.localRepoPrForkHref;
-                if (upstreamHref && forkHref) renderLocalRepoCompareTargets(link, upstreamHref, forkHref);
+                if (upstreamHref && forkHref) installLocalRepoCompareTargets(link, upstreamHref, forkHref);
                 continue;
             }
             if (!isComparePullRequestButton(link)) continue;
@@ -35603,7 +35608,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('local repo compare rewrite preserves the button and follows alternate toolbar mode', () => {
-        const host = document.createElement('div');
+        let host = document.createElement('div');
         host.innerHTML =
             '<a href="/octo/demo/compare/detached537?expand=1" class="btn btn-primary" title="Open comparison">Compare & pull request</a>' +
             '<a href="/octo/demo/compare/other?expand=1">Plain compare link</a>';
@@ -35649,6 +35654,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 1,
                 'restores one upstream link after a banner rerender',
             );
+            const snapshot = host.cloneNode(true);
+            host.replaceWith(snapshot);
+            host = snapshot;
+            rewriteLocalRepoCompareLinks(host, {
+                currentRepo: { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' },
+                baseBranch: 'main',
+            });
+            setAckAlternateMode(true);
+            ackEq(host.querySelector('a').getAttribute('href'), '/octo/demo/compare/detached537?expand=1',
+                'restored page snapshots still follow Shift mode');
         } finally {
             setAckAlternateMode(false);
             host.remove();
