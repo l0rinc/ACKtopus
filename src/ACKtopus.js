@@ -10272,12 +10272,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         for (const rawThread of threads.values()) {
             const thread = sortCommentsChronologically(rawThread);
             const first = thread[0];
-            let loc = '';
-            if (first.file) {
-                loc = ` - ${first.file}`;
-                if (first.line) loc += ':' + first.line;
-                if (first.commitSha) loc += '@' + first.commitSha;
-            }
+            const location = formatCommentLocation(first.file, first.line, first.commitSha);
+            const loc = location ? ` - ${location}` : '';
             const threadMeta = [];
             const threadIds = [...new Set(thread.map((c) => c.threadId).filter(Boolean))];
             if (threadIds.length === 1) threadMeta.push(`* Thread: ${threadIds[0]}`);
@@ -20878,9 +20874,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function formatSuggestedReplyEntries(entries, selectedId = '') {
         return entries
             .map((entry, index) => {
-                const location = entry.file
-                    ? `${entry.file}${entry.line ? `:${entry.line}` : ''}${entry.commitSha ? `@${entry.commitSha}` : ''}`
-                    : '';
+                const location = formatCommentLocation(entry.file, entry.line, entry.commitSha);
                 const meta = [entry.source, entry.date, location, entry.permalink].filter(Boolean).join(' | ');
                 const selected = selectedId && entry.id === selectedId ? ' [SELECTED]' : '';
                 return `### ${index + 1}. ${entry.author}${selected}${meta ? ` (${meta})` : ''}\n${entry.body}`;
@@ -22503,11 +22497,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const inlineText = inlineComments
                 .map((c) => {
-                    const loc = [
-                        c.path || '',
-                        c.line ? `:${c.line}` : '',
-                        c.commit_id ? `@${String(c.commit_id).slice(0, 8)}` : '',
-                    ].join('');
+                    const loc = formatCommentLocation(c.path, c.line, c.commit_id ? String(c.commit_id).slice(0, 8) : '');
                     return `**${c.user?.login || '?'}** (${safeDate(c.created_at)})${loc ? ` [${loc}]` : ''}:\n${safeBody(c.body)}`;
                 })
                 .join('\n\n---\n\n');
@@ -39425,9 +39415,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function gatherFullPRContext'),
             source.indexOf('function scrollToAndHighlight'),
         );
-        ackAssert(fn.includes("loc += ':' + first.line"), 'formats thread location as file:line');
+        ackAssert(
+            fn.includes('formatCommentLocation(first.file, first.line, first.commitSha)'),
+            'formats thread location as file:line@sha',
+        );
         ackAssert(fn.includes('c.commitSha'), 'references commitSha in formatting');
-        ackAssert(fn.includes("'@' + first.commitSha"), 'formats as file:line@sha');
     });
 
     ackTest('gatherFullPRContext groups comments by thread', () => {
