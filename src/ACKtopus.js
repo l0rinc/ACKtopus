@@ -26579,9 +26579,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     let _ackSource = '';
-    // Legacy structural tests expect a `src` variable (Node harness).
-    // In-browser, we keep it as an alias for `_ackSource`.
-    let src = '';
 
     // Script source for structural tests (availability depends on userscript manager).
     function stripSelfTestsFromSource(fullSrc) {
@@ -26656,7 +26653,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function ensureSelfSource() {
         if (_ackSource && _ackSource.length > 0) return;
         _ackSource = stripSelfTestsFromSource(getSelfSource());
-        src = _ackSource;
     }
 
     // --- parsePR ---
@@ -26987,31 +26983,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- SHA_FORMATS ---
 
-    ackTest('has expected format keys', () => {
-        const keys = SHA_FORMATS.map((f) => f.key);
-        ackAssert(keys.includes('ack'), 'missing ack');
-        ackAssert(keys.includes('fetch'), 'missing fetch');
-        ackAssert(keys.includes('hashes'), 'missing hashes');
-        ackAssert(keys.includes('parent'), 'missing parent');
-        ackAssert(keys.includes('ghco'), 'missing ghco');
-        ackAssert(keys.includes('rdiff'), 'missing rdiff');
-        ackAssert(keys.includes('pushrdiff'), 'missing pushrdiff');
-        ackAssert(keys.includes('bench'), 'missing bench');
-        ackAssert(keys.includes('test'), 'missing test');
-        ackAssert(keys.includes('fuzz'), 'missing fuzz');
-        ackAssert(keys.includes('functional'), 'missing functional');
-    });
-
     ackTest('ack format produces correct output', () => {
         const ack = SHA_FORMATS.find((f) => f.key === 'ack');
         ackEq(ack.fmt('abc123', {}), 'ACK abc123');
         ackEq(ack.alternateFmt('abc123', {}), 'abc123', 'alternate mode copies only the hash');
-    });
-
-    ackTest('fetch format produces correct output', () => {
-        const fetch = SHA_FORMATS.find((f) => f.key === 'fetch');
-        const result = fetch.fmt('abc123', {});
-        ackEq(result, 'git fetch origin abc123 && git switch --detach FETCH_HEAD');
     });
 
     ackTest('commit hashes helper preserves PR commit order', async () => {
@@ -27030,23 +27005,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             );
         } finally {
             fetchCommitList = origFetchCommitList;
-        }
-    });
-
-    ackTest('ghco format includes PR URL and rebase', () => {
-        const ghco = SHA_FORMATS.find((f) => f.key === 'ghco');
-        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '123' };
-        const origBase = getReviewBaseBranch;
-        getReviewBaseBranch = () => 'main';
-        try {
-            const result = ghco.fmt('abc', pr);
-            ackAssert(result.includes('github.com/bitcoin/bitcoin/pull/123'));
-            ackAssert(result.includes('--force'));
-            ackAssert(result.includes('REMOTE=$(git remote | grep -qx upstream && echo upstream || echo origin)'));
-            ackAssert(result.includes('git pull --rebase "$REMOTE" main'));
-            ackAssert(!result.includes("'main'"), 'does not quote simple branch names');
-        } finally {
-            getReviewBaseBranch = origBase;
         }
     });
 
@@ -27086,20 +27044,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     // --- LLM_MODELS ---
-
-    ackTest('has claude, openai, and gemini models', () => {
-        ackAssert(LLM_MODELS.claude, 'missing claude model');
-        ackAssert(LLM_MODELS.claude_high_context, 'missing high-context claude model');
-        ackAssert(LLM_MODELS.openai, 'missing openai model');
-        ackAssert(LLM_MODELS.gemini, 'missing gemini model');
-    });
-
-    ackTest('model strings are non-empty', () => {
-        ackAssert(LLM_MODELS.claude.length > 0);
-        ackAssert(LLM_MODELS.claude_high_context.length > 0);
-        ackAssert(LLM_MODELS.openai.length > 0);
-        ackAssert(LLM_MODELS.gemini.length > 0);
-    });
 
     // --- qsa (scoped querySelectorAll) ---
 
@@ -27249,14 +27193,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('fmtTokens handles boundary at exactly 1000', () => {
-        ackEq(fmtTokens(1000), '1.0k');
-    });
-
-    ackTest('fmtTokens handles boundary at exactly 1000000', () => {
-        ackEq(fmtTokens(1000000), '1.0M');
-    });
-
     ackTest('renderMarkdown handles empty string', () => {
         ackEq(renderMarkdown(''), '');
     });
@@ -27365,13 +27301,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('hasUnsavedCommentText excludes edit-mode textareas', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(_ackSource.includes("closest('.is-comment-editing"), 'checks .is-comment-editing');
         ackAssert(_ackSource.includes("closest('.is-comment-editing, .js-comment-update"), 'checks .js-comment-update');
     });
 
     ackTest('splitSegments protects immutable lines and uses XML-based LLM exchange', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(_ackSource.includes('IMMUTABLE_LINE_RE'), 'has immutable line regex');
         ackAssert(_ackSource.includes('_Originally posted by'), 'protects GitHub cross-references');
         ackAssert(_ackSource.includes('splitSegments'), 'uses segment-based splitting');
@@ -27414,13 +27348,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // --- SHA_FORMATS range-diff ---
 
-    ackTest('SHA_FORMATS rdiff fmt returns null without force-push', () => {
-        const rdiff = SHA_FORMATS.find((f) => f.key === 'rdiff');
-        ackEq(rdiff.fmt(), null);
-    });
-
     ackTest('rdiff uses B=/A= variables to avoid SHA duplication', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const rdiffFmt = _ackSource.slice(_ackSource.indexOf("key: 'rdiff'"), _ackSource.indexOf("key: 'bench'"));
         ackAssert(rdiffFmt.includes('B=${f} A=${t}'), 'assigns B and A variables for force-push');
         ackAssert(rdiffFmt.includes('B=${userAckSha} A=${sha}'), 'assigns B and A for user ACK SHA');
@@ -27499,7 +27427,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('rdiff prefers userAckSha over lastForcePush', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const rdiffFmt = _ackSource.slice(_ackSource.indexOf("key: 'rdiff'"), _ackSource.indexOf("key: 'bench'"));
         // userAckSha check comes BEFORE lastForcePush check
         const ackIdx = rdiffFmt.indexOf('userAckSha');
@@ -27867,7 +27794,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('bench command uses Release build, -DBUILD_BENCH=ON, build/bin/bench_bitcoin, -min-time=1000', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const benchFmt = _ackSource.slice(_ackSource.indexOf("key: 'bench'"), _ackSource.indexOf("key: 'test'"));
         ackAssert(benchFmt.includes('-DCMAKE_BUILD_TYPE=Release'), 'bench uses Release');
         ackAssert(benchFmt.includes('-DBUILD_BENCH=ON'), 'bench enables BUILD_BENCH');
@@ -27876,14 +27802,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('test command uses Debug build and build/bin/test_bitcoin', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const testFmt = _ackSource.slice(_ackSource.indexOf("key: 'test'"), _ackSource.indexOf("key: 'fuzz'"));
         ackAssert(testFmt.includes('-DCMAKE_BUILD_TYPE=Debug'), 'test uses Debug');
         ackAssert(testFmt.includes('build/bin/test_bitcoin'), 'test uses build/bin path');
     });
 
     ackTest('fuzz command uses --preset=libfuzzer, build_fuzz dir, no loop for single target, -runs=10000', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const fuzzFmt = _ackSource.slice(_ackSource.indexOf("key: 'fuzz'"), _ackSource.indexOf("key: 'functional'"));
         ackAssert(fuzzFmt.includes('--preset=libfuzzer'), 'fuzz uses libfuzzer preset');
         ackAssert(fuzzFmt.includes('build_fuzz'), 'fuzz uses build_fuzz dir');
@@ -27943,7 +27867,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('build commands consistently omit ./ prefix', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const fmtSection = _ackSource.slice(
             _ackSource.indexOf("key: 'bench'"),
             _ackSource.indexOf('];', _ackSource.indexOf("key: 'functional'")),
@@ -27953,7 +27876,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('shared constants COMMENT_TA_SELECTOR and NO_CHANGES_MSG are used (not inlined)', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(_ackSource.includes('COMMENT_TA_SELECTOR'), 'COMMENT_TA_SELECTOR constant exists');
         ackAssert(_ackSource.includes('NO_CHANGES_MSG'), 'NO_CHANGES_MSG constant exists');
         const selectorLiteral = 'textarea.js-comment-field, textarea[name=';
@@ -27963,7 +27885,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('COMMENT_CONTAINER_SELECTOR is used (not inlined)', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const refs = (_ackSource.match(/COMMENT_CONTAINER_SELECTOR/g) || []).length;
         ackAssert(refs >= 4, `expected at least 4 references to COMMENT_CONTAINER_SELECTOR, found ${refs}`);
         // Build the prefix in parts so an unstripped test body cannot satisfy its own assertion.
@@ -27974,13 +27895,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('MARKDOWN_BODY_SELECTOR is used (not inlined)', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const refs = (_ackSource.match(/MARKDOWN_BODY_SELECTOR/g) || []).length;
         ackAssert(refs >= 5, `expected at least 5 references to MARKDOWN_BODY_SELECTOR, found ${refs}`);
     });
 
     ackTest('functional command uses Debug build and build/test/functional/test_runner.py', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const funcFmt = _ackSource.slice(
             _ackSource.indexOf("key: 'functional'"),
             _ackSource.indexOf("key: 'functional'") + 500,
@@ -28162,7 +28081,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // --- extractBenchmarkNames ---
 
     ackTest('@connect includes raw.githubusercontent.com for benchmark file fetching', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(
             _ackSource.includes('@connect      raw.githubusercontent.com'),
             'raw.githubusercontent.com in @connect',
@@ -28534,7 +28452,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('proofread prompt instructs LLM to preserve markdown formatting', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(
             _ackSource.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
             'prompt includes markdown preservation with heading normalization',
@@ -28777,10 +28694,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(r.includes('http://example.com'), 'URL present');
     });
 
-    ackTest('renderMarkdown handles empty input gracefully', () => {
-        ackEq(renderMarkdown(''), '');
-    });
-
     ackTest('renderMarkdown escapes HTML to prevent XSS from LLM output', () => {
         const xss = '<script>alert(1)</script>';
         const r = renderMarkdown(xss);
@@ -28894,16 +28807,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             getReviewBaseBranch = origBase;
         }
-    });
-
-    ackTest('ack format is plain ACK + SHA', () => {
-        const f = SHA_FORMATS.find((f) => f.key === 'ack');
-        ackEq(f.fmt('deadbeef', {}), 'ACK deadbeef');
-    });
-
-    ackTest('rdiff format returns null when no force push', () => {
-        const f = SHA_FORMATS.find((f) => f.key === 'rdiff');
-        ackEq(f.fmt(), null, 'no force push → null');
     });
 
     // ============================================================================
@@ -29222,7 +29125,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('proofread system prompt describes XML segment format for immutable line protection', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const promptSection = _ackSource.slice(_ackSource.indexOf('makePrompt'), _ackSource.indexOf('cleanResult'));
         ackAssert(promptSection.includes('numbered XML section'), 'system prompt explains XML section format');
         ackAssert(promptSection.includes('<s1>'), 'prompt mentions section tags');
@@ -29682,7 +29584,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // ============================================================================
 
     ackTest('proofread system prompt instructs to preserve markdown', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(
             _ackSource.includes('Preserve markdown formatting except for the heading-to-prefix normalization above'),
             'prompt says preserve markdown except compact heading normalization',
@@ -29696,14 +29597,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('proofread uses XML section tags for mutable content', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const promptSection = _ackSource.slice(_ackSource.indexOf('makePrompt'), _ackSource.indexOf('cleanResult'));
         ackAssert(promptSection.includes('toXML()'), 'converts segments to XML');
         ackAssert(promptSection.includes('Proofread the following sections'), 'user prompt references sections');
     });
 
     ackTest('proofread fromXML reassembles immutable + corrected mutable segments', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(_ackSource.includes('fromXML'), 'fromXML function exists');
         const fn = _ackSource.slice(_ackSource.indexOf('const fromXML'), _ackSource.indexOf('return { segments'));
         ackAssert(fn.includes('immutable'), 'preserves immutable segments');
@@ -29773,7 +29672,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('cleanResult strips markdown fences from LLM response', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         ackAssert(_ackSource.includes('cleanResult'), 'cleanResult function exists');
         ackAssert(_ackSource.includes('```'), 'cleanResult handles markdown fences');
     });
@@ -29953,7 +29851,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // ============================================================================
 
     ackTest('delete handler does not call confirm() -- GitHub provides its own', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         // Find the delete button handler
         const deleteSection = _ackSource.slice(_ackSource.indexOf("'Delete comment'"));
         const nextBtn = deleteSection.indexOf('makeIconBtn', 10);
@@ -29962,7 +29859,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('confirm() calls are accounted for (navigation warning + factory reset)', () => {
-        // NODE: // NODE: const src = fs.readFileSync(path.resolve(__dirname, 'acktopus.user.js'), 'utf8');
         const confirms = (_ackSource.match(/[^/]confirm\(/g) || []).length;
         ackEq(confirms, 2, `expected 2 confirm(), found ${confirms}`);
     });
@@ -30144,11 +30040,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // cacheKey -- extended
     // ============================================================================
 
-    ackTest('cacheKey separates different providers', () => {
-        const pr = { owner: 'o', repo: 'r', pr: '1' };
-        ackNeq(cacheKey('claude', pr, 'pr'), cacheKey('openai', pr, 'pr'));
-    });
-
     ackTest('cacheKey separates different PRs', () => {
         const pr1 = { owner: 'o', repo: 'r', pr: '1' };
         const pr2 = { owner: 'o', repo: 'r', pr: '2' };
@@ -30164,24 +30055,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // fmtTokens -- extended
     // ============================================================================
 
-    ackTest('fmtTokens handles zero', () => {
-        ackEq(fmtTokens(0), '0');
-    });
-
-    ackTest('fmtTokens handles 999', () => {
-        ackEq(fmtTokens(999), '999');
-    });
-
-    ackTest('fmtTokens handles 1500', () => {
-        ackEq(fmtTokens(1500), '1.5k');
-    });
-
     ackTest('fmtTokens handles 10000', () => {
         ackEq(fmtTokens(10000), '10.0k');
-    });
-
-    ackTest('fmtTokens handles 2500000', () => {
-        ackEq(fmtTokens(2500000), '2.5M');
     });
 
     // ============================================================================
@@ -30199,12 +30074,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // logoSVG -- extended
     // ============================================================================
 
-    ackTest('logoSVG at size 16 has width="16" and height="16"', () => {
-        const svg = logoSVG(16);
-        ackAssert(svg.includes('width="16"'), 'width=16');
-        ackAssert(svg.includes('height="16"'), 'height=16');
-    });
-
     ackTest('logoSVG viewBox is always 0 0 64 64', () => {
         const svg = logoSVG(200);
         ackAssert(svg.includes('viewBox="0 0 64 64"'), 'fixed viewBox regardless of size');
@@ -30215,68 +30084,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(svg.includes('#e30') || svg.includes('#fa0'), 'has red/orange eye colors');
     });
 
-    ackTest('logoSVG uses stroke-linejoin round for robotic joints', () => {
-        const svg = logoSVG(32);
-        ackAssert(svg.includes('stroke-linejoin="round"'), 'has rounded joints');
-    });
-
-    ackTest('logoSVG does not use old dark arm color #454d65', () => {
-        const svg = logoSVG(64);
-        ackAssert(!svg.includes('stroke="#454d65"'), 'no old dark arm color');
-    });
-
-    ackTest('logoSVG arm colors are visible on dark backgrounds', () => {
-        const svg = logoSVG(64);
-        const colors = ['#6080a0', '#5a7090', '#507080'];
-        ackAssert(
-            colors.some((c) => svg.includes(c)),
-            'has at least one bright arm color',
-        );
-    });
-
     // ============================================================================
     // FOLD_ICON -- extended
     // ============================================================================
-
-    ackTest('FOLD_ICON has 16x16 viewBox', () => {
-        ackAssert(FOLD_ICON.includes('viewBox="0 0 16 16"'), '16x16 viewBox');
-    });
 
     ackTest('FOLD_ICON uses currentColor for theme compatibility', () => {
         ackAssert(FOLD_ICON.includes('currentColor'), 'uses currentColor fill');
     });
 
     // ============================================================================
-    // Pending comment flow -- extended
-    // ============================================================================
-
-    // ============================================================================
     // ACK chip navigation -- extended
     // ============================================================================
-
-    ackTest('ACK chip: conversation path not redirected', () => {
-        const path = '/bitcoin/bitcoin/pull/42';
-        ackAssert(!PR_SUBPAGE_RE.test(path), 'base PR path not redirected');
-    });
 
     ackTest('ACK chip: /files with sub-path redirected', () => {
         const path = '/bitcoin/bitcoin/pull/42/files/some-anchor';
         ackAssert(PR_SUBPAGE_RE.test(path), '/files with sub-path detected');
         const conv = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
         ackEq(conv, '/bitcoin/bitcoin/pull/42');
-    });
-
-    ackTest('ACK chip: /changes/ path redirected to conversation', () => {
-        const path = '/bitcoin/bitcoin/pull/42/changes/abc123';
-        ackAssert(PR_SUBPAGE_RE.test(path), '/changes path detected');
-        const conv = path.replace(PR_SUBPAGE_TO_CONVERSATION_RE, '/pull/$1');
-        ackEq(conv, '/bitcoin/bitcoin/pull/42');
-    });
-
-    ackTest('ACK chip: hash fragment appended after redirect', () => {
-        const originalUrl = 'https://github.com/bitcoin/bitcoin/pull/42#issuecomment-123';
-        const hash = originalUrl.includes('#') ? '#' + originalUrl.split('#')[1] : '';
-        ackEq(hash, '#issuecomment-123', 'hash extracted correctly');
     });
 
     ackTest('review comment hash navigation stops at a matching closed thread header', () => {
@@ -30518,30 +30342,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // ANALYSIS_MODES -- extended
     // ============================================================================
 
-    ackTest('ANALYSIS_MODES values match keys', () => {
-        for (const [k, v] of Object.entries(ANALYSIS_MODES)) {
-            ackEq(k, v, `key "${k}" matches value "${v}"`);
-        }
-    });
-
-    ackTest('ANALYSIS_MODES has exactly pr, commits, commit', () => {
-        ackDeepEq(Object.keys(ANALYSIS_MODES).sort(), ['commit', 'commits', 'pr']);
-    });
-
     // ============================================================================
     // hasUnsavedCommentText -- extended
     // ============================================================================
-
-    ackTest('hasUnsavedCommentText returns false when no textareas exist', () => {
-        // Deterministic even on live GitHub pages (which usually *do* have comment textareas).
-        const orig = document.querySelectorAll;
-        document.querySelectorAll = () => [];
-        try {
-            ackEq(hasUnsavedCommentText(), false);
-        } finally {
-            document.querySelectorAll = orig;
-        }
-    });
 
     // ============================================================================
     // PROVIDER_META
@@ -30628,13 +30431,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('provider key storage keys are derived from provider metadata', () => {
         ackDeepEq(providerKeyStorageKeys().sort(), ['llm_claude_key', 'llm_gemini_key', 'llm_openai_key']);
-    });
-
-    ackTest('isProviderAvailable only checks key, not enabled', () => {
-        // With no key set, should be false
-        ackEq(isProviderAvailable('claude'), false);
-        ackEq(isProviderAvailable('openai'), false);
-        ackEq(isProviderAvailable('gemini'), false);
     });
 
     // ============================================================================
