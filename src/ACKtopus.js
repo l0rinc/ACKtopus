@@ -26588,41 +26588,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         autoCollapseCompareFiles();
     }
 
-    tryInject();
-    scheduleReviewCommentHashNavigation('initial load');
-    if (isPRPage() && !_ackTesting) {
+    // Shared route-change work: rebuild the toolbar, honor a #discussion_r
+    // hash, and rebuild the floating commit nav. addFloatingCommitNav removes
+    // stale bars on non-PR pages, so it runs unconditionally.
+    function refreshAfterNavigation(reason) {
+        if (_ackTesting) return;
+        tryInject();
+        scheduleReviewCommentHashNavigation(reason);
         addFloatingCommitNav({ immediate: true });
         hideNativeCommitNav();
     }
-    document.addEventListener('turbo:load', () => {
-        if (_ackTesting) return;
-        tryInject();
-        scheduleReviewCommentHashNavigation('turbo load');
-        if (isPRPage()) {
-            addFloatingCommitNav({ immediate: true });
-            hideNativeCommitNav();
-        }
-    });
-    document.addEventListener('turbo:render', () => {
-        if (_ackTesting) return;
-        tryInject();
-        scheduleReviewCommentHashNavigation('turbo render');
-        if (isPRPage()) {
-            addFloatingCommitNav({ immediate: true });
-            hideNativeCommitNav();
-        }
-    });
+
+    if (!_ackTesting) refreshAfterNavigation('initial load');
+    document.addEventListener('turbo:load', () => refreshAfterNavigation('turbo load'));
+    document.addEventListener('turbo:render', () => refreshAfterNavigation('turbo render'));
     window.addEventListener('pageshow', (e) => {
         if (_ackTesting || !e.persisted) return;
         lastUrl = location.href;
         lastInjectedPR = null;
         lastInjectedPath = null;
-        tryInject();
-        scheduleReviewCommentHashNavigation('pageshow');
-        if (isPRPage()) {
-            addFloatingCommitNav({ immediate: true });
-            hideNativeCommitNav();
-        }
+        refreshAfterNavigation('pageshow');
     });
     // Clean injected elements before turbo caches the page snapshot.
     // Without this, pressing back shows a stale cached page with old toolbar/ACKs,
@@ -30576,9 +30561,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             helper.includes('attempt < REVIEW_COMMENT_HASH_MAX_ATTEMPTS'),
             'uses a fixed recovery attempt budget',
         );
-        ackAssert(source.includes("scheduleReviewCommentHashNavigation('initial load')"), 'runs on initial load');
+        ackAssert(source.includes("refreshAfterNavigation('initial load')"), 'runs on initial load');
         ackAssert(source.includes("scheduleReviewCommentHashNavigation('hashchange')"), 'runs on hash changes');
-        ackAssert(source.includes("scheduleReviewCommentHashNavigation('turbo load')"), 'runs after turbo loads');
+        ackAssert(source.includes("refreshAfterNavigation('turbo load')"), 'runs after turbo loads');
         ackAssert(!source.includes('schedulePostHashRevealToolbarRefresh'), 'does not schedule delayed toolbar rebuild after hash reveal');
     });
 
@@ -33895,8 +33880,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(block.includes('e.persisted'), 'only handles bfcache restores');
         ackAssert(block.includes('lastInjectedPR = null'), 'clears injected PR cache before reinject');
         ackAssert(block.includes('lastInjectedPath = null'), 'clears injected path cache before reinject');
-        ackAssert(block.includes('tryInject()'), 'forces fresh reinject on pageshow');
-        ackAssert(block.includes('addFloatingCommitNav({ immediate: true })'), 'rebuilds floating commit nav immediately on pageshow');
+        ackAssert(block.includes("refreshAfterNavigation('pageshow')"), 'forces fresh reinject on pageshow');
+        const refresh = sourceSection(source, 'function refreshAfterNavigation', "refreshAfterNavigation('initial load')");
+        ackAssert(refresh.includes('tryInject()'), 'route refresh reinjects the toolbar');
+        ackAssert(
+            refresh.includes('addFloatingCommitNav({ immediate: true })'),
+            'route refresh rebuilds the floating commit nav immediately',
+        );
         ackAssert(!block.includes('autoOpenReactionPopup(document)'), 'does not eagerly scan every restored comment');
         ackAssert(!block.includes('prefillCommitHash(document)'), 'does not duplicate the injector prefill pass');
     });
@@ -33946,8 +33936,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('addFloatingCommitNav runs on all navigation events', () => {
         const source = _ackSource;
-        const immediateCalls = (source.match(/addFloatingCommitNav\(\{ immediate: true \}\)/g) || []).length;
-        ackAssert(immediateCalls >= 5, `addFloatingCommitNav immediate navigation calls >= 5, found ${immediateCalls}`);
+        const refresh = sourceSection(source, 'function refreshAfterNavigation', "refreshAfterNavigation('initial load')");
+        ackAssert(refresh.includes('addFloatingCommitNav({ immediate: true })'), 'route refresh rebuilds the commit nav');
+        for (const reason of ['initial load', 'turbo load', 'turbo render', 'pageshow', 'url change']) {
+            ackAssert(source.includes(`refreshAfterNavigation('${reason}')`), `${reason} uses the shared route refresh`);
+        }
     });
 
     ackTest('overlayImgSpinner fades image and overlays spinner without replacing it', () => {
@@ -36426,7 +36419,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(clearFn.includes('_compareDebounceTimer'), 'clears compare debounce timer');
         ackAssert(clearFn.includes('_compareWatchdogTimer'), 'clears compare watchdog timer');
-        const tryInjectFn = sourceSection(source, 'function tryInject()', '\n    tryInject();');
+        const tryInjectFn = sourceSection(source, 'function tryInject()', '\n    // Shared route-change work');
         ackAssert(tryInjectFn.includes('clearCompareWatcher()'), 'navigation away clears compare watcher');
     });
 
@@ -47043,9 +47036,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 scheduleReviewCommentHashNavigation('hash url change');
                 return;
             }
-            tryInject();
-            addFloatingCommitNav({ immediate: true });
-            scheduleReviewCommentHashNavigation('url change');
+            refreshAfterNavigation('url change');
         }
     };
     navWindow.addEventListener('popstate', () => {
