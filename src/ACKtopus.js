@@ -7278,8 +7278,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             testFill.style.background = '#238636';
             testDetails.textContent = '';
             testDetails.style.display = 'none';
-            runACKtopusTests((passed, failed, total, name, ok) => {
-                const done = passed + failed;
+            runACKtopusTests((passed, failed, total, name, ok, skipped = 0) => {
+                const done = passed + failed + skipped;
                 testCounter.textContent = `${done}/${total}`;
                 testFill.style.width = `${((done / total) * 100).toFixed(1)}%`;
                 if (failed > 0) testFill.style.background = '#f85149';
@@ -7291,9 +7291,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     testDetails.appendChild(line);
                 }
             })
-                .then(({ failed, skipped }) => {
+                .then(({ passed, failed, skipped }) => {
                     if (failed === 0) {
-                        testStatus.textContent = skipped ? `✅ all passed (skipped ${skipped})` : `✅ all passed`;
+                        testStatus.textContent = `✅ ${passed} passed${skipped ? ` (${skipped} skipped)` : ''}`;
                         testStatus.style.color = '#3fb950';
                     } else {
                         testStatus.textContent = `❌ ${failed} failed`;
@@ -46647,6 +46647,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
         // Snapshot mutable global state that live GitHub sessions may have already populated.
         const stateSnapshot = {
+            alternateMode: ackAlternateMode,
             lastForcePush,
             lastForcePushRange,
             lastForcePushSignature,
@@ -46764,8 +46765,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 const { name, fn, dom } = _ackTests[i];
                 if (dom && !isGitHub) {
                     skipped++;
-                    passed++;
-                    onProgress?.(passed, failed, _ackTests.length, name, true);
+                    onProgress?.(passed, failed, _ackTests.length, name, true, skipped);
                     continue;
                 }
 
@@ -46773,7 +46773,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 try {
                     await fn();
                     passed++;
-                    onProgress?.(passed, failed, _ackTests.length, name, true);
+                    onProgress?.(passed, failed, _ackTests.length, name, true, skipped);
                 } catch (e) {
                     failed++;
                     failures.push({ name, error: e.message });
@@ -46782,7 +46782,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                         'color: #f85149; font-weight: bold',
                         'color: #8b949e',
                     );
-                    onProgress?.(passed, failed, _ackTests.length, name, false);
+                    onProgress?.(passed, failed, _ackTests.length, name, false, skipped);
                 }
             }
         } finally {
@@ -46820,6 +46820,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                     for (const [k, v] of gmSnapshot.entries()) gmOrig.setValue(k, v);
                 }
             } catch (_) {}
+            setAckAlternateMode(stateSnapshot.alternateMode);
             if (isGitHub) {
                 setTimeout(() => {
                     if (_ackTesting) return;
@@ -46832,7 +46833,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             for (const f of failures) console.error(`  ❌ ${f.name}: ${f.error}`);
             console.groupEnd();
         } else {
-            console.log(`%cACKtopus: all ${passed} tests passed ✅`, 'color: #3fb950; font-weight: bold');
+            console.log(`%cACKtopus: ${passed} tests passed, ${skipped} skipped ✅`, 'color: #3fb950; font-weight: bold');
         }
         return { passed, failed, total: _ackTests.length, failures, skipped };
     }
