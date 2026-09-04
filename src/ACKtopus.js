@@ -19282,7 +19282,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (childHref) hrefs.add(childHref);
             });
         };
-        roots.forEach(collect);
+        collect(container);
+        for (const root of roots) {
+            if (root.id) ids.add(root.id);
+        }
 
         let match = '';
         const findId = (re) => {
@@ -39847,6 +39850,28 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             getEditFormRequest = origGetEditFormRequest;
             abortAckLifetime('test cleanup');
             host.remove();
+        }
+    });
+
+    ackTest('edit form lookup keeps a timeline comment separate from neighboring review comments', () => {
+        const previousPage = parsePageContext;
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="js-discussion">
+                <div id="issuecomment-81"><div class="timeline-comment" id="ack-target-comment">
+                    <include-fragment src="/octo/demo/issue_comments/81/edit_form"></include-fragment>
+                </div></div>
+                <div id="discussion_r82" class="review-comment">
+                    <include-fragment src="/octo/demo/pull/123/review_comment/82/edit_form"></include-fragment>
+                </div>
+            </div>`;
+        try {
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            const request = getEditFormRequest(host.querySelector('#ack-target-comment'));
+            ackAssert(request.url.includes('/issue_comments/81/edit_form'), 'keeps the selected timeline comment');
+            ackEq(request.frag, host.querySelector('#ack-target-comment include-fragment'), 'uses its own fragment');
+        } finally {
+            parsePageContext = previousPage;
         }
     });
 
