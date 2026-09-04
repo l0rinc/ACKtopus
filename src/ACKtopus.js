@@ -11497,8 +11497,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             renderRobotThreadMessages();
         }
 
-        function rememberMessage(role, content) {
-            const thread = getActiveRobotThread();
+        function rememberMessage(role, content, threadId = activeThreadId) {
+            const thread = robotThreads.find((thread) => thread.id === threadId);
+            if (!thread) return;
             const text = String(content || '');
             thread.messages.push({ role, content: text });
             thread.messages = thread.messages.slice(-40);
@@ -11507,7 +11508,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (firstUser) thread.title = firstUser.replace(/\s+/g, ' ').slice(0, 80);
             }
             thread.updatedAt = Date.now();
-            history = thread.messages;
+            if (thread.id === activeThreadId) history = thread.messages;
             saveRobotChatThreads();
             renderRobotThreadList();
         }
@@ -11588,7 +11589,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
 
-        async function runFindSearch(query, assistantMsg, stopSpin, provider) {
+        async function runFindSearch(query, assistantMsg, stopSpin, provider, threadId) {
             const body = assistantMsg._ackBody || assistantMsg;
             body.innerHTML = '';
             assistantMsg.dataset.ackRawContent = '';
@@ -11634,7 +11635,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } catch (_) {}
             }
             const persistFindProgress = () => {
-                const thread = getActiveRobotThread();
+                const thread = robotThreads.find((thread) => thread.id === threadId);
+                if (!thread) return;
                 const content = findSearchMarkdown(found);
                 if (persistedAssistantIndex < 0) {
                     thread.messages.push({ role: 'assistant', content });
@@ -11648,7 +11650,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     persistedAssistantIndex = Math.max(0, persistedAssistantIndex - removed);
                 }
                 thread.updatedAt = Date.now();
-                history = thread.messages;
+                if (thread.id === activeThreadId) history = thread.messages;
                 saveRobotChatThreads();
                 renderRobotThreadList();
             };
@@ -11807,6 +11809,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             let assistantMsg = null;
             let stopSpin = () => {};
+            let exchangeThreadId = activeThreadId;
             const startAssistantSpinner = () => {
                 assistantMsg = addMessage('assistant', '');
                 stopSpin = startBrailleAnimation((frame) => {
@@ -11814,6 +11817,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
             };
             const startPersistedExchange = (userLabel, threadMeta = null) => {
+                exchangeThreadId = activeThreadId;
                 addMessage('user', userLabel);
                 rememberMessage('user', userLabel);
                 if (threadMeta) {
@@ -11831,6 +11835,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             } else {
                 startPersistedExchange(recipeCfg ? recipeCfg.label : text);
             }
+            const exchangeHistory = [...history];
 
             // Build/refresh page index (shared across regular chat and /find)
             chatPageIndex = gatherPageIndex();
@@ -11859,10 +11864,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     stopSpin();
                     const trimmed = result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    rememberMessage('assistant', trimmed);
+                    rememberMessage('assistant', trimmed, exchangeThreadId);
                     messages.scrollTop = messages.scrollHeight;
                 } else if (isNavQuery) {
-                    await runFindSearch(text, assistantMsg, stopSpin, provider);
+                    await runFindSearch(text, assistantMsg, stopSpin, provider, exchangeThreadId);
                 } else if (recipeCfg?.fullPRContext) {
                     const prForRecipe = parsePR();
                     if (!prForRecipe) throw new Error('this recipe is only available on pull request pages');
@@ -11986,7 +11991,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             : result.trim();
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
                     if (generatedPrompt) setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt);
-                    rememberMessage('assistant', trimmed);
+                    rememberMessage('assistant', trimmed, exchangeThreadId);
                     messages.scrollTop = messages.scrollHeight;
                 } else {
                     // Regular chat mode - with [ref:N] citation support
@@ -11998,7 +12003,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const extra = getLLMConfig().instructions.chat || DEFAULT_INSTRUCTIONS.chat;
                     const system = `${getReviewSystemBase()}\n\n${extra}${citationInstructions}\n\n${context}${diffBlock}`;
 
-                    const historyText = history
+                    const historyText = exchangeHistory
                         .map((m) => (m.role === 'user' ? `User: ${m.content}` : `Assistant: ${m.content}`))
                         .join('\n\n');
 
@@ -12007,7 +12012,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const trimmed = result.trim();
                     // Render markdown then replace [ref:N] with clickable navigation links
                     setAssistantHtml(assistantMsg, linkifyRefs(renderMarkdown(trimmed), chatPageIndex), trimmed);
-                    rememberMessage('assistant', trimmed);
+                    rememberMessage('assistant', trimmed, exchangeThreadId);
                     messages.scrollTop = messages.scrollHeight;
                 }
             } catch (e) {
@@ -38622,6 +38627,48 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'falls back to exact permalink or configured mirror navigation',
         );
         ackAssert(_ackSource.includes('ack_skip_hash_reveal_once'), 'permalink navigation suppresses broad hash reveal');
+    });
+
+    ackTest('chat replies stay with the discussion that sent the question', async () => {
+        const previousCall = callLLM;
+        const previousContext = fetchPRContext;
+        const previousIndex = gatherPageIndex;
+        const previousChatContext = gatherChatContext;
+        let panel;
+        let finishReply;
+        let requestStarted;
+        const started = new Promise((resolve) => { requestStarted = resolve; });
+        try {
+            GM_setValue('activeProvider', 'claude');
+            GM_setValue('llm_claude_key', 'test-key');
+            GM_setValue('repo_mirrors', '');
+            fetchPRContext = async () => ({ diff: '' });
+            gatherPageIndex = () => [];
+            gatherChatContext = () => '';
+            callLLM = () => new Promise((resolve) => {
+                finishReply = resolve;
+                requestStarted();
+            });
+            panel = buildChatPanel();
+            document.body.appendChild(panel);
+            const input = panel.querySelector('textarea');
+            input.value = 'First discussion question';
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+            await started;
+            panel.querySelector('button[title="Start a new robot discussion"]').click();
+            finishReply('First discussion reply');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const threads = GM_getValue(robotChatHistoryKeyForPage(), []);
+            const original = threads.find((thread) => thread.messages.some((message) => message.content === 'First discussion question'));
+            ackAssert(original.messages.some((message) => message.content === 'First discussion reply'), 'reply stays in its original history');
+            ackAssert(!panel.querySelector('.ack-chat-messages').textContent.includes('First discussion reply'), 'new discussion stays empty');
+        } finally {
+            callLLM = previousCall;
+            fetchPRContext = previousContext;
+            gatherPageIndex = previousIndex;
+            gatherChatContext = previousChatContext;
+            panel?.querySelector('button[title="Close robot panel"]')?.click();
+        }
     });
 
     ackTest('Robot find search is passive and robot discussions persist', () => {
