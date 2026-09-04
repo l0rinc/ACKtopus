@@ -7819,6 +7819,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                                 rejectWithLoggedError('stream error', e?.message || String(e), e);
                                 return;
                             }
+                            if (!streamState.done) {
+                                rejectWithLoggedError('incomplete stream', 'response ended before the completion marker');
+                                return;
+                            }
                             resolveWithText(
                                 streamState.text,
                                 streamState.inputTokens,
@@ -40702,6 +40706,42 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             GM_xmlhttpRequest = origReq;
             parsePageContext = origParsePageContext;
             pageKind = origPageKind;
+        }
+    });
+
+    ackTest('callLLM rejects incomplete streams and only caches completed responses', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPageContext = parsePageContext;
+        try {
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            for (const [provider, delta, end] of [
+                ['claude', { type: 'content_block_delta', delta: { text: 'reply' } }, '{"type":"message_stop"}'],
+                ['openai', { choices: [{ delta: { content: 'reply' } }] }, '[DONE]'],
+            ]) {
+                GM_setValue(`llm_${provider}_key`, 'test-key');
+                const system = `stream completion ${provider}`;
+                const user = 'test request';
+                const key = buildPromptCacheKey(provider, LLM_MODELS[provider], system, user);
+                let complete = false;
+                GM_xmlhttpRequest = ({ onload }) => onload({
+                    status: 200,
+                    responseText: `data: ${JSON.stringify(delta)}\n\n${complete ? `data: ${end}\n\n` : ''}`,
+                });
+                let error;
+                try {
+                    await callLLM(provider, system, user);
+                } catch (e) {
+                    error = e;
+                }
+                ackAssert(error?.message.includes('incomplete stream'), 'rejects missing completion marker');
+                ackEq(GM_getValue(key, null), null, 'does not cache incomplete text');
+                complete = true;
+                ackEq(await callLLM(provider, system, user), 'reply', 'accepts completed response on retry');
+                ackEq(GM_getValue(key, null), 'reply', 'caches the completed response');
+            }
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            parsePageContext = originalPageContext;
         }
     });
 
