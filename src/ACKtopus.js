@@ -22473,24 +22473,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     const MAX_REVIEW_AID_BATCH_COMMITS = 4;
     const MAX_COMMIT_EXPLAIN_BATCH_COMMITS = 8;
+    const COMMIT_PROMPT_PATCH_BUDGET = 120000;
+    const COMMIT_PROMPT_PATCH_MAX = 15000;
 
-    async function fetchCommitReviewAidChunk(pr, commits, { provider, extraContext = '' } = {}) {
-        let totalLen = 0;
+    // One prompt entry per commit with a clipped patch, until the shared patch
+    // budget (optionally pre-charged by a full PR patch) is used up.
+    async function buildCommitPromptEntries(pr, commits, usedChars = 0) {
+        let totalLen = usedChars;
         const commitEntries = [];
         for (const c of commits) {
-            if (totalLen > 120000) {
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\n(patch omitted, context limit)`);
+            const head = `SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}`;
+            if (totalLen > COMMIT_PROMPT_PATCH_BUDGET) {
+                commitEntries.push(`${head}\n(patch omitted, context limit)`);
                 continue;
             }
             try {
                 const patch = await fetchCommitPatch(pr, c.sha);
-                const truncated = patch.slice(0, 15000);
+                const truncated = patch.slice(0, COMMIT_PROMPT_PATCH_MAX);
                 totalLen += truncated.length;
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\nPatch:\n${truncated}`);
+                commitEntries.push(`${head}\nPatch:\n${truncated}`);
             } catch (_) {
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\n(patch unavailable)`);
+                commitEntries.push(`${head}\n(patch unavailable)`);
             }
         }
+        return commitEntries;
+    }
+
+    async function fetchCommitReviewAidChunk(pr, commits, { provider, extraContext = '' } = {}) {
+        const commitEntries = await buildCommitPromptEntries(pr, commits);
 
         const config = getLLMConfig();
         const extraInstr = config.instructions.pseudocode || DEFAULT_INSTRUCTIONS.pseudocode;
@@ -22509,22 +22519,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommitExplainChunk(pr, commits, { provider, extraContext = '', fullPatch = '' } = {}) {
-        let totalLen = fullPatch.length;
-        const commitEntries = [];
-        for (const c of commits) {
-            if (totalLen > 120000) {
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\n(patch omitted, context limit)`);
-                continue;
-            }
-            try {
-                const patch = await fetchCommitPatch(pr, c.sha);
-                const truncated = patch.slice(0, 15000);
-                totalLen += truncated.length;
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\nPatch:\n${truncated}`);
-            } catch (_) {
-                commitEntries.push(`SHA: ${c.sha.slice(0, 8)}\nMessage: ${c.msg}\n(patch unavailable)`);
-            }
-        }
+        const commitEntries = await buildCommitPromptEntries(pr, commits, fullPatch.length);
 
         const config = getLLMConfig();
         const extra = config.instructions.commits || DEFAULT_INSTRUCTIONS.commits;
