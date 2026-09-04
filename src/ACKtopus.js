@@ -8097,6 +8097,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     // force-push detection and on page re-inject (handles edited descriptions).
     let _prContextCache = null;
     let _prContextKey = '';
+    let _prContextGeneration = 0;
 
     async function fetchPRContext(pr) {
         if (!pr)
@@ -8114,6 +8115,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         // Check cache first (keyed on owner/repo/pr - invalidated on force-push/submit)
         const baseKey = `${pr.owner}/${pr.repo}/${pr.pr}`;
         if (_prContextCache && _prContextKey.startsWith(baseKey + ':')) return _prContextCache;
+        const generation = _prContextGeneration;
+        let complete = false;
         const ctx = {
             diff: '',
             commitMessages: '',
@@ -8147,16 +8150,20 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 ctx.closedAt = prResp.value.closed_at || '';
                 ctx.draft = !!prResp.value.draft;
             }
+            complete = [patchResp, commitsResp, prResp].every((response) => response.status === 'fulfilled');
         } catch (_) {}
         // Cache key includes head SHA for diagnostics; actual invalidation
         // happens via explicit invalidatePRContext() calls on submit/force-push/navigation
         const key = `${pr.owner}/${pr.repo}/${pr.pr}:${ctx.headSha || ''}`;
-        _prContextCache = ctx;
-        _prContextKey = key;
+        if (complete && generation === _prContextGeneration) {
+            _prContextCache = ctx;
+            _prContextKey = key;
+        }
         return ctx;
     }
 
     function invalidatePRContext() {
+        _prContextGeneration++;
         _prContextCache = null;
         _prContextKey = '';
         _prReplyRowsKey = '';
@@ -40669,6 +40676,45 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('_prContextCache &&'), 'checks cache before fetching');
         ackAssert(fn.includes('return _prContextCache'), 'returns cached value early');
         ackAssert(fn.includes("baseKey + ':'"), 'uses delimiter to prevent prefix collision (PR/1 vs PR/10)');
+    });
+
+    ackTest('PR context invalidation survives an older request finishing later', async () => {
+        const originalPatch = fetchPatch;
+        const originalFetch = gmFetch;
+        const pr = { owner: 'octo', repo: 'demo', pr: '123' };
+        let finishOld;
+        try {
+            fetchPatch = () => new Promise((resolve) => { finishOld = resolve; });
+            gmFetch = async (url) => url.includes('/commits?') ? [] : { title: 'Current title' };
+            const pending = fetchPRContext(pr);
+            invalidatePRContext();
+            fetchPatch = async () => 'current patch';
+            const current = await fetchPRContext(pr);
+            finishOld('old patch');
+            await pending;
+            ackEq(await fetchPRContext(pr), current, 'late response cannot repopulate an invalidated cache');
+        } finally {
+            fetchPatch = originalPatch;
+            gmFetch = originalFetch;
+            invalidatePRContext();
+        }
+    });
+
+    ackTest('PR context retries missing data after a temporary fetch failure', async () => {
+        const originalPatch = fetchPatch;
+        const originalFetch = gmFetch;
+        const pr = { owner: 'octo', repo: 'demo', pr: '123' };
+        try {
+            gmFetch = async (url) => url.includes('/commits?') ? [] : { title: 'Current title' };
+            fetchPatch = async () => { throw new Error('temporary failure'); };
+            ackEq((await fetchPRContext(pr)).diff, '', 'returns available partial context');
+            fetchPatch = async () => 'recovered patch';
+            ackEq((await fetchPRContext(pr)).diff, 'recovered patch', 'retries the missing patch');
+        } finally {
+            fetchPatch = originalPatch;
+            gmFetch = originalFetch;
+            invalidatePRContext();
+        }
     });
 
     ackTest('callLLM prompt cache respects cacheEnabled setting', async () => {
