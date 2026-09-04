@@ -245,11 +245,16 @@
         return files.length ? files.map(shellQuote).join(' ') : '';
     }
 
+    const PR_SSR_SCRIPT_SELECTOR =
+        'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]';
+
+    function prSSRScriptElement() {
+        return document.querySelector(PR_SSR_SCRIPT_SELECTOR);
+    }
+
     function readPRSSRData() {
         try {
-            const scriptEl = document.querySelector(
-                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]',
-            );
+            const scriptEl = prSSRScriptElement();
             if (!scriptEl?.textContent) return null;
             return JSON.parse(scriptEl.textContent);
         } catch (_) {
@@ -12350,18 +12355,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
         if (commits.length === 0) {
-            try {
-                const scriptEl = document.querySelector(
-                    'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]',
-                );
-                const data = scriptEl?.textContent ? JSON.parse(scriptEl.textContent) : null;
-                const ssrCommits = data?.payload?.pullRequestsChangesRoute?.commits || [];
-                for (const c of ssrCommits) {
-                    const sha = c?.oid || c?.sha || '';
-                    const msg = c?.messageHeadline || c?.commit?.message || '';
-                    if (sha) commits.push({ sha, msg, el: null });
-                }
-            } catch (_) {}
+            const ssrCommits = readPRSSRData()?.payload?.pullRequestsChangesRoute?.commits || [];
+            for (const c of ssrCommits) {
+                const sha = c?.oid || c?.sha || '';
+                const msg = c?.messageHeadline || c?.commit?.message || '';
+                if (sha) commits.push({ sha, msg, el: null });
+            }
         }
         return commits;
     }
@@ -14571,9 +14570,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function readViewerPendingReviewFromSSR(diagnostics = null) {
         try {
-            const scriptEl = document.querySelector(
-                'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]',
-            );
+            const scriptEl = prSSRScriptElement();
             if (diagnostics) diagnostics.scriptFound = !!scriptEl?.textContent;
             if (!scriptEl?.textContent) return null;
             if (viewerPendingReviewSsrCache.has(scriptEl)) {
