@@ -3951,6 +3951,7 @@
             } catch (e) {
                 if (shouldWarnOptionalGitHubApiError(e))
                     console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
+                return map;
             }
             if (_reviewCommitMapRequest === request) {
                 _reviewCommitMap = { prKey, map, authors };
@@ -35113,6 +35114,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('page <= 5'), 'paginates up to 5 pages');
         ackAssert(fn.includes('comments.length < 100'), 'stops on last page');
         ackAssert(fn.includes('apiSnapshots.inlineComments'), 'accepts the inline-comment first page from member discovery');
+    });
+
+    ackTest('review comment metadata retries after a failed lookup', async () => {
+        const previousMap = _reviewCommitMap;
+        const previousRequest = _reviewCommitMapRequest;
+        const previousFetch = gmFetch;
+        try {
+            _reviewCommitMap = null;
+            _reviewCommitMapRequest = null;
+            gmFetch = async () => { throw new Error('temporary failure'); };
+            ackDeepEq(await fetchReviewCommentCommits('octo', 'demo', 81), {});
+            gmFetch = async () => [{ id: 7, original_commit_id: 'abcdef0123456789', user: { login: 'me' } }];
+            ackDeepEq(await fetchReviewCommentCommits('octo', 'demo', 81), { 7: 'abcdef0' }, 'retries missing metadata');
+        } finally {
+            _reviewCommitMap = previousMap;
+            _reviewCommitMapRequest = previousRequest;
+            gmFetch = previousFetch;
+        }
     });
 
     ackTest('fetchReviewCommentCommits reuses an inline-comment snapshot without a request', async () => {
