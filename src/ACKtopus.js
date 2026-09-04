@@ -26468,7 +26468,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         path = location.pathname,
         root = String(path || '') === location.pathname ? document : null,
     ) {
-        if (!/\/compare\/[^/]+\.\.\.?[^/]+/.test(path)) return false;
+        if (!/\/compare\/[^?#]+\.\.\.?[^?#]+/.test(path)) return false;
         return !isPRCreationPage(path, root);
     }
 
@@ -38703,6 +38703,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     });
 
     ackTest('isToolbarPage detects PR, issue, compare, and commit URLs', () => {
+        ackEq(isToolbarPage('/octo/demo/compare/release/v1...topic/fix'), true, 'allows slashes in both branch names');
         ackEq(isToolbarPage('/bitcoin/bitcoin/pull/123'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin/issues/34645'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin/compare/abc123...def456'), true);
