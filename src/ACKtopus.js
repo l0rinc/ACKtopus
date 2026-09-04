@@ -957,24 +957,18 @@
     // Turbo navigation (instead of firing against stale DOM).
     async function ackSleep(ms, lt = null) {
         const lifetime = lt || ensureAckLifetime('sleep');
+        if (lifetime.signal.aborted) return true;
         return new Promise((resolve) => {
-            let done = false;
-            const id = setTimeout(() => {
-                if (done) return;
-                done = true;
+            const finish = (aborted) => {
+                clearTimeout(id);
                 lifetime.timers.delete(id);
-                resolve(false); // not aborted
-            }, ms);
+                lifetime.signal.removeEventListener('abort', onAbort);
+                resolve(aborted);
+            };
+            const onAbort = () => finish(true);
+            const id = setTimeout(() => finish(false), ms);
             lifetime.timers.add(id);
-            lifetime.onAbort(() => {
-                if (done) return;
-                done = true;
-                try {
-                    clearTimeout(id);
-                } catch (_) {}
-                lifetime.timers.delete(id);
-                resolve(true); // aborted
-            });
+            lifetime.signal.addEventListener('abort', onAbort, { once: true });
         });
     }
 
@@ -39057,6 +39051,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             _ackSuppressUnsavedCommentWarning = previous;
         }
+    });
+
+    ackTest('ackSleep handles completed and aborted page lifetimes', async () => {
+        const lifetime = createAckLifetime(0, 'test sleep');
+        ackEq(await ackSleep(0, lifetime), false, 'ordinary wait completes');
+        ackEq(lifetime.timers.size, 0, 'completed timer is removed');
+        const pending = ackSleep(1000, lifetime);
+        lifetime.ac.abort();
+        ackEq(await pending, true, 'pending wait is canceled');
+        ackEq(await ackSleep(0, lifetime), true, 'already aborted lifetime stays canceled');
+        ackEq(lifetime.timers.size, 0, 'no timers remain');
     });
 
     ackTest('async waits are lifetime-aware (no raw await setTimeout Promises)', () => {
