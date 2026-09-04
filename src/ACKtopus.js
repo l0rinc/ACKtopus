@@ -35256,11 +35256,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('buildAckPanel call site fetches members and logs diagnostics before building panel', () => {
-        const source = _ackSource;
-        const callSite = source.slice(
-            source.indexOf('fetchRepoMembers(pr.owner'),
-            source.indexOf('fetchRepoMembers(pr.owner') + 800,
-        );
+        const callSite = sourceSection(_ackSource, 'async function loadAsyncPRData', 'function shouldRefreshExistingConversationEnhancements');
         ackAssert(callSite.includes('buildAckPanel(acks, memberLogins)'), 'passes memberLogins to buildAckPanel');
         ackAssert(callSite.includes('getMaintainerLogins'), 'gets maintainer set for logging');
         ackAssert(callSite.includes('boldUsers'), 'logs which users will be bold');
