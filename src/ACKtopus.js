@@ -16682,6 +16682,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return target.tagName === 'DETAILS' && !!target.closest?.('.outdated-comment, .minimized-comment');
         }
         if (mutation.attributeName !== 'class') return false;
+        if (mutation.oldValue !== undefined) {
+            const nativeClasses = (value) => String(value || '').split(/\s+/).filter((name) => name && !name.startsWith('ack-')).join(' ');
+            if (nativeClasses(mutation.oldValue) === nativeClasses(target.getAttribute('class'))) return false;
+        }
         if (attrTargetMayNeedFastEditorAffordances(target)) return true;
         return !!target.matches?.(ATTR_REFRESH_SELECTOR);
     }
@@ -16750,6 +16754,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }).observe(document.body, {
         attributes: true,
+        attributeOldValue: true,
         subtree: true,
         attributeFilter: ['class', 'open', 'data-resolved'],
     });
@@ -32538,6 +32543,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             true,
             'opening a resolved thread still refreshes controls',
         );
+        const observer = new MutationObserver(() => {});
+        observer.observe(comment, { attributes: true, attributeOldValue: true });
+        try {
+            comment.className = 'timeline-comment';
+            ackEq(attrMutationMayNeedRefresh(observer.takeRecords()[0]), false, 'ignores unchanged native classes');
+            comment.classList.add('ack-decoration');
+            ackEq(attrMutationMayNeedRefresh(observer.takeRecords()[0]), false, 'decoration does not trigger another injector pass');
+            comment.classList.add('is-comment-editing');
+            ackEq(attrMutationMayNeedRefresh(observer.takeRecords()[0]), true, 'native edit transitions still refresh');
+        } finally {
+            observer.disconnect();
+        }
     });
 
     ackTest('visible comment work is chunked and cancellable', () => {
