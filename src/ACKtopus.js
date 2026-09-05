@@ -15701,8 +15701,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function findGithubReviewOptionsAnchor(root = document) {
-        const candidates = qsa(root, 'button, summary, [role="button"]').filter((el) => {
-            if (!isVisible(el) || isUnrelatedGithubGear(el)) return false;
+        return qsa(root, 'button, summary, [role="button"]').find((el) => {
+            if (isUnrelatedGithubGear(el)) return false;
             const hasGear = !!el.querySelector?.('.octicon-gear, svg[class*="octicon-gear"]');
             const label = reviewOptionLabelText(el);
             if (/reviewers|assignees|labels|milestone|projects|development/i.test(label)) return false;
@@ -15710,15 +15710,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 label,
             );
             if (!hasGear && !reviewSettingsLabel) return false;
-            if (reviewSettingsLabel) return true;
-            return hasGear && !!el.closest?.('#files, #files_bucket, .file-navigation, .diffbar, [data-testid*="diff" i], [class*="Diff"]');
-        });
-        return candidates[0] || null;
+            if (!reviewSettingsLabel && !el.closest?.('#files, #files_bucket, .file-navigation, .diffbar, [data-testid*="diff" i], [class*="Diff"]')) return false;
+            return isVisible(el);
+        }) || null;
     }
 
-    function findGithubReviewOptionsContainer() {
+    function findGithubReviewOptionsContainer(anchor = findGithubReviewOptionsAnchor(document)) {
         return (
-            findGithubReviewOptionsAnchor(document)?.parentElement ||
+            anchor?.parentElement ||
             document.querySelector(
                 '#files_bucket .file-navigation, #files .file-navigation, .file-navigation, #files_bucket, #files, [data-testid*="diff" i]',
             ) ||
@@ -15798,7 +15797,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
 
-        const container = findGithubReviewOptionsContainer();
+        const anchor = findGithubReviewOptionsAnchor(document);
+        const container = findGithubReviewOptionsContainer(anchor);
         if (!container || isAckOwnedOverlay(container)) return;
 
         let host = document.querySelector('.ack-github-review-options');
@@ -15814,7 +15814,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
 
-        const anchor = findGithubReviewOptionsAnchor(document);
         if (anchor?.parentElement) {
             const insertionPoint = anchor.closest?.('details') || anchor;
             insertionPoint.after(host);
