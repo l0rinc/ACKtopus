@@ -3012,8 +3012,8 @@
         GM_setValue(GITHUB_HTTP_CACHE_INDEX_KEY, entries);
     }
 
-    function pruneGithubHttpCache(now = Date.now()) {
-        const entries = readGithubHttpCacheIndex().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+    function pruneGithubHttpCache(now = Date.now(), entries = readGithubHttpCacheIndex()) {
+        entries.sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
         const kept = [];
         let totalBytes = 0;
         for (const entry of entries) {
@@ -3087,8 +3087,7 @@
         GM_setValue(key, value);
         const index = readGithubHttpCacheIndex().filter((entry) => entry.key !== key);
         index.push({ key, prKey, ts: value.ts, bytes });
-        writeGithubHttpCacheIndex(index);
-        pruneGithubHttpCache(value.ts);
+        pruneGithubHttpCache(value.ts, index);
         return value;
     }
 
@@ -36481,7 +36480,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackEq(index.length, GITHUB_HTTP_CACHE_MAX_ENTRIES, 'bounds the number of cached responses');
             ackEq(values.size, index.length + 1, 'evicted bodies leave no orphaned storage');
             ackAssert(index.every((entry) => values.has(entry.key)), 'every indexed body exists');
-            ackEq(indexWrites, 2 * (GITHUB_HTTP_CACHE_MAX_ENTRIES + 1), 'characterizes index writes per response');
+            ackEq(indexWrites, GITHUB_HTTP_CACHE_MAX_ENTRIES + 1, 'writes the pruned index once per response');
             const retainedUrl = values.get(index[0].key).url;
             rememberGithubHttpCache(retainedUrl, {}, response, [{ id: 1, body: 'edited' }]);
             ackEq(readGithubHttpCacheIndex().length, index.length, 'replacement does not duplicate an index entry');
