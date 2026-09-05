@@ -298,6 +298,10 @@ On repository pages, ACKtopus rewrites one-sided or cross-fork compare links so 
 
 ## Development checks
 
+ACKtopus's persistent GitHub API cache uses [conditional requests](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests): stored response bodies are reused only after GitHub returns `304 Not Modified`. Changed pages replace their cached contents, including edits and deletions, while other pages retain their own validators. Unchanged bodies are not rewritten to storage. GitHub's native timeline and editors continue to use GitHub's own loading and update logic.
+
+Comment enhancements process changed subtrees, avoid searching neighboring comments for editors, and filter possible controls before measuring their layout. Unchanged classes and ACKtopus-only decoration classes do not queue another editor refresh.
+
 - `pnpm run check` runs a Node syntax check over the userscript.
 - `pnpm run build` runs TypeScript over the JavaScript source without emitting files.
 - The in-browser self-test runner is available from ACKtopus settings on GitHub pages and covers DOM-dependent behavior against the live page.
