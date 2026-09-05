@@ -3098,23 +3098,6 @@
         return cached?.etag ? { ...headers, 'If-None-Match': cached.etag } : headers;
     }
 
-    function touchGithubHttpCache(cached) {
-        if (!cached?.key) return cached;
-        const value = { ...cached, ts: Date.now() };
-        delete value.key;
-        GM_setValue(cached.key, value);
-        const index = readGithubHttpCacheIndex().filter((entry) => entry.key !== cached.key);
-        index.push({
-            key: cached.key,
-            prKey: githubHttpCachePRKey(cached.url),
-            ts: value.ts,
-            bytes: value.bytes,
-        });
-        writeGithubHttpCacheIndex(index);
-        pruneGithubHttpCache(value.ts);
-        return { key: cached.key, ...value };
-    }
-
     const _githubJsonRequests = new Map();
 
     function gmFetch(url) {
@@ -3137,7 +3120,7 @@
                 headers,
                 onload: (r) => {
                     if (r.status === 304 && cached) {
-                        resolve(touchGithubHttpCache(cached).data);
+                        resolve(cached.data);
                     } else if (r.status >= 200 && r.status < 300) {
                         try {
                             const data = parseGithubJson(r, url);
@@ -3169,7 +3152,7 @@
                             headers: fallbackHeaders,
                             onload: (r2) => {
                                 if (r2.status === 304 && fallbackCached) {
-                                    resolve(touchGithubHttpCache(fallbackCached).data);
+                                    resolve(fallbackCached.data);
                                 } else if (r2.status >= 200 && r2.status < 300) {
                                     try {
                                         const data = parseGithubJson(r2, url);
@@ -36473,16 +36456,21 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
 
         const originalRequest = GM_xmlhttpRequest;
+        const originalSetValue = GM_setValue;
+        let writes = 0;
         let requestedHeaders = null;
         try {
+            GM_setValue = (key, value) => { writes++; originalSetValue(key, value); };
             GM_xmlhttpRequest = (opts) => {
                 requestedHeaders = opts.headers;
                 opts.onload?.({ status: 304, responseText: '', responseHeaders: 'etag: "comments-v1"' });
             };
             ackDeepEq(await gmFetch(url), cachedData, 'returns the previously parsed response after 304');
             ackEq(requestedHeaders?.['If-None-Match'], '"comments-v1"', 'asks GitHub to validate the cached ETag');
+            ackEq(writes, 0, 'unchanged responses do not rewrite the body or cache index');
         } finally {
             GM_xmlhttpRequest = originalRequest;
+            GM_setValue = originalSetValue;
             invalidateGithubHttpCacheForPR('ack-cache-test/demo#77');
         }
     });
