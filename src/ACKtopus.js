@@ -17492,8 +17492,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         let el = element?.nodeType === 1 ? element : element?.parentElement || null;
         for (let i = 0; i < 12 && el && el !== document.body; i++, el = el.parentElement) {
-            if (!el.matches?.(EDIT_SCOPE_SELECTOR) && !el.querySelector?.(EDIT_SCOPE_SELECTOR)) continue;
-            if (isExistingPostEditForm(el)) return el;
+            if (el.matches?.(EDIT_SCOPE_SELECTOR) || el.querySelector?.(EDIT_SCOPE_SELECTOR)) {
+                if (isExistingPostEditForm(el)) return el;
+            }
+            if (el.matches?.(WIDE_COMMENT_CONTAINER_SELECTOR)) break;
         }
         return null;
     }
@@ -39531,6 +39533,18 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             abortAckLifetime('test cleanup');
             host.remove();
         }
+    });
+
+    ackTest('edit form discovery stops at an unrelated comment', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `<div class="js-discussion">
+            <div class="timeline-comment"><span id="loaded-comment-text">Loaded text</span></div>
+            <div class="timeline-comment is-comment-editing">
+                <form class="js-comment-update"><textarea>Draft</textarea><button>Update</button><button>Cancel</button></form>
+            </div>
+        </div>`;
+        ackEq(findEditForm(host.querySelector('#loaded-comment-text')), null, 'does not search the rest of the discussion');
+        ackEq(findEditForm(host.querySelector('textarea')), host.querySelector('form'), 'still resolves the real editor');
     });
 
     ackTest('edit form lookup keeps a timeline comment separate from neighboring review comments', () => {
