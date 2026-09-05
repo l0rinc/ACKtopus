@@ -3074,9 +3074,7 @@
         if (!etag || bytes > GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES) return null;
 
         const key = githubHttpCacheKey(url, headers);
-        const previous = readGithubHttpCache(url, headers);
         const prKey = githubHttpCachePRKey(url);
-        if (previous?.etag && previous.etag !== etag && prKey) invalidateGithubHttpCacheForPR(prKey);
 
         const value = {
             url,
@@ -36575,7 +36573,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('a changed GitHub ETag invalidates every cached endpoint for that PR', () => {
+    ackTest('a changed GitHub ETag preserves other endpoints for separate validation', async () => {
         const headers = { Accept: 'application/vnd.github+json' };
         const commentsUrl = 'https://api.github.com/repos/ack-cache-test/demo/issues/78/comments?per_page=100';
         const reviewsUrl = 'https://api.github.com/repos/ack-cache-test/demo/pulls/78/reviews?per_page=100';
@@ -36587,9 +36585,48 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         rememberGithubHttpCache(reviewsUrl, headers, response('reviews-v1', [{ id: 2 }]), [{ id: 2 }]);
         rememberGithubHttpCache(commentsUrl, headers, response('comments-v2', [{ id: 3 }]), [{ id: 3 }]);
 
-        ackEq(readGithubHttpCache(reviewsUrl, headers), null, 'drops sibling endpoint data after a detected change');
-        ackDeepEq(readGithubHttpCache(commentsUrl, headers)?.data, [{ id: 3 }], 'keeps only the new response');
-        invalidateGithubHttpCacheForPR('ack-cache-test/demo#78');
+        ackEq(readGithubHttpCache(reviewsUrl, headers)?.etag, '"reviews-v1"', 'retains the other endpoint validator');
+        ackDeepEq(readGithubHttpCache(commentsUrl, headers)?.data, [{ id: 3 }], 'replaces the changed response');
+        const previousRequest = GM_xmlhttpRequest;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                ackEq(opts.headers['If-None-Match'], '"reviews-v1"', 'still validates the retained response');
+                opts.onload({ status: 200, ...response('reviews-v2', [{ id: 4 }]) });
+            };
+            ackDeepEq(await gmFetch(reviewsUrl), [{ id: 4 }], 'returns updated data instead of the retained snapshot');
+        } finally {
+            GM_xmlhttpRequest = previousRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#78');
+        }
+    });
+
+    ackTest('cached comment pages reflect edits, deletions, and a shorter final list', async () => {
+        const urlForPage = (page) => `https://api.github.com/repos/ack-cache-test/demo/issues/79/comments?per_page=100&page=${page}`;
+        const previousRequest = GM_xmlhttpRequest;
+        let rows = Array.from({ length: 201 }, (_,i) => ({ id: i + 1, body: `Comment ${i + 1}` }));
+        const statuses = [];
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                const page = Number(new URL(opts.url).searchParams.get('page'));
+                const responseText = JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+                const etag = `"${hashPrompt(responseText)}"`;
+                const status = opts.headers['If-None-Match'] === etag ? 304 : 200;
+                statuses.push(status);
+                opts.onload({ status, responseText: status === 304 ? '' : responseText, responseHeaders: `etag: ${etag}` });
+            };
+            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'fills the cache on the first visit');
+            statuses.length = 0;
+            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'reuses validated comment pages');
+            ackDeepEq(statuses, [304, 304, 304], 'unchanged comments need no response bodies');
+            rows[0] = { id: 1, body: 'Edited comment' };
+            rows = rows.filter((row) => row.id !== 151);
+            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'reflects edits and deletions across page boundaries');
+            rows = rows.slice(0, 50);
+            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'does not append old cached pages after the list shrinks');
+        } finally {
+            GM_xmlhttpRequest = previousRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#79');
+        }
     });
 
     ackTest('GitHub API helpers remember bad PATs and rate limits', () => {
