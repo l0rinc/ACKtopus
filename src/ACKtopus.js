@@ -5117,20 +5117,23 @@
 
     function rewriteLocalRepoCompareLinks(root = document, opts = {}) {
         let rewritten = 0;
+        const links = qsa(root, 'a[href*="/compare/"]').filter(
+            (link) => link.dataset.localRepoPrRewritten === '1' || isComparePullRequestButton(link),
+        );
+        if (!links.length) return rewritten;
         const scanRoot = opts.root || root || document;
         const pagePath = opts.path || location.pathname;
         const currentRepo = opts.currentRepo || currentGitHubRepo(scanRoot, pagePath);
         const branchPath = opts.path || (opts.currentRepo && currentRepo ? `/${currentRepo.owner}/${currentRepo.repo}` : pagePath);
         const baseBranch = normalizeBranchName(opts.baseBranch || currentGitHubRepoBaseBranch(scanRoot, branchPath));
         if (!currentRepo) return rewritten;
-        for (const link of qsa(root, 'a[href*="/compare/"]')) {
+        for (const link of links) {
             if (link.dataset.localRepoPrRewritten === '1') {
                 const upstreamHref = link.dataset.localRepoPrUpstreamHref;
                 const forkHref = link.dataset.localRepoPrForkHref;
                 if (upstreamHref && forkHref) installLocalRepoCompareTargets(link, upstreamHref, forkHref);
                 continue;
             }
-            if (!isComparePullRequestButton(link)) continue;
             const originalHref = link.getAttribute('href') || '';
             const rewrite = rewriteLocalRepoCompareHref(originalHref, {
                 currentRepo,
