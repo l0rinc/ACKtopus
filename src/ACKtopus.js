@@ -15796,7 +15796,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         if (anchor?.parentElement) {
             const insertionPoint = anchor.closest?.('details') || anchor;
-            insertionPoint.after(host);
+            if (insertionPoint.nextSibling !== host) insertionPoint.after(host);
         } else if (!host.isConnected || host.parentElement !== container) {
             container.appendChild(host);
         }
@@ -43822,7 +43822,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             observer.observe(fixture, { childList: true, subtree: true });
             installGithubReviewOptions();
             ackEq(host.querySelector('input'), checkbox, 'preserves the checkbox instance');
-            ackEq(observer.takeRecords().length, 2, 'characterizes redundant removal and reinsertion');
+            ackEq(observer.takeRecords().length, 0, 'unchanged controls do not create more DOM mutations');
             findGithubReviewOptionsAnchor = () => fixture.querySelector('button');
             installGithubReviewOptions();
             ackEq(fixture.querySelector('button').nextSibling, host, 'follows a changed native anchor');
