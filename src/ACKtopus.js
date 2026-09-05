@@ -36459,6 +36459,43 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(!key.includes('secret-token'), 'does not expose the token in the cache key');
     });
 
+    ackTest('GitHub HTTP cache keeps response bodies and its bounded index aligned', () => {
+        const originalGet = GM_getValue;
+        const originalSet = GM_setValue;
+        const originalDelete = GM_deleteValue;
+        const values = new Map();
+        let indexWrites = 0;
+        try {
+            GM_getValue = (key, fallback) => values.has(key) ? values.get(key) : fallback;
+            GM_setValue = (key, value) => {
+                if (key === GITHUB_HTTP_CACHE_INDEX_KEY) indexWrites++;
+                values.set(key, value);
+            };
+            GM_deleteValue = (key) => values.delete(key);
+            const url = (page) => `https://api.github.com/repos/ack-cache-test/demo/issues/81/comments?page=${page}`;
+            const response = { responseText: '[]', responseHeaders: 'etag: "comments-v1"' };
+            for (let page = 1; page <= GITHUB_HTTP_CACHE_MAX_ENTRIES + 1; page++) {
+                rememberGithubHttpCache(url(page), {}, response, []);
+            }
+            const index = readGithubHttpCacheIndex();
+            ackEq(index.length, GITHUB_HTTP_CACHE_MAX_ENTRIES, 'bounds the number of cached responses');
+            ackEq(values.size, index.length + 1, 'evicted bodies leave no orphaned storage');
+            ackAssert(index.every((entry) => values.has(entry.key)), 'every indexed body exists');
+            ackEq(indexWrites, 2 * (GITHUB_HTTP_CACHE_MAX_ENTRIES + 1), 'characterizes index writes per response');
+            const retainedUrl = values.get(index[0].key).url;
+            rememberGithubHttpCache(retainedUrl, {}, response, [{ id: 1, body: 'edited' }]);
+            ackEq(readGithubHttpCacheIndex().length, index.length, 'replacement does not duplicate an index entry');
+            ackDeepEq(readGithubHttpCache(retainedUrl, {})?.data, [{ id: 1, body: 'edited' }], 'keeps the replacement body');
+            pruneGithubHttpCache(Date.now() + GITHUB_HTTP_CACHE_MAX_AGE_MS + 1);
+            ackEq(readGithubHttpCacheIndex().length, 0, 'removes expired index entries');
+            ackEq(values.size, 1, 'removes expired bodies too');
+        } finally {
+            GM_getValue = originalGet;
+            GM_setValue = originalSet;
+            GM_deleteValue = originalDelete;
+        }
+    });
+
     ackTest('gmFetch reuses JSON only after an ETag validation', async () => {
         const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/77/comments?per_page=100';
         const baseHeaders = ghApiHeaders();
@@ -43760,6 +43797,47 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         input.checked = false;
         input.dispatchEvent(new Event('change', { bubbles: true }));
         ackEq(changed, false, 'reports changed state');
+    });
+
+    ackTest('GitHub review options stay beside their current anchor across refreshes', () => {
+        const originalAnchor = findGithubReviewOptionsAnchor;
+        const originalDiffPage = isDiffReviewPage;
+        const originalTimelinePage = isTimelineFilterPage;
+        const existingHost = document.querySelector('.ack-github-review-options');
+        const existingParent = existingHost?.parentNode;
+        const existingNext = existingHost?.nextSibling;
+        const fixture = document.createElement('div');
+        fixture.innerHTML = '<details><summary>Diff settings</summary></details><button>File options</button>';
+        const observer = new MutationObserver(() => {});
+        let host;
+        try {
+            existingHost?.remove();
+            document.body.appendChild(fixture);
+            isDiffReviewPage = () => true;
+            isTimelineFilterPage = () => false;
+            findGithubReviewOptionsAnchor = () => fixture.querySelector('summary');
+            installGithubReviewOptions();
+            host = fixture.querySelector('.ack-github-review-options');
+            ackEq(fixture.querySelector('details').nextSibling, host, 'places controls after the settings disclosure');
+            const checkbox = host.querySelector('input');
+            observer.observe(fixture, { childList: true, subtree: true });
+            installGithubReviewOptions();
+            ackEq(host.querySelector('input'), checkbox, 'preserves the checkbox instance');
+            ackEq(observer.takeRecords().length, 2, 'characterizes redundant removal and reinsertion');
+            findGithubReviewOptionsAnchor = () => fixture.querySelector('button');
+            installGithubReviewOptions();
+            ackEq(fixture.querySelector('button').nextSibling, host, 'follows a changed native anchor');
+            host.remove();
+            installGithubReviewOptions();
+            ackAssert(fixture.querySelector('.ack-github-review-options')?.isConnected, 'restores removed controls');
+        } finally {
+            observer.disconnect();
+            fixture.remove();
+            findGithubReviewOptionsAnchor = originalAnchor;
+            isDiffReviewPage = originalDiffPage;
+            isTimelineFilterPage = originalTimelinePage;
+            if (existingParent) existingParent.insertBefore(existingHost, existingNext);
+        }
     });
 
     ackTest('diff review helpers detect diff-like review pages', () => {
