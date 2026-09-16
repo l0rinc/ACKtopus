@@ -16731,7 +16731,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const first = group.find((line) => !line.deleted) || group[0];
         const meta = getDiffSelectionLineMeta(first.cell);
         if (!meta?.lineNum) return;
-        const lineNumberCell = meta.row?.querySelector('[data-line-number]') || meta.row?.firstElementChild;
+        // Use the line-number cell the location was read from: in split view
+        // the row's first numbered cell is the old-side line.
+        const lineNumberCell = meta.lineEl || meta.row?.firstElementChild;
         if (!lineNumberCell || lineNumberCell === first.cell) return;
         const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
         const state = { kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, head, path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'), full_hunk_hash: signature };
@@ -23477,7 +23479,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ?.match(/^Diff for: (.+)$/)?.[1] ||
             '';
 
-        return { codeCell, row, fileName, lineNum, side, anchorId };
+        return { codeCell, row, fileName, lineNum, side, anchorId, lineEl };
     }
 
     function getDiffSelectionContext(sel) {
@@ -27392,7 +27394,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         host.innerHTML = '<table><tr><td data-line-number="6" id="diff-abcL6"></td><td class="blob-code blob-code-deletion">return old;</td><td data-line-number="7" id="diff-abcR7"></td><td class="blob-code blob-code-addition">return updated;</td></tr></table>';
         const split = jevChangedRow(host.querySelector('tr'));
         ackEq(split?.excerpt, '- return old;\n+ return updated;');
-        ackEq(getDiffSelectionLineMeta(split.cell)?.lineNum, '7', 'split diff badge belongs on new line');
+        const splitMeta = getDiffSelectionLineMeta(split.cell);
+        ackEq(splitMeta?.lineNum, '7', 'split diff badge belongs on new line');
+        ackEq(splitMeta?.lineEl?.id, 'diff-abcR7', 'badge slot is the new-side line-number cell');
     });
 
     ackTest('sourceSection fails closed when structural-test anchors drift', () => {
