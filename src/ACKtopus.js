@@ -6604,8 +6604,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             }
         });
         resetInMemoryCaches();
+        jevCacheMemory = null;
         // jev_enabled was just deleted; stop classifying until it is re-enabled.
         jevConfigured = false;
+        jevEpoch++;
+        document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
+        resetJevTrackers();
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
@@ -7379,14 +7383,24 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             if (maintEl) GM_setValue('maintainer_logins', maintEl.value);
             const mirrorEl = document.getElementById('ack-repo-mirrors');
             if (mirrorEl) GM_setValue('repo_mirrors', mirrorEl.value);
+            const previousJevKey = GM_getValue('jev_api_key', '').trim();
+            const nextJevKey = jevInput.value.trim();
+            const nextJevConfigured = jevToggle.checked && !!nextJevKey;
+            const jevSettingsChanged = jevConfigured !== nextJevConfigured || previousJevKey !== nextJevKey;
+            if (jevSettingsChanged) jevEpoch++;
             GM_setValue('jev_enabled', jevToggle.checked);
-            if (jevInput.value.trim()) GM_setValue('jev_api_key', jevInput.value.trim());
+            if (nextJevKey) GM_setValue('jev_api_key', nextJevKey);
             else GM_deleteValue('jev_api_key');
-            jevConfigured = jevToggle.checked && !!jevInput.value.trim();
+            jevConfigured = nextJevConfigured;
             jevRejectedKey = '';
+            jevSchemaRejected = false;
             jevPauseUntil = 0;
             closePanel();
             if (jevEnabled()) {
+                if (jevSettingsChanged) {
+                    document.querySelectorAll('.ack-jev-badges:empty').forEach((badge) => badge.remove());
+                    resetJevTrackers();
+                }
                 queueJevPageAnnotations();
                 for (const container of leafLazyCommentContainers()) {
                     const bounds = container.getBoundingClientRect();
@@ -16266,15 +16280,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = 2;
+    const JEV_SCHEMA = 3;
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+    const JEV_PUBLIC_CHECK_TTL_MS = 60000;
     const JEV_MAX_REQUESTS_PER_PAGE = 250;
     const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)[_-][A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
         commit: {
-            role: { type: 'choice', instructions: 'What is the primary role of this parent-relative commit patch? Judge the patch, not just the message.', criteria: {
+            role: { type: 'choice', instructions: 'What is the primary role of the shown parent-relative commit diff? It may sample files; judge the shown code, not just the message.', criteria: {
                 test: 'Adds or strengthens an executable test or characterization',
                 fix: 'Changes production behavior to fix a problem',
                 refactor: 'Restructures code without an intended behavior change',
@@ -16288,7 +16303,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             effort: { type: 'score', instructions: 'How much effort is needed to review this patch carefully, considering size, interactions, and required external context?', criteria: [
                 'Quick and self-contained', 'Moderate context or several interactions', 'Deep context, subtle invariants, or many interactions',
             ] },
-            message_match: { type: 'noul', instructions: 'Does the commit message accurately describe the actual parent-relative patch without materially overstating it?' },
+            message_match: { type: 'noul', instructions: 'Does the commit message accurately describe the shown parent-relative diff without materially overstating it? Stay uncertain when files are omitted.' },
             test_oracle: { type: 'choice', instructions: 'If this patch adds or changes tests, do their assertions distinguish the intended behavior from a plausible wrong implementation? Do not count assertions added only to production code as tests.', criteria: {
                 direct: 'The changed test has a discriminating assertion tied to the behavior',
                 weak: 'The changed test lacks a useful oracle, or only checks incidental execution',
@@ -16344,16 +16359,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevPending = new Map();
     const jevJobs = [];
     const jevPublicChecks = new Map();
+    const jevPublicRetryTimers = new Map();
+    const jevPublicRetryWarned = new Set();
     let jevCacheMemory = null;
     let jevActive = 0;
     let jevPageKey = '';
     let jevPageRequests = 0;
+    let jevEpoch = 0;
     let jevRejectedKey = '';
+    let jevSchemaRejected = false;
     let jevPauseUntil = 0;
+    let jevPauseRetryTimer = null;
     let jevConfigured = !!GM_getValue('jev_enabled', false) && !!GM_getValue('jev_api_key', '');
 
     function jevEnabled() {
-        return jevConfigured && Date.now() >= jevPauseUntil && GM_getValue('jev_api_key', '') !== jevRejectedKey;
+        return jevConfigured && !jevSchemaRejected && Date.now() >= jevPauseUntil &&
+            (!jevRejectedKey || GM_getValue('jev_api_key', '') !== jevRejectedKey);
     }
 
     function jevCacheId(kind, state) {
@@ -16415,10 +16436,55 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         catch (_) { return false; }
     }
 
+    function jevRequeueEmptyAnnotations(root = document) {
+        if (!jevEnabled() || !parsePR()) return;
+        root.querySelectorAll('.ack-jev-badges:empty').forEach((slot) => slot.remove());
+        resetJevTrackers();
+        queueJevPageAnnotations();
+        for (const container of leafLazyCommentContainers()) {
+            const bounds = container.getBoundingClientRect();
+            if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+        }
+    }
+
+    function jevRetryPublicCheck(key, root = document) {
+        const current = parsePR();
+        if (!current || `${current.owner}/${current.repo}`.toLowerCase() !== key || !jevEnabled()) return;
+        jevPublicChecks.delete(key);
+        jevRequeueEmptyAnnotations(root);
+    }
+
+    function jevResumeAfterPause() {
+        jevPauseRetryTimer = null;
+        if (Date.now() < jevPauseUntil) {
+            jevSchedulePauseRetry();
+            return;
+        }
+        if (jevPauseUntil && jevEnabled()) jevRequeueEmptyAnnotations();
+    }
+
+    function jevSchedulePauseRetry() {
+        if (jevPauseRetryTimer !== null) clearTimeout(jevPauseRetryTimer);
+        jevPauseRetryTimer = setTimeout(jevResumeAfterPause, Math.max(0, jevPauseUntil - Date.now()));
+    }
+
+    function jevSchedulePublicRetry(key, reason) {
+        if (!jevPublicRetryWarned.has(key)) {
+            jevPublicRetryWarned.add(key);
+            if (!_ackTesting) console.warn(`ACKtopus: Jev public check failed for ${key} (${reason}). Retrying in one minute if this repository is still open.`);
+        }
+        if (jevPublicRetryTimers.has(key)) return;
+        const timer = setTimeout(() => {
+            jevPublicRetryTimers.delete(key);
+            jevRetryPublicCheck(key);
+        }, JEV_PUBLIC_CHECK_TTL_MS);
+        jevPublicRetryTimers.set(key, timer);
+    }
+
     function jevPublicRepository(pr) {
         const key = `${pr.owner}/${pr.repo}`.toLowerCase();
         const previous = jevPublicChecks.get(key);
-        if (previous && Date.now() - previous.ts < 60000) return previous.check;
+        if (previous && Date.now() - previous.ts < JEV_PUBLIC_CHECK_TTL_MS) return previous.check;
         // An unauthenticated 200 response with private:false is proof that
         // ordinary visitors can read this repository. A 401/404/error skips it.
         const check = new Promise((resolve) => {
@@ -16428,11 +16494,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 headers: { Accept: 'application/vnd.github+json' },
                 anonymous: true,
                 timeout: 10000,
-                onload: (r) => resolve(jevIsPublicRepoResponse(r)),
-                onerror: () => resolve(false),
-                ontimeout: () => resolve(false),
+                onload: (r) => {
+                    if (r.status === 403 || r.status === 429 || (r.status >= 500 && r.status < 600)) {
+                        jevSchedulePublicRetry(key, `HTTP ${r.status}`);
+                    } else if (jevPublicRetryTimers.has(key)) {
+                        clearTimeout(jevPublicRetryTimers.get(key));
+                        jevPublicRetryTimers.delete(key);
+                    }
+                    resolve(jevIsPublicRepoResponse(r));
+                },
+                onerror: () => { jevSchedulePublicRetry(key, 'network error'); resolve(false); },
+                ontimeout: () => { jevSchedulePublicRetry(key, 'timeout'); resolve(false); },
             });
-        }).catch(() => false);
+        }).catch(() => { jevSchedulePublicRetry(key, 'network error'); return false; });
         jevPublicChecks.set(key, { ts: Date.now(), check });
         return check;
     }
@@ -16455,12 +16529,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         setTimeout(() => jevPost(kind, state, attempt + 1).then(resolve, reject), 500 * 2 ** attempt);
                         return;
                     }
-                    if (r.status === 429 || r.status === 529) jevPauseUntil = Date.now() + 60000;
-                    if (r.status === 401 || r.status === 422) jevRejectedKey = key;
+                    if (r.status === 429 || r.status === 529) {
+                        jevPauseUntil = Date.now() + 60000;
+                        jevSchedulePauseRetry();
+                    }
+                    if (r.status === 401) jevRejectedKey = key;
+                    if (r.status === 422) jevSchemaRejected = true;
                     if (r.status < 200 || r.status >= 300) {
-                        // 422 means TypeSafe rejected the request shape, not the key; keep
-                        // the body so the console warning says what was wrong.
-                        return reject(new Error(`Jev HTTP ${r.status}: ${String(r.responseText || '').slice(0, 160)}`));
+                        const reason = r.status === 422 ? ' (request shape rejected; annotations paused)' : '';
+                        return reject(new Error(`Jev HTTP ${r.status}${reason}: ${String(r.responseText || '').slice(0, 160)}`));
                     }
                     try {
                         const result = jevValidatedResult(kind, JSON.parse(r.responseText));
@@ -16485,14 +16562,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevEvaluate(pr, kind, state) {
+        const epoch = jevEpoch;
         const id = jevCacheId(kind, state);
         const cached = jevReadCache(id);
-        if (cached) return jevPublicRepository(pr).then((isPublic) => isPublic ? cached : null);
+        if (cached) return jevPublicRepository(pr).then((isPublic) => isPublic && epoch === jevEpoch && jevEnabled() ? cached : null);
         if (jevPending.has(id)) return jevPending.get(id);
         const pageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
         if (pageKey !== jevPageKey) { jevPageKey = pageKey; jevPageRequests = 0; }
         if (jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) return Promise.resolve(null);
-        jevPageRequests++;
         const routePath = location.pathname;
         const pending = new Promise((resolve) => {
             jevJobs.push(async () => {
@@ -16500,7 +16577,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (location.pathname !== routePath) return resolve(null);
                     if (!jevEnabled() || !(await jevPublicRepository(pr))) return resolve(null);
                     if (location.pathname !== routePath) return resolve(null);
+                    if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
+                    if (jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) return resolve(null);
+                    jevPageRequests++;
                     const result = await jevPost(kind, state);
+                    if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
                     resolve(result);
                 } catch (e) {
@@ -16624,6 +16705,46 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    function jevPatchFileExcerpt(file, maxChars) {
+        if (file.length <= maxChars) return file;
+        const hunks = [...file.matchAll(/^@@(?:@)? /gm)].map((match) => match.index);
+        if (hunks.length < 2 || maxChars < 1200) return file.slice(0, maxChars);
+        const header = file.slice(0, hunks[0]).slice(0, Math.min(320, Math.floor(maxChars / 5)));
+        const count = Math.min(hunks.length, 3);
+        const marker = '\n[intervening hunks omitted]\n';
+        const perHunk = Math.floor((maxChars - header.length - marker.length * (count - 1)) / count);
+        const sampled = Array.from({ length: count }, (_, index) => {
+            const start = hunks[Math.round(index * (hunks.length - 1) / (count - 1))];
+            return file.slice(start, start + perHunk);
+        });
+        return header + sampled.join(marker);
+    }
+
+    function jevCommitPatchExcerpt(patchText, maxChars = 7000) {
+        const patch = String(patchText || '');
+        // The commit message is sent separately. Begin at the diff so mbox
+        // headers cannot consume most of a small request budget.
+        const diffStart = patch.search(/^diff --git /m);
+        const diff = diffStart < 0 ? patch : patch.slice(diffStart);
+        if (diff.length <= maxChars) {
+            return { text: diff, clipped: diff.includes('@@ deleted file contents omitted @@') };
+        }
+
+        const files = diff.split(/(?=^diff --git )/m).filter(Boolean);
+        if (files.length < 2) return { text: jevPatchFileExcerpt(diff, maxChars), clipped: true };
+
+        // Take the beginning of files spread across the commit. Each beginning
+        // includes its file header and, budget permitting, changed lines.
+        // The marker makes omitted material explicit to the classifier.
+        const count = Math.min(files.length, 12);
+        const marker = '\n[intervening diff omitted]\n';
+        const perFile = Math.floor((maxChars - marker.length * (count - 1)) / count);
+        const sampled = Array.from({ length: count }, (_, index) =>
+            jevPatchFileExcerpt(files[Math.round(index * (files.length - 1) / (count - 1))], perFile),
+        );
+        return { text: sampled.join(marker), clipped: true };
+    }
+
     function queueJevCommitRow(commit) {
         const pr = parsePR();
         if (!pr) return;
@@ -16649,7 +16770,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!isPublic || !slot.isConnected) return;
             try {
                 const patch = await fetchCommitPatch(pr, sha);
-                const state = { kind: 'commit', repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg.slice(0, 1200), patch: patch.slice(0, 7000), patch_clipped: patch.length > 7000 };
+                const excerpt = jevCommitPatchExcerpt(patch);
+                const state = { kind: 'commit', repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg.slice(0, 1200), patch: excerpt.text, patch_clipped: excerpt.clipped };
                 const result = await jevEvaluate(pr, 'commit', state);
                 if (result) jevWriteCache(alias, { ...result, partial: state.patch_clipped }, `${pr.owner}/${pr.repo}#${pr.pr}`);
                 if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'commit', result, `${sha.slice(0, 12)} parent-relative patch`, state.patch_clipped);
@@ -27284,6 +27406,69 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!JEV_SECRET_RE.test('const sk = value + 1; // ghp_short'), 'leaves ordinary code alone');
     });
 
+    ackTest('Jev distinguishes rejected request shape from an invalid key', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldConfigured = jevConfigured;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const oldPauseUntil = jevPauseUntil;
+        let status = 422;
+        let keyValue = 'synthetic-key';
+        try {
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            jevPauseUntil = 0;
+            GM_getValue = (key, fallback) => key === 'jev_api_key' ? keyValue : oldGet(key, fallback);
+            GM_xmlhttpRequest = (opts) => opts.onload({ status, responseText: 'bad questions' });
+            keyValue = '';
+            const missingKey = await jevPost('comment', { selected_comment: 'fixture' }).catch((e) => e);
+            ackEq(missingKey.message, 'Jev API key missing');
+            keyValue = 'synthetic-key';
+            const shapeError = await jevPost('comment', { selected_comment: 'fixture' }).catch((e) => e);
+            ackAssert(shapeError.message.includes('request shape rejected; annotations paused'));
+            ackEq(jevRejectedKey, '', 'a schema error does not mark the key invalid');
+            ackAssert(jevSchemaRejected && !jevEnabled(), 'a schema error pauses further requests');
+            jevSchemaRejected = false;
+            status = 401;
+            await jevPost('comment', { selected_comment: 'fixture' }).catch(() => {});
+            ackEq(jevRejectedKey, 'synthetic-key', 'an authentication error marks the key invalid');
+            ackAssert(!jevSchemaRejected, 'an authentication error does not set the schema flag');
+        } finally {
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+            jevConfigured = oldConfigured;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
+            jevPauseUntil = oldPauseUntil;
+        }
+    });
+
+    ackTest('Jev commit excerpt skips mbox prose and samples later files', () => {
+        const file = (name) => `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n-old\n+new\n${' context\n'.repeat(120)}`;
+        const patch = `From abcdef\nSubject: repeated commit message\n\n${'message text\n'.repeat(800)}` +
+            ['first.cpp', 'middle.cpp', 'last.cpp'].map(file).join('');
+        const excerpt = jevCommitPatchExcerpt(patch, 600);
+        ackAssert(excerpt.clipped);
+        ackAssert(excerpt.text.length <= 600, 'stays within the request budget');
+        ackAssert(excerpt.text.startsWith('diff --git a/first.cpp'), 'starts with diff rather than mbox prose');
+        ackAssert(excerpt.text.includes('diff --git a/middle.cpp'), 'samples an intervening file');
+        ackAssert(excerpt.text.includes('diff --git a/last.cpp'), 'samples the final file');
+        ackAssert(excerpt.text.includes('[intervening diff omitted]'), 'marks incomplete evidence');
+        const small = jevCommitPatchExcerpt('Subject: message\n' + file('only.cpp').slice(0, 90));
+        ackAssert(!small.clipped);
+        ackAssert(small.text.startsWith('diff --git a/only.cpp'));
+        ackAssert(jevCommitPatchExcerpt('diff --git a/gone.cpp b/gone.cpp\n@@ deleted file contents omitted @@').clipped,
+            'deleted-file bodies omitted by the shared fetcher mark evidence incomplete');
+        const longHunk = (line) => `@@ -${line} +${line} @@\n-old\n+new\n${' context\n'.repeat(400)}`;
+        const oneLargeFile = 'diff --git a/large.cpp b/large.cpp\n--- a/large.cpp\n+++ b/large.cpp\n' +
+            [1, 101, 201].map(longHunk).join('');
+        const hunkSample = jevCommitPatchExcerpt(oneLargeFile, 1800);
+        ackAssert(hunkSample.clipped && hunkSample.text.length <= 1800);
+        for (const line of [1, 101, 201]) ackAssert(hunkSample.text.includes(`@@ -${line} +${line} @@`), 'samples hunks across one large file');
+    });
+
     ackTest('Jev evidence cache keys change with edits and patch content', () => {
         const before = { kind: 'comment', selected_comment: 'Please check the bound' };
         const edited = { ...before, selected_comment: 'Please check the overflow' };
@@ -27387,6 +27572,301 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevPageRequests = oldPageRequests;
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev retries transient public checks without spending the TypeSafe page budget', async () => {
+        const oldGet = GM_getValue;
+        const oldSet = GM_setValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldCacheMemory = jevCacheMemory;
+        const oldConfigured = jevConfigured;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const pr = { owner: 'acktopus-retry-fixture', repo: 'example', pr: '9' };
+        const key = 'acktopus-retry-fixture/example';
+        const denied = { owner: 'acktopus-denied-fixture', repo: 'example' };
+        const serverError = { owner: 'acktopus-server-fixture', repo: 'example' };
+        let status = 403;
+        let gets = 0;
+        let posts = 0;
+        try {
+            jevCacheMemory = [];
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            jevPageKey = '';
+            jevPageRequests = 0;
+            GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
+            GM_setValue = () => {};
+            GM_xmlhttpRequest = (opts) => {
+                if (opts.method === 'GET') {
+                    gets++;
+                    ackAssert(opts.anonymous, 'repository proof stays anonymous');
+                    opts.onload({ status, responseText: status === 200 ? '{"private":false}' : '' });
+                } else {
+                    posts++;
+                    opts.onload({ status: 200, responseText: JSON.stringify({
+                        model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+                    }) });
+                }
+            };
+            ackEq(await jevEvaluate(pr, 'comment', { selected_comment: 'first attempt' }), null);
+            ackEq(jevPageRequests, 0, 'a failed public check does not use the TypeSafe request budget');
+            ackEq(posts, 0, 'no repository content was posted');
+            ackAssert(jevPublicRetryTimers.has(key), 'a transient failure schedules a retry');
+            ackEq(await jevPublicRepository(pr), false);
+            ackEq(gets, 1, 'the failed check is shared during its cooldown');
+            status = 200;
+            jevPublicChecks.delete(key); // Simulate the scheduled retry after the cooldown.
+            const result = await jevEvaluate(pr, 'comment', { selected_comment: 'second attempt' });
+            ackEq(result?.answers.intent.choice, 'concern');
+            ackAssert(!jevPublicRetryTimers.has(key), 'a completed public check cancels the stale retry timer');
+            ackEq(gets, 2);
+            ackEq(posts, 1);
+            ackEq(jevPageRequests, 1, 'only the actual TypeSafe POST uses the budget');
+            status = 404;
+            ackEq(await jevPublicRepository(denied), false);
+            ackAssert(!jevPublicRetryTimers.has('acktopus-denied-fixture/example'), 'a missing or private repository is not retried');
+            status = 500;
+            ackEq(await jevPublicRepository(serverError), false);
+            ackAssert(jevPublicRetryTimers.has('acktopus-server-fixture/example'), 'a server error is retried');
+        } finally {
+            clearTimeout(jevPublicRetryTimers.get(key));
+            jevPublicRetryTimers.delete(key);
+            jevPublicRetryWarned.delete(key);
+            jevPublicChecks.delete(key);
+            clearTimeout(jevPublicRetryTimers.get('acktopus-server-fixture/example'));
+            jevPublicRetryTimers.delete('acktopus-server-fixture/example');
+            jevPublicRetryWarned.delete('acktopus-server-fixture/example');
+            jevPublicChecks.delete('acktopus-server-fixture/example');
+            jevPublicChecks.delete('acktopus-denied-fixture/example');
+            GM_getValue = oldGet;
+            GM_setValue = oldSet;
+            GM_xmlhttpRequest = oldRequest;
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevCacheMemory = oldCacheMemory;
+            jevConfigured = oldConfigured;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
+        }
+    });
+
+    ackTest('Jev retry resumes empty slots on the current enabled PR in the same repository', () => {
+        const oldParsePR = parsePR;
+        const oldQueuePage = queueJevPageAnnotations;
+        const oldLeafContainers = leafLazyCommentContainers;
+        const oldQueueComment = queueJevComment;
+        const oldDiffObserved = jevDiffObserved;
+        const oldHunkObserved = jevHunkObserved;
+        const oldConfigured = jevConfigured;
+        const oldGet = GM_getValue;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const pr = { owner: 'acktopus-retry-fixture', repo: 'example', pr: '9' };
+        const key = 'acktopus-retry-fixture/example';
+        let currentPr = { owner: 'different-repository', repo: 'example', pr: '1' };
+        const root = document.createElement('div');
+        root.innerHTML = '<span class="ack-jev-badges" id="retry-empty"></span><span class="ack-jev-badges" id="retry-filled">🧪</span>';
+        const visible = { getBoundingClientRect: () => ({ top: 0, bottom: 10 }) };
+        const hidden = { getBoundingClientRect: () => ({ top: -100, bottom: -10 }) };
+        let pages = 0;
+        const comments = [];
+        try {
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
+            parsePR = () => currentPr;
+            queueJevPageAnnotations = () => { pages++; };
+            leafLazyCommentContainers = () => [visible, hidden];
+            queueJevComment = (container) => { comments.push(container); };
+            jevDiffObserved = new WeakSet();
+            jevHunkObserved = new WeakMap();
+            jevDiffObserved.add(root);
+            jevHunkObserved.set(root, 'old signature');
+            jevPublicChecks.set(key, { ts: Date.now(), check: Promise.resolve(false) });
+            jevRetryPublicCheck(key, root);
+            ackEq(pages, 0, 'a different repository does not retry');
+            ackAssert(root.querySelector('#retry-empty'));
+            currentPr = { ...pr, pr: '11' }; // A new PR opened during the cooldown.
+            jevConfigured = false;
+            jevRetryPublicCheck(key, root);
+            ackEq(pages, 0, 'disabled annotations do not retry');
+            jevConfigured = true;
+            jevRetryPublicCheck(key, root);
+            ackEq(pages, 1, 'current page annotations are queued again');
+            ackDeepEq(comments, [visible], 'only visible comments are queued again');
+            ackAssert(!root.querySelector('#retry-empty'), 'empty failed slot is removed');
+            ackAssert(root.querySelector('#retry-filled'), 'completed badges remain');
+            ackAssert(!jevDiffObserved.has(root) && !jevHunkObserved.has(root), 'visibility trackers are reset');
+            ackAssert(!jevPublicChecks.has(key), 'next attempt requires fresh anonymous proof');
+        } finally {
+            parsePR = oldParsePR;
+            queueJevPageAnnotations = oldQueuePage;
+            leafLazyCommentContainers = oldLeafContainers;
+            queueJevComment = oldQueueComment;
+            jevDiffObserved = oldDiffObserved;
+            jevHunkObserved = oldHunkObserved;
+            jevConfigured = oldConfigured;
+            GM_getValue = oldGet;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
+            jevPublicChecks.delete(key);
+        }
+    });
+
+    ackTest('Jev resumes empty annotations after the TypeSafe cooldown', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldRequeue = jevRequeueEmptyAnnotations;
+        const oldConfigured = jevConfigured;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const oldPauseUntil = jevPauseUntil;
+        const oldPauseRetryTimer = jevPauseRetryTimer;
+        let resumes = 0;
+        let posts = 0;
+        try {
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            jevPauseUntil = 0;
+            jevPauseRetryTimer = null;
+            GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
+            GM_xmlhttpRequest = (opts) => {
+                posts++;
+                ackEq(opts.method, 'POST', 'the pause retry does not make an extra GitHub request');
+                opts.onload({ status: 429, responseText: 'rate limited' });
+            };
+            jevRequeueEmptyAnnotations = () => { resumes++; };
+            const error = await jevPost('comment', { selected_comment: 'cooldown fixture' }, 2).catch((e) => e);
+            ackAssert(error.message.includes('Jev HTTP 429'));
+            ackEq(posts, 1);
+            ackAssert(jevPauseUntil > Date.now() && jevPauseRetryTimer !== null, 'final rate limit schedules one cooldown retry');
+            clearTimeout(jevPauseRetryTimer);
+            jevPauseRetryTimer = null;
+            jevPauseUntil = Date.now() - 1;
+            jevConfigured = false;
+            jevResumeAfterPause();
+            ackEq(resumes, 0, 'disabled annotations stay stopped');
+            jevConfigured = true;
+            jevResumeAfterPause();
+            ackEq(resumes, 1, 'empty annotations are requeued after the cooldown');
+            ackEq(posts, 1, 'resuming does not itself post or fetch');
+        } finally {
+            if (jevPauseRetryTimer !== null) clearTimeout(jevPauseRetryTimer);
+            jevPauseRetryTimer = oldPauseRetryTimer;
+            jevPauseUntil = oldPauseUntil;
+            jevConfigured = oldConfigured;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
+            jevRequeueEmptyAnnotations = oldRequeue;
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+        }
+    });
+
+    ackTest('Jev discards a response completed after its settings epoch changes', async () => {
+        const oldGet = GM_getValue;
+        const oldSet = GM_setValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldCacheMemory = jevCacheMemory;
+        const oldConfigured = jevConfigured;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldEpoch = jevEpoch;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const pr = { owner: 'acktopus-epoch-fixture', repo: 'example', pr: '10' };
+        const state = { selected_comment: 'response after disable' };
+        let post = null;
+        let cacheWrites = 0;
+        try {
+            jevCacheMemory = [];
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
+            GM_setValue = () => { cacheWrites++; };
+            GM_xmlhttpRequest = (opts) => {
+                if (opts.method === 'GET') opts.onload({ status: 200, responseText: '{"private":false}' });
+                else post = opts;
+            };
+            const pending = jevEvaluate(pr, 'comment', state);
+            for (let i = 0; i < 4 && !post; i++) await Promise.resolve();
+            ackAssert(post, 'the TypeSafe request is in flight');
+            jevEpoch++;
+            jevConfigured = false;
+            post.onload({ status: 200, responseText: JSON.stringify({
+                model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+            }) });
+            ackEq(await pending, null);
+            ackEq(cacheWrites, 0, 'the disabled request cannot restore a cleared cache');
+            ackEq(jevReadCache(jevCacheId('comment', state)), null);
+        } finally {
+            GM_getValue = oldGet;
+            GM_setValue = oldSet;
+            GM_xmlhttpRequest = oldRequest;
+            jevPublicChecks.delete('acktopus-epoch-fixture/example');
+            jevCacheMemory = oldCacheMemory;
+            jevConfigured = oldConfigured;
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevEpoch = oldEpoch;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
+        }
+    });
+
+    ackTest('Jev does not post queued work after reset and quick re-enable', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldCacheMemory = jevCacheMemory;
+        const oldConfigured = jevConfigured;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldEpoch = jevEpoch;
+        const oldRejectedKey = jevRejectedKey;
+        const oldSchemaRejected = jevSchemaRejected;
+        const pr = { owner: 'acktopus-queued-epoch-fixture', repo: 'example', pr: '11' };
+        let publicCheck = null;
+        let posts = 0;
+        try {
+            jevCacheMemory = [];
+            jevConfigured = true;
+            jevRejectedKey = '';
+            jevSchemaRejected = false;
+            jevPageKey = '';
+            jevPageRequests = 0;
+            GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
+            GM_xmlhttpRequest = (opts) => {
+                if (opts.method === 'GET') publicCheck = opts;
+                else posts++;
+            };
+            const pending = jevEvaluate(pr, 'comment', { selected_comment: 'queued before reset' });
+            ackAssert(publicCheck, 'anonymous repository proof is pending');
+            jevEpoch++;
+            jevConfigured = false;
+            jevConfigured = true;
+            publicCheck.onload({ status: 200, responseText: '{"private":false}' });
+            ackEq(await pending, null);
+            ackEq(posts, 0, 'stale queued work cannot send to TypeSafe');
+            ackEq(jevPageRequests, 0, 'stale queued work does not use the page budget');
+        } finally {
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+            jevPublicChecks.delete('acktopus-queued-epoch-fixture/example');
+            jevCacheMemory = oldCacheMemory;
+            jevConfigured = oldConfigured;
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevEpoch = oldEpoch;
+            jevRejectedKey = oldRejectedKey;
+            jevSchemaRejected = oldSchemaRejected;
         }
     });
 
