@@ -16437,8 +16437,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function jevPost(kind, state, attempt = 0) {
         if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
         const key = GM_getValue('jev_api_key', '').trim();
+        if (!key) return Promise.reject(new Error('Jev API key missing'));
         const body = JSON.stringify({ state, model: JEV_MODEL, questions: JEV_QUESTIONS[kind] });
-        if (!key || JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
+        if (JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -16453,7 +16454,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                     if (r.status === 429 || r.status === 529) jevPauseUntil = Date.now() + 60000;
                     if (r.status === 401 || r.status === 422) jevRejectedKey = key;
-                    if (r.status < 200 || r.status >= 300) return reject(new Error(`Jev HTTP ${r.status}`));
+                    if (r.status < 200 || r.status >= 300) {
+                        // 422 means TypeSafe rejected the request shape, not the key; keep
+                        // the body so the console warning says what was wrong.
+                        return reject(new Error(`Jev HTTP ${r.status}: ${String(r.responseText || '').slice(0, 160)}`));
+                    }
                     try {
                         const result = jevValidatedResult(kind, JSON.parse(r.responseText));
                         result ? resolve(result) : reject(new Error('Invalid Jev response'));
