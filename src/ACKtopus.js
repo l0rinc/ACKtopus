@@ -16633,12 +16633,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             return;
         }
-        // A complete patch is fetched once per visible commit. The excerpt
-        // cap keeps the Jev request bounded without hiding that it was clipped.
+        // The patch comes from the shared per-commit cache (also used by the
+        // lightbulb and explain helpers), so a visible commit is fetched once.
+        // The excerpt cap keeps the Jev request bounded without hiding that it
+        // was clipped.
         jevPublicRepository(pr).then(async (isPublic) => {
             if (!isPublic || !slot.isConnected) return;
             try {
-                const patch = await gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
+                const patch = await fetchCommitPatch(pr, sha);
                 const state = { kind: 'commit', repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg.slice(0, 1200), patch: patch.slice(0, 7000), patch_clipped: patch.length > 7000 };
                 const result = await jevEvaluate(pr, 'commit', state);
                 if (result) jevWriteCache(alias, { ...result, partial: state.patch_clipped }, `${pr.owner}/${pr.repo}#${pr.pr}`);
