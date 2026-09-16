@@ -16268,7 +16268,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_CACHE_LIMIT = 400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const JEV_MAX_REQUESTS_PER_PAGE = 250;
-    const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)_[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
+    const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)[_-][A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
         commit: {
             role: { type: 'choice', instructions: 'What is the primary role of this parent-relative commit patch? Judge the patch, not just the message.', criteria: {
@@ -27258,6 +27258,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(jevIsPublicRepoResponse({ status: 200, responseText: '{"private":false}' }));
         ackAssert(!jevIsPublicRepoResponse({ status: 200, responseText: '{"private":true}' }));
         ackAssert(!jevIsPublicRepoResponse({ status: 404, responseText: '{"private":false}' }));
+    });
+
+    ackTest('Jev refuses to send credential-shaped excerpts', () => {
+        ackAssert(JEV_SECRET_RE.test('key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123'), 'catches hyphenated sk- provider keys');
+        ackAssert(JEV_SECRET_RE.test('token ghp_abcdefghijklmnopqrstuvwxyz0123'), 'catches GitHub tokens');
+        ackAssert(JEV_SECRET_RE.test('-----BEGIN RSA PRIVATE KEY-----'), 'catches private key blocks');
+        ackAssert(!JEV_SECRET_RE.test('const sk = value + 1; // ghp_short'), 'leaves ordinary code alone');
     });
 
     ackTest('Jev evidence cache keys change with edits and patch content', () => {
