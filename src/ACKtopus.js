@@ -6595,7 +6595,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function factoryReset() {
         const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
-        const keep = new Set([...providerKeyStorageKeys(), 'github_pat']);
+        const keep = new Set([...providerKeyStorageKeys(), 'github_pat', 'jev_api_key']);
         let count = 0;
         keys.forEach((k) => {
             if (!keep.has(k)) {
@@ -6604,6 +6604,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             }
         });
         resetInMemoryCaches();
+        // jev_enabled was just deleted; stop classifying until it is re-enabled.
+        jevConfigured = false;
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
@@ -41702,6 +41704,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const fn = source.slice(source.indexOf('function factoryReset'), source.indexOf('// --- Config Panel'));
         ackAssert(fn.includes('providerKeyStorageKeys()'), 'keeps provider API keys through provider metadata');
         ackAssert(fn.includes('github_pat'), 'keeps GitHub PAT');
+        ackAssert(fn.includes("'jev_api_key'"), 'keeps the TypeSafe key like the other API keys');
+        ackAssert(fn.includes('jevConfigured = false'), 'stops Jev once its opt-in flag is gone');
         ackAssert(fn.includes('GM_deleteValue'), 'deletes GM values');
         ackAssert(fn.includes('keep.has'), 'uses keep set to filter');
     });
