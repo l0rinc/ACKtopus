@@ -217,6 +217,14 @@ Keeps a personal list of PRs you want to come back to. You can add the current P
 
 Lets you configure the optional GitHub PAT, Claude/OpenAI/Gemini API keys, active provider, maintainer logins, custom instructions for each recipe, full-patch context, LLM caching, cache clearing, and factory reset. The GitHub PAT is used only for API reads; public repositories need no repository permissions, and the token does not need PR write access. ACKtopus uses Claude Sonnet 5 for normal Claude requests, Claude Opus 5 for high-context Claude recipes, ChatGPT `gpt-5.5`, and Gemini `gemini-3.5-flash`. Settings validation checks every model version ACKtopus can call for the provider, including high-context Claude Opus and the OpenAI image model; secondary model failures are shown as warnings when the primary model is usable. Provider key, usage, and billing links point to each provider's own console, including Google AI Studio for Gemini. High-context recipes use the larger request timeout for every configured provider. The toolbar background toggles compact mode. Selection popups use the same active provider/model as the rest of ACKtopus (no separate selection-helper settings).
 
+### Jev review badges (optional)
+
+Enable **Jev review badges** in Settings and enter a TypeSafe API key. ACKtopus then adds compact emoji badges beside commits, visible diff hunks, and comments. Hover for the category, model signal, evidence location, and model version. Commit badges separate role, potential impact if wrong, review effort, message/patch fit, and possible inconsistencies. Hunk badges identify topics such as arithmetic, lifetime, locking, persistence, validation, consensus, performance, and tests. Comment badges classify the comment's review purpose. 🔎 means a possible inconsistency to inspect; it is not a verified bug.
+
+ACKtopus confirms the repository is public with an anonymous GitHub API request before sending bounded excerpts to [TypeSafe's Jev API](https://docs.typesafe.ai/api). Private repositories are skipped. Classification runs in the background, with at most three concurrent requests and 250 new requests per page visit. Results are cached for up to 14 days against the exact comment text or diff excerpt and the Jev rubric, so edits and force pushes get new classifications. Large commits and hunks are excerpted, and their tooltips say so. The TypeSafe key is stored in Tampermonkey settings, like the other provider keys.
+
+🧫 marks a changed test that may lack a discriminating assertion. It is a review lead, not established test coverage.
+
 ## In-page review helpers
 
 ### Commit prefix on single-commit views

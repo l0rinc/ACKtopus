@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.254
+// @version      1.255
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18,6 +18,7 @@
 // @connect      patch-diff.githubusercontent.com
 // @connect      api.anthropic.com
 // @connect      api.openai.com
+// @connect      api.typesafe.ai
 // @connect      generativelanguage.googleapis.com
 // @connect      keys.openpgp.org
 // @require      https://cdn.jsdelivr.net/npm/openpgp@6.3.0/dist/openpgp.min.js
@@ -74,6 +75,8 @@
         '.ack-diff-selection-btnrow{-ms-overflow-style:none;scrollbar-width:none}',
         '.ack-diff-selection-output-action::-webkit-scrollbar{display:none}',
         '.ack-diff-selection-output-action{-ms-overflow-style:none;scrollbar-width:none}',
+        '.ack-jev-badges{display:inline-flex;align-items:center;gap:2px;margin-left:5px;vertical-align:middle}',
+        '.ack-jev-badge{display:inline-block;font-size:12px;line-height:1.2;cursor:help}',
     ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
@@ -6539,6 +6542,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             }
         });
         count += invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        const jevEntries = jevCacheEntries();
+        const keptJevEntries = jevEntries.filter((entry) => entry.prKey !== `${pr.owner}/${pr.repo}#${pr.pr}`);
+        if (keptJevEntries.length !== jevEntries.length) {
+            jevCacheMemory = keptJevEntries;
+            GM_setValue(JEV_CACHE_KEY, keptJevEntries);
+            count++;
+        }
         count += clearRobotChatHistoryForPage();
         return count;
     }
@@ -6561,6 +6571,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('commitlist_') ||
             k.startsWith('forcepush_sig_') ||
             k.startsWith(GITHUB_HTTP_CACHE_PREFIX) ||
+            k === JEV_CACHE_KEY ||
             k === GITHUB_HTTP_CACHE_INDEX_KEY ||
             k === GITHUB_PAGED_HINTS_KEY ||
             k === 'llm_cache_timestamps';
@@ -6570,6 +6581,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 count++;
             }
         });
+        jevCacheMemory = null;
         resetInMemoryCaches();
         console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
         return count;
@@ -6815,6 +6827,43 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             marginBottom: '4px',
         });
         panel.appendChild(ghFormatHelp);
+
+        // Jev is separate from the conversational LLM providers. It only
+        // classifies public repository excerpts after the reviewer opts in.
+        sep();
+        const jevTitle = document.createElement('label');
+        jevTitle.textContent = '🔎 Jev review badges';
+        jevTitle.style.display = 'block';
+        jevTitle.style.marginBottom = '5px';
+        panel.appendChild(jevTitle);
+        const jevToggle = document.createElement('input');
+        jevToggle.type = 'checkbox';
+        jevToggle.id = 'ack-jev-enabled';
+        jevToggle.checked = !!GM_getValue('jev_enabled', false);
+        jevTitle.prepend(jevToggle);
+        const jevDescription = document.createElement('div');
+        jevDescription.textContent = 'Optional advisory emoji categories for commits, visible diff hunks, and comments. ACKtopus sends bounded excerpts to TypeSafe only after an anonymous GitHub check confirms the repository is public. Private repositories are skipped.';
+        Object.assign(jevDescription.style, { fontSize: '11px', color: '#8b949e', marginBottom: '5px' });
+        panel.appendChild(jevDescription);
+        const jevInput = document.createElement('input');
+        jevInput.type = 'password';
+        jevInput.id = 'ack-jev-api-key';
+        jevInput.value = GM_getValue('jev_api_key', '');
+        jevInput.placeholder = 'TypeSafe API key';
+        jevInput.autocomplete = 'off';
+        jevInput.title = 'Stored in Tampermonkey settings; sent only to api.typesafe.ai';
+        Object.assign(jevInput.style, {
+            width: '100%', padding: '6px 10px', boxSizing: 'border-box', background: '#0d1117',
+            border: '1px solid #30363d', borderRadius: '6px', color: '#c9d1d9', fontSize: '12px',
+        });
+        panel.appendChild(jevInput);
+        const jevHelp = document.createElement('a');
+        jevHelp.href = 'https://console.typesafe.ai/';
+        jevHelp.target = '_blank';
+        jevHelp.rel = 'noopener noreferrer';
+        jevHelp.textContent = 'TypeSafe API key →';
+        Object.assign(jevHelp.style, { display: 'block', textAlign: 'right', fontSize: '11px', color: '#58a6ff' });
+        panel.appendChild(jevHelp);
 
         // --- Maintainer list ---
         const maintRow = document.createElement('div');
@@ -7328,7 +7377,20 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             if (maintEl) GM_setValue('maintainer_logins', maintEl.value);
             const mirrorEl = document.getElementById('ack-repo-mirrors');
             if (mirrorEl) GM_setValue('repo_mirrors', mirrorEl.value);
+            GM_setValue('jev_enabled', jevToggle.checked);
+            if (jevInput.value.trim()) GM_setValue('jev_api_key', jevInput.value.trim());
+            else GM_deleteValue('jev_api_key');
+            jevConfigured = jevToggle.checked && !!jevInput.value.trim();
+            jevRejectedKey = '';
+            jevPauseUntil = 0;
             closePanel();
+            if (jevEnabled()) {
+                queueJevPageAnnotations();
+                for (const container of leafLazyCommentContainers()) {
+                    const bounds = container.getBoundingClientRect();
+                    if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+                }
+            } else document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
         });
 
         const cancelBtn = document.createElement('button');
@@ -16195,6 +16257,506 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    // --- Optional Jev review annotations ---
+    // These are review leads, not correctness verdicts. Only public GitHub
+    // repository content is sent to TypeSafe, and only after opt-in.
+    const JEV_MODEL = 'jev-latest';
+    const JEV_SCHEMA = 2;
+    const JEV_CACHE_KEY = 'jev_annotations_v1';
+    const JEV_CACHE_LIMIT = 400;
+    const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+    const JEV_MAX_REQUESTS_PER_PAGE = 250;
+    const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)_[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
+    const JEV_QUESTIONS = {
+        commit: {
+            role: { type: 'choice', instructions: 'What is the primary role of this parent-relative commit patch? Judge the patch, not just the message.', criteria: {
+                test: 'Adds or strengthens an executable test or characterization',
+                fix: 'Changes production behavior to fix a problem',
+                refactor: 'Restructures code without an intended behavior change',
+                docs: 'Changes documentation or prose only',
+                mixed: 'Mixes independent concerns that would be easier to review separately',
+                other: 'None of these is clearly supported',
+            } },
+            risk: { type: 'score', instructions: 'If this change is wrong, how consequential could its behavior be? This is impact, not the probability of a bug. Use only the shown patch.', criteria: [
+                'Localized cosmetic or test-only effect', 'Localized behavior or performance effect', 'Consensus, persistence, security, concurrency, or broad runtime effect',
+            ] },
+            effort: { type: 'score', instructions: 'How much effort is needed to review this patch carefully, considering size, interactions, and required external context?', criteria: [
+                'Quick and self-contained', 'Moderate context or several interactions', 'Deep context, subtle invariants, or many interactions',
+            ] },
+            message_match: { type: 'noul', instructions: 'Does the commit message accurately describe the actual parent-relative patch without materially overstating it?' },
+            test_oracle: { type: 'choice', instructions: 'If this patch adds or changes tests, do their assertions distinguish the intended behavior from a plausible wrong implementation? Do not count assertions added only to production code as tests.', criteria: {
+                direct: 'The changed test has a discriminating assertion tied to the behavior',
+                weak: 'The changed test lacks a useful oracle, or only checks incidental execution',
+                not_applicable: 'This patch does not change tests',
+                unknown: 'The shown patch is too incomplete to decide',
+            } },
+            concern: { type: 'noul', instructions: 'Does the shown patch itself contain a specific apparent inconsistency or edge case worth checking? Do not infer a defect solely from risk or missing external context.' },
+        },
+        hunk: {
+            topic: { type: 'choice', instructions: 'Which review topic is most relevant to these changed lines?', criteria: {
+                arithmetic: 'Bounds, signedness, overflow, or integer arithmetic',
+                lifetime: 'Ownership, object lifetime, or memory safety',
+                locking: 'Concurrency, locking, or race conditions',
+                persistence: 'Persistent state, serialization, or data migration',
+                validation: 'Input validation, errors, or failure paths',
+                consensus: 'Consensus or protocol behavior',
+                performance: 'Performance, repeated work, or algorithmic complexity',
+                tests: 'Tests or test oracles',
+                other: 'No particular topic is established by this excerpt',
+            } },
+            concern: { type: 'noul', instructions: 'Is there a specific apparent mistake or inconsistency in the shown before/after lines? Do not treat a risky topic or missing callers as a defect.' },
+        },
+        comment: {
+            intent: { type: 'choice', instructions: 'What is the main review purpose of the selected comment? Classify what it says, without deciding whether its claim is correct.', criteria: {
+                concern: 'Raises a possible bug, inconsistency, or concrete correctness concern',
+                test: 'Requests or discusses a discriminating test or evidence',
+                suggestion: 'Suggests a code or documentation change',
+                question: 'Asks for clarification without a concrete defect claim',
+                ack: 'Approves or acknowledges the change',
+                explanation: 'Explains behavior or context without requesting action',
+                other: 'None of these is clearly supported',
+            } },
+        },
+    };
+    const JEV_LABELS = {
+        role: {
+            test: ['🧪', 'Test or characterization commit'], fix: ['🛠️', 'Behavior fix commit'],
+            refactor: ['🧹', 'Refactor commit'], docs: ['📚', 'Documentation commit'],
+            mixed: ['🔀', 'Possibly mixed commit scope'],
+        },
+        topic: {
+            arithmetic: ['🧮', 'Arithmetic or bounds review'], lifetime: ['🧠', 'Lifetime or ownership review'],
+            locking: ['🔒', 'Locking or concurrency review'], persistence: ['🗃️', 'Persistence or serialization review'],
+            validation: ['🚦', 'Validation or error-path review'], consensus: ['⚖️', 'Consensus or protocol review'],
+            performance: ['⏱️', 'Performance review'], tests: ['🧪', 'Test-oracle review'],
+        },
+        intent: {
+            concern: ['🐛', 'Comment raises a possible correctness concern; claim unverified'],
+            test: ['🧪', 'Comment discusses a test or evidence'], suggestion: ['🛠️', 'Comment suggests a change'],
+            question: ['❓', 'Clarification question'],
+        },
+    };
+    const jevPending = new Map();
+    const jevJobs = [];
+    const jevPublicChecks = new Map();
+    let jevCacheMemory = null;
+    let jevActive = 0;
+    let jevPageKey = '';
+    let jevPageRequests = 0;
+    let jevRejectedKey = '';
+    let jevPauseUntil = 0;
+    let jevConfigured = !!GM_getValue('jev_enabled', false) && !!GM_getValue('jev_api_key', '');
+
+    function jevEnabled() {
+        return jevConfigured && Date.now() >= jevPauseUntil && GM_getValue('jev_api_key', '') !== jevRejectedKey;
+    }
+
+    function jevCacheId(kind, state) {
+        return hashPrompt(JSON.stringify([JEV_SCHEMA, JEV_MODEL, kind, state]));
+    }
+
+    function jevCacheEntries() {
+        if (!jevCacheMemory) {
+            const stored = GM_getValue(JEV_CACHE_KEY, []);
+            jevCacheMemory = Array.isArray(stored) ? stored : [];
+        }
+        return jevCacheMemory;
+    }
+
+    function jevReadCache(id) {
+        return jevCacheEntries().find((entry) => entry?.id === id && Date.now() - entry.ts < JEV_CACHE_TTL_MS)?.result || null;
+    }
+
+    function jevWriteCache(id, result, prKey) {
+        const kept = jevCacheEntries()
+            .filter((entry) => entry?.id !== id && Date.now() - entry.ts < JEV_CACHE_TTL_MS)
+            .slice(-(JEV_CACHE_LIMIT - 1));
+        kept.push({ id, result, prKey, ts: Date.now() });
+        jevCacheMemory = kept;
+        GM_setValue(JEV_CACHE_KEY, kept);
+    }
+
+    function jevValidatedAnswer(question, answer) {
+        if (!answer || answer.type !== question.type) return null;
+        if (question.type === 'noul') {
+            return Number.isFinite(answer.noul) && answer.noul >= 0 && answer.noul <= 1
+                ? { type: 'noul', noul: answer.noul } : null;
+        }
+        if (question.type === 'score') {
+            return Number.isFinite(answer.score) && answer.score >= 0 && answer.score <= question.criteria.length - 1
+                ? { type: 'score', score: answer.score } : null;
+        }
+        const choice = answer.choice;
+        const probability = answer.probabilities?.[choice];
+        return Object.hasOwn(question.criteria, choice) && Number.isFinite(probability) && probability >= 0 && probability <= 1
+            ? { type: 'choice', choice, probability } : null;
+    }
+
+    function jevValidatedResult(kind, response) {
+        const questions = JEV_QUESTIONS[kind];
+        if (!questions || !response?.answers || typeof response.model !== 'string') return null;
+        const answers = {};
+        for (const [name, question] of Object.entries(questions)) {
+            const answer = jevValidatedAnswer(question, response.answers[name]);
+            if (!answer) return null;
+            answers[name] = answer;
+        }
+        return { model: response.model.slice(0, 80), answers };
+    }
+
+    function jevIsPublicRepoResponse(response) {
+        if (response?.status !== 200) return false;
+        try { return JSON.parse(response.responseText)?.private === false; }
+        catch (_) { return false; }
+    }
+
+    function jevPublicRepository(pr) {
+        const key = `${pr.owner}/${pr.repo}`.toLowerCase();
+        const previous = jevPublicChecks.get(key);
+        if (previous && Date.now() - previous.ts < 60000) return previous.check;
+        // An unauthenticated 200 response with private:false is proof that
+        // ordinary visitors can read this repository. A 401/404/error skips it.
+        const check = new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`,
+                headers: { Accept: 'application/vnd.github+json' },
+                anonymous: true,
+                timeout: 10000,
+                onload: (r) => resolve(jevIsPublicRepoResponse(r)),
+                onerror: () => resolve(false),
+                ontimeout: () => resolve(false),
+            });
+        }).catch(() => false);
+        jevPublicChecks.set(key, { ts: Date.now(), check });
+        return check;
+    }
+
+    function jevPost(kind, state, attempt = 0) {
+        if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
+        const key = GM_getValue('jev_api_key', '').trim();
+        const body = JSON.stringify({ state, model: JEV_MODEL, questions: JEV_QUESTIONS[kind] });
+        if (!key || JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://api.typesafe.ai/v1/systemone',
+                headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+                data: body,
+                timeout: 15000,
+                onload: (r) => {
+                    if ((r.status === 429 || r.status === 529) && attempt < 2) {
+                        setTimeout(() => jevPost(kind, state, attempt + 1).then(resolve, reject), 500 * 2 ** attempt);
+                        return;
+                    }
+                    if (r.status === 429 || r.status === 529) jevPauseUntil = Date.now() + 60000;
+                    if (r.status === 401 || r.status === 422) jevRejectedKey = key;
+                    if (r.status < 200 || r.status >= 300) return reject(new Error(`Jev HTTP ${r.status}`));
+                    try {
+                        const result = jevValidatedResult(kind, JSON.parse(r.responseText));
+                        result ? resolve(result) : reject(new Error('Invalid Jev response'));
+                    } catch (e) { reject(e); }
+                },
+                onerror: () => reject(new Error('Jev network error')),
+                ontimeout: () => reject(new Error('Jev timed out')),
+            });
+        });
+    }
+
+    function jevPump() {
+        while (jevActive < 3 && jevJobs.length) {
+            const job = jevJobs.shift();
+            jevActive++;
+            job().finally(() => {
+                jevActive--;
+                jevPump();
+            });
+        }
+    }
+
+    function jevEvaluate(pr, kind, state) {
+        const id = jevCacheId(kind, state);
+        const cached = jevReadCache(id);
+        if (cached) return jevPublicRepository(pr).then((isPublic) => isPublic ? cached : null);
+        if (jevPending.has(id)) return jevPending.get(id);
+        const pageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
+        if (pageKey !== jevPageKey) { jevPageKey = pageKey; jevPageRequests = 0; }
+        if (jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) return Promise.resolve(null);
+        jevPageRequests++;
+        const routePath = location.pathname;
+        const pending = new Promise((resolve) => {
+            jevJobs.push(async () => {
+                try {
+                    if (location.pathname !== routePath) return resolve(null);
+                    if (!jevEnabled() || !(await jevPublicRepository(pr))) return resolve(null);
+                    if (location.pathname !== routePath) return resolve(null);
+                    const result = await jevPost(kind, state);
+                    jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
+                    resolve(result);
+                } catch (e) {
+                    console.warn('ACKtopus: Jev annotation skipped:', e?.message || e);
+                    resolve(null);
+                } finally {
+                    jevPending.delete(id);
+                }
+            });
+            jevPump();
+        });
+        jevPending.set(id, pending);
+        return pending;
+    }
+
+    function jevBadge(slot, emoji, meaning, signal, result, evidence) {
+        const badge = document.createElement('span');
+        badge.className = 'ack-jev-badge';
+        badge.textContent = emoji;
+        const detail = `${meaning}\nJev signal: ${signal}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; check the full code and tests.`;
+        badge.title = detail;
+        badge.setAttribute('role', 'img');
+        badge.setAttribute('aria-label', detail);
+        slot.appendChild(badge);
+    }
+
+    function jevRender(slot, kind, result, evidence, partial = false) {
+        slot.replaceChildren();
+        if (!result) return;
+        const a = result.answers;
+        const labelKey = kind === 'commit' ? 'role' : kind === 'hunk' ? 'topic' : 'intent';
+        const label = JEV_LABELS[labelKey][a[labelKey].choice];
+        const proof = partial ? `${evidence} (excerpt only)` : evidence;
+        if (label && a[labelKey].probability >= 0.55) jevBadge(slot, label[0], label[1], `${Math.round(a[labelKey].probability * 100)}%`, result, proof);
+        if (kind === 'commit') {
+            if (a.risk.score >= 1.5) jevBadge(slot, '🔥', 'Potential impact if wrong is high; this is not a bug probability', `${a.risk.score.toFixed(2)}/2 impact score`, result, proof);
+            if (a.effort.score >= 1.5) jevBadge(slot, '🧩', 'Likely deep review effort', `${a.effort.score.toFixed(2)}/2 effort score`, result, proof);
+            if (a.message_match.noul <= 0.35) jevBadge(slot, '📝', 'Commit message may not match this patch', `${Math.round((1 - a.message_match.noul) * 100)}% mismatch signal`, result, proof);
+            if (a.test_oracle.choice === 'weak' && a.test_oracle.probability >= 0.8) jevBadge(slot, '🧫', 'Changed test may lack a discriminating oracle; inspect its assertions', `${Math.round(a.test_oracle.probability * 100)}%`, result, proof);
+        }
+        if ((kind === 'commit' || kind === 'hunk') && a.concern.noul >= 0.9) {
+            jevBadge(slot, '🔎', 'Possible inconsistency to inspect; Jev has not verified a mistake', `${Math.round(a.concern.noul * 100)}%`, result, proof);
+        }
+    }
+
+    function jevSlot(target, id) {
+        if (!target) return null;
+        let slot = target.querySelector(':scope > .ack-jev-badges');
+        if (!slot) {
+            slot = document.createElement('span');
+            slot.className = 'ack-jev-badges';
+            target.appendChild(slot);
+        }
+        if (slot.dataset.ackJevId === id) return null;
+        slot.dataset.ackJevId = id;
+        return slot;
+    }
+
+    function queueJevComment(container) {
+        if (_ackTesting || !jevEnabled()) return;
+        const pr = parsePR();
+        if (!pr) return;
+        for (const body of container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || []) {
+            const text = body.textContent?.trim();
+            if (!text || body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            const comment = body.closest(COMMENT_CONTAINER_BASE_SELECTOR) || body.closest(COMMENT_CONTAINER_SELECTOR) || container;
+            const sharedThread = comment.querySelectorAll(MARKDOWN_BODY_SELECTOR).length > 1;
+            const header = (sharedThread ? body.parentElement : comment.querySelector('.timeline-comment-header, [class*="__activityHeader"], .review-comment-header, .TimelineItem-header')) || comment;
+            const state = { kind: 'comment', repository: `${pr.owner}/${pr.repo}`, selected_comment: text.slice(0, 1800), full_text_hash: hashPrompt(text) };
+            const id = jevCacheId('comment', state);
+            const slot = jevSlot(header, id);
+            if (!slot) continue;
+            const evidence = getCommentPermalink(comment) || `${pr.owner}/${pr.repo}#comment`;
+            jevEvaluate(pr, 'comment', state).then((result) => {
+                if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'comment', result, evidence, text.length > 1800);
+            });
+        }
+    }
+
+    function queueJevCommentUpdates(root) {
+        if (_ackTesting || !jevEnabled() || root === document) return;
+        if (!root.matches?.(MARKDOWN_BODY_SELECTOR) && !root.closest?.(MARKDOWN_BODY_SELECTOR) && !root.querySelector?.(MARKDOWN_BODY_SELECTOR)) return;
+        const container = root.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) || root.querySelector?.(WIDE_COMMENT_CONTAINER_SELECTOR);
+        if (!container) return;
+        const bounds = container.getBoundingClientRect();
+        if (bounds.bottom >= -200 && bounds.top <= window.innerHeight + 200) queueJevComment(container);
+    }
+
+    const jevCommitRecords = new WeakMap();
+    const jevCommitObserved = new WeakMap();
+    const jevCommitObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            jevCommitObserver.unobserve(entry.target);
+            const commit = jevCommitRecords.get(entry.target);
+            if (commit) queueJevCommitRow(commit);
+        }
+    }, { rootMargin: '300px' });
+
+    function queueJevCommitRows() {
+        if (_ackTesting || !jevEnabled()) return;
+        const mode = getAnalysisMode();
+        if (mode !== ANALYSIS_MODES.commits && mode !== ANALYSIS_MODES.commit) return;
+        const commits = mode === ANALYSIS_MODES.commits ? parseCommitsFromPage() : [];
+        if (mode === ANALYSIS_MODES.commit) {
+            const header = document.querySelector('.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2');
+            const sha = pathCommitSha();
+            if (header && sha) {
+                const clean = header.cloneNode(true);
+                clean.querySelectorAll('[class^="ack-"], [class*=" ack-"]').forEach((element) => element.remove());
+                commits.push({ sha, msg: clean.textContent.trim(), el: header });
+            }
+        }
+        for (const commit of commits) {
+            if (!commit.el) continue;
+            const id = `${commit.sha}:${commit.msg}`;
+            if (jevCommitObserved.get(commit.el) === id && commit.el.querySelector(':scope > .ack-jev-badges')) continue;
+            jevCommitObserved.set(commit.el, id);
+            jevCommitRecords.set(commit.el, commit);
+            jevCommitObserver.observe(commit.el);
+        }
+    }
+
+    function queueJevCommitRow(commit) {
+        const pr = parsePR();
+        if (!pr) return;
+        const sha = commit.sha;
+        const id = `commit:${sha}:${commit.msg}`;
+        const slot = jevSlot(commit.el, id);
+        if (!slot) return;
+        const alias = jevCacheId('commit', { repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg });
+        const cached = jevReadCache(alias);
+        if (cached) {
+            jevPublicRepository(pr).then((isPublic) => {
+                if (isPublic && slot.isConnected && slot.dataset.ackJevId === id) {
+                    jevRender(slot, 'commit', cached, `${sha.slice(0, 12)} parent-relative patch`, cached.partial);
+                }
+            });
+            return;
+        }
+        // A complete patch is fetched once per visible commit. The excerpt
+        // cap keeps the Jev request bounded without hiding that it was clipped.
+        jevPublicRepository(pr).then(async (isPublic) => {
+            if (!isPublic || !slot.isConnected) return;
+            try {
+                const patch = await gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
+                const state = { kind: 'commit', repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg.slice(0, 1200), patch: patch.slice(0, 7000), patch_clipped: patch.length > 7000 };
+                const result = await jevEvaluate(pr, 'commit', state);
+                if (result) jevWriteCache(alias, { ...result, partial: state.patch_clipped }, `${pr.owner}/${pr.repo}#${pr.pr}`);
+                if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'commit', result, `${sha.slice(0, 12)} parent-relative patch`, state.patch_clipped);
+            } catch (e) { console.warn('ACKtopus: Jev commit patch skipped:', e?.message || e); }
+        });
+    }
+
+    const jevDiffObserved = new WeakSet();
+    const jevDiffPending = new WeakSet();
+    const jevVisibleDiffQueue = [];
+    function queueJevDiffFile(file) {
+        if (jevDiffPending.has(file)) return;
+        jevDiffPending.add(file);
+        jevVisibleDiffQueue.push(file);
+        scheduleJevDiffProcessing();
+    }
+    function scheduleJevDiffProcessing() {
+        scheduleAckBackgroundWork('jev-visible-diffs', ({ isCanceled }) => {
+            if (isCanceled()) { scheduleJevDiffProcessing(); return; }
+            const file = jevVisibleDiffQueue.shift();
+            if (file) jevDiffPending.delete(file);
+            if (file?.isConnected) queueJevDiffHunks(file);
+            if (jevVisibleDiffQueue.length) scheduleJevDiffProcessing();
+        }, { delayMs: 100, reason: 'visible-diff' });
+    }
+    const jevDiffObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            jevDiffObserver.unobserve(entry.target);
+            queueJevDiffFile(entry.target);
+        }
+    }, { rootMargin: '300px' });
+    const jevHunkRecords = new WeakMap();
+    const jevHunkObserved = new WeakMap();
+    const jevHunkObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            jevHunkObserver.unobserve(entry.target);
+            const record = jevHunkRecords.get(entry.target);
+            jevHunkRecords.delete(entry.target);
+            if (record) queueJevVisibleHunk(record);
+        }
+    }, { rootMargin: '250px' });
+
+    function queueJevDiffUpdates(root) {
+        if (_ackTesting || !jevEnabled() || root === document) return;
+        const file = root.closest?.(DIFF_FILE_SELECTOR);
+        if (file && jevDiffObserved.has(file)) queueJevDiffFile(file);
+    }
+
+    function jevChangedRow(row) {
+        const cells = [...row.querySelectorAll('td.blob-code, td.diff-text, td.diff-text-cell')];
+        if (!cells.length) cells.push(...row.querySelectorAll('[data-testid="diff-line-content"]'));
+        const rowSignal = `${row.className || ''} ${row.getAttribute('data-diff-line-type') || ''}`;
+        const cellSignal = (cell) => `${cell.className || ''} ${cell.getAttribute('data-diff-line-type') || ''}`;
+        const addition = cells.find((cell) => /addition|\badd\b/i.test(cellSignal(cell)));
+        const deletion = cells.find((cell) => /deletion|\bdelete\b/i.test(cellSignal(cell)));
+        const cell = addition || deletion || (/(?:addition|deletion|\badd\b|\bdelete\b)/i.test(rowSignal) ? cells[0] : null);
+        if (!cell) return null;
+        const text = cell.textContent?.trim();
+        if (!text) return null;
+        const signal = /addition|deletion|\badd\b|\bdelete\b/i.test(cellSignal(cell)) ? cellSignal(cell) : rowSignal;
+        const changedCells = cells.filter((candidate) => /addition|deletion|\badd\b|\bdelete\b/i.test(cellSignal(candidate)));
+        const excerpt = changedCells.length > 1
+            ? changedCells.map((candidate) => `${/deletion|delete/i.test(cellSignal(candidate)) ? '-' : '+'} ${candidate.textContent.trim().slice(0, 500)}`).join('\n')
+            : `${/deletion|delete/i.test(signal) ? '-' : '+'} ${text.slice(0, 500)}`;
+        return { row, cell, text: text.slice(0, 500), excerpt, fullText: cells.map((part) => part.textContent).join('\n'), deleted: /deletion|delete/i.test(signal) };
+    }
+
+    function queueJevVisibleHunk({ pr, path, head, group, signature }) {
+        if (!jevEnabled()) return;
+        const first = group.find((line) => !line.deleted) || group[0];
+        const meta = getDiffSelectionLineMeta(first.cell);
+        if (!meta?.lineNum) return;
+        const lineNumberCell = meta.row?.querySelector('[data-line-number]') || meta.row?.firstElementChild;
+        if (!lineNumberCell || lineNumberCell === first.cell) return;
+        const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
+        const state = { kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, head, path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'), full_hunk_hash: signature };
+        const id = jevCacheId('hunk', state);
+        const slot = jevSlot(lineNumberCell, id);
+        if (!slot) return;
+        jevEvaluate(pr, 'hunk', state).then((result) => {
+            if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'hunk', result, locationKey, group.length > 16);
+        });
+    }
+
+    function queueJevDiffHunks(file) {
+        if (_ackTesting || !jevEnabled() || !file.isConnected) return;
+        const pr = parsePR();
+        const path = readDiffFilePath(file);
+        if (!pr || !path) return;
+        const head = getImmediatePRHeadSHA() || pathCommitSha();
+        const changed = [...file.querySelectorAll('tr')].map(jevChangedRow).filter(Boolean);
+        const groups = [];
+        for (const line of changed) {
+            const last = groups[groups.length - 1];
+            if (last && last[last.length - 1].row.nextElementSibling === line.row) last.push(line);
+            else groups.push([line]);
+        }
+        for (const group of groups) {
+            const first = group.find((line) => !line.deleted) || group[0];
+            const signature = hashPrompt(head + group.map((line) => line.fullText).join('\n'));
+            if (jevHunkObserved.get(first.cell) === signature) continue;
+            jevHunkObserved.set(first.cell, signature);
+            jevHunkRecords.set(first.cell, { pr, path, head, group, signature });
+            jevHunkObserver.observe(first.cell);
+        }
+    }
+
+    function queueJevPageAnnotations() {
+        if (_ackTesting || !jevEnabled()) return;
+        queueJevCommitRows();
+        for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) {
+            if (jevDiffObserved.has(file) || !file.querySelector('tr')) continue;
+            jevDiffObserved.add(file);
+            jevDiffObserver.observe(file);
+        }
+    }
+
     // --- Lazy Visibility Observer for Comment-Level Work ---
 
     // Instead of processing all comments eagerly, observe containers and run
@@ -16225,6 +16787,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         expandReactionAvatars(container);
         verifyPGPSignatures(container);
         addCommitBadges(container);
+        queueJevComment(container);
         const elapsed = Math.round(ackNow() - started);
         if (elapsed > 25) ackBackgroundLog('visible comment decoration was slow', { elapsed_ms: elapsed }, 1000);
     }
@@ -16292,6 +16855,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Keep DOM mutations in a single ordered pipeline so both the initial inject
     // pass and the mutation observers stay consistent and idempotent.
     const ROOT_INJECTORS = [
+        { name: 'jevCommentUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevCommentUpdates },
+        { name: 'jevDiffUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevDiffUpdates },
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
         { name: 'localRepoCompareLinks', when: (ctx) => ctx.onRepositoryPage, fn: rewriteLocalRepoCompareLinks },
         { name: 'pullRequestListPage', when: (ctx) => ctx.onRepositoryPage, fn: enhancePullRequestListPage },
@@ -16344,6 +16909,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'hideNativeCommitNav', when: (ctx) => ctx.onPR, fn: hideNativeCommitNav },
         { name: 'normalizePRHeaderHeadBranch', when: (ctx) => ctx.onPR, fn: normalizePRHeaderHeadBranch },
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
+        { name: 'jevAnnotations', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevPageAnnotations },
         {
             name: 'githubReviewOptions',
             when: (ctx) => ctx.onToolbar,
@@ -26432,7 +26998,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             .querySelectorAll(
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
                     '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, ' +
-                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-actions, .ack-config-overlay, ' +
+                    '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-actions, .ack-config-overlay, .ack-jev-badges, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
             .forEach((el) => el.remove());
@@ -26658,6 +27224,153 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'test-suite marker should not be present in _ackSource',
         );
         ackAssert(_ackSource.includes('function tryInject'), 'expected runtime code in _ackSource');
+    });
+
+    ackTest('Jev accepts only complete typed answers and public repository proof', () => {
+        const response = { model: 'jev-test', answers: {
+            role: { type: 'choice', choice: 'fix', probabilities: { fix: 0.91 } },
+            risk: { type: 'score', score: 1.8 },
+            effort: { type: 'score', score: 0.5 },
+            message_match: { type: 'noul', noul: 0.1 },
+            test_oracle: { type: 'choice', choice: 'not_applicable', probabilities: { not_applicable: 0.99 } },
+            concern: { type: 'noul', noul: 0.93 },
+        } };
+        ackEq(jevValidatedResult('commit', response)?.answers.role.choice, 'fix');
+        ackEq(jevValidatedResult('commit', { ...response, answers: { ...response.answers, role: { ...response.answers.role, choice: 'invented' } } }), null);
+        ackEq(jevValidatedResult('commit', { ...response, answers: { ...response.answers, concern: { type: 'noul', noul: 1.2 } } }), null);
+        ackAssert(jevIsPublicRepoResponse({ status: 200, responseText: '{"private":false}' }));
+        ackAssert(!jevIsPublicRepoResponse({ status: 200, responseText: '{"private":true}' }));
+        ackAssert(!jevIsPublicRepoResponse({ status: 404, responseText: '{"private":false}' }));
+    });
+
+    ackTest('Jev evidence cache keys change with edits and patch content', () => {
+        const before = { kind: 'comment', selected_comment: 'Please check the bound' };
+        const edited = { ...before, selected_comment: 'Please check the overflow' };
+        ackNeq(jevCacheId('comment', before), jevCacheId('comment', edited));
+        ackNeq(jevCacheId('comment', before), jevCacheId('hunk', before));
+        ackNeq(jevCacheId('commit', { sha: 'abc', patch: '+old' }), jevCacheId('commit', { sha: 'abc', patch: '+new' }));
+        const long = 'x'.repeat(1800);
+        ackNeq(
+            jevCacheId('comment', { selected_comment: long, full_text_hash: hashPrompt(long + 'a') }),
+            jevCacheId('comment', { selected_comment: long, full_text_hash: hashPrompt(long + 'b') }),
+            'edits beyond the transmitted excerpt must invalidate the result',
+        );
+    });
+
+    ackTest('Jev badges distinguish impact score from defect probability', () => {
+        const slot = document.createElement('span');
+        const result = { model: 'jev-test', answers: {
+            role: { type: 'choice', choice: 'fix', probability: 0.91 },
+            risk: { type: 'score', score: 1.8 }, effort: { type: 'score', score: 1.7 },
+            message_match: { type: 'noul', noul: 0.1 }, test_oracle: { type: 'choice', choice: 'weak', probability: 0.95 },
+            concern: { type: 'noul', noul: 0.93 },
+        } };
+        jevRender(slot, 'commit', result, 'abc123 patch', true);
+        ackEq(slot.textContent, '🛠️🔥🧩📝🧫🔎');
+        ackAssert(slot.children[1].title.includes('1.80/2 impact score'));
+        ackAssert(slot.children[1].title.includes('excerpt only'));
+        ackAssert(slot.children[4].title.includes('discriminating oracle'));
+        ackAssert(slot.children[5].title.includes('has not verified a mistake'));
+    });
+
+    ackTest('Jev never sends a private repository excerpt', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldCacheMemory = jevCacheMemory;
+        const oldConfigured = jevConfigured;
+        const pr = { owner: 'acktopus-private-fixture', repo: 'example', pr: '7' };
+        let posts = 0;
+        try {
+            jevCacheMemory = null;
+            jevConfigured = true;
+            GM_getValue = (key, fallback) => key === 'jev_enabled' ? true : key === 'jev_api_key' ? 'synthetic-key' : oldGet(key, fallback);
+            GM_xmlhttpRequest = (opts) => {
+                if (opts.method === 'POST') posts++;
+                opts.onload?.({ status: 200, responseText: '{"private":true}' });
+            };
+            const result = await jevEvaluate(pr, 'comment', { selected_comment: 'private fixture only' });
+            ackEq(result, null);
+            ackEq(posts, 0, 'a private repository must never reach TypeSafe');
+        } finally {
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+            jevPublicChecks.delete('acktopus-private-fixture/example');
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevCacheMemory = oldCacheMemory;
+            jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev reuses exact cached evidence and reclassifies edited comments', async () => {
+        const oldGet = GM_getValue;
+        const oldSet = GM_setValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldCacheMemory = jevCacheMemory;
+        const oldConfigured = jevConfigured;
+        const pr = { owner: 'acktopus-public-fixture', repo: 'example', pr: '8' };
+        const values = new Map([['jev_enabled', true], ['jev_api_key', 'synthetic-key']]);
+        let posts = 0;
+        try {
+            jevCacheMemory = null;
+            jevConfigured = true;
+            GM_getValue = (key, fallback) => values.has(key) ? values.get(key) : fallback;
+            GM_setValue = (key, value) => values.set(key, value);
+            GM_xmlhttpRequest = (opts) => {
+                if (opts.method === 'GET') {
+                    ackAssert(opts.anonymous, 'public check must be anonymous');
+                    opts.onload({ status: 200, responseText: '{"private":false}' });
+                } else {
+                    posts++;
+                    opts.onload({ status: 200, responseText: JSON.stringify({
+                        model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+                    }) });
+                }
+            };
+            const before = { selected_comment: 'The old bound looks wrong' };
+            const after = { selected_comment: 'The revised overflow check looks wrong' };
+            ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
+            ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
+            ackEq((await jevEvaluate(pr, 'comment', after))?.answers.intent.choice, 'concern');
+            ackEq(posts, 2, 'the edit must miss the old evidence cache');
+        } finally {
+            GM_getValue = oldGet;
+            GM_setValue = oldSet;
+            GM_xmlhttpRequest = oldRequest;
+            jevPublicChecks.delete('acktopus-public-fixture/example');
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevCacheMemory = oldCacheMemory;
+            jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev classifies changed diff rows without changing code text', () => {
+        const host = document.createElement('div');
+        host.setAttribute('data-path', 'src/example.cpp');
+        host.innerHTML = '<table><tr class="blob-code-addition"><td data-line-number="7" id="diff-abcR7"></td><td class="blob-code blob-code-addition">return value + 1;</td></tr></table>';
+        const row = host.querySelector('tr');
+        const changed = jevChangedRow(row);
+        ackEq(changed?.text, 'return value + 1;');
+        const meta = getDiffSelectionLineMeta(changed.cell);
+        ackEq(meta?.lineNum, '7');
+        ackEq(meta?.fileName, 'src/example.cpp');
+        const codeBefore = changed.cell.textContent;
+        const slot = jevSlot(row.querySelector('[data-line-number]'), 'fixture');
+        jevRender(slot, 'hunk', { model: 'jev-test', answers: {
+            topic: { type: 'choice', choice: 'arithmetic', probability: 0.98 },
+            concern: { type: 'noul', noul: 0.95 },
+        } }, 'src/example.cpp:R7');
+        ackEq(changed.cell.textContent, codeBefore, 'line annotation must not pollute copied code');
+        ackEq(slot.textContent, '🧮🔎');
+        host.innerHTML = '<table><tr><td data-line-number="6" id="diff-abcL6"></td><td class="blob-code blob-code-deletion">return old;</td><td data-line-number="7" id="diff-abcR7"></td><td class="blob-code blob-code-addition">return updated;</td></tr></table>';
+        const split = jevChangedRow(host.querySelector('tr'));
+        ackEq(split?.excerpt, '- return old;\n+ return updated;');
+        ackEq(getDiffSelectionLineMeta(split.cell)?.lineNum, '7', 'split diff badge belongs on new line');
     });
 
     ackTest('sourceSection fails closed when structural-test anchors drift', () => {
