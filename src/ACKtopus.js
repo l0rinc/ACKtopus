@@ -7392,7 +7392,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     const bounds = container.getBoundingClientRect();
                     if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
                 }
-            } else document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
+            } else {
+                document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
+                resetJevTrackers();
+            }
         });
 
         const cancelBtn = document.createElement('button');
@@ -16654,7 +16657,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
-    const jevDiffObserved = new WeakSet();
+    let jevDiffObserved = new WeakSet();
     const jevDiffPending = new WeakSet();
     const jevVisibleDiffQueue = [];
     function queueJevDiffFile(file) {
@@ -16680,7 +16683,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }, { rootMargin: '300px' });
     const jevHunkRecords = new WeakMap();
-    const jevHunkObserved = new WeakMap();
+    let jevHunkObserved = new WeakMap();
+
+    // Forget which files and hunks were annotated so re-enabling Jev on the
+    // same page annotates them again. Commit rows re-check their badge slot.
+    function resetJevTrackers() {
+        jevDiffObserved = new WeakSet();
+        jevHunkObserved = new WeakMap();
+    }
     const jevHunkObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
             if (!entry.isIntersecting) continue;
