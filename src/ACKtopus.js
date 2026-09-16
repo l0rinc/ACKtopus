@@ -16684,10 +16684,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }, { rootMargin: '250px' });
 
+    // Start watching a diff file once it has rendered rows. Returns false when
+    // it is already watched or has no rows yet.
+    function observeJevDiffFile(file) {
+        if (jevDiffObserved.has(file) || !file.querySelector('tr')) return false;
+        jevDiffObserved.add(file);
+        jevDiffObserver.observe(file);
+        return true;
+    }
+
     function queueJevDiffUpdates(root) {
         if (_ackTesting || !jevEnabled() || root === document) return;
         const file = root.closest?.(DIFF_FILE_SELECTOR);
-        if (file && jevDiffObserved.has(file)) queueJevDiffFile(file);
+        if (file) {
+            // Rows added inside a watched file (Load diff, expanded context)
+            // re-scan it; a file whose rows only arrived now starts being watched.
+            if (!observeJevDiffFile(file) && jevDiffObserved.has(file)) queueJevDiffFile(file);
+            return;
+        }
+        // GitHub streams later files in as new subtrees; the document-level pass
+        // does not run again on bulk diff pages, so watch them from here.
+        for (const nested of root.querySelectorAll?.(DIFF_FILE_SELECTOR) || []) observeJevDiffFile(nested);
     }
 
     function jevChangedRow(row) {
@@ -16752,11 +16769,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function queueJevPageAnnotations() {
         if (_ackTesting || !jevEnabled()) return;
         queueJevCommitRows();
-        for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) {
-            if (jevDiffObserved.has(file) || !file.querySelector('tr')) continue;
-            jevDiffObserved.add(file);
-            jevDiffObserver.observe(file);
-        }
+        for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) observeJevDiffFile(file);
     }
 
     // --- Lazy Visibility Observer for Comment-Level Work ---
@@ -27349,6 +27362,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
         }
+    });
+
+    ackTest('Jev watches diff files that GitHub renders after the first pass', () => {
+        const fn = sourceSection(_ackSource, 'function queueJevDiffUpdates', 'function jevChangedRow');
+        ackAssert(fn.includes('observeJevDiffFile(file)'), 'a file whose rows arrived later starts being watched');
+        ackAssert(fn.includes('root.querySelectorAll?.(DIFF_FILE_SELECTOR)'), 'newly streamed files under a mutation root are watched');
+        ackAssert(fn.includes('queueJevDiffFile(file)'), 'watched files are re-scanned when rows change');
     });
 
     ackTest('Jev classifies changed diff rows without changing code text', () => {
