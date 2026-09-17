@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.255
+// @version      1.256
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16826,7 +16826,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const [emoji, meaning, signal] of jevStackSignals(result)) {
             jevBadge(slot, emoji, meaning, signal, result, evidence);
         }
-        if (slot.parentElement) slot.parentElement.hidden = !slot.childElementCount;
+        if (!slot.childElementCount) {
+            jevBadge(slot, 'ℹ️',
+                'No specific stack review signal crossed the display thresholds; this does not establish correctness, test execution, or adequate coverage',
+                'No thresholded signal', result, evidence);
+        }
+        if (slot.parentElement) slot.parentElement.hidden = false;
     }
 
     function jevStackPatchBudget(commitCount) {
@@ -23470,7 +23475,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // - Show only on the final `mouseup` (avoids flicker while dragging or held double-clicks).
     // - Works for multi-line selections and side-by-side diff panes.
     // - Deterministic prompts (temperature 0) so caching is effective.
-    // - Provider/context work only happens after an explicit toolbar action.
+    // - The short contextual summary runs after a stable selection; the larger
+    //   explain/fact-check/simplify/proofread requests need an explicit action.
     // - Async race-safe: request IDs prevent stale results after the selection changes.
 
     const DIFF_SELECTION_TOOLBAR_ID = 'ack-diff-selection-toolbar';
@@ -23548,6 +23554,89 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Ignore spinner frames / placeholder.
         if (raw === '…' || BRAILLE_STATES.includes(raw)) return '';
         return raw;
+    }
+
+    function buildDiffSelectionOneLinerRequest(ctx, provider) {
+        const selected = String(ctx.text || '').trim().replace(/\r\n/g, '\n');
+        const parent = String(ctx.parentText || '').trim().replace(/\r\n/g, '\n');
+        const selectedExcerpt = selected.length > 2000 ? `${selected.slice(0, 2000)}\n[selection clipped]` : selected;
+        const overview = getCachedPRLightbulbOverview(ctx.pr, provider)?.text || '';
+        const locationText = [
+            ctx.commitSha ? `Commit ${ctx.commitSha.slice(0, 8)}` : '',
+            ctx.file || '',
+            ctx.startLabel
+                ? `${ctx.startLabel}${ctx.endLabel && ctx.endLabel !== ctx.startLabel ? `-${ctx.endLabel}` : ''}`
+                : '',
+        ]
+            .filter(Boolean)
+            .join(' | ');
+        const system =
+            'In 1-2 very short lines (max 180 characters total), describe the role or purpose of the selection in the change. Add useful context or implications; do not paraphrase the selection. If the supplied context is insufficient, say so. No markdown, quotes, or preamble.';
+        const user = [
+            locationText,
+            overview ? `PR overview:\n${overview.slice(0, 1000)}` : '',
+            parent && parent !== selected ? `Containing text block:\n${parent.slice(0, 2000)}` : '',
+            ctx.threadText ? `Thread context:\n${ctx.threadText.slice(0, 1500)}` : '',
+            ctx.contextLines ? `Nearby lines:\n${ctx.contextLines.slice(0, 1000)}` : '',
+            `Selection:\n${selectedExcerpt}`,
+        ]
+            .filter(Boolean)
+            .join('\n\n');
+        return { system, user };
+    }
+
+    function queueDiffSelectionOneLiner(ctx, selectionKey) {
+        const el = _diffSelectionOneLinerEl;
+        if (!el) return;
+        const { provider } = getTooltipLLMTarget();
+        if (!isProviderAvailable(provider)) {
+            el.textContent = 'Choose an LLM provider with a key in Settings for a quick summary.';
+            el.style.display = 'block';
+            return;
+        }
+        const reqId = ++_diffSelectionOneLinerReqId;
+        const actionReqId = _diffSelectionActionReqId;
+        const isCurrent = () =>
+            reqId === _diffSelectionOneLinerReqId &&
+            actionReqId === _diffSelectionActionReqId &&
+            selectionKey === _diffSelectionCtxKey &&
+            (window.getSelection?.()?.toString?.() || '').replace(/\r\n/g, '\n') === ctx.text &&
+            el.isConnected;
+        el.style.display = 'block';
+        _diffSelectionOneLinerStopAnim = startBrailleAnimation((frame) => {
+            if (isCurrent()) el.textContent = frame;
+        });
+        // The popup is already delayed until mouseup settles. This second delay
+        // avoids a request when the user immediately adjusts the selection.
+        _diffSelectionOneLinerTimer = ackSetTimeout(async () => {
+            _diffSelectionOneLinerTimer = null;
+            if (!isCurrent()) return;
+            try {
+                const { system, user } = buildDiffSelectionOneLinerRequest(ctx, provider);
+                const raw = await callLLM(provider, system, user, {
+                    maxTokens: 100,
+                    requestLabel: 'selection-quick-summary',
+                });
+                if (!isCurrent()) return;
+                const summary = String(raw || '')
+                    .split(/\r?\n/)
+                    .map((line) => line.trim().replace(/\s+/g, ' '))
+                    .filter(Boolean)
+                    .join('\n');
+                el.textContent = summary || 'No quick summary returned.';
+            } catch (error) {
+                if (!isCurrent()) return;
+                el.textContent = `Quick summary unavailable: ${error.message || error}`;
+            } finally {
+                if (reqId === _diffSelectionOneLinerReqId && _diffSelectionOneLinerStopAnim) {
+                    _diffSelectionOneLinerStopAnim();
+                    _diffSelectionOneLinerStopAnim = null;
+                }
+                if (isCurrent()) ackRaf(() => {
+                    if (isCurrent()) updateDiffSelectionToolbar();
+                });
+            }
+        }, 250);
     }
 
     function installDiffSelectionActions() {
@@ -24349,7 +24438,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         const nextKey = diffSelectionCtxKey(ctx);
-        if (nextKey && nextKey !== _diffSelectionCtxKey) {
+        const changed = !!nextKey && nextKey !== _diffSelectionCtxKey;
+        if (changed) {
             _diffSelectionCtxKey = nextKey;
             // Cancel any in-flight action from the previous selection.
             _diffSelectionActionReqId++;
@@ -24364,6 +24454,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _diffSelectionCtx = ctx;
 
         const bar = ensureDiffSelectionToolbar();
+        if (changed) queueDiffSelectionOneLiner(ctx, nextKey);
         const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
         // Show first so we can measure the real size (column layout can be taller).
         bar.style.display = 'flex';
@@ -27651,7 +27742,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!host.hidden, 'a partial marker makes the summary visible');
         ackAssert(!slot.firstChild.title.includes('Model:'), 'no Jev inference is implied for skipped partial stacks');
         jevRenderStack(slot, refactor, 'synthetic refactor');
-        ackAssert(host.hidden, 'no empty stack-review label remains visible when no signal crosses a threshold');
+        ackEq(slot.textContent, 'ℹ️', 'a completed review without thresholded signals stays visible');
+        ackAssert(!host.hidden, 'the completed stack review is discoverable');
+        ackAssert(slot.firstChild.title.includes('does not establish correctness'),
+            'a neutral badge does not imply the stack is correct');
     });
 
     ackTest('Jev stack excerpts stay under the shared state cap', () => {
@@ -38748,13 +38842,154 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('bar.style.width = `${targetW}px`'), 'sets width from clamped row width');
     });
 
-    ackTest('diff selection toolbar does not auto-run LLM work on selection', () => {
+    ackTest('diff selection toolbar starts a short summary for a new selection', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function updateDiffSelectionToolbar'),
             source.indexOf('async function fetchBatchCommitExplanations'),
         );
-        ackAssert(fn.includes("_diffSelectionOneLinerEl.style.display = 'none'"), 'new selections keep output hidden');
+        ackAssert(fn.includes('if (changed) queueDiffSelectionOneLiner(ctx, nextKey)'), 'new selection starts summary');
+        ackEq((fn.match(/queueDiffSelectionOneLiner\(ctx, nextKey\)/g) || []).length, 1,
+            'repositioning the same selection does not restart its summary');
+        const queue = source.slice(
+            source.indexOf('function queueDiffSelectionOneLiner'),
+            source.indexOf('function installDiffSelectionActions'),
+        );
+        ackAssert(queue.includes('maxTokens: 100'), 'summary uses a small output budget');
+        ackAssert(queue.includes('callLLM(provider, system, user'), 'summary requests contextual text');
+        ackAssert(queue.includes('selectionKey === _diffSelectionCtxKey'), 'stale selection cannot render');
+        ackAssert(queue.includes('actionReqId === _diffSelectionActionReqId'), 'explicit action supersedes summary');
+        ackAssert(queue.includes('Quick summary unavailable:'), 'failure is visible instead of an empty popup');
+    });
+
+    ackTest('quick selection summary prompt is bounded and adds context beyond selected text', () => {
+        const ctx = {
+            text: 'selected phrase',
+            parentText: 'parent context '.repeat(500),
+            threadText: 'thread context '.repeat(500),
+            contextLines: 'nearby line '.repeat(500),
+            commitSha: 'a'.repeat(40),
+            file: 'src/example.cpp',
+            startLabel: 'R42',
+            pr: null,
+        };
+        const { system, user } = buildDiffSelectionOneLinerRequest(ctx, 'openai');
+        ackAssert(system.includes('role or purpose'), 'asks for purpose, not a paraphrase');
+        ackAssert(user.includes('Commit aaaaaaaa | src/example.cpp | R42'), 'includes selection location');
+        ackAssert(user.includes('Containing text block:'), 'includes parent context');
+        ackAssert(user.includes('Thread context:'), 'includes reply thread');
+        ackAssert(user.includes('Nearby lines:'), 'includes neighboring diff lines');
+        ackAssert(user.endsWith('Selection:\nselected phrase'), 'places exact selection last');
+        const large = buildDiffSelectionOneLinerRequest({ ...ctx, text: 'selected phrase '.repeat(500) }, 'openai');
+        ackAssert(large.user.length < 8000, 'keeps automatic request bounded');
+        ackAssert(large.user.includes('[selection clipped]'), 'large selection is explicitly marked incomplete');
+    });
+
+    ackTest('quick selection summary fills the popup from a cached model response', async () => {
+        const previousParsePageContext = parsePageContext;
+        const previousOutput = _diffSelectionOneLinerEl;
+        const previousKey = _diffSelectionCtxKey;
+        const selection = window.getSelection();
+        const priorRange = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
+        const host = document.createElement('div');
+        host.textContent = 'selected phrase';
+        const output = document.createElement('div');
+        document.body.append(host, output);
+        try {
+            const range = document.createRange();
+            range.selectNodeContents(host);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            setActiveProvider('claude');
+            GM_setValue(providerKeyStorageKey('claude'), 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            const ctx = { text: 'selected phrase', parentText: '', pr: null };
+            const { system, user } = buildDiffSelectionOneLinerRequest(ctx, 'claude');
+            GM_setValue(buildPromptCacheKey('claude', LLM_MODELS.claude, system, user), 'Purpose from cache');
+            _diffSelectionOneLinerEl = output;
+            _diffSelectionCtxKey = 'test-selection';
+            queueDiffSelectionOneLiner(ctx, 'test-selection');
+            await new Promise((resolve) => ackSetTimeout(resolve, 300));
+            ackEq(output.textContent, 'Purpose from cache', 'cached text appears below the action buttons');
+        } finally {
+            cancelDiffSelectionOneLiner();
+            _diffSelectionOneLinerEl = previousOutput;
+            _diffSelectionCtxKey = previousKey;
+            parsePageContext = previousParsePageContext;
+            selection.removeAllRanges();
+            if (priorRange) selection.addRange(priorRange);
+            host.remove();
+            output.remove();
+        }
+    });
+
+    ackTest('quick selection popup explains a missing provider key', () => {
+        const previousOutput = _diffSelectionOneLinerEl;
+        const output = document.createElement('div');
+        document.body.appendChild(output);
+        try {
+            setActiveProvider('claude');
+            GM_setValue(providerKeyStorageKey('claude'), '');
+            _diffSelectionOneLinerEl = output;
+            queueDiffSelectionOneLiner({ text: 'selected phrase' }, 'test-selection');
+            ackAssert(output.textContent.includes('provider with a key'), 'popup has useful status text');
+            ackEq(output.style.display, 'block', 'status text is visible');
+        } finally {
+            _diffSelectionOneLinerEl = previousOutput;
+            output.remove();
+        }
+    });
+
+    ackTest('late quick summary cannot overwrite an explicit selection action', async () => {
+        const previousRequest = GM_xmlhttpRequest;
+        const previousParsePageContext = parsePageContext;
+        const previousOutput = _diffSelectionOneLinerEl;
+        const previousKey = _diffSelectionCtxKey;
+        const selection = window.getSelection();
+        const priorRange = selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
+        const host = document.createElement('div');
+        host.textContent = 'selected phrase';
+        const output = document.createElement('div');
+        document.body.append(host, output);
+        let finishRequest;
+        try {
+            const range = document.createRange();
+            range.selectNodeContents(host);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '123' });
+            setActiveProvider('claude');
+            GM_setValue(providerKeyStorageKey('claude'), 'test-key');
+            GM_setValue('llm_cache_enabled', false);
+            GM_xmlhttpRequest = ({ onload }) => {
+                finishRequest = () => onload({
+                    status: 200,
+                    responseText: JSON.stringify({ content: [{ text: 'Late quick summary' }] }),
+                });
+            };
+            _diffSelectionOneLinerEl = output;
+            _diffSelectionCtxKey = 'test-selection';
+            queueDiffSelectionOneLiner({ text: 'selected phrase', parentText: '', pr: null }, 'test-selection');
+            await new Promise((resolve) => ackSetTimeout(resolve, 300));
+            ackAssert(finishRequest, 'summary request started');
+            _diffSelectionActionReqId++;
+            cancelDiffSelectionOneLiner();
+            output.textContent = 'Action result';
+            finishRequest();
+            await new Promise((resolve) => ackSetTimeout(resolve, 0));
+            ackEq(output.textContent, 'Action result', 'late summary leaves the action output intact');
+        } finally {
+            cancelDiffSelectionOneLiner();
+            GM_xmlhttpRequest = previousRequest;
+            parsePageContext = previousParsePageContext;
+            _diffSelectionOneLinerEl = previousOutput;
+            _diffSelectionCtxKey = previousKey;
+            selection.removeAllRanges();
+            if (priorRange) selection.addRange(priorRange);
+            host.remove();
+            output.remove();
+        }
     });
 
     ackTest('diff selection helper only updates on mouseup (no selectionchange listener)', () => {
