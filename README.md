@@ -219,7 +219,7 @@ Lets you configure the optional GitHub PAT, Claude/OpenAI/Gemini API keys, activ
 
 ### Jev review badges (optional)
 
-Enable **Jev review badges** in Settings and enter a TypeSafe API key. ACKtopus then adds compact emoji badges beside commits, visible diff hunks, and comments. Hover for the category, model signal, evidence location, and model version. Commit badges separate role, potential impact if wrong, review effort, message/patch fit, and possible inconsistencies. Hunk badges identify topics such as arithmetic, lifetime, locking, persistence, validation, consensus, performance, and tests. Comment badges classify the comment's review purpose. 🔎 means a possible inconsistency to inspect; it is not a verified bug.
+Enable **Jev review badges** in Settings and enter a TypeSafe API key. ACKtopus then adds compact emoji badges beside commits, visible diff hunks, and comments. Hover for the category, model signal, evidence location, and model version. Commit badges separate role, potential impact if wrong, review effort, message/patch fit, and possible inconsistencies. Hunk badges identify topics such as arithmetic, lifetime, locking, persistence, validation, consensus, performance, and tests. Comment badges classify the comment's review purpose. On the PR Commits tab, a stack badge checks the ordered commits for a direct test oracle, regression sensitivity, production assertions standing in for tests, test/fix ordering, and completed-run claims without supplied execution evidence. It marks a candidate test-before-fix sequence only when the ordering and both test-oracle signals agree; it does not claim the test passed before the fix. Stacks above 12 commits or with clipped/missing evidence show only 📎 for incomplete evidence. 🔎 means a possible inconsistency to inspect; it is not a verified bug.
 
 ACKtopus confirms the repository is public with an anonymous GitHub API request before sending bounded excerpts to [TypeSafe's Jev API](https://docs.typesafe.ai/api). Private repositories are skipped. Temporary GitHub check failures trigger a console warning and a retry after one minute. Classification runs in the background, with at most three concurrent requests and 250 new requests per page visit. Results are cached for up to 14 days against the exact comment text or diff excerpt and the Jev rubric, so edits and force pushes get new classifications. Large commit diffs are sampled across files and hunks; large visible hunks are excerpted. Their tooltips say when evidence is incomplete. The TypeSafe key is stored in Tampermonkey settings, like the other provider keys.
 
@@ -237,7 +237,7 @@ On PR conversation, commits-list, single-commit, and changes views, ACKtopus add
 
 ### Explain / Chat / Fact check on selections
 
-When you select text on a PR page (diff lines, commit messages, or comments), ACKtopus shows a small popup with a short (1-2 line) context summary and:
+When you select text on a PR page (diff lines, commit messages, or comments), ACKtopus shows a small popup with:
 
 - **Explain**: quick explanation of the selected snippet in the context of the commit
 - **Fact check**: checks whether the selected claim is accurate using the full PR context
@@ -247,10 +247,10 @@ When you select text on a PR page (diff lines, commit messages, or comments), AC
 
 For short replies like “sure, done”, **Fact check** also includes the surrounding reply thread so the claim can be interpreted in context.
 
-If a cached PR-level lightbulb overview exists, ACKtopus feeds that into these quick selection helpers (especially the short summary / explain / simplify paths) to improve relevance without turning them into slow, heavy requests. The helper also includes the surrounding parent text block so the selected snippet is interpreted in context instead of isolation.
+If a cached PR-level lightbulb overview exists, ACKtopus feeds that into these quick selection helpers to improve relevance. The helper also includes the surrounding parent text block so the selected snippet is interpreted in context instead of isolation.
 
 The popup keeps the action buttons on a single row, prefers to open below the selection when there is room, stays viewport-clamped, and can be dismissed by clicking anywhere outside of it.
-The quick 1-2 line summary is fetched automatically after a short stable-selection delay when an LLM provider is configured. If the selection is cleared or immediately copied with `Cmd+C` / `Ctrl+C`, ACKtopus suppresses the tooltip and skips the LLM call.
+Selection helpers run when you choose **Explain**, **Fact check**, **Simplify**, or **Proofread**; selecting or copying text alone does not start an LLM request.
 
 ### Start a review (from Conversation replies)
 

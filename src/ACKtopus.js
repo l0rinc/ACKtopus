@@ -6607,8 +6607,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         jevCacheMemory = null;
         // jev_enabled was just deleted; stop classifying until it is re-enabled.
         jevConfigured = false;
+        jevStackRejected = false;
         jevEpoch++;
         document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
+        document.querySelectorAll('.ack-jev-stack-summary').forEach((summary) => summary.remove());
         resetJevTrackers();
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
@@ -7394,11 +7396,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             jevConfigured = nextJevConfigured;
             jevRejectedKey = '';
             jevSchemaRejected = false;
+            jevStackRejected = false;
             jevPauseUntil = 0;
             closePanel();
             if (jevEnabled()) {
                 if (jevSettingsChanged) {
                     document.querySelectorAll('.ack-jev-badges:empty').forEach((badge) => badge.remove());
+                    document.querySelectorAll('.ack-jev-stack-summary').forEach((summary) => summary.remove());
                     resetJevTrackers();
                 }
                 queueJevPageAnnotations();
@@ -7408,6 +7412,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 }
             } else {
                 document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
+                document.querySelectorAll('.ack-jev-stack-summary').forEach((summary) => summary.remove());
                 resetJevTrackers();
             }
         });
@@ -16286,6 +16291,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const JEV_PUBLIC_CHECK_TTL_MS = 60000;
     const JEV_MAX_REQUESTS_PER_PAGE = 250;
+    const JEV_STACK_MAX_COMMITS = 12;
+    const JEV_STACK_PATCH_CHARS = 12000;
+    const JEV_STACK_MAX_STATE_CHARS = 80000;
     const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)[_-][A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
         commit: {
@@ -16337,6 +16345,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 other: 'None of these is clearly supported',
             } },
         },
+        stack: {
+            executable_oracle: { type: 'noul', instructions: 'Does the shown stack add a runnable test whose assertion directly observes the production behavior changed by a fix? Do not count production assertions, setup alone, or a no-throw check that would also pass after restoring the old behavior.' },
+            regression_sensitivity: { type: 'noul', instructions: 'Would at least one changed test fail if the specific production behavior fixed by this stack were restored? Judge the assertions, not test order or test names.' },
+            production_assertion_only: { type: 'noul', instructions: 'Does the shown stack add a production assertion for a behavior fix without adding a runnable discriminating test for that behavior? A production assertion is not a test.' },
+            characterization_order: { type: 'choice', instructions: 'How are a test and production fix ordered in the shown stack? Judge order separately from whether the test has a useful oracle. For a behavior-preserving refactor or prose-only stack, choose not_applicable; do not demand new coverage.', criteria: {
+                before_fix: 'A distinct earlier commit adds a relevant runnable test before a later production fix; this does not establish that the test passed before the fix',
+                with_fix: 'The first relevant test is added in the same commit as the production fix',
+                after_fix: 'The first relevant test is added after the production fix',
+                no_test: 'A production fix is shown, with no relevant test in the shown stack',
+                not_applicable: 'The shown stack contains no production behavior fix needing characterization',
+                unclear: 'The order or relationship cannot be determined from the shown evidence',
+            } },
+            validation_support: { type: 'choice', instructions: 'Do commit messages explicitly claim a completed test run, build, fuzz run, benchmark, or measured result, and is that claim supported by revision-bound execution evidence in the supplied state? Describing added test code, expected behavior, or intended assertions is not a claim that a command ran.', criteria: {
+                no_completed_claim: 'No message claims that validation or measurement was completed',
+                supported: 'An explicit completed-run or measurement claim has matching revision-bound execution evidence in the supplied state',
+                evidence_missing: 'An explicit completed-run or measurement claim exists, but matching execution evidence is absent from the supplied state',
+                unclear: 'The wording or evidence is too incomplete to classify',
+            } },
+        },
     };
     const JEV_LABELS = {
         role: {
@@ -16368,6 +16395,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevEpoch = 0;
     let jevRejectedKey = '';
     let jevSchemaRejected = false;
+    let jevStackRejected = false;
     let jevPauseUntil = 0;
     let jevPauseRetryTimer = null;
     let jevConfigured = !!GM_getValue('jev_enabled', false) && !!GM_getValue('jev_api_key', '');
@@ -16513,6 +16541,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevPost(kind, state, attempt = 0) {
         if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
+        if (kind === 'stack' && jevStackRejected) return Promise.reject(new Error('Jev stack review paused after a rejected request'));
         const key = GM_getValue('jev_api_key', '').trim();
         if (!key) return Promise.reject(new Error('Jev API key missing'));
         const body = JSON.stringify({ state, model: JEV_MODEL, questions: JEV_QUESTIONS[kind] });
@@ -16534,9 +16563,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         jevSchedulePauseRetry();
                     }
                     if (r.status === 401) jevRejectedKey = key;
-                    if (r.status === 422) jevSchemaRejected = true;
+                    if (r.status === 422) {
+                        if (kind === 'stack') jevStackRejected = true;
+                        else jevSchemaRejected = true;
+                    }
                     if (r.status < 200 || r.status >= 300) {
-                        const reason = r.status === 422 ? ' (request shape rejected; annotations paused)' : '';
+                        const reason = r.status === 422
+                            ? kind === 'stack' ? ' (stack review paused)' : ' (request shape rejected; annotations paused)'
+                            : '';
                         return reject(new Error(`Jev HTTP ${r.status}${reason}: ${String(r.responseText || '').slice(0, 160)}`));
                     }
                     try {
@@ -16745,6 +16779,174 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return { text: sampled.join(marker), clipped: true };
     }
 
+    function jevStackSignals(result) {
+        const a = result.answers;
+        const signals = [];
+        const order = a.characterization_order.choice;
+        const direct = a.executable_oracle.noul;
+        const sensitive = a.regression_sensitivity.noul;
+        // Order alone can describe a vacuous test. Require both independent
+        // oracle signals before marking a useful test-before-fix sequence.
+        if (order === 'before_fix' && a.characterization_order.probability >= 0.7) {
+            if (direct >= 0.7 && sensitive >= 0.7) {
+                signals.push(['🧪', 'Candidate test-before-fix sequence with a direct, regression-sensitive test; whether it passed before the fix was not checked', `${Math.round(direct * 100)}% oracle, ${Math.round(sensitive * 100)}% sensitivity`]);
+            } else if (direct < 0.5 || sensitive < 0.5) {
+                signals.push(['🧫', 'A test appears before the fix but may not distinguish the corrected behavior', `${Math.round(direct * 100)}% oracle, ${Math.round(sensitive * 100)}% sensitivity`]);
+            }
+        } else if (order === 'with_fix' && a.characterization_order.probability >= 0.75) {
+            signals.push(['🔗', 'The first relevant test appears in the same commit as the production fix', `${Math.round(a.characterization_order.probability * 100)}% order signal`]);
+        } else if (order === 'after_fix' && a.characterization_order.probability >= 0.75) {
+            signals.push(['🔀', 'The first relevant test appears after the production fix', `${Math.round(a.characterization_order.probability * 100)}% order signal`]);
+        } else if (order === 'no_test' && a.characterization_order.probability >= 0.8) {
+            signals.push(['🧫', 'A production fix appears without a relevant test in this stack', `${Math.round(a.characterization_order.probability * 100)}% order signal`]);
+        }
+        if (a.production_assertion_only.noul >= 0.8) {
+            signals.push(['⚠️', 'A production assertion may be standing in for a runnable test', `${Math.round(a.production_assertion_only.noul * 100)}% signal`]);
+        }
+        if (a.validation_support.choice === 'evidence_missing' && a.validation_support.probability >= 0.8) {
+            signals.push(['📋', 'A commit message appears to claim a completed run or measurement; matching revision-bound execution evidence was not supplied to Jev', `${Math.round(a.validation_support.probability * 100)}% signal`]);
+        }
+        return signals;
+    }
+
+    function jevRenderStack(slot, result, evidence, partial = false) {
+        slot.replaceChildren();
+        if (partial) {
+            const badge = document.createElement('span');
+            badge.className = 'ack-jev-badge';
+            badge.textContent = '📎';
+            badge.title = `Stack evidence is incomplete; inspect the full commit sequence and patches\nEvidence: ${evidence}\nNo stack-level conclusion was drawn.`;
+            badge.setAttribute('role', 'img');
+            badge.setAttribute('aria-label', badge.title);
+            slot.appendChild(badge);
+            if (slot.parentElement) slot.parentElement.hidden = false;
+            return;
+        }
+        if (!result) return;
+        for (const [emoji, meaning, signal] of jevStackSignals(result)) {
+            jevBadge(slot, emoji, meaning, signal, result, evidence);
+        }
+        if (slot.parentElement) slot.parentElement.hidden = !slot.childElementCount;
+    }
+
+    function jevStackPatchBudget(commitCount) {
+        // Reserve room for messages, hashes, and JSON escaping in the shared
+        // state. The final serialized-size check below is authoritative.
+        return Math.min(JEV_STACK_PATCH_CHARS, Math.floor((JEV_STACK_MAX_STATE_CHARS - 30000) / commitCount));
+    }
+
+    function jevStackVisibleListMatches(commits, visibleShas, visibleHead) {
+        if (!visibleShas.length) return false;
+        let previous = -1;
+        for (const sha of visibleShas) {
+            const matches = commits.map((commit, index) => commit.sha?.startsWith(sha) ? index : -1).filter((index) => index >= 0);
+            if (matches.length !== 1 || matches[0] <= previous) return false;
+            previous = matches[0];
+        }
+        // Without an independently observed head, require the visible list to
+        // reach the API head before attaching a stack conclusion to this DOM.
+        return !!visibleHead || previous === commits.length - 1;
+    }
+
+    function queueJevStackSummary() {
+        if (_ackTesting || !jevEnabled() || jevStackRejected || getAnalysisMode() !== ANALYSIS_MODES.commits) return;
+        const pr = parsePR();
+        const visibleCommits = parseCommitsFromPage();
+        const first = visibleCommits.find((commit) => commit.el)?.el;
+        if (!pr || !first) return;
+        const visibleHead = getImmediatePRHeadSHA();
+        const visibleShas = visibleCommits.map((commit) => commit.sha);
+        const visibleList = visibleShas.join(',');
+        const visibleKey = `${pr.owner}/${pr.repo}#${pr.pr}:${visibleHead}:${hashPrompt(visibleList)}`;
+        let summary = first.querySelector(':scope > .ack-jev-stack-summary');
+        if (!summary) {
+            summary = document.createElement('div');
+            summary.className = 'ack-jev-stack-summary';
+            summary.style.cssText = 'font-size:12px;line-height:1.5;margin:2px 0 5px;color:#8b949e';
+            summary.textContent = 'Stack review';
+            summary.hidden = true;
+            first.prepend(summary);
+        }
+        const existingSlot = summary.querySelector('.ack-jev-badges');
+        if (summary.dataset.ackJevStackKey === visibleKey &&
+            (summary.dataset.ackJevStackPending === '1' || summary.dataset.ackJevStackDone === '1')) return;
+        summary.dataset.ackJevStackKey = visibleKey;
+        summary.dataset.ackJevStackPending = '1';
+        delete summary.dataset.ackJevStackDone;
+        let slot = existingSlot;
+        if (!slot) {
+            slot = document.createElement('span');
+            slot.className = 'ack-jev-badges';
+            summary.appendChild(slot);
+        }
+        slot.replaceChildren();
+        summary.hidden = true;
+        const routePath = location.pathname;
+        const epoch = jevEpoch;
+        const stillCurrent = (head) => {
+            const currentHead = getImmediatePRHeadSHA();
+            return slot.isConnected && location.pathname === routePath && epoch === jevEpoch &&
+                summary.dataset.ackJevStackKey === visibleKey && jevEnabled() &&
+                parseCommitsFromPage().map((commit) => commit.sha).join(',') === visibleList &&
+                (!currentHead || currentHead === head);
+        };
+        (async () => {
+            if (!(await jevPublicRepository(pr)) || !stillCurrent(visibleHead)) return;
+            // One API page is sufficient to know whether the entire stack fits
+            // the bound; larger stacks get a partial badge without a Jev call.
+            const commits = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=${JEV_STACK_MAX_COMMITS + 1}&page=1`);
+            if (!Array.isArray(commits) || !commits.length || !stillCurrent(visibleHead)) return;
+            const head = commits[commits.length - 1]?.sha || '';
+            if (visibleHead && commits.length <= JEV_STACK_MAX_COMMITS && head !== visibleHead) return;
+            const evidence = `${pr.owner}/${pr.repo}#${pr.pr}, ${commits.length > JEV_STACK_MAX_COMMITS ? `more than ${JEV_STACK_MAX_COMMITS}` : commits.length} ordered commits`;
+            if (commits.length > JEV_STACK_MAX_COMMITS) {
+                jevRenderStack(slot, null, `${evidence} (stack limit)`, true);
+                summary.dataset.ackJevStackDone = '1';
+                return;
+            }
+            if (commits.some((commit) => !/^[0-9a-f]{40}$/i.test(commit.sha || ''))) return;
+            if (!jevStackVisibleListMatches(commits, visibleShas, visibleHead)) return;
+            const records = [];
+            let partial = false;
+            for (let i = 0; i < commits.length; i += 3) {
+                const batch = await Promise.allSettled(commits.slice(i, i + 3).map((commit) => fetchCommitPatch(pr, commit.sha)));
+                if (!stillCurrent(head)) return;
+                for (let j = 0; j < batch.length; j++) {
+                    const commit = commits[i + j];
+                    const message = String(commit.commit?.message || '');
+                    const patch = batch[j].status === 'fulfilled' ? batch[j].value : '';
+                    const excerpt = jevCommitPatchExcerpt(patch, jevStackPatchBudget(commits.length));
+                    const clipped = !patch || excerpt.clipped || message.length > 800;
+                    partial ||= clipped;
+                    records.push({
+                        sha: commit.sha, message: message.slice(0, 800), full_message_hash: hashPrompt(message),
+                        patch: excerpt.text, full_patch_hash: hashPrompt(patch), patch_clipped: clipped,
+                    });
+                }
+            }
+            if (!stillCurrent(head)) return;
+            const state = {
+                kind: 'stack', repository: `${pr.owner}/${pr.repo}`, pr: pr.pr, head,
+                validation_evidence: 'No revision-bound test, build, fuzz, or measurement results were supplied.',
+                commits: records, partial,
+            };
+            if (partial || JSON.stringify(state).length > JEV_STACK_MAX_STATE_CHARS) {
+                jevRenderStack(slot, null, `${evidence} (excerpt only)`, true);
+                summary.dataset.ackJevStackDone = '1';
+                return;
+            }
+            const result = await jevEvaluate(pr, 'stack', state);
+            if (stillCurrent(head) && result) {
+                jevRenderStack(slot, result, evidence);
+                summary.dataset.ackJevStackDone = '1';
+            }
+        })().catch((e) => {
+            if (stillCurrent(visibleHead)) console.warn('ACKtopus: Jev stack review skipped:', e?.message || e);
+        }).finally(() => {
+            if (summary.dataset.ackJevStackKey === visibleKey) delete summary.dataset.ackJevStackPending;
+        });
+    }
+
     function queueJevCommitRow(commit) {
         const pr = parsePR();
         if (!pr) return;
@@ -16910,6 +17112,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function queueJevPageAnnotations() {
         if (_ackTesting || !jevEnabled()) return;
         queueJevCommitRows();
+        queueJevStackSummary();
         for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) observeJevDiffFile(file);
     }
 
@@ -27399,6 +27602,88 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!jevIsPublicRepoResponse({ status: 404, responseText: '{"private":false}' }));
     });
 
+    ackTest('Jev stack result requires every independent evidence signal', () => {
+        const response = { model: 'jev-test', answers: {
+            executable_oracle: { type: 'noul', noul: 0.91 },
+            regression_sensitivity: { type: 'noul', noul: 0.88 },
+            production_assertion_only: { type: 'noul', noul: 0.02 },
+            characterization_order: { type: 'choice', choice: 'before_fix', probabilities: { before_fix: 0.9 } },
+            validation_support: { type: 'choice', choice: 'no_completed_claim', probabilities: { no_completed_claim: 0.95 } },
+        } };
+        ackEq(jevValidatedResult('stack', response)?.answers.characterization_order.choice, 'before_fix');
+        ackEq(jevValidatedResult('stack', { ...response, answers: { ...response.answers, regression_sensitivity: undefined } }), null,
+            'ordering cannot substitute for a missing regression-sensitivity judgment');
+        ackAssert(JEV_QUESTIONS.stack.validation_support.instructions.includes('explicitly claim a completed'),
+            'descriptions of test code must not be treated as completed validation claims');
+    });
+
+    ackTest('Jev stack badges require a direct sensitive oracle and an explicit validation claim', () => {
+        const base = { model: 'jev-test', answers: {
+            executable_oracle: { type: 'noul', noul: 0.9 },
+            regression_sensitivity: { type: 'noul', noul: 0.9 },
+            production_assertion_only: { type: 'noul', noul: 0.05 },
+            characterization_order: { type: 'choice', choice: 'before_fix', probability: 0.9 },
+            validation_support: { type: 'choice', choice: 'no_completed_claim', probability: 0.95 },
+        } };
+        ackEq(jevStackSignals(base).map((badge) => badge[0]).join(''), '🧪');
+        const vacuous = { ...base, answers: { ...base.answers,
+            executable_oracle: { type: 'noul', noul: 0.08 },
+            regression_sensitivity: { type: 'noul', noul: 0.07 },
+        } };
+        ackEq(jevStackSignals(vacuous).map((badge) => badge[0]).join(''), '🧫',
+            'test-before-fix ordering with a vacuous oracle is not characterization');
+        const refactor = { ...vacuous, answers: { ...vacuous.answers,
+            characterization_order: { type: 'choice', choice: 'not_applicable', probability: 0.98 },
+        } };
+        ackEq(jevStackSignals(refactor).map((badge) => badge[0]).join(''), '',
+            'a clean refactor needs no new behavioral test');
+        const claimedRun = { ...base, answers: { ...base.answers,
+            validation_support: { type: 'choice', choice: 'evidence_missing', probability: 0.92 },
+        } };
+        ackAssert(jevStackSignals(claimedRun).some((badge) => badge[0] === '📋'),
+            'only an explicit completed-run claim gets a validation-evidence badge');
+        const host = document.createElement('div');
+        host.hidden = true;
+        const slot = document.createElement('span');
+        host.appendChild(slot);
+        jevRenderStack(slot, base, 'synthetic stack', true);
+        ackEq(slot.textContent, '📎', 'partial evidence suppresses favorable conclusions');
+        ackAssert(!host.hidden, 'a partial marker makes the summary visible');
+        ackAssert(!slot.firstChild.title.includes('Model:'), 'no Jev inference is implied for skipped partial stacks');
+        jevRenderStack(slot, refactor, 'synthetic refactor');
+        ackAssert(host.hidden, 'no empty stack-review label remains visible when no signal crosses a threshold');
+    });
+
+    ackTest('Jev stack excerpts stay under the shared state cap', () => {
+        ackEq(jevStackPatchBudget(1), 12000);
+        const perCommit = jevStackPatchBudget(JEV_STACK_MAX_COMMITS);
+        const patch = 'diff --git a/test.cpp b/test.cpp\n@@ -1 +1 @@\n' + '+change\n'.repeat(900);
+        const records = Array.from({ length: JEV_STACK_MAX_COMMITS }, (_, index) => ({
+            sha: String(index).padStart(40, '0'), message: 'm'.repeat(800),
+            full_message_hash: hashPrompt('m'.repeat(800)),
+            patch: jevCommitPatchExcerpt(patch, perCommit).text,
+            full_patch_hash: hashPrompt(patch), patch_clipped: true,
+        }));
+        const state = { kind: 'stack', repository: 'bitcoin/bitcoin', pr: '123', head: '0'.repeat(40),
+            validation_evidence: 'No revision-bound test, build, fuzz, or measurement results were supplied.',
+            commits: records, partial: true };
+        ackAssert(perCommit <= JEV_STACK_PATCH_CHARS);
+        ackAssert(JSON.stringify(state).length <= JEV_STACK_MAX_STATE_CHARS,
+            'a maximum-size ordinary evidence bundle fits the cap');
+    });
+
+    ackTest('Jev stack conclusions require the visible ordered commits and current head', () => {
+        const commits = ['a', 'b', 'c'].map((digit) => ({ sha: digit.repeat(40) }));
+        ackAssert(jevStackVisibleListMatches(commits, ['a'.repeat(8), 'b'.repeat(8), 'c'.repeat(8)], ''),
+            'a complete visible sequence is consistent with the API list');
+        ackAssert(!jevStackVisibleListMatches(commits, ['a'.repeat(8), 'b'.repeat(8)], ''),
+            'without an independent head, a partial visible list cannot anchor a conclusion');
+        ackAssert(!jevStackVisibleListMatches(commits, ['a'.repeat(8), 'd'.repeat(8), 'c'.repeat(8)], ''),
+            'an API response for a different force-pushed stack is rejected');
+        ackAssert(!jevStackVisibleListMatches(commits, ['b'.repeat(8), 'a'.repeat(8), 'c'.repeat(8)], ''),
+            'the order must match');
+    });
+
     ackTest('Jev refuses to send credential-shaped excerpts', () => {
         ackAssert(JEV_SECRET_RE.test('key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123'), 'catches hyphenated sk- provider keys');
         ackAssert(JEV_SECRET_RE.test('token ghp_abcdefghijklmnopqrstuvwxyz0123'), 'catches GitHub tokens');
@@ -27441,6 +27726,50 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevConfigured = oldConfigured;
             jevRejectedKey = oldRejectedKey;
             jevSchemaRejected = oldSchemaRejected;
+            jevPauseUntil = oldPauseUntil;
+        }
+    });
+
+    ackTest('Jev stack schema rejection leaves existing annotations usable', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldConfigured = jevConfigured;
+        const oldStackRejected = jevStackRejected;
+        const oldSchemaRejected = jevSchemaRejected;
+        const oldRejectedKey = jevRejectedKey;
+        const oldPauseUntil = jevPauseUntil;
+        let posts = 0;
+        try {
+            jevConfigured = true;
+            jevStackRejected = false;
+            jevSchemaRejected = false;
+            jevRejectedKey = '';
+            jevPauseUntil = 0;
+            GM_getValue = (key, fallback) => key === 'jev_api_key' ? 'synthetic-key' : oldGet(key, fallback);
+            GM_xmlhttpRequest = (opts) => {
+                posts++;
+                const kind = JSON.parse(opts.data).state.kind;
+                opts.onload(kind === 'stack'
+                    ? { status: 422, responseText: 'stack too large' }
+                    : { status: 200, responseText: JSON.stringify({ model: 'jev-test', answers: {
+                        intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } },
+                    } }) });
+            };
+            const stackError = await jevPost('stack', { kind: 'stack', commits: [] }).catch((e) => e);
+            ackAssert(stackError.message.includes('stack review paused'));
+            ackAssert(jevStackRejected && !jevSchemaRejected && jevEnabled(),
+                'only the stack request is paused after 422');
+            await jevPost('stack', { kind: 'stack', commits: [] }).catch(() => {});
+            ackEq(posts, 1, 'a second stack request is blocked locally');
+            ackEq((await jevPost('comment', { kind: 'comment', selected_comment: 'fixture' })).answers.intent.choice, 'concern');
+            ackEq(posts, 2, 'comment annotations still reach Jev');
+        } finally {
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+            jevConfigured = oldConfigured;
+            jevStackRejected = oldStackRejected;
+            jevSchemaRejected = oldSchemaRejected;
+            jevRejectedKey = oldRejectedKey;
             jevPauseUntil = oldPauseUntil;
         }
     });
