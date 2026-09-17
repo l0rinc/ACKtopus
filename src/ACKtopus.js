@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.257
+// @version      1.258
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -77,6 +77,10 @@
         '.ack-diff-selection-output-action{-ms-overflow-style:none;scrollbar-width:none}',
         '.ack-jev-badges{display:inline-flex;align-items:center;gap:2px;margin-left:5px;vertical-align:middle}',
         '.ack-jev-badge{display:inline-block;font-size:12px;line-height:1.2;cursor:help}',
+        'h2.ack-commit-heading{display:flex;align-items:baseline;gap:5px}',
+        'h2.ack-commit-heading>[data-component="Text"]{min-width:0;flex:0 1 auto}',
+        '.ack-commit-heading-actions{display:inline-flex;align-items:center;gap:2px;flex:none;white-space:nowrap}',
+        'h2.ack-commit-heading>.ack-jev-badges{margin-left:1px;flex:none;white-space:nowrap}',
         '.ack-jev-line-anchor{padding-inline-end:34px!important}',
         '.ack-jev-line-anchor>.ack-jev-badges{position:absolute;top:1px;right:2px;z-index:2;margin:0;padding:0 2px;white-space:nowrap;background:var(--bgColor-default,Canvas);border-radius:3px}',
     ].join('');
@@ -17248,9 +17252,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return slot;
     }
 
+    function commitHeadingActions(header) {
+        if (!header?.matches('h2') || !header.querySelector(':scope > [data-component="Text"]')) return null;
+        header.classList.add('ack-commit-heading');
+        let actions = header.querySelector(':scope > .ack-commit-heading-actions');
+        if (!actions) {
+            actions = document.createElement('span');
+            actions.className = 'ack-commit-heading-actions';
+            header.prepend(actions);
+        }
+        return actions;
+    }
+
     function jevCommitBadgeTarget(commit) {
         const row = commit?.el;
         if (!row) return null;
+        if (commitHeadingActions(row)) return row;
         if (row.matches('.commit-title, [data-testid="commit-title"]')) return row;
         const title = row.querySelector('[data-listview-item-title-container]');
         if (title) return title.querySelector('[class*="trailingBadgesContainer"]') || title.querySelector('h4, h3') || title;
@@ -17648,7 +17665,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             summary.className = 'ack-jev-stack-summary';
             summary.style.cssText = placement.inline
                 ? 'font-size:12px;line-height:1.5;margin-left:6px;color:#8b949e'
-                : 'font-size:12px;line-height:1.5;margin:2px 0 5px;color:#8b949e';
+                : 'font-size:12px;line-height:1.5;padding:6px 12px;margin:0 0 2px;' +
+                    'color:var(--fgColor-muted,#8b949e);border-bottom:1px solid var(--borderColor-muted,#30363d);' +
+                    'box-sizing:border-box';
             summary.textContent = 'Stack review';
             summary.hidden = true;
             placement.container.insertBefore(summary, placement.before);
@@ -25566,6 +25585,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const container =
             commitHeader.closest('.bgColor-inset, .tmp-p-3, .commit-desc, .full-commit') || commitHeader.parentElement;
         if (container.querySelector('.ack-commit-explain')) return;
+        const actionTarget = commitHeadingActions(commitHeader) || commitHeader;
 
         const makeCommitHeaderButton = (className, text, title) => {
             const button = document.createElement('button');
@@ -25581,8 +25601,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 opacity: '0.4',
                 lineHeight: 'inherit',
                 verticalAlign: 'middle',
-                display: 'inline',
-                float: 'left',
+                display: 'inline-flex',
             });
             button.addEventListener('mouseenter', () => {
                 button.style.opacity = '1';
@@ -25759,8 +25778,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         });
 
-        commitHeader.prepend(proofreadBtn);
-        commitHeader.prepend(btn);
+        actionTarget.prepend(proofreadBtn);
+        actionTarget.prepend(btn);
 
         // Auto-show if lightbulb was open on previous commit (cached data = instant)
         const pr = parsePR();
@@ -29591,6 +29610,55 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             parsePR = oldParsePR;
             jevPublicRepository = oldPublicRepository;
+        }
+    });
+
+    ackTest('React commit detail keeps GitHub title and review controls on one line', () => {
+        // Reduced from scratch_17.txt, captured on a real commit detail page.
+        const oldParsePR = parsePR;
+        const oldPublicRepository = jevPublicRepository;
+        const mount = document.createElement('div');
+        mount.innerHTML = '<div class="d-flex flex-column flex-justify-between border-bottom tmp-p-3 bgColor-inset">' +
+            '<div class="flex-1"><h2 class="prc-Heading-Heading-MtWFE" data-component="Heading">' +
+            '<span class="ws-pre-wrap f5 wb-break-word prc-Text-Text-9mHv3" data-component="Text">' +
+            '<div>test: script compression with off-curve and wrong-Y P2PK pubkeys</div></span></h2>' +
+            '<span class="ws-pre-wrap f6 wb-break-word text-mono mt-2 prc-Text-Text-9mHv3" data-component="Text">' +
+            'Adds coverage for two cases.</span></div></div>';
+        document.body.appendChild(mount);
+        const heading = mount.querySelector('h2');
+        const title = heading.querySelector('[data-component="Text"]');
+        const description = mount.querySelector('.text-mono');
+        try {
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
+            jevPublicRepository = () => Promise.resolve(false);
+            addSingleCommitExplainButton();
+            queueJevCommitRow({ sha: '27c6a2c75bf90ef03f8b297a00853d910170a0c6', msg: title.textContent, el: heading });
+            addSingleCommitExplainButton();
+
+            const actions = heading.querySelector('.ack-commit-heading-actions');
+            const explain = heading.querySelector('.ack-commit-explain');
+            const proofread = heading.querySelector('.ack-commit-proofread');
+            const badge = heading.querySelector('.ack-jev-badges');
+            ackAssert(actions && explain && proofread && badge, 'both controls and Jev slot appear beside the title');
+            ackEq(explain.parentElement, actions, 'lightbulb is in the shared action group');
+            ackEq(proofread.parentElement, actions, 'proofread button is in the shared action group');
+            ackEq(badge.parentElement, heading, 'Jev badge follows the title, outside clickable controls');
+            ackEq(heading.children[0], actions, 'buttons precede the subject');
+            ackEq(heading.children[1], title, 'GitHub subject stays in the middle');
+            ackEq(heading.children[2], badge, 'Jev badge trails the subject');
+            ackEq(heading.querySelector('[data-component="Text"]'), title, 'GitHub title node is not replaced');
+            ackEq(title.textContent, 'test: script compression with off-curve and wrong-Y P2PK pubkeys');
+            ackEq(description.textContent, 'Adds coverage for two cases.', 'commit body remains intact');
+            ackEq(heading.querySelectorAll('.ack-commit-explain').length, 1, 'repeat injection is idempotent');
+            ackEq(heading.querySelectorAll('.ack-commit-proofread').length, 1, 'proofread control is not duplicated');
+            ackEq(heading.querySelectorAll('.ack-jev-badges').length, 1, 'Jev slot is not duplicated');
+            ackEq(explain.style.float, '', 'lightbulb no longer floats over GitHub title');
+            ackEq(proofread.style.float, '', 'proofread button no longer floats over GitHub title');
+            ackEq(getComputedStyle(heading).display, 'flex', 'heading uses one flex line for title and actions');
+        } finally {
+            parsePR = oldParsePR;
+            jevPublicRepository = oldPublicRepository;
+            mount.remove();
         }
     });
 
@@ -36859,38 +36927,44 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('escapeHTML(truncMsg'), 'commit message is HTML-escaped before innerHTML');
     });
 
-    ackTest('single commit explain button is inserted inline inside commit title element', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function addSingleCommitExplainButton'),
-            source.indexOf('function inject()'),
-        );
-        // Button uses float:left to sit inline with text regardless of parent layout
-        ackAssert(fn.includes("float: 'left'"), 'button uses float:left for inline positioning');
-        ackAssert(fn.includes("display: 'inline'"), 'button has display: inline');
-        ackAssert(fn.includes('commitHeader.prepend(btn)'), 'prepends into header');
-    });
-
-    ackTest('single commit proofread button is inserted inline beside the lightbulb', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function addSingleCommitExplainButton'),
-            source.indexOf('// --- Co-authored-by'),
-        );
-        ackAssert(fn.includes('ack-commit-proofread'), 'creates commit-message proofread button');
-        ackAssert(
-            fn.includes('Proofread this commit message against its patch (read-only)'),
-            'proofread button title describes read-only commit-message check',
-        );
-        ackAssert(
-            fn.includes('runReadOnlyCommitMessagesProofread(proofreadBtn)'),
-            'proofread button runs read-only commit-message proofreading',
-        );
-        ackAssert(fn.includes('commitHeader.prepend(proofreadBtn)'), 'prepends proofread button into header');
-        ackAssert(
-            fn.indexOf('commitHeader.prepend(proofreadBtn)') < fn.indexOf('commitHeader.prepend(btn)'),
-            'lightbulb remains first after both prepends',
-        );
+    ackTest('classic single commit title keeps controls inline and proofread click scoped', () => {
+        const oldParsePR = parsePR;
+        const oldProofread = runReadOnlyCommitMessagesProofread;
+        const mount = document.createElement('div');
+        mount.innerHTML = '<div class="commit-desc"><h1 class="commit-title">' +
+            '<span id="classic-commit-subject">Fix the bound</span></h1></div>';
+        document.body.appendChild(mount);
+        let proofreadTarget = null;
+        let bubbled = false;
+        try {
+            parsePR = () => null;
+            runReadOnlyCommitMessagesProofread = (button) => { proofreadTarget = button; };
+            mount.addEventListener('click', () => { bubbled = true; });
+            addSingleCommitExplainButton();
+            addSingleCommitExplainButton();
+            const title = mount.querySelector('.commit-title');
+            const subject = title.querySelector('#classic-commit-subject');
+            const explain = title.querySelector('.ack-commit-explain');
+            const proofread = title.querySelector('.ack-commit-proofread');
+            ackAssert(explain && proofread, 'both controls are next to the classic title');
+            ackEq(title.children[0], explain, 'lightbulb appears before proofread and subject');
+            ackEq(title.children[1], proofread, 'proofread appears before the subject');
+            ackEq(subject.textContent, 'Fix the bound', 'GitHub subject text is unchanged');
+            ackEq(title.querySelectorAll('.ack-commit-explain').length, 1, 'repeat injection is idempotent');
+            ackEq(title.querySelectorAll('.ack-commit-proofread').length, 1, 'proofread is not duplicated');
+            ackEq(explain.style.float, '', 'lightbulb does not float');
+            ackEq(proofread.style.float, '', 'proofread does not float');
+            ackAssert(proofread.title.includes('read-only'), 'proofread explains that the check is read-only');
+            const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+            proofread.dispatchEvent(click);
+            ackEq(proofreadTarget, proofread, 'proofread invokes the commit-message check');
+            ackAssert(click.defaultPrevented, 'proofread click does not trigger GitHub navigation');
+            ackAssert(!bubbled, 'proofread click does not activate the surrounding commit title');
+        } finally {
+            parsePR = oldParsePR;
+            runReadOnlyCommitMessagesProofread = oldProofread;
+            mount.remove();
+        }
     });
 
     ackTest('hidden-item pagination buttons are detected without ajax-pagination-form wrapper', () => {
