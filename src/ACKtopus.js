@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.256
+// @version      1.257
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -77,6 +77,8 @@
         '.ack-diff-selection-output-action{-ms-overflow-style:none;scrollbar-width:none}',
         '.ack-jev-badges{display:inline-flex;align-items:center;gap:2px;margin-left:5px;vertical-align:middle}',
         '.ack-jev-badge{display:inline-block;font-size:12px;line-height:1.2;cursor:help}',
+        '.ack-jev-line-anchor{padding-inline-end:34px!important}',
+        '.ack-jev-line-anchor>.ack-jev-badges{position:absolute;top:1px;right:2px;z-index:2;margin:0;padding:0 2px;white-space:nowrap;background:var(--bgColor-default,Canvas);border-radius:3px}',
     ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
@@ -2941,22 +2943,29 @@
     function githubHttpCachePRKey(url) {
         try {
             const parsed = new URL(url);
-            if (parsed.hostname !== 'api.github.com') return '';
-            const match = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(?:pulls|issues)\/(\d+)(?:\/|$)/);
+            const match = parsed.hostname === 'api.github.com'
+                ? parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(?:pulls|issues)\/(\d+)(?:\/|$)/)
+                : parsed.hostname === 'github.com'
+                    ? parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\.patch|\/|$)/)
+                    : null;
             return match ? `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}#${match[3]}` : '';
         } catch (_) {
             return '';
         }
     }
 
-    function githubHttpCacheScope(headers = {}) {
-        const authorization = String(headers.Authorization || '');
+    function githubHttpCacheScope(headers = {}, anonymous = false) {
+        if (anonymous) return 'explicit-anonymous';
+        const authorization = String(Object.entries(headers).find(([name]) => name.toLowerCase() === 'authorization')?.[1] || '');
         return authorization ? `auth:${hashPrompt(authorization)}` : 'anonymous';
     }
 
-    function githubHttpCacheKey(url, headers = {}) {
-        const accept = String(headers.Accept || '');
-        return `${GITHUB_HTTP_CACHE_PREFIX}${hashPrompt(`${githubHttpCacheScope(headers)}\0${accept}\0${url}`)}`;
+    function githubHttpCacheKey(url, headers = {}, anonymous = false) {
+        const vary = Object.entries(headers)
+            .filter(([name]) => !/^(authorization|if-none-match)$/i.test(name))
+            .map(([name, value]) => [name.toLowerCase(), String(value)])
+            .sort(([a], [b]) => a.localeCompare(b));
+        return `${GITHUB_HTTP_CACHE_PREFIX}${hashPrompt(`${githubHttpCacheScope(headers, anonymous)}\0${JSON.stringify(vary)}\0${url}`)}`;
     }
 
     function githubPagedRequestTemplate(urlForPage) {
@@ -3026,6 +3035,7 @@
                 kept.length >= GITHUB_HTTP_CACHE_MAX_ENTRIES || totalBytes + bytes > GITHUB_HTTP_CACHE_MAX_TOTAL_BYTES;
             if (expired || overBudget) {
                 GM_deleteValue(entry.key);
+                _githubHttpValidationTimes.delete(entry.key);
                 continue;
             }
             kept.push(entry);
@@ -3035,33 +3045,49 @@
         return kept;
     }
 
-    function readGithubHttpCache(url, headers = {}, now = Date.now()) {
-        const key = githubHttpCacheKey(url, headers);
+    function readGithubHttpCache(url, headers = {}, now = Date.now(), anonymous = false) {
+        const key = githubHttpCacheKey(url, headers, anonymous);
         const cached = GM_getValue(key, null);
         if (
             !cached ||
             cached.url !== url ||
-            cached.scope !== githubHttpCacheScope(headers) ||
+            cached.scope !== githubHttpCacheScope(headers, anonymous) ||
             typeof cached.etag !== 'string' ||
             !cached.etag ||
             !Object.prototype.hasOwnProperty.call(cached, 'data') ||
             !Number.isFinite(cached.ts) ||
             now - cached.ts > GITHUB_HTTP_CACHE_MAX_AGE_MS
         ) {
-            if (cached) GM_deleteValue(key);
+            if (cached) {
+                GM_deleteValue(key);
+                _githubHttpValidationTimes.delete(key);
+            }
             return null;
         }
         return { key, ...cached };
     }
 
+    const _githubHttpPrGenerations = new Map();
+
+    function githubHttpCacheGeneration(url) {
+        return _githubHttpPrGenerations.get(githubHttpCachePRKey(url)) || 0;
+    }
+
     function invalidateGithubHttpCacheForPR(prKey) {
         if (!prKey) return 0;
+        _githubHttpPrGenerations.set(prKey, (_githubHttpPrGenerations.get(prKey) || 0) + 1);
+        invalidateGithubGraphQLForPR(prKey);
+        if (_reviewCommitMap?.prKey === prKey) _reviewCommitMap = null;
+        if (_reviewCommitMapRequest?.prKey === prKey) _reviewCommitMapRequest = null;
+        const contextKey = prKey.replace('#', '/');
+        if (_prContextKey.startsWith(`${contextKey}:`) || _prReplyRowsKey === contextKey) invalidatePRContext();
         const entries = readGithubHttpCacheIndex();
         const kept = [];
         let removed = 0;
         for (const entry of entries) {
             if (entry.prKey === prKey) {
                 GM_deleteValue(entry.key);
+                _githubHttpValidationTimes.delete(entry.key);
                 removed++;
             } else {
                 kept.push(entry);
@@ -3071,17 +3097,17 @@
         return removed + invalidateGithubPagedHintsForPR(prKey);
     }
 
-    function rememberGithubHttpCache(url, headers, response, data) {
+    function rememberGithubHttpCache(url, headers, response, data, anonymous = false) {
         const etag = githubResponseHeader(response, 'etag');
         const bytes = String(response?.responseText || '').length;
         if (!etag || bytes > GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES) return null;
 
-        const key = githubHttpCacheKey(url, headers);
+        const key = githubHttpCacheKey(url, headers, anonymous);
         const prKey = githubHttpCachePRKey(url);
 
         const value = {
             url,
-            scope: githubHttpCacheScope(headers),
+            scope: githubHttpCacheScope(headers, anonymous),
             etag,
             data,
             ts: Date.now(),
@@ -3099,15 +3125,45 @@
     }
 
     const _githubJsonRequests = new Map();
+    const _githubHttpValidationTimes = new Map();
+    let _githubJsonResetGeneration = 0;
 
-    function gmFetch(url) {
-        const baseHeaders = ghApiHeaders();
-        const requestKey = githubHttpCacheKey(url, baseHeaders);
+    function githubHttpFreshForMs(url) {
+        let path = '';
+        try { path = new URL(url).pathname; } catch (_) { return 0; }
+        if (/^\/repos\/[^/]+\/[^/]+\/commits\/[0-9a-f]{40}$/i.test(path)) return 24 * 60 * 60 * 1000;
+        if (/^\/orgs\/[^/]+\/public_members$/.test(path)) return 5 * 60 * 1000;
+        if (/^\/repos\/[^/]+\/[^/]+$/.test(path)) return 30 * 1000;
+        if (path.startsWith('/search/')) return 5 * 1000;
+        return 10 * 1000;
+    }
+
+    function githubHttpInvalidatedError(url) {
+        return new Error(`GitHub data changed while loading ${url}; retry the request`);
+    }
+
+    function gmFetch(url, { anonymous = false, headers: extraHeaders = {}, freshForMs } = {}) {
+        const resetGeneration = _githubJsonResetGeneration;
+        const baseHeaders = { ...(anonymous ? { Accept: 'application/vnd.github+json' } : ghApiHeaders()) };
+        for (const [name, value] of Object.entries(extraHeaders || {})) {
+            const normalized = name.toLowerCase() === 'authorization' ? 'Authorization'
+                : name.toLowerCase() === 'accept' ? 'Accept' : name;
+            if (anonymous && /^(authorization|cookie|proxy-authorization)$/i.test(normalized)) continue;
+            baseHeaders[normalized] = value;
+        }
+        const generation = githubHttpCacheGeneration(url);
+        const requestKey = `${githubHttpCacheKey(url, baseHeaders, anonymous)}:${resetGeneration}:${generation}`;
         const pending = _githubJsonRequests.get(requestKey);
         if (pending) return pending;
 
+        const cached = readGithubHttpCache(url, baseHeaders, Date.now(), anonymous);
+        const freshness = freshForMs === undefined ? githubHttpFreshForMs(url) :
+            Math.max(0, Math.min(GITHUB_HTTP_CACHE_MAX_AGE_MS, Number(freshForMs) || 0));
+        if (cached && Date.now() - Math.max(cached.ts, _githubHttpValidationTimes.get(cached.key) || 0) < freshness) {
+            return Promise.resolve(cached.data);
+        }
+
         const request = new Promise((resolve, reject) => {
-            const cached = readGithubHttpCache(url, baseHeaders);
             const headers = githubConditionalHeaders(baseHeaders, cached);
             const preflight = githubRateLimitPreflightError(url, headers);
             if (preflight) {
@@ -3118,13 +3174,17 @@
                 method: 'GET',
                 url,
                 headers,
+                ...(anonymous ? { anonymous: true } : {}),
                 onload: (r) => {
+                    if (resetGeneration !== _githubJsonResetGeneration ||
+                        generation !== githubHttpCacheGeneration(url)) return reject(githubHttpInvalidatedError(url));
                     if (r.status === 304 && cached) {
+                        _githubHttpValidationTimes.set(cached.key, Date.now());
                         resolve(cached.data);
                     } else if (r.status >= 200 && r.status < 300) {
                         try {
                             const data = parseGithubJson(r, url);
-                            rememberGithubHttpCache(url, baseHeaders, r, data);
+                            rememberGithubHttpCache(url, baseHeaders, r, data, anonymous);
                             resolve(data);
                         } catch (e) {
                             reject(e);
@@ -3138,9 +3198,15 @@
                             return;
                         }
                         rememberGithubBadPat(r);
-                        const fallbackBaseHeaders = { Accept: 'application/vnd.github+json' };
+                        const fallbackBaseHeaders = { Accept: 'application/vnd.github+json', ...baseHeaders };
+                        delete fallbackBaseHeaders.Authorization;
                         const fallbackCached = readGithubHttpCache(url, fallbackBaseHeaders);
                         const fallbackHeaders = githubConditionalHeaders(fallbackBaseHeaders, fallbackCached);
+                        if (fallbackCached && Date.now() - Math.max(fallbackCached.ts,
+                            _githubHttpValidationTimes.get(fallbackCached.key) || 0) < freshness) {
+                            resolve(fallbackCached.data);
+                            return;
+                        }
                         const fallbackPreflight = githubRateLimitPreflightError(url, fallbackHeaders);
                         if (fallbackPreflight) {
                             reject(fallbackPreflight);
@@ -3151,7 +3217,10 @@
                             url,
                             headers: fallbackHeaders,
                             onload: (r2) => {
+                                if (resetGeneration !== _githubJsonResetGeneration ||
+                                    generation !== githubHttpCacheGeneration(url)) return reject(githubHttpInvalidatedError(url));
                                 if (r2.status === 304 && fallbackCached) {
+                                    _githubHttpValidationTimes.set(fallbackCached.key, Date.now());
                                     resolve(fallbackCached.data);
                                 } else if (r2.status >= 200 && r2.status < 300) {
                                     try {
@@ -3183,81 +3252,136 @@
         return tracked;
     }
 
-    // Like gmFetch, but returns raw text instead of parsed JSON.
-    function gmFetchText(url) {
-        return new Promise((resolve, reject) => {
+    const _githubTextRequests = new Map();
+    const _githubTextResponses = new Map();
+    const _githubTextForceGenerations = new Map();
+    let _githubTextResetGeneration = 0;
+    const GITHUB_TEXT_SESSION_MAX_ENTRIES = 16;
+    const GITHUB_TEXT_PATCH_FRESH_MS = 10_000;
+
+    function githubTextUrlIsImmutable(url) {
+        try {
+            const { hostname, pathname } = new URL(url);
+            return (hostname === 'github.com' && /^\/[^/]+\/[^/]+\/commit\/[0-9a-f]{40}\.patch$/i.test(pathname)) ||
+                (hostname === 'raw.githubusercontent.com' && /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\//i.test(pathname));
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function rememberGithubTextSession(key, response, data, immutable, patch) {
+        const etag = githubResponseHeader(response, 'etag');
+        if ((!etag && !immutable && !patch) || data.length > GITHUB_HTTP_CACHE_MAX_ENTRY_BYTES) return;
+        _githubTextResponses.delete(key);
+        _githubTextResponses.set(key, { etag, data, ts: Date.now() });
+        while (_githubTextResponses.size > GITHUB_TEXT_SESSION_MAX_ENTRIES) {
+            _githubTextResponses.delete(_githubTextResponses.keys().next().value);
+        }
+    }
+
+    function gmFetchGithubText(url, baseHeaders, { force = false, persistent = false } = {}) {
+        const resetGeneration = _githubTextResetGeneration;
+        const generation = githubHttpCacheGeneration(url);
+        const baseKey = githubHttpCacheKey(url, baseHeaders);
+        if (force) _githubTextForceGenerations.set(baseKey, (_githubTextForceGenerations.get(baseKey) || 0) + 1);
+        const forceGeneration = _githubTextForceGenerations.get(baseKey) || 0;
+        const key = `${baseKey}:${resetGeneration}:${generation}:${forceGeneration}`;
+        if (!force) {
+            const pending = _githubTextRequests.get(key);
+            if (pending) return pending;
+        }
+        const immutable = githubTextUrlIsImmutable(url);
+        const patch = /\.patch(?:\?|$)/.test(url);
+        const cached = !force && (_githubTextResponses.get(key) || (persistent ? readGithubHttpCache(url, baseHeaders) : null));
+        if (cached && immutable) return Promise.resolve(cached.data);
+        if (cached && patch && Date.now() - cached.ts < GITHUB_TEXT_PATCH_FRESH_MS) {
+            return Promise.resolve(cached.data);
+        }
+        const headers = force ? { ...baseHeaders, 'Cache-Control': 'no-cache' } : githubConditionalHeaders(baseHeaders, cached);
+        const request = new Promise((resolve, reject) => {
+            const apiRequest = new URL(url).hostname === 'api.github.com';
+            const preflight = apiRequest ? githubRateLimitPreflightError(url, headers) : null;
+            if (preflight) {
+                reject(preflight);
+                return;
+            }
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
-                headers: ghApiHeaders(),
-                onload: (r) =>
-                    r.status >= 200 && r.status < 300
-                        ? resolve(r.responseText)
-                        : reject(githubHttpError(r, url)),
+                headers,
+                onload: (response) => {
+                    if (_githubTextResetGeneration !== resetGeneration ||
+                        githubHttpCacheGeneration(url) !== generation ||
+                        (_githubTextForceGenerations.get(baseKey) || 0) !== forceGeneration) {
+                        reject(githubHttpInvalidatedError(url));
+                        return;
+                    }
+                    if (response.status === 304 && cached) {
+                        if (_githubTextResponses.has(key)) _githubTextResponses.get(key).ts = Date.now();
+                        resolve(cached.data);
+                    } else if (response.status >= 200 && response.status < 300) {
+                        const data = String(response.responseText || '');
+                        rememberGithubTextSession(key, response, data, immutable, patch);
+                        if (persistent && !force) rememberGithubHttpCache(url, baseHeaders, response, data);
+                        resolve(data);
+                    } else {
+                        if (apiRequest) rememberGithubRateLimit(response, headers);
+                        reject(githubHttpError(response, url));
+                    }
+                },
                 ...githubGetTransportHandlers(url, reject),
             });
+        });
+        if (force) return request;
+        const tracked = request.finally(() => {
+            if (_githubTextRequests.get(key) === tracked) _githubTextRequests.delete(key);
+        });
+        _githubTextRequests.set(key, tracked);
+        return tracked;
+    }
+
+    // Like gmFetch, but returns text. Web patches can rely on GitHub cookies, so keep their bodies in this page session.
+    function gmFetchText(url) {
+        const headers = { ...ghApiHeaders(), Accept: 'text/plain' };
+        return gmFetchGithubText(url, headers, {
+            persistent: !!headers.Authorization && new URL(url).hostname === 'raw.githubusercontent.com',
         });
     }
 
-    // Fetch raw same-origin page HTML via the userscript transport so we avoid
-    // GitHub's patched window.fetch path and its page-side side effects.
-    function gmFetchPageText(url, { accept = 'text/html' } = {}) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+    // Page HTML can contain a short-lived write nonce and cookie-specific data.
+    async function gmFetchPageText(url, { accept = 'text/html', force = false, pageSessionFallback = false } = {}) {
+        const resetGeneration = _githubTextResetGeneration;
+        const generation = githubHttpCacheGeneration(url);
+        const baseKey = githubHttpCacheKey(url, { Accept: accept });
+        const request = gmFetchGithubText(url, { Accept: accept }, { force });
+        const forceGeneration = _githubTextForceGenerations.get(baseKey) || 0;
+        try {
+            return await request;
+        } catch (gmError) {
+            if (!pageSessionFallback || new URL(url, location.href).origin !== location.origin) throw gmError;
+            if (_githubTextResetGeneration !== resetGeneration ||
+                githubHttpCacheGeneration(url) !== generation ||
+                (_githubTextForceGenerations.get(baseKey) || 0) !== forceGeneration) throw githubHttpInvalidatedError(url);
+            const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
+            const response = await pageFetchWithRetry(pageFetch, url, {
                 method: 'GET',
-                url,
+                credentials: 'same-origin',
+                cache: 'no-store',
                 headers: { Accept: accept },
-                onload: (r) =>
-                    r.status >= 200 && r.status < 300
-                        ? resolve(r.responseText)
-                        : reject(githubHttpError(r, url)),
-                ...githubGetTransportHandlers(url, reject),
-            });
-        });
+            }, { label: 'fetch GitHub page HTML', attempts: 2 });
+            if (!response.ok) throw new Error(`GitHub page HTTP ${response.status} for ${url}: ${gmError?.message || gmError}`);
+            const html = await response.text();
+            if (_githubTextResetGeneration !== resetGeneration ||
+                githubHttpCacheGeneration(url) !== generation ||
+                (_githubTextForceGenerations.get(baseKey) || 0) !== forceGeneration) throw githubHttpInvalidatedError(url);
+            return html;
+        }
     }
 
     function fetchCommitPullRequests(owner, repo, sha) {
         const url = `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls`;
-        const authHeaders = { ...ghApiHeaders(), Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' };
-        const tryHeaders = [authHeaders, { Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' }];
-        return new Promise((resolve, reject) => {
-            let attempt = 0;
-            const run = () => {
-                const preflight = githubRateLimitPreflightError(url, tryHeaders[attempt]);
-                if (preflight) {
-                    reject(preflight);
-                    return;
-                }
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url,
-                    headers: tryHeaders[attempt],
-                    onload: (r) => {
-                        if (r.status >= 200 && r.status < 300) {
-                            try {
-                                resolve(parseGithubJson(r, url));
-                            } catch (e) {
-                                reject(e);
-                            }
-                            return;
-                        }
-                        if (isGithubRateLimitResponse(r)) {
-                            rememberGithubRateLimit(r, tryHeaders[attempt]);
-                            reject(githubHttpError(r, url));
-                            return;
-                        }
-                        if ((r.status === 401 || r.status === 403) && attempt === 0 && tryHeaders[attempt].Authorization) {
-                            rememberGithubBadPat(r);
-                            attempt++;
-                            run();
-                            return;
-                        }
-                        reject(githubHttpError(r, url));
-                    },
-                    ...githubGetTransportHandlers(url, reject),
-                });
-            };
-            run();
+        return gmFetch(url, {
+            headers: { Accept: 'application/vnd.github.groot-preview+json, application/vnd.github+json' },
         });
     }
 
@@ -3954,11 +4078,10 @@
             } catch (e) {
                 if (shouldWarnOptionalGitHubApiError(e))
                     console.warn('ACKtopus: fetchReviewCommentCommits failed:', e.message || e);
-                return map;
+                return _reviewCommitMapRequest === request ? map : {};
             }
-            if (_reviewCommitMapRequest === request) {
-                _reviewCommitMap = { prKey, map, authors };
-            }
+            if (_reviewCommitMapRequest !== request) return {};
+            _reviewCommitMap = { prKey, map, authors };
             return map;
         })();
         try {
@@ -6542,6 +6665,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             }
         });
         count += invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        jevInvalidateCommentCachesForPR(pr);
         const jevEntries = jevCacheEntries();
         const keptJevEntries = jevEntries.filter((entry) => entry.prKey !== `${pr.owner}/${pr.repo}#${pr.pr}`);
         if (keptJevEntries.length !== jevEntries.length) {
@@ -6583,6 +6707,16 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         jevCacheMemory = null;
         resetInMemoryCaches();
+        jevEpoch++;
+        document.querySelectorAll('.ack-jev-badges, .ack-jev-stack-summary').forEach((badge) => badge.remove());
+        resetJevTrackers();
+        if (jevEnabled() && parsePR()) {
+            queueJevPageAnnotations();
+            for (const container of leafLazyCommentContainers()) {
+                const bounds = container.getBoundingClientRect();
+                if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+            }
+        }
         console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
         return count;
     }
@@ -6591,6 +6725,25 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
         _reviewCommitMapRequest = null;
+        _githubJsonResetGeneration++;
+        _githubJsonRequests.clear();
+        _githubHttpValidationTimes.clear();
+        _githubGraphQLResetGeneration++;
+        _githubGraphQLRequests.clear();
+        _githubGraphQLResults.clear();
+        _githubTextResetGeneration++;
+        _githubTextRequests.clear();
+        _githubTextResponses.clear();
+        _githubTextForceGenerations.clear();
+        _rawFileCache.clear();
+        clearCommitPatchCache();
+        commitListCache.clear();
+        invalidatePRContext();
+        _prReplyRowsKey = '';
+        _prReplyRowsTs = 0;
+        _prReplyRowsPromise = null;
+        _verifiedFetchMetaCache.clear();
+        resetJevCommentCaches();
     }
 
     function factoryReset() {
@@ -6605,7 +6758,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         resetInMemoryCaches();
         jevCacheMemory = null;
-        // jev_enabled was just deleted; stop classifying until it is re-enabled.
+        // Preserve an explicit off state across reloads even though a newly
+        // configured TypeSafe key enables Jev by default.
+        GM_setValue('jev_enabled', false);
         jevConfigured = false;
         jevStackRejected = false;
         jevEpoch++;
@@ -6836,8 +6991,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         panel.appendChild(ghFormatHelp);
 
-        // Jev is separate from the conversational LLM providers. It only
-        // classifies public repository excerpts after the reviewer opts in.
+        // Jev is separate from the conversational LLM providers. A saved key
+        // enables its public-repository classifications by default.
         sep();
         const jevTitle = document.createElement('label');
         jevTitle.textContent = '🔎 Jev review badges';
@@ -6847,10 +7002,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const jevToggle = document.createElement('input');
         jevToggle.type = 'checkbox';
         jevToggle.id = 'ack-jev-enabled';
-        jevToggle.checked = !!GM_getValue('jev_enabled', false);
+        jevToggle.checked = !!GM_getValue('jev_enabled', true);
         jevTitle.prepend(jevToggle);
         const jevDescription = document.createElement('div');
-        jevDescription.textContent = 'Optional advisory emoji categories for commits, visible diff hunks, and comments. ACKtopus sends bounded excerpts to TypeSafe only after an anonymous GitHub check confirms the repository is public. Private repositories are skipped.';
+        jevDescription.textContent = 'Advisory emoji categories for commits, visible diff hunks, and comments. Saving a TypeSafe key enables them by default; uncheck this box to disable them. ACKtopus sends bounded excerpts only after an anonymous GitHub check confirms the repository is public. Private repositories are skipped.';
         Object.assign(jevDescription.style, { fontSize: '11px', color: '#8b949e', marginBottom: '5px' });
         panel.appendChild(jevDescription);
         const jevInput = document.createElement('input');
@@ -7144,7 +7299,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const resetAllBtn = document.createElement('button');
         resetAllBtn.textContent = '☢ Factory reset';
         resetAllBtn.title =
-            'Deletes ALL stored data except API keys: caches, custom instructions, preferences, usage stats. Cannot be undone.';
+            'Deletes caches, custom instructions, preferences, and usage stats. Keeps API keys and turns off Jev. Cannot be undone.';
         Object.assign(resetAllBtn.style, {
             padding: '4px 12px',
             fontSize: '11px',
@@ -7158,7 +7313,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         resetAllBtn.addEventListener('click', () => {
             if (
                 !confirm(
-                    'This will delete ALL stored data except API keys (caches, custom instructions, preferences, usage stats). Continue?',
+                    'This will delete caches, custom instructions, preferences, and usage stats, keep API keys, and turn off Jev. Continue?',
                 )
             )
                 return;
@@ -8369,6 +8524,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     const RAW_FILE_CACHE_MAX = 32;
 
     function fetchRawFile(url) {
+        // Branch refs can change or lose a file, so only resolved commit URLs keep an unvalidated result
+        if (!githubTextUrlIsImmutable(url)) return gmFetchText(url).catch(() => '');
         const cached = _rawFileCache.get(url);
         if (cached) return cached;
         const request = gmFetchText(url).catch(() => {
@@ -14112,8 +14269,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return ghApiHeaders().Authorization || '';
     }
 
+    const _githubGraphQLResults = new Map();
+    const _githubGraphQLRequests = new Map();
+    let _githubGraphQLResetGeneration = 0;
+    const GITHUB_GRAPHQL_FRESH_MS = 10 * 1000;
+
+    function githubGraphQLPRKey(variables = {}) {
+        return variables?.owner && variables?.repo && Number.isInteger(Number(variables?.number))
+            ? `${variables.owner}/${variables.repo}#${variables.number}` : '';
+    }
+
+    function invalidateGithubGraphQLForPR(prKey) {
+        for (const [key, entry] of _githubGraphQLResults) {
+            if (entry.prKey === prKey) _githubGraphQLResults.delete(key);
+        }
+    }
+
     // GitHub GraphQL API via PAT (no cookies/CSRF required).
     async function patGraphQL(query, variables) {
+        const resetGeneration = _githubGraphQLResetGeneration;
         const auth = patAuthHeaderValue();
         if (!auth) throw new Error('no PAT configured');
         const url = 'https://api.github.com/graphql';
@@ -14121,15 +14295,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'Content-Type': 'application/json',
             Authorization: auth,
         };
+        const cacheable = /^\s*(?:query\b|\{)/.test(query) && !/\bmutation\b/i.test(query) &&
+            !/\bviewerLatestReview\b/.test(query);
+        const prKey = githubGraphQLPRKey(variables);
+        const generation = _githubHttpPrGenerations.get(prKey) || 0;
+        const cacheKey = cacheable ? hashPrompt(`${auth}\0${query}\0${JSON.stringify(variables || {})}`) : '';
+        const cached = cacheKey && _githubGraphQLResults.get(cacheKey);
+        if (cached && Date.now() - cached.ts < GITHUB_GRAPHQL_FRESH_MS) return cached.data;
+        if (cacheKey && _githubGraphQLRequests.has(`${cacheKey}:${resetGeneration}:${generation}`)) {
+            return _githubGraphQLRequests.get(`${cacheKey}:${resetGeneration}:${generation}`);
+        }
         const preflight = githubRateLimitPreflightError(url, headers);
         if (preflight) throw preflight;
-        return new Promise((resolve, reject) => {
+        const request = new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
                 url,
                 headers,
                 data: JSON.stringify({ query, variables }),
                 onload(resp) {
+                    if (resetGeneration !== _githubGraphQLResetGeneration ||
+                        generation !== (_githubHttpPrGenerations.get(prKey) || 0)) {
+                        reject(githubHttpInvalidatedError(url));
+                        return;
+                    }
                     if (resp.status < 200 || resp.status >= 300) {
                         if (isGithubRateLimitResponse(resp)) rememberGithubRateLimit(resp, headers);
                         else if (resp.status === 401 || resp.status === 403) rememberGithubBadPat(resp);
@@ -14147,6 +14336,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ...githubGetTransportHandlers(url, reject),
             });
         });
+        if (!cacheKey) return request;
+        const pendingKey = `${cacheKey}:${resetGeneration}:${generation}`;
+        const tracked = request.then((data) => {
+            if (resetGeneration === _githubGraphQLResetGeneration &&
+                generation === (_githubHttpPrGenerations.get(prKey) || 0)) {
+                _githubGraphQLResults.delete(cacheKey);
+                _githubGraphQLResults.set(cacheKey, { data, ts: Date.now(), prKey });
+                while (_githubGraphQLResults.size > 32) _githubGraphQLResults.delete(_githubGraphQLResults.keys().next().value);
+            }
+            return data;
+        }).finally(() => {
+            if (_githubGraphQLRequests.get(pendingKey) === tracked) _githubGraphQLRequests.delete(pendingKey);
+        });
+        _githubGraphQLRequests.set(pendingKey, tracked);
+        return tracked;
     }
 
     function isAckOwnedReviewControl(el) {
@@ -14362,25 +14566,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!force && cached && now - cached.ts < 5_000 && cached.nonce && cached.clientVersion) return cached;
 
             const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}/changes`;
-            let html = '';
-            try {
-                html = await gmFetchPageText(url);
-            } catch (gmErr) {
-                const pageFetch = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).fetch;
-                const resp = await pageFetchWithRetry(
-                    pageFetch,
-                    url,
-                    {
-                        method: 'GET',
-                        credentials: 'same-origin',
-                        cache: 'no-store',
-                        headers: { Accept: 'text/html' },
-                    },
-                    { label: 'fetch /changes meta', attempts: 2 },
-                );
-                if (!resp.ok) throw new Error(`fetch /changes meta HTTP ${resp.status}: ${gmErr?.message || gmErr}`);
-                html = await resp.text();
-            }
+            const html = await gmFetchPageText(url, { force, pageSessionFallback: true });
             const nonce = html.match(/name=["']fetch-nonce["'][^>]*content=["']([^"']+)["']/i)?.[1] || '';
             const clientVersion = html.match(/name=["']release["'][^>]*content=["']([^"']+)["']/i)?.[1] || '';
             const out = { nonce, clientVersion, ts: now };
@@ -14494,6 +14680,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const msg = json?.error || json?.message || resp.statusText || 'request failed';
             throw new Error(`create_review_comment HTTP ${resp.status}: ${msg}`);
         }
+        invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        jevInvalidateCommentCachesForPR(pr);
         return json;
     }
 
@@ -14821,8 +15009,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return false;
             }
 
-            const resp = await fetch(location.href, { headers: { Accept: 'text/html' } });
-            const html = await resp.text();
+            const html = await gmFetchPageText(location.href, { force: true });
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const freshThread =
                 doc
@@ -15125,11 +15312,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     _backfillRefreshTimer = setTimeout(refreshQueuePanel, 200);
                 }
             };
-            // Same-origin HTML fetch (uses session cookies, avoids API rate limit)
-            fetch(`https://github.com/${item.owner}/${item.repo}/pull/${item.pr}`, {
-                headers: { Accept: 'text/html' },
-            })
-                .then((r) => (r.ok ? r.text() : null))
+            // Same-origin HTML fetch avoids API rate limits and reuses the shared cache.
+            gmFetchPageText(`https://github.com/${item.owner}/${item.repo}/pull/${item.pr}`)
                 .then((html) => {
                     if (!html) return;
                     const m = html.match(/<title>([^<]*)<\/title>/);
@@ -15492,58 +15676,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const numMatch = query.match(/^#?(\d+)$/);
             if (numMatch) {
                 const prNum = numMatch[1];
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: `https://api.github.com/repos/${repoOwner}/${repoName}/pulls/${prNum}`,
-                    headers: ghApiHeaders(),
-                    onload: (r) => {
-                        if (cancelled) return;
-                        if (r.status < 200 || r.status >= 300) {
-                            searchResults.innerHTML = '';
-                            return;
-                        }
-                        try {
-                            const p = JSON.parse(r.responseText);
-                            renderSearchResults([{ owner: repoOwner, repo: repoName, pr: p.number, title: p.title }]);
-                        } catch {
-                            searchResults.innerHTML = '';
-                        }
-                    },
-                    onerror: () => {
-                        if (!cancelled) searchResults.innerHTML = '';
-                    },
-                });
+                void gmFetch(`https://api.github.com/repos/${repoOwner}/${repoName}/pulls/${prNum}`)
+                    .then((p) => {
+                        if (!cancelled) renderSearchResults([{ owner: repoOwner, repo: repoName, pr: p.number, title: p.title }]);
+                    })
+                    .catch(() => { if (!cancelled) searchResults.innerHTML = ''; });
                 return;
             }
 
             // Text search via GitHub search API
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: `https://api.github.com/search/issues?q=${encodeURIComponent(query)}+repo:${repoOwner}/${repoName}+type:pr&per_page=8`,
-                headers: ghApiHeaders(),
-                onload: (r) => {
+            void gmFetch(`https://api.github.com/search/issues?q=${encodeURIComponent(query)}+repo:${repoOwner}/${repoName}+type:pr&per_page=8`)
+                .then((data) => {
                     if (cancelled) return;
-                    if (r.status < 200 || r.status >= 300) {
-                        searchResults.innerHTML = '';
-                        return;
-                    }
-                    try {
-                        const data = JSON.parse(r.responseText);
-                        const items = (data.items || []).map((i) => ({
-                            owner: repoOwner,
-                            repo: repoName,
-                            pr: i.number,
-                            title: i.title,
-                        }));
-                        renderSearchResults(items);
-                    } catch {
-                        searchResults.innerHTML = '';
-                    }
-                },
-                onerror: () => {
-                    if (!cancelled) searchResults.innerHTML = '';
-                },
-            });
+                    const items = (data.items || []).map((i) => ({
+                        owner: repoOwner,
+                        repo: repoName,
+                        pr: i.number,
+                        title: i.title,
+                    }));
+                    renderSearchResults(items);
+                })
+                .catch(() => { if (!cancelled) searchResults.innerHTML = ''; });
         }
 
         search.addEventListener('input', () => {
@@ -16285,7 +16438,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = 3;
+    const JEV_SCHEMA = { commit: 3, hunk: 3, comment: 4, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -16344,6 +16497,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 explanation: 'Explains behavior or context without requesting action',
                 other: 'None of these is clearly supported',
             } },
+            claim_type: { type: 'choice', instructions: 'Classify the selected comment itself. A short reply such as "done" is an implementation claim only when the supplied exact earlier thread request makes its meaning clear. Do not turn a question, suggestion, or quoted claim into an assertion by its author.', criteria: {
+                applied: 'The author claims that a specific earlier review request was implemented or fixed',
+                factual: 'The author makes a checkable claim about the shown code, patch, or test',
+                none: 'No checkable code or implementation claim is made',
+                unclear: 'A claim may be present, but its meaning or referent is unclear',
+            } },
+            claim_support: { type: 'choice', instructions: 'Compare the selected claim with only the supplied exact thread and current-head code evidence. A reply saying "done" is contradicted only if the specific earlier request is clear and the complete relevant current-head evidence directly shows it remains unimplemented. A file absent from a PR patch, missing context, tests not run, and omitted code are insufficient evidence, never proof of a false claim. For multiple claims with different outcomes choose mixed. Do not infer correctness from an ACK.', criteria: {
+                supported: 'The specific checkable claim is directly supported by the supplied code evidence',
+                contradicted: 'The specific checkable claim is directly contradicted by the supplied code evidence',
+                mixed: 'The selected comment makes multiple checkable claims with differing support',
+                insufficient: 'The supplied code or thread evidence cannot decide the claim',
+                not_applicable: 'The selected comment makes no checkable claim',
+            } },
         },
         stack: {
             executable_oracle: { type: 'noul', instructions: 'Does the shown stack add a runnable test whose assertion directly observes the production behavior changed by a fix? Do not count production assertions, setup alone, or a no-throw check that would also pass after restoring the old behavior.' },
@@ -16388,6 +16554,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevPublicChecks = new Map();
     const jevPublicRetryTimers = new Map();
     const jevPublicRetryWarned = new Set();
+    const jevCommentEvidenceRequests = new Map();
+    const jevCommentEvidenceSnapshots = new Map();
+    const jevCommentPatchCache = new Map();
+    const jevAnonymousCommentLists = new Map();
+    const jevCommentListFreshReads = new Set();
+    const jevCommentRefreshAttempts = new Map();
+    const jevCommentCacheVersions = new Map();
+    const jevCommentKnownPermalinks = new Map();
+    let jevCommentResetGeneration = 0;
+    const JEV_COMMENT_LIST_PAGE_SIZE = 100;
+    const JEV_COMMENT_LIST_MAX_PAGES = 10;
+    const JEV_COMMENT_LIST_TTL_MS = 60 * 1000;
+    let jevAnonymousCommentWarned = false;
+
+    function resetJevCommentCaches() {
+        jevCommentResetGeneration++;
+        jevCommentEvidenceRequests.clear();
+        jevCommentEvidenceSnapshots.clear();
+        jevCommentPatchCache.clear();
+        jevAnonymousCommentLists.clear();
+        jevCommentListFreshReads.clear();
+        jevCommentRefreshAttempts.clear();
+        jevCommentCacheVersions.clear();
+        jevCommentKnownPermalinks.clear();
+        jevAnonymousCommentWarned = false;
+    }
     let jevCacheMemory = null;
     let jevActive = 0;
     let jevPageKey = '';
@@ -16398,7 +16590,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevStackRejected = false;
     let jevPauseUntil = 0;
     let jevPauseRetryTimer = null;
-    let jevConfigured = !!GM_getValue('jev_enabled', false) && !!GM_getValue('jev_api_key', '');
+    let jevConfigured = !!GM_getValue('jev_enabled', true) && !!GM_getValue('jev_api_key', '');
 
     function jevEnabled() {
         return jevConfigured && !jevSchemaRejected && Date.now() >= jevPauseUntil &&
@@ -16406,7 +16598,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevCacheId(kind, state) {
-        return hashPrompt(JSON.stringify([JEV_SCHEMA, JEV_MODEL, kind, state]));
+        return hashPrompt(JSON.stringify([JEV_SCHEMA[kind], JEV_MODEL, kind, state]));
     }
 
     function jevCacheEntries() {
@@ -16515,26 +16707,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (previous && Date.now() - previous.ts < JEV_PUBLIC_CHECK_TTL_MS) return previous.check;
         // An unauthenticated 200 response with private:false is proof that
         // ordinary visitors can read this repository. A 401/404/error skips it.
-        const check = new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`,
-                headers: { Accept: 'application/vnd.github+json' },
-                anonymous: true,
-                timeout: 10000,
-                onload: (r) => {
-                    if (r.status === 403 || r.status === 429 || (r.status >= 500 && r.status < 600)) {
-                        jevSchedulePublicRetry(key, `HTTP ${r.status}`);
-                    } else if (jevPublicRetryTimers.has(key)) {
-                        clearTimeout(jevPublicRetryTimers.get(key));
-                        jevPublicRetryTimers.delete(key);
-                    }
-                    resolve(jevIsPublicRepoResponse(r));
-                },
-                onerror: () => { jevSchedulePublicRetry(key, 'network error'); resolve(false); },
-                ontimeout: () => { jevSchedulePublicRetry(key, 'timeout'); resolve(false); },
-            });
-        }).catch(() => { jevSchedulePublicRetry(key, 'network error'); return false; });
+        const clearRetry = () => {
+            if (!jevPublicRetryTimers.has(key)) return;
+            clearTimeout(jevPublicRetryTimers.get(key));
+            jevPublicRetryTimers.delete(key);
+        };
+        const check = gmFetch(`https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`,
+            { anonymous: true, freshForMs: 0 }).then((data) => {
+            clearRetry();
+            return data?.private === false;
+        }).catch((error) => {
+            const status = Number(error?.status || 0);
+            if (!status || status === 403 || status === 429 || (status >= 500 && status < 600)) {
+                jevSchedulePublicRetry(key, status ? `HTTP ${status}` : 'network error');
+            } else {
+                clearRetry();
+            }
+            return false;
+        });
         jevPublicChecks.set(key, { ts: Date.now(), check });
         return check;
     }
@@ -16642,7 +16832,383 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         slot.appendChild(badge);
     }
 
-    function jevRender(slot, kind, result, evidence, partial = false) {
+    function jevCommentFactSignals(result, state) {
+        const { claim_type: type, claim_support: support } = result.answers;
+        const signals = [];
+        if (type.probability < 0.8 || type.choice === 'unclear') {
+            signals.push(['❔', 'Jev could not identify a specific claim to check from this comment', `${Math.round(type.probability * 100)}% ${type.choice}`]);
+            return signals;
+        }
+        if (type.choice === 'none') {
+            signals.push(['ℹ️', 'This comment does not appear to make a checkable code or implementation claim', `${Math.round(type.probability * 100)}% no-claim signal`]);
+            return signals;
+        }
+        if (!state.evidence_complete || (type.choice === 'applied' && (!state.exact_request || !state.head_file_complete))) {
+            if (type.choice === 'applied' && state.exact_request && state.code_evidence &&
+                support.choice === 'contradicted' && support.probability >= 0.9) {
+                signals.push(['🔎', 'Jev sees a possible mismatch in a partial PR diff; inspect the full current file before judging the reply', `${Math.round(support.probability * 100)}% partial-evidence conflict signal`]);
+                return signals;
+            }
+            signals.push(['📎', 'The claim needs more current-head code or exact thread evidence before it can be checked', 'Evidence incomplete']);
+            return signals;
+        }
+        if (support.probability < 0.85) {
+            signals.push(['❔', 'Jev could not confidently judge this claim against the supplied evidence', `${Math.round(support.probability * 100)}% ${support.choice}`]);
+        } else if (support.choice === 'contradicted' && type.choice === 'applied' && state.exact_request) {
+            signals.push(['🚨', 'Possible unaddressed review request: the reply claims a fix, but the current-head file and patch appear to conflict with that exact request', `${Math.round(support.probability * 100)}% conflict signal`]);
+        } else if (support.choice === 'contradicted') {
+            signals.push(['🔎', 'The comment claim appears to conflict with the shown current-head patch; inspect the full code before concluding it is wrong', `${Math.round(support.probability * 100)}% conflict signal`]);
+        } else if (support.choice === 'supported') {
+            signals.push(['✅', 'The specific claim appears supported by the shown current-head code evidence; this does not establish overall correctness', `${Math.round(support.probability * 100)}% support signal`]);
+        } else if (support.choice === 'mixed') {
+            signals.push(['⚖️', 'This comment has multiple claims with different support in the shown evidence', `${Math.round(support.probability * 100)}% mixed signal`]);
+        } else {
+            signals.push(['❔', 'The supplied evidence cannot decide this comment claim', `${Math.round(support.probability * 100)}% insufficient-evidence signal`]);
+        }
+        return signals;
+    }
+
+    function jevCommentPatchForFile(patch, path, maxChars = 12000) {
+        const wanted = String(path || '').replace(/^\/+/, '');
+        const lines = String(patch || '').split(/\r?\n/);
+        const selected = [];
+        let commit = '';
+        let inFile = false;
+        let found = false;
+        let selectedLength = 0;
+        for (const line of lines) {
+            const mbox = line.match(/^From ([0-9a-f]{40}) /i);
+            if (mbox) { commit = mbox[1]; inFile = false; continue; }
+            const header = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+            if (header) {
+                inFile = header[1] === wanted || header[2] === wanted;
+                if (inFile) {
+                    found = true;
+                    selected.push(`Commit: ${commit || 'unknown'}`, line);
+                    selectedLength += commit.length + line.length + 19;
+                }
+                continue;
+            }
+            if (inFile) { selected.push(line); selectedLength += line.length + 1; }
+            if (selectedLength > maxChars) return { text: selected.join('\n').slice(0, maxChars), complete: false, found };
+        }
+        const text = selected.join('\n');
+        return { text, complete: found && !text.includes('@@ deleted file contents omitted @@'), found };
+    }
+
+    function jevCommentPatchHead(patch) {
+        const commits = [...String(patch || '').matchAll(/^From ([0-9a-f]{40}) /gm)];
+        return commits.at(-1)?.[1] || '';
+    }
+
+    function jevCommentOwnPermalink(body) {
+        const own = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [id^="discussion_r"], [data-testid="review-comment"]');
+        if (!own || own.querySelectorAll(MARKDOWN_BODY_SELECTOR).length !== 1) return '';
+        return getCommentPermalink(own);
+    }
+
+    function jevCommentPublicIdentity(pr, permalink) {
+        let url;
+        try { url = new URL(permalink); } catch (_) { return null; }
+        const prPath = `/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
+        if (url.origin !== location.origin ||
+            (url.pathname !== prPath && !url.pathname.startsWith(`${prPath}/`))) return null;
+        const id = url.hash.match(/^#(discussion_r|issuecomment-|pullrequestreview-)(\d+)$/)?.[2];
+        if (!id) return null;
+        const kind = url.hash.startsWith('#discussion_r') ? 'review-comment'
+            : url.hash.startsWith('#issuecomment-') ? 'issue-comment' : 'review';
+        const base = `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
+        const apiUrl = kind === 'review-comment' ? `${base}/pulls/comments/${id}`
+            : kind === 'issue-comment' ? `${base}/issues/comments/${id}`
+                : `${base}/pulls/${pr.pr}/reviews/${id}`;
+        return { id, kind, apiUrl, permalink: `${url.origin}${url.pathname}${url.hash}` };
+    }
+
+    function jevAnonymousCommentJson(url, fresh = false) {
+        return gmFetch(url, { anonymous: true, freshForMs: fresh ? 0 : JEV_COMMENT_LIST_TTL_MS }).catch((error) => {
+            if (!jevAnonymousCommentWarned && !_ackTesting) {
+                jevAnonymousCommentWarned = true;
+                console.warn(`ACKtopus: Jev comment checks unavailable (${error?.message || 'GitHub read failed'}); anonymous GitHub access will be retried.`);
+            }
+            return null;
+        });
+    }
+
+    function jevCommentPublicApiMatches(pr, identity, response) {
+        if (String(response?.id) !== identity.id || typeof response.body !== 'string') return false;
+        const expected = `https://api.github.com/repos/${pr.owner}/${pr.repo}/` +
+            `${identity.kind === 'issue-comment' ? 'issues' : 'pulls'}/${pr.pr}`;
+        const actual = identity.kind === 'issue-comment' ? response.issue_url : response.pull_request_url;
+        return String(actual || '').toLowerCase() === expected.toLowerCase();
+    }
+
+    function jevPlainCommentTextDiffers(source, visible) {
+        // Markdown changes its rendered text, but plain prose should match. If
+        // GitHub has edited a simple comment since this page rendered, wait
+        // for the visible comment to update before annotating it.
+        if (/[`*_~\[\]<>#|\\]/.test(source)) return false;
+        const normalized = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+        return normalized(source) !== normalized(visible);
+    }
+
+    function jevCommentListRow(row) {
+        const body = String(row?.body || '');
+        const diffHunk = String(row?.diff_hunk || '');
+        return {
+            id: row?.id, body: body.slice(0, 1801), body_length: body.length,
+            body_hash: hashPrompt(body), updated_at: row?.updated_at || '',
+            in_reply_to_id: row?.in_reply_to_id,
+            issue_url: row?.issue_url, pull_request_url: row?.pull_request_url,
+            path: row?.path, original_commit_id: row?.original_commit_id,
+            commit_id: row?.commit_id, diff_hunk: diffHunk.slice(0, 3001),
+            diff_hunk_length: diffHunk.length,
+        };
+    }
+
+    function jevCommentListUrl(pr, kind, page) {
+        const base = `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
+        const endpoint = kind === 'review-comment' ? `pulls/${pr.pr}/comments`
+            : kind === 'issue-comment' ? `issues/${pr.pr}/comments` : `pulls/${pr.pr}/reviews`;
+        return `${base}/${endpoint}?per_page=${JEV_COMMENT_LIST_PAGE_SIZE}&page=${page}`;
+    }
+
+    function jevCommentListKey(pr, kind) {
+        return `${pr.owner}/${pr.repo}#${pr.pr}:${kind}`;
+    }
+
+    function jevCommentPRKey(pr) {
+        return `${pr.owner}/${pr.repo}#${pr.pr}:`;
+    }
+
+    function jevInvalidateCommentCachesForPR(pr, includeCodeEvidence = true) {
+        if (!pr) return;
+        const prefix = jevCommentPRKey(pr);
+        jevCommentCacheVersions.set(prefix, (jevCommentCacheVersions.get(prefix) || 0) + 1);
+        for (const key of jevAnonymousCommentLists.keys()) if (key.startsWith(prefix)) jevAnonymousCommentLists.delete(key);
+        for (const key of jevCommentRefreshAttempts.keys()) if (key.startsWith(prefix)) jevCommentRefreshAttempts.delete(key);
+        for (const [key, value] of jevCommentKnownPermalinks) {
+            if (value.prKey === prefix) jevCommentKnownPermalinks.delete(key);
+        }
+        for (const kind of ['review-comment', 'issue-comment', 'review']) {
+            jevCommentListFreshReads.add(jevCommentListKey(pr, kind));
+        }
+        if (includeCodeEvidence) {
+            for (const key of jevCommentEvidenceSnapshots.keys()) if (key.startsWith(prefix)) jevCommentEvidenceSnapshots.delete(key);
+            for (const key of jevCommentPatchCache.keys()) if (key.startsWith(prefix)) jevCommentPatchCache.delete(key);
+            const current = parsePR();
+            if (current && jevCommentPRKey(current) === prefix) {
+                document.querySelectorAll('.ack-jev-comment-badges').forEach((slot) => slot.remove());
+                setTimeout(() => {
+                    if (!jevEnabled() || jevCommentPRKey(parsePR() || {}) !== prefix) return;
+                    for (const container of leafLazyCommentContainers()) {
+                        const bounds = container.getBoundingClientRect();
+                        if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+                    }
+                }, 150);
+            }
+        }
+    }
+
+    function jevCommentShouldRefreshList(pr, identity, visibleHash) {
+        const key = `${jevCommentListKey(pr, identity.kind)}:${identity.id}:${visibleHash}`;
+        const previous = jevCommentRefreshAttempts.get(key);
+        if (previous && Date.now() - previous < 60000) return false;
+        jevCommentRefreshAttempts.set(key, Date.now());
+        while (jevCommentRefreshAttempts.size > 200) {
+            jevCommentRefreshAttempts.delete(jevCommentRefreshAttempts.keys().next().value);
+        }
+        return true;
+    }
+
+    function jevCommentPublicSnapshot(pr, kind, refresh = false) {
+        const key = jevCommentListKey(pr, kind);
+        const previous = jevAnonymousCommentLists.get(key);
+        if (previous?.pending) return previous.request;
+        if (!refresh && previous && Date.now() - previous.ts <
+            (previous.complete ? JEV_COMMENT_LIST_TTL_MS : 30000)) return previous.request;
+        const entry = { request: null, ts: Date.now(), pending: true, complete: false };
+        entry.request = (async () => {
+            const fresh = refresh || jevCommentListFreshReads.has(key);
+            const byId = new Map();
+            const rows = [];
+            for (let page = 1; page <= JEV_COMMENT_LIST_MAX_PAGES; page++) {
+                const url = jevCommentListUrl(pr, kind, page);
+                const batch = await jevAnonymousCommentJson(url, fresh);
+                if (!Array.isArray(batch) || batch.length > JEV_COMMENT_LIST_PAGE_SIZE) return null;
+                for (const raw of batch) {
+                    const row = jevCommentListRow(raw);
+                    if (!row.id) return null;
+                    byId.set(String(row.id), row);
+                    rows.push(row);
+                }
+                if (batch.length < JEV_COMMENT_LIST_PAGE_SIZE) {
+                    jevCommentListFreshReads.delete(key);
+                    return { byId, rows };
+                }
+            }
+            return { truncated: true }; // Exact comments need separate anonymous proof.
+        })().catch(() => null).then((snapshot) => {
+            entry.pending = false;
+            entry.complete = !!snapshot;
+            entry.ts = Date.now();
+            return snapshot;
+        });
+        jevAnonymousCommentLists.set(key, entry);
+        while (jevAnonymousCommentLists.size > 6) jevAnonymousCommentLists.delete(jevAnonymousCommentLists.keys().next().value);
+        return entry.request;
+    }
+
+    function jevCommentHasSoleReply(snapshot, rootId, replyId) {
+        if (!snapshot?.byId.has(String(rootId))) return false;
+        const replies = snapshot.rows.filter((row) => String(row?.in_reply_to_id || '') === String(rootId));
+        return replies.length === 1 && String(replies[0]?.id) === String(replyId);
+    }
+
+    async function jevCommentCurrentEvidence(pr) {
+        const resetGeneration = jevCommentResetGeneration;
+        const immediateHead = readHeadShaFromSSR();
+        const key = `${pr.owner}/${pr.repo}#${pr.pr}:${immediateHead}`;
+        const snapshot = jevCommentEvidenceSnapshots.get(key);
+        if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_LIST_TTL_MS) return snapshot.evidence;
+        if (jevCommentEvidenceRequests.has(key)) return jevCommentEvidenceRequests.get(key);
+        const request = (async () => {
+            const info = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
+                { freshForMs: 0 });
+            const head = String(info?.head?.sha || '');
+            if (!/^[0-9a-f]{40}$/i.test(head) || (immediateHead && immediateHead !== head)) return null;
+            const changed = Number(info.changed_files);
+            const lines = Number(info.additions) + Number(info.deletions);
+            if (!Number.isFinite(changed) || !Number.isFinite(lines) || changed > 25 || lines > 1800) {
+                return { head, patch: '', complete: false, reason: 'PR patch exceeds the bounded review limit' };
+            }
+            const patchKey = `${pr.owner}/${pr.repo}#${pr.pr}:${head}`;
+            const cachedPatch = jevCommentPatchCache.get(patchKey);
+            const patch = cachedPatch && Date.now() - cachedPatch.ts < 60000
+                ? cachedPatch.patch : await fetchPatch(pr);
+            const after = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
+                { freshForMs: 0 });
+            if (after?.head?.sha !== head || (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
+            if (jevCommentPatchHead(patch) !== head) {
+                return { head, patch: '', complete: false, reason: 'Current PR diff does not match the confirmed head commit' };
+            }
+            jevCommentPatchCache.set(patchKey, { patch, ts: Date.now() });
+            while (jevCommentPatchCache.size > 4) jevCommentPatchCache.delete(jevCommentPatchCache.keys().next().value);
+            return { head, patch, complete: !!patch && patch.length <= 60000,
+                reason: patch.length > 60000 ? 'PR patch exceeds the bounded review limit' : '' };
+        })().catch(() => null);
+        const tracked = request.then((evidence) => {
+            if (evidence && resetGeneration === jevCommentResetGeneration) {
+                jevCommentEvidenceSnapshots.set(key, { evidence, ts: Date.now() });
+                while (jevCommentEvidenceSnapshots.size > 4) {
+                    jevCommentEvidenceSnapshots.delete(jevCommentEvidenceSnapshots.keys().next().value);
+                }
+            }
+            return evidence;
+        }).finally(() => {
+            if (jevCommentEvidenceRequests.get(key) === tracked) jevCommentEvidenceRequests.delete(key);
+        });
+        jevCommentEvidenceRequests.set(key, tracked);
+        return tracked;
+    }
+
+    async function jevCommentReviewState(pr, comment, body) {
+        const resetGeneration = jevCommentResetGeneration;
+        const cacheKey = jevCommentPRKey(pr);
+        const cacheVersion = jevCommentCacheVersions.get(cacheKey) || 0;
+        const currentVersion = () => resetGeneration === jevCommentResetGeneration &&
+            (jevCommentCacheVersions.get(cacheKey) || 0) === cacheVersion;
+        const visibleText = body.textContent?.trim() || '';
+        const permalink = jevCommentOwnPermalink(body);
+        const identity = jevCommentPublicIdentity(pr, permalink);
+        if (!identity || body.closest('.js-pending-review-comment, [id^="pullrequest-"]') ||
+            commentHasOwnPendingReviewMarker(comment)) return null;
+        const state = {
+            kind: 'comment', repository: `${pr.owner}/${pr.repo}`, pr: pr.pr,
+            selected_comment: '', full_text_hash: hashPrompt(visibleText),
+            selected_complete: false, selected_permalink: identity.permalink,
+            head: '', code_evidence: '', code_evidence_hash: '', evidence_complete: false,
+            exact_request: false, head_file_complete: false,
+            evidence_note: 'Current-head code evidence unavailable',
+        };
+        // The public gate runs before fetching evidence for a TypeSafe request.
+        if (!(await jevPublicRepository(pr))) return null;
+        let snapshot = await jevCommentPublicSnapshot(pr, identity.kind);
+        const truncated = !!snapshot?.truncated;
+        let apiComment = truncated
+            ? jevCommentListRow(await jevAnonymousCommentJson(identity.apiUrl, true))
+            : snapshot?.byId.get(identity.id);
+        if (!truncated && snapshot && (!apiComment || (apiComment.body_length <= 1800 &&
+            jevPlainCommentTextDiffers(apiComment.body, visibleText))) &&
+            jevCommentShouldRefreshList(pr, identity, hashPrompt(visibleText))) {
+            snapshot = await jevCommentPublicSnapshot(pr, identity.kind, true);
+            apiComment = snapshot?.truncated
+                ? jevCommentListRow(await jevAnonymousCommentJson(identity.apiUrl, true))
+                : snapshot?.byId.get(identity.id);
+        }
+        if (!jevCommentPublicApiMatches(pr, identity, apiComment)) return null;
+        if (apiComment.body_length <= 1800 && jevPlainCommentTextDiffers(apiComment.body, visibleText)) return null;
+        state.selected_comment = apiComment.body.slice(0, 1800);
+        state.full_text_hash = apiComment.body_hash;
+        state.comment_updated_at = apiComment.updated_at;
+        state.selected_complete = apiComment.body_length <= 1800;
+        state.comment_id = identity.id;
+        let rootComment = null;
+        if (identity.kind === 'review-comment') {
+            const rootId = String(apiComment.in_reply_to_id || identity.id);
+            const rootIdentity = jevCommentPublicIdentity(pr,
+                `${location.origin}/${pr.owner}/${pr.repo}/pull/${pr.pr}#discussion_r${rootId}`);
+            rootComment = rootId === identity.id ? apiComment
+                : snapshot?.truncated && rootIdentity
+                    ? jevCommentListRow(await jevAnonymousCommentJson(rootIdentity.apiUrl, true))
+                    : snapshot?.byId.get(rootId);
+            if (!rootIdentity || !jevCommentPublicApiMatches(pr, rootIdentity, rootComment)) return null;
+            state.anchor = {
+                path: String(rootComment.path || ''),
+                commit: String(rootComment.original_commit_id || rootComment.commit_id || ''),
+                diff_hunk: String(rootComment.diff_hunk || '').slice(0, 3000),
+            };
+            state.anchor_complete = !!rootComment.diff_hunk && rootComment.diff_hunk_length <= 3000;
+            if (apiComment.in_reply_to_id) {
+                const request = rootComment.body;
+                state.exact_request = !snapshot?.truncated && !!request && rootComment.body_length <= 1800 &&
+                    jevCommentHasSoleReply(snapshot, rootId, identity.id);
+                state.thread_request = request.slice(0, 1800);
+                state.thread_request_hash = rootComment.body_hash;
+                state.thread_request_updated_at = rootComment.updated_at;
+            }
+        }
+        const current = await jevCommentCurrentEvidence(pr);
+        if (!current) return currentVersion()
+            ? { ...state, evidence_note: 'Current PR head could not be matched to this page' } : null;
+        state.head = current.head;
+        if (!current.complete) return currentVersion()
+            ? { ...state, evidence_note: current.reason || 'Current PR patch unavailable' } : null;
+        const file = state.anchor?.path;
+        const selection = file ? jevCommentPatchForFile(current.patch, file) : {
+            text: current.patch.slice(0, 12000),
+            complete: current.patch.length <= 12000 && !current.patch.includes('@@ deleted file contents omitted @@'),
+            found: false,
+        };
+        state.code_evidence = selection.text;
+        state.code_evidence_hash = hashPrompt(current.patch);
+        if (file && selection.complete) {
+            const rawUrl = benchmarkRawFileUrl(pr, file, current.head);
+            const headFile = rawUrl ? await fetchRawFile(rawUrl) : '';
+            state.head_file_complete = !!headFile && headFile.length <= 16000 && !headFile.includes('\0');
+            if (state.head_file_complete) state.current_head_file = headFile;
+        }
+        state.evidence_note = file
+            ? `${file} in the current PR diff${state.head_file_complete ? ' and full file at head' : ' (head file incomplete)'}`
+            : `Current PR diff${selection.complete ? '' : ' (excerpt only; no exact line anchor)'}`;
+        // A missing file in the PR patch never proves a requested change was
+        // omitted; a fix may be in another file or code outside the diff.
+        state.evidence_complete = selection.complete && !!selection.text && state.selected_complete &&
+            (!file || (state.anchor_complete && state.head_file_complete)) &&
+            (!apiComment?.in_reply_to_id || state.exact_request);
+        return currentVersion() ? state : null;
+    }
+
+    function jevRender(slot, kind, result, evidence, partial = false, state = null) {
         slot.replaceChildren();
         if (!result) return;
         const a = result.answers;
@@ -16659,6 +17225,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if ((kind === 'commit' || kind === 'hunk') && a.concern.noul >= 0.9) {
             jevBadge(slot, '🔎', 'Possible inconsistency to inspect; Jev has not verified a mistake', `${Math.round(a.concern.noul * 100)}%`, result, proof);
         }
+        if (kind === 'comment') {
+            for (const [emoji, meaning, signal] of jevCommentFactSignals(result, state || {})) {
+                jevBadge(slot, emoji, meaning, signal, result, `${proof}; ${state?.evidence_note || 'no current-head code evidence'}`);
+            }
+            if (!slot.childElementCount) {
+                jevBadge(slot, 'ℹ️', 'No checkable claim or confident review category was found in this comment', 'No thresholded signal', result, proof);
+            }
+        }
     }
 
     function jevSlot(target, id) {
@@ -16674,23 +17248,216 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return slot;
     }
 
+    function jevCommitBadgeTarget(commit) {
+        const row = commit?.el;
+        if (!row) return null;
+        if (row.matches('.commit-title, [data-testid="commit-title"]')) return row;
+        const title = row.querySelector('[data-listview-item-title-container]');
+        if (title) return title.querySelector('[class*="trailingBadgesContainer"]') || title.querySelector('h4, h3') || title;
+        const link = row.querySelector('a.markdown-title, .commit-title a, a[href*="/commits/"], a[href*="/changes/"]');
+        return link?.parentElement || row;
+    }
+
+    function jevCommentBadgeTarget(header) {
+        if (!header) return null;
+        const author = header.querySelector('a.author, [data-testid="comment-author"] a, a[data-testid="author-link"]') ||
+            [...header.querySelectorAll('a[data-hovercard-type="user"]')].find((link) => link.textContent?.trim());
+        return author?.parentElement || header.querySelector('h3, [data-testid="comment-header-title"]') || header;
+    }
+
+    function jevHunkBadgeSlot(lineNumberCell, id) {
+        if (!lineNumberCell) return null;
+        lineNumberCell.classList.add('ack-jev-line-anchor');
+        // Keep any sticky positioning supplied by GitHub. Absolute badges must
+        // not add width to the narrow line-number table column.
+        const position = window.getComputedStyle(lineNumberCell).position;
+        if (!position || position === 'static') lineNumberCell.style.position = 'relative';
+        return jevSlot(lineNumberCell, id);
+    }
+
+    const jevCommentPendingBodies = new WeakSet();
+    const jevCommentPendingHashes = new WeakMap();
+    const jevCommentObservedHashes = new WeakMap();
+    const jevCommentSeenBodies = new WeakMap();
+    const jevCommentThreadVersions = new WeakMap();
+    const jevCommentRefreshTimers = new WeakMap();
+
+    function jevCommentThreadRoot(body, fallback = null) {
+        return getCommentThreadRoot(body) || body?.closest?.(COMMENT_CONTAINER_BASE_SELECTOR) || fallback || null;
+    }
+
+    function jevInvalidateChangedCommentBadges(mutations) {
+        if (!jevConfigured) return;
+        const pr = parsePR();
+        if (!pr) return;
+        const changed = new Map();
+        const add = (root, body = null) => {
+            if (!root) return;
+            if (!changed.has(root)) changed.set(root, new Set());
+            if (body) changed.get(root).add(body);
+        };
+        const bodiesIn = (node) => {
+            if (node?.nodeType !== 1) return [];
+            return [...(node.matches?.(MARKDOWN_BODY_SELECTOR) ? [node] : []),
+                ...(node.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
+        };
+        for (const mutation of mutations) {
+            const target = mutation.target?.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+            if (!target?.closest) continue;
+            const body = target.closest(MARKDOWN_BODY_SELECTOR);
+            const root = jevCommentThreadRoot(body || target, target.closest(COMMENT_CONTAINER_BASE_SELECTOR));
+            if (body) {
+                const previous = jevCommentSeenBodies.get(body);
+                const expected = previous?.hash ?? jevCommentPendingHashes.get(body) ??
+                    jevCommentObservedHashes.get(body);
+                if (expected !== undefined && expected !== hashPrompt(body.textContent?.trim() || '') ||
+                    expected === undefined && mutation.type === 'characterData' &&
+                    !!root?.querySelector?.('.ack-jev-comment-badges')) {
+                    add(root, body);
+                }
+            }
+            if (mutation.type !== 'childList') continue;
+            const stableBodies = new Set();
+            for (const node of mutation.removedNodes || []) {
+                for (const removed of bodiesIn(node)) {
+                    if (removed.isConnected) continue;
+                    const permalink = jevCommentOwnPermalink(removed);
+                    const replacement = permalink && [...(root?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])]
+                        .find((candidate) => candidate !== removed &&
+                            jevCommentOwnPermalink(candidate) === permalink &&
+                            hashPrompt(candidate.textContent?.trim() || '') ===
+                            hashPrompt(removed.textContent?.trim() || ''));
+                    if (replacement) {
+                        stableBodies.add(replacement);
+                        const record = jevCommentSeenBodies.get(removed);
+                        if (record) jevCommentSeenBodies.set(replacement, record);
+                        jevCommentSeenBodies.delete(removed);
+                        jevCommentObservedHashes.set(replacement, hashPrompt(replacement.textContent?.trim() || ''));
+                        continue;
+                    }
+                    if (jevCommentSeenBodies.has(removed) || jevCommentPendingBodies.has(removed) ||
+                        root?.querySelector?.('.ack-jev-comment-badges')) add(root, removed);
+                }
+            }
+            if (root?.querySelector?.('.ack-jev-comment-badges')) {
+                for (const node of mutation.addedNodes || []) {
+                    for (const added of bodiesIn(node)) {
+                        if (stableBodies.has(added)) continue;
+                        const permalink = jevCommentOwnPermalink(added);
+                        const known = permalink && jevCommentKnownPermalinks.get(permalink);
+                        if (known?.hash === hashPrompt(added.textContent?.trim() || '')) continue;
+                        add(root, added);
+                    }
+                }
+            }
+        }
+        if (!changed.size) return;
+        jevInvalidateCommentCachesForPR(pr, false);
+        invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        for (const [root, changedBodies] of changed) {
+            jevCommentThreadVersions.set(root, (jevCommentThreadVersions.get(root) || 0) + 1);
+            root.querySelectorAll?.('.ack-jev-comment-badges').forEach((slot) => slot.remove());
+            for (const body of [...changedBodies, ...(root.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])]) {
+                const previous = jevCommentSeenBodies.get(body);
+                previous?.slot?.remove();
+                jevCommentSeenBodies.delete(body);
+                jevCommentObservedHashes.set(body, hashPrompt(body.textContent?.trim() || ''));
+            }
+            const oldTimer = jevCommentRefreshTimers.get(root);
+            if (oldTimer) clearTimeout(oldTimer);
+            const timer = setTimeout(() => {
+                jevCommentRefreshTimers.delete(root);
+                if (root.isConnected && jevEnabled()) queueJevComment(root);
+            }, 150);
+            jevCommentRefreshTimers.set(root, timer);
+        }
+    }
+
     function queueJevComment(container) {
         if (_ackTesting || !jevEnabled()) return;
         const pr = parsePR();
         if (!pr) return;
+        const prVersion = jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0;
         for (const body of container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || []) {
             const text = body.textContent?.trim();
-            if (!text || body.id === 'issue-body' || body.closest('#issue-body')) continue;
-            const comment = body.closest(COMMENT_CONTAINER_BASE_SELECTOR) || body.closest(COMMENT_CONTAINER_SELECTOR) || container;
+            if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            const originalHash = hashPrompt(text);
+            let previous = jevCommentSeenBodies.get(body);
+            const observedHash = jevCommentObservedHashes.get(body);
+            if (observedHash !== undefined && observedHash !== originalHash ||
+                previous && previous.hash !== originalHash) {
+                jevInvalidateChangedCommentBadges([{ type: 'characterData', target: body }]);
+                previous = null;
+            }
+            jevCommentObservedHashes.set(body, originalHash);
+            if (!text) {
+                previous?.slot?.remove();
+                jevCommentSeenBodies.delete(body);
+                continue;
+            }
+            if (jevCommentPendingBodies.has(body)) continue;
+            const ssrHead = readHeadShaFromSSR();
+            if (previous?.hash === originalHash && previous.head === ssrHead &&
+                previous.epoch === jevEpoch && previous.slot?.isConnected &&
+                previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_LIST_TTL_MS) continue;
+            if (previous && (previous.head !== ssrHead || previous.epoch !== jevEpoch)) {
+                previous.slot?.remove();
+                jevCommentSeenBodies.delete(body);
+            }
+            const candidate = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [data-testid="review-comment"]');
+            const specificComment = candidate?.querySelectorAll(MARKDOWN_BODY_SELECTOR).length === 1 ? candidate : null;
+            const comment = specificComment || body.closest(COMMENT_CONTAINER_BASE_SELECTOR) || body.closest(COMMENT_CONTAINER_SELECTOR) || container;
+            const thread = jevCommentThreadRoot(body, comment);
+            const threadVersion = jevCommentThreadVersions.get(thread) || 0;
             const sharedThread = comment.querySelectorAll(MARKDOWN_BODY_SELECTOR).length > 1;
-            const header = (sharedThread ? body.parentElement : comment.querySelector('.timeline-comment-header, [class*="__activityHeader"], .review-comment-header, .TimelineItem-header')) || comment;
-            const state = { kind: 'comment', repository: `${pr.owner}/${pr.repo}`, selected_comment: text.slice(0, 1800), full_text_hash: hashPrompt(text) };
-            const id = jevCacheId('comment', state);
-            const slot = jevSlot(header, id);
-            if (!slot) continue;
-            const evidence = getCommentPermalink(comment) || `${pr.owner}/${pr.repo}#comment`;
-            jevEvaluate(pr, 'comment', state).then((result) => {
-                if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'comment', result, evidence, text.length > 1800);
+            const header = (specificComment || !sharedThread
+                ? comment.querySelector('.timeline-comment-header, [class*="__activityHeader"], .review-comment-header, .TimelineItem-header')
+                : body.parentElement) || comment;
+            jevCommentPendingBodies.add(body);
+            jevCommentPendingHashes.set(body, originalHash);
+            void jevCommentReviewState(pr, comment, body).then((state) => {
+                if (!state) {
+                    previous?.slot?.remove();
+                    jevCommentSeenBodies.delete(body);
+                    return;
+                }
+                if (!jevEnabled() || !body.isConnected || hashPrompt(body.textContent?.trim() || '') !== originalHash ||
+                    (jevCommentThreadVersions.get(thread) || 0) !== threadVersion ||
+                    (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) !== prVersion) return;
+                const id = jevCacheId('comment', state);
+                const slot = jevSlot(jevCommentBadgeTarget(header), id);
+                if (!slot) return;
+                slot.classList.add('ack-jev-comment-badges');
+                const evidence = `${state.selected_permalink || `${pr.owner}/${pr.repo}#comment`}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`;
+                return jevEvaluate(pr, 'comment', state).then((result) => {
+                    const currentHead = getImmediatePRHeadSHA();
+                    if (slot.isConnected && slot.dataset.ackJevId === id &&
+                        hashPrompt(body.textContent?.trim() || '') === originalHash &&
+                        (jevCommentThreadVersions.get(thread) || 0) === threadVersion &&
+                        (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) === prVersion &&
+                        (!currentHead || !state.head || currentHead === state.head)) {
+                        jevRender(slot, 'comment', result, evidence, !state.evidence_complete || text.length > 1800, state);
+                        if (result && slot.childElementCount) {
+                            jevCommentSeenBodies.set(body, { hash: originalHash, head: readHeadShaFromSSR(),
+                                epoch: jevEpoch, slot, ts: Date.now() });
+                            jevCommentKnownPermalinks.set(state.selected_permalink,
+                                { prKey: jevCommentPRKey(pr), hash: originalHash });
+                            while (jevCommentKnownPermalinks.size > 400) {
+                                jevCommentKnownPermalinks.delete(jevCommentKnownPermalinks.keys().next().value);
+                            }
+                        }
+                    }
+                });
+            }).catch((error) => {
+                if (!_ackTesting) console.warn('ACKtopus: Jev comment evidence skipped:', error?.message || error);
+            }).finally(() => {
+                jevCommentPendingBodies.delete(body);
+                jevCommentPendingHashes.delete(body);
+                if (body.isConnected && (hashPrompt(body.textContent?.trim() || '') !== originalHash ||
+                    (jevCommentThreadVersions.get(thread) || 0) !== threadVersion ||
+                    (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) !== prVersion)) {
+                    setTimeout(() => { if (thread.isConnected) queueJevComment(thread); }, 0);
+                }
             });
         }
     }
@@ -16732,7 +17499,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const commit of commits) {
             if (!commit.el) continue;
             const id = `${commit.sha}:${commit.msg}`;
-            if (jevCommitObserved.get(commit.el) === id && commit.el.querySelector(':scope > .ack-jev-badges')) continue;
+            if (jevCommitObserved.get(commit.el) === id && jevCommitBadgeTarget(commit)?.querySelector(':scope > .ack-jev-badges')) continue;
             jevCommitObserved.set(commit.el, id);
             jevCommitRecords.set(commit.el, commit);
             jevCommitObserver.observe(commit.el);
@@ -16853,24 +17620,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return !!visibleHead || previous === commits.length - 1;
     }
 
+    function jevStackSummaryPlacement(first) {
+        // React commit rows are list items. A block inserted into a row becomes
+        // another grid item and displaces GitHub's title and metadata columns.
+        const list = first.closest('[data-listview-component="items-list"], ul, ol, .commit-group');
+        if (list?.parentElement && list !== first) return { container: list.parentElement, before: list, inline: false };
+        const title = first.querySelector('[data-listview-item-title-container], .commit-title, h4, h3');
+        if (!title) return null;
+        return { container: title.querySelector('[class*="trailingBadgesContainer"]') || title, before: null, inline: true };
+    }
+
     function queueJevStackSummary() {
         if (_ackTesting || !jevEnabled() || jevStackRejected || getAnalysisMode() !== ANALYSIS_MODES.commits) return;
         const pr = parsePR();
         const visibleCommits = parseCommitsFromPage();
         const first = visibleCommits.find((commit) => commit.el)?.el;
         if (!pr || !first) return;
+        const placement = jevStackSummaryPlacement(first);
+        if (!placement) return;
         const visibleHead = getImmediatePRHeadSHA();
         const visibleShas = visibleCommits.map((commit) => commit.sha);
         const visibleList = visibleShas.join(',');
         const visibleKey = `${pr.owner}/${pr.repo}#${pr.pr}:${visibleHead}:${hashPrompt(visibleList)}`;
-        let summary = first.querySelector(':scope > .ack-jev-stack-summary');
+        let summary = placement.container.querySelector(':scope > .ack-jev-stack-summary');
         if (!summary) {
-            summary = document.createElement('div');
+            summary = document.createElement(placement.inline ? 'span' : 'div');
             summary.className = 'ack-jev-stack-summary';
-            summary.style.cssText = 'font-size:12px;line-height:1.5;margin:2px 0 5px;color:#8b949e';
+            summary.style.cssText = placement.inline
+                ? 'font-size:12px;line-height:1.5;margin-left:6px;color:#8b949e'
+                : 'font-size:12px;line-height:1.5;margin:2px 0 5px;color:#8b949e';
             summary.textContent = 'Stack review';
             summary.hidden = true;
-            first.prepend(summary);
+            placement.container.insertBefore(summary, placement.before);
         }
         const existingSlot = summary.querySelector('.ack-jev-badges');
         if (summary.dataset.ackJevStackKey === visibleKey &&
@@ -16957,7 +17738,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!pr) return;
         const sha = commit.sha;
         const id = `commit:${sha}:${commit.msg}`;
-        const slot = jevSlot(commit.el, id);
+        const slot = jevSlot(jevCommitBadgeTarget(commit), id);
         if (!slot) return;
         const alias = jevCacheId('commit', { repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg });
         const cached = jevReadCache(alias);
@@ -17084,7 +17865,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
         const state = { kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, head, path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'), full_hunk_hash: signature };
         const id = jevCacheId('hunk', state);
-        const slot = jevSlot(lineNumberCell, id);
+        const slot = jevHunkBadgeSlot(lineNumberCell, id);
         if (!slot) return;
         jevEvaluate(pr, 'hunk', state).then((result) => {
             if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'hunk', result, locationKey, group.length > 16);
@@ -17107,7 +17888,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const group of groups) {
             const first = group.find((line) => !line.deleted) || group[0];
             const signature = hashPrompt(head + group.map((line) => line.fullText).join('\n'));
-            if (jevHunkObserved.get(first.cell) === signature) continue;
+            const meta = getDiffSelectionLineMeta(first.cell);
+            if (jevHunkObserved.get(first.cell) === signature &&
+                meta?.lineEl?.querySelector(':scope > .ack-jev-badges')) continue;
             jevHunkObserved.set(first.cell, signature);
             jevHunkRecords.set(first.cell, { pr, path, head, group, signature });
             jevHunkObserver.observe(first.cell);
@@ -17424,6 +18207,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         'a[data-testid="prev-commit-link"]',
         '.PullRequestHeaderSummary-module__summaryContainer__dA7dP',
         '[data-testid="commit-row-item"]',
+        '[data-listview-item-title-container]',
+        '[class*="trailingBadgesContainer"]',
         '.js-commits-list-item',
         '.TimelineItem--condensed',
         '.file-navigation',
@@ -17566,6 +18351,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     new MutationObserver((mutations) => {
         if (_ackTesting || !shouldRunEditorInjectors()) return;
+        jevInvalidateChangedCommentBadges(mutations);
         if (!collectDomMutationBatch(mutations)) return;
         const lt = ensureAckLifetime('dom-observer');
         if (lt.gen !== _domObserverAbortGen) {
@@ -17583,7 +18369,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             delayMs: 120,
             reason: 'mutation',
         });
-    }).observe(document.body, { childList: true, subtree: true });
+    }).observe(document.body, { childList: true, characterData: true, subtree: true });
 
     // Attribute observer: catches edit-mode class flips (is-comment-editing,
     // data-resolved, open) that the childList observer misses. Debounced to
@@ -18574,14 +19360,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         document.addEventListener('pointerup', clearPress, { capture: true, once: true });
         document.addEventListener('pointercancel', clearPress, { capture: true, once: true });
+        const unarm = () => {
+            document.removeEventListener('click', swallowRetargetedClick, true);
+            document.removeEventListener('pointerdown', unarm, true);
+        };
         const swallowRetargetedClick = (ev) => {
             if (!ev.isTrusted) return; // programmatic menu automation must pass through
             ev.preventDefault();
             ev.stopPropagation();
             unarm();
         };
-        const unarm = () => document.removeEventListener('click', swallowRetargetedClick, true);
         document.addEventListener('click', swallowRetargetedClick, true);
+        // A new physical press is a separate user action, such as choosing
+        // Delete from GitHub's menu. Never swallow its ensuing click.
+        document.addEventListener('pointerdown', unarm, { capture: true, once: true });
         ackSetTimeout(unarm, 400);
     }
 
@@ -19676,8 +20468,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Opens the kebab menu invisibly and clicks the specified action.
     // Design principle: use GitHub's native edit_form fragment when it exists.
     // For React UI where edit/delete buttons don't exist in DOM until the
-    // popover renders, fall back to clicking native menu items. Uses opacity:0
-    // to prevent visible menu flash.
+    // popover renders, fall back to clicking native menu items.
     // Safety: only these actions are allowed via triggerMenuAction.
     // Prevents accidental clicks on dangerous menu items (e.g. "Report", "Lock").
     const SAFE_MENU_ACTIONS = new Set(['edit', 'delete']);
@@ -20265,18 +21056,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (nativeTa) return nativeTa;
             }
             ackLogEvent('edit: trying fragment fallback', { reason, url });
-            const html = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url,
-                    headers: { Accept: 'text/html' },
-                    onload: (r) =>
-                        r.status >= 200 && r.status < 300
-                            ? resolve(r.responseText)
-                            : reject(new Error(`HTTP ${r.status}`)),
-                    onerror: reject,
-                });
-            });
+            const html = await gmFetchPageText(url, { force: true });
             const tmp = document.createElement('div');
             tmp.innerHTML = html;
             const nodes = Array.from(tmp.childNodes);
@@ -20453,32 +21233,103 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Search header first, then the full container.
         const kebab = findCommentMenuTrigger(header, container);
         if (!kebab) return;
-        const menu =
-            kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
-        const origOpacity = menu.style.opacity;
-        menu.style.opacity = '0';
-        lt.onAbort(() => {
-            try {
-                menu.style.opacity = origOpacity;
-            } catch (_) {}
-        });
+        const details = kebab.closest('details');
+        const wasOpen = !!details?.hasAttribute('open');
+        const controlledMenuId = kebab.getAttribute('aria-controls') || kebab.getAttribute('popovertarget');
+        const nearbyBeforeOpen = new Set(getNearbyCommentMenuRoots(kebab));
+        const wasReactOpen = kebab.getAttribute('aria-expanded') === 'true';
+        let sawReactMenuOpen = wasReactOpen;
+        let clickedAction = false;
+        let cleanedUp = false;
+        const cleanup = () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            // A failed lookup must not leave GitHub's fullscreen overlay open.
+            if (!clickedAction && !wasOpen) details?.removeAttribute('open');
+            if (!clickedAction && !details && !wasReactOpen && kebab.isConnected &&
+                kebab.getAttribute('aria-expanded') === 'true') kebab.click();
+        };
+        const menuWasClosed = () => {
+            if (details) return !details.hasAttribute('open');
+            const expanded = kebab.getAttribute('aria-expanded');
+            if (expanded === 'true') {
+                sawReactMenuOpen = true;
+                return false;
+            }
+            if (expanded === 'false' && sawReactMenuOpen) return true;
+            if (controlledMenuId) {
+                const controlled = document.getElementById(controlledMenuId);
+                if (controlled) {
+                    const visible = controlled.getAttribute('aria-hidden') !== 'true' &&
+                        !controlled.hasAttribute('hidden') && isVisible(controlled);
+                    if (visible) sawReactMenuOpen = true;
+                    else if (sawReactMenuOpen) return true;
+                } else if (sawReactMenuOpen) return true;
+            }
+            return false;
+        };
+        const shouldStop = () => lt.signal.aborted || !kebab.isConnected || menuWasClosed();
+        const actionMenuRoots = () => {
+            const roots = [];
+            const add = (root) => { if (root && !roots.includes(root)) roots.push(root); };
+            // These roots are tied to this trigger. The enclosing thread can
+            // contain several comments, so never search all of its menus.
+            if (details) add(details);
+            if (controlledMenuId) add(document.getElementById(controlledMenuId));
+            if (kebab.id) {
+                const id = cssEscape(kebab.id);
+                for (const root of document.querySelectorAll(
+                    `[role="menu"][aria-labelledby="${id}"], [popover][aria-labelledby="${id}"]`,
+                )) add(root);
+            }
+            add(kebab.closest('[data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement);
+
+            // A React portal without an explicit control ID is safe to use only
+            // if exactly one new menu appeared near this trigger after opening.
+            const newlyVisible = getNearbyCommentMenuRoots(kebab).filter((root) =>
+                !nearbyBeforeOpen.has(root) &&
+                !!root.querySelector('[role="menuitem"], .ActionListItem, .dropdown-item'),
+            );
+            const outermost = newlyVisible.filter((root) =>
+                !newlyVisible.some((other) => other !== root && other.contains(root)),
+            );
+            if (outermost.length === 1 &&
+                (!kebab.hasAttribute('aria-expanded') || kebab.getAttribute('aria-expanded') === 'true')) {
+                add(outermost[0]);
+            }
+            return roots;
+        };
+        // Keep GitHub's native menu visible so the user can choose the action
+        // manually if our targeted lookup misses a new menu variant.
+        lt.onAbort(cleanup);
         openMenuTrigger(kebab);
         const tryFind = (attempt) => {
+            if (shouldStop()) {
+                cleanup();
+                return;
+            }
             if (attempt > 8) {
-                menu.style.opacity = origOpacity;
+                cleanup();
+                ackLogEvent(`${actionName} comment menu item not found`, {
+                    target: container?.id || container?.className || 'unknown',
+                }, 'warn');
                 return;
             }
             ackSetTimeout(
                 () => {
-                    const searchRoots = getCommentMenuRoots(kebab, container, {
-                        includeDocument: false,
-                        includeNearby: true,
-                    });
+                    // A manual native action can close a React portal while this
+                    // retry is queued; never search another comment's menu then.
+                    if (shouldStop()) {
+                        cleanup();
+                        return;
+                    }
+                    const searchRoots = actionMenuRoots();
                     for (const root of searchRoots) {
                         for (const item of root.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
                             if (!isVisible(item)) continue;
                             if (commentMenuItemMatchesAction(item, actionName)) {
-                                menu.style.opacity = origOpacity;
+                                clickedAction = true;
+                                cleanup();
                                 item.click();
                                 if (/delete/i.test(actionName)) scheduleDeleteConfirmDefault();
                                 if (/edit/i.test(actionName)) schedulePostEditRefresh(container);
@@ -26570,11 +27421,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // Fallback: scrape commits from PR commits page (same-origin, no rate limit)
         try {
-            const resp = await fetch(`/${owner}/${repo}/pull/${prNum}/commits`, {
-                headers: { Accept: 'text/html' },
-            });
-            if (!resp.ok) return [];
-            const html = await resp.text();
+            const html = await gmFetchPageText(`https://github.com/${owner}/${repo}/pull/${prNum}/commits`);
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const commits = [];
             for (const a of doc.querySelectorAll('a.markdown-title, a[href*="/commits/"], a[href*="/changes/"]')) {
@@ -27693,6 +28540,426 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!jevIsPublicRepoResponse({ status: 404, responseText: '{"private":false}' }));
     });
 
+    const jevMockCommentAnswers = () => ({
+        intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } },
+        claim_type: { type: 'choice', choice: 'none', probabilities: { none: 0.95 } },
+        claim_support: { type: 'choice', choice: 'not_applicable', probabilities: { not_applicable: 0.95 } },
+    });
+
+    ackTest('Jev comment fact badges require exact complete evidence for a done claim', () => {
+        const result = { model: 'jev-test', answers: {
+            intent: { type: 'choice', choice: 'explanation', probability: 0.9 },
+            claim_type: { type: 'choice', choice: 'applied', probability: 0.95 },
+            claim_support: { type: 'choice', choice: 'contradicted', probability: 0.94 },
+        } };
+        const badge = (state) => jevCommentFactSignals(result, state)[0]?.[0];
+        ackEq(badge({ evidence_complete: true, exact_request: true, head_file_complete: true }), '🚨');
+        ackEq(badge({ evidence_complete: false, exact_request: true }), '📎',
+            'clipped or missing patch cannot claim a request is unaddressed');
+        ackEq(badge({ evidence_complete: true, exact_request: false, head_file_complete: true }), '📎',
+            'a bare done reply without its exact request is not a negative finding');
+        const supported = { ...result, answers: { ...result.answers,
+            claim_support: { type: 'choice', choice: 'supported', probability: 0.91 },
+        } };
+        ackEq(jevCommentFactSignals(supported, { evidence_complete: true, exact_request: true, head_file_complete: true })[0][0], '✅');
+        const mixed = { ...result, answers: { ...result.answers,
+            claim_type: { type: 'choice', choice: 'factual', probability: 0.95 },
+            claim_support: { type: 'choice', choice: 'mixed', probability: 0.9 },
+        } };
+        ackEq(jevCommentFactSignals(mixed, { evidence_complete: true })[0][0], '⚖️');
+        ackEq(jevValidatedResult('comment', { model: 'jev-test', answers: jevMockCommentAnswers() })?.answers.claim_type.choice, 'none');
+        ackEq(jevValidatedResult('comment', { model: 'jev-test', answers: { intent: jevMockCommentAnswers().intent } }), null,
+            'partial TypeSafe answers must not create a fact badge');
+    });
+
+    ackTest('Jev comment patch evidence selects exact file across commits and marks clips', () => {
+        const shaA = 'a'.repeat(40);
+        const shaB = 'b'.repeat(40);
+        const patch = `From ${shaA} Thu Jan 1 00:00:00 1970\n` +
+            'diff --git a/src/target.cpp b/src/target.cpp\n@@ -1 +1 @@\n-old\n+fixed\n' +
+            'diff --git a/src/other.cpp b/src/other.cpp\n@@ -1 +1 @@\n-no\n+yes\n' +
+            `From ${shaB} Thu Jan 1 00:00:00 1970\n` +
+            'diff --git a/src/target.cpp b/src/target.cpp\n@@ -2 +2 @@\n-a\n+b\n';
+        const selected = jevCommentPatchForFile(patch, 'src/target.cpp');
+        ackEq(jevCommentPatchHead(patch), shaB, 'the final mbox commit identifies the patch head');
+        ackNeq(jevCommentPatchHead(patch), shaA, 'an earlier commit cannot certify the current PR patch');
+        ackAssert(selected.complete && selected.found);
+        ackAssert(selected.text.includes(`Commit: ${shaA}`) && selected.text.includes(`Commit: ${shaB}`));
+        ackAssert(!selected.text.includes('src/other.cpp'), 'unrelated file diff is excluded');
+        ackEq(jevCommentPatchForFile(patch, 'src/missing.cpp').complete, false,
+            'absence of a file is not proof that feedback was ignored');
+        ackEq(jevCommentPatchForFile(patch, 'src/target.cpp', 40).complete, false,
+            'a clipped relevant diff cannot support a contradiction badge');
+    });
+
+    ackTest('Jev public comment lookup never sends a GitHub credential', async () => {
+        const oldFetch = gmFetch;
+        const url = `https://api.github.com/repos/acktopus-comment-fixture/demo/issues/comments/${Date.now()}`;
+        let sent;
+        try {
+            gmFetch = async (_url, options) => { sent = options; return { id: 7, body: 'Public' }; };
+            ackEq((await jevAnonymousCommentJson(url))?.id, 7);
+            ackEq(sent.anonymous, true, 'the exact comment must be readable without cookies or PAT');
+            ackAssert(!sent.headers?.Authorization, 'the public proof request passes no GitHub PAT');
+        } finally {
+            gmFetch = oldFetch;
+        }
+    });
+
+    ackTest('Jev anonymous comment lists share bounded pages and refresh after edits', async () => {
+        const oldAnonymous = jevAnonymousCommentJson;
+        const pr = { owner: 'acktopus-list-fixture', repo: 'demo', pr: '8' };
+        const firstPage = Array.from({ length: 100 }, (_, index) => ({
+            id: index + 1, body: `Review ${index + 1}`, updated_at: '2026-01-01T00:00:00Z',
+        }));
+        let calls = 0;
+        let edited = false;
+        let incomplete = false;
+        try {
+            jevAnonymousCommentJson = async (url) => {
+                calls++;
+                if (url.includes('/pulls/8/comments?') && url.endsWith('page=1')) return firstPage;
+                if (url.includes('/pulls/8/comments?') && url.endsWith('page=2')) return incomplete ? null
+                    : [{ id: 101, body: edited ? 'Edited review' : 'Original review',
+                        updated_at: edited ? '2026-01-02T00:00:00Z' : '2026-01-01T00:00:00Z' }];
+                return [];
+            };
+            const first = await jevCommentPublicSnapshot(pr, 'review-comment');
+            ackEq(first.byId.get('101').body, 'Original review');
+            ackEq(calls, 2, 'a complete 101-comment snapshot takes two anonymous list reads');
+            ackEq((await jevCommentPublicSnapshot(pr, 'review-comment')).byId.get('101').body,
+                'Original review');
+            ackEq(calls, 2, 'nearby comments reuse the complete snapshot');
+            edited = true;
+            const refreshed = await jevCommentPublicSnapshot(pr, 'review-comment', true);
+            ackEq(refreshed.byId.get('101').body, 'Edited review');
+            ackEq(refreshed.byId.get('101').updated_at, '2026-01-02T00:00:00Z');
+            ackEq(calls, 4, 'a visible edit forces fresh anonymous pages');
+            jevAnonymousCommentLists.delete(jevCommentListKey(pr, 'review-comment'));
+            incomplete = true;
+            ackEq(await jevCommentPublicSnapshot(pr, 'review-comment'), null,
+                'a missing page cannot prove any selected comment is public');
+            ackAssert(jevCommentListUrl(pr, 'issue-comment', 1).includes('/issues/8/comments?'));
+            ackAssert(jevCommentListUrl(pr, 'review', 1).includes('/pulls/8/reviews?'));
+        } finally {
+            jevAnonymousCommentJson = oldAnonymous;
+            jevAnonymousCommentLists.delete(jevCommentListKey(pr, 'review-comment'));
+        }
+    });
+
+    ackTest('Jev comment edits and deletes remove thread badges and cached public proof', () => {
+        const oldConfigured = jevConfigured;
+        const pr = parsePR();
+        const root = document.createElement('div');
+        root.className = 'js-line-comments';
+        root.innerHTML = '<div class="review-comment"><span class="ack-jev-badges ack-jev-comment-badges">✅</span><div class="markdown-body">Please guard the bound.</div></div>' +
+            '<div class="review-comment"><span class="ack-jev-badges ack-jev-comment-badges">🚨</span><div class="markdown-body">Done.</div></div>';
+        const bodies = root.querySelectorAll('.markdown-body');
+        const slots = root.querySelectorAll('.ack-jev-badges');
+        const listKey = jevCommentListKey(pr, 'review-comment');
+        const versionKey = jevCommentPRKey(pr);
+        const oldVersion = jevCommentCacheVersions.get(versionKey) || 0;
+        try {
+            jevConfigured = true;
+            jevAnonymousCommentLists.set(listKey, { complete: true, ts: Date.now(), request: Promise.resolve({}) });
+            bodies.forEach((body, index) => jevCommentSeenBodies.set(body,
+                { hash: hashPrompt(body.textContent.trim()), slot: slots[index] }));
+            bodies[0].textContent = 'Please guard both bounds.';
+            jevInvalidateChangedCommentBadges([{ type: 'characterData', target: bodies[0].firstChild }]);
+            ackEq(root.querySelectorAll('.ack-jev-badges').length, 0,
+                'editing the root request immediately removes both its and the reply verdict');
+            ackAssert(!jevAnonymousCommentLists.has(listKey), 'an edit invalidates the cached public list');
+            ackAssert((jevCommentCacheVersions.get(versionKey) || 0) > oldVersion,
+                'in-flight comment evidence from before the edit is invalidated');
+            const afterEditVersion = jevCommentCacheVersions.get(versionKey);
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: root.firstElementChild,
+                removedNodes: [slots[0]], addedNodes: [] }]);
+            ackEq(jevCommentCacheVersions.get(versionKey), afterEditVersion,
+                'removing ACKtopus’s own badge does not trigger another invalidation');
+            const orphanReplySlot = document.createElement('span');
+            orphanReplySlot.className = 'ack-jev-badges ack-jev-comment-badges';
+            bodies[1].parentElement.prepend(orphanReplySlot);
+            bodies[0].textContent = 'Please guard both bounds and add a test.';
+            jevInvalidateChangedCommentBadges([{ type: 'characterData', target: bodies[0].firstChild }]);
+            ackAssert(!orphanReplySlot.isConnected,
+                'editing an unbadged root still removes an existing reply verdict');
+            const replySlot = document.createElement('span');
+            replySlot.className = 'ack-jev-badges ack-jev-comment-badges';
+            bodies[1].parentElement.prepend(replySlot);
+            jevCommentSeenBodies.set(bodies[0], { hash: hashPrompt(bodies[0].textContent.trim()) });
+            jevCommentSeenBodies.set(bodies[1], { hash: hashPrompt(bodies[1].textContent.trim()), slot: replySlot });
+            bodies[0].remove();
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: root.firstElementChild,
+                removedNodes: [bodies[0]], addedNodes: [] }]);
+            ackEq(root.querySelectorAll('.ack-jev-badges').length, 0,
+                'deleting the root request immediately removes the reply verdict');
+        } finally {
+            const timer = jevCommentRefreshTimers.get(root);
+            if (timer) clearTimeout(timer);
+            jevCommentRefreshTimers.delete(root);
+            jevAnonymousCommentLists.delete(listKey);
+            jevCommentCacheVersions.set(versionKey, oldVersion);
+            jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev same-text comment hydration leaves badges and public cache intact', () => {
+        const oldConfigured = jevConfigured;
+        const pr = parsePR();
+        const root = document.createElement('div');
+        root.className = 'js-line-comments';
+        const permalink = `${location.origin}${location.pathname}#discussion_r77`;
+        root.innerHTML = '<div class="review-comment">' +
+            `<a id="discussion_r77-permalink" href="${permalink}"></a>` +
+            '<span class="ack-jev-badges ack-jev-comment-badges">✅</span>' +
+            '<div class="markdown-body">Done.</div></div>';
+        const body = root.querySelector('.markdown-body');
+        const slot = root.querySelector('.ack-jev-comment-badges');
+        const hash = hashPrompt('Done.');
+        const listKey = jevCommentListKey(pr, 'review-comment');
+        const versionKey = jevCommentPRKey(pr);
+        const originalVersion = jevCommentCacheVersions.get(versionKey) || 0;
+        try {
+            jevConfigured = true;
+            jevAnonymousCommentLists.set(listKey, { complete: true, ts: Date.now(), request: Promise.resolve({}) });
+            jevCommentPendingBodies.add(body);
+            jevCommentPendingHashes.set(body, hash);
+            const wrapper = document.createElement('span');
+            body.appendChild(wrapper);
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: body,
+                removedNodes: [], addedNodes: [wrapper] }]);
+            ackEq(jevCommentCacheVersions.get(versionKey) || 0, originalVersion,
+                'an unchanged pending body must not invalidate the PR');
+            ackAssert(jevAnonymousCommentLists.has(listKey) && slot.parentElement,
+                'same-text wrapper insertion preserves the badge and list snapshot');
+            const pendingWrapper = root.firstElementChild;
+            const pendingReplacement = pendingWrapper.cloneNode(true);
+            root.replaceChild(pendingReplacement, pendingWrapper);
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: root,
+                removedNodes: [pendingWrapper], addedNodes: [pendingReplacement] }]);
+            ackEq(jevCommentCacheVersions.get(versionKey) || 0, originalVersion,
+                'same-text replacement of a pending comment does not invalidate the PR');
+            jevCommentPendingBodies.delete(body);
+            jevCommentPendingHashes.delete(body);
+            const hydratedBody = pendingReplacement.querySelector('.markdown-body');
+            jevCommentSeenBodies.set(hydratedBody,
+                { hash, slot: pendingReplacement.querySelector('.ack-jev-comment-badges') });
+            jevCommentKnownPermalinks.set(permalink, { prKey: versionKey, hash });
+            const oldWrapper = root.firstElementChild;
+            const replacement = oldWrapper.cloneNode(true);
+            root.replaceChild(replacement, oldWrapper);
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: root,
+                removedNodes: [oldWrapper], addedNodes: [replacement] }]);
+            ackEq(jevCommentCacheVersions.get(versionKey) || 0, originalVersion,
+                'replacing a wrapper with the same comment ID and text does not refetch');
+            ackAssert(jevAnonymousCommentLists.has(listKey) && root.querySelector('.ack-jev-comment-badges'),
+                'the hydrated comment keeps its badge and public proof');
+        } finally {
+            jevCommentPendingBodies.delete(body);
+            jevCommentPendingHashes.delete(body);
+            jevAnonymousCommentLists.delete(listKey);
+            jevCommentKnownPermalinks.delete(permalink);
+            jevCommentCacheVersions.set(versionKey, originalVersion);
+            jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev comment mutation observer watches in-place text edits', () => {
+        ackAssert(_ackSource.includes('jevInvalidateChangedCommentBadges(mutations);'),
+            'the main mutation observer calls the comment invalidation hook');
+        ackAssert(_ackSource.includes('.observe(document.body, { childList: true, characterData: true, subtree: true });'),
+            'characterData changes are observed as well as replaced child nodes');
+    });
+
+    ackTest('Jev posted reply invalidation clears visible comment verdicts and in-flight states', () => {
+        const pr = parsePR();
+        const key = jevCommentPRKey(pr);
+        const listKey = jevCommentListKey(pr, 'review-comment');
+        const before = jevCommentCacheVersions.get(key) || 0;
+        const slot = document.createElement('span');
+        slot.className = 'ack-jev-badges ack-jev-comment-badges';
+        document.body.appendChild(slot);
+        try {
+            jevAnonymousCommentLists.set(listKey, { complete: true, ts: Date.now(), request: Promise.resolve({}) });
+            jevCommentEvidenceSnapshots.set(`${key}head`, { ts: Date.now(), evidence: {} });
+            jevInvalidateCommentCachesForPR(pr);
+            ackAssert(!slot.isConnected, 'a new reply removes old sole-reply verdicts immediately');
+            ackAssert(!jevAnonymousCommentLists.has(listKey) && !jevCommentEvidenceSnapshots.has(`${key}head`),
+                'the next classification must refetch thread and head evidence');
+            ackAssert((jevCommentCacheVersions.get(key) || 0) > before,
+                'in-flight verdicts from before the reply cannot render afterward');
+        } finally {
+            slot.remove();
+            jevAnonymousCommentLists.delete(listKey);
+            jevCommentEvidenceSnapshots.delete(`${key}head`);
+            jevCommentCacheVersions.set(key, before);
+        }
+    });
+
+    ackTest('Jev comment evidence binds a reply to its own ID, exact request, and current head', async () => {
+        const oldPublic = jevPublicRepository;
+        const oldAnonymous = jevAnonymousCommentJson;
+        const oldFetch = gmFetch;
+        const oldPatch = fetchPatch;
+        const oldRaw = fetchRawFile;
+        const oldSSR = readHeadShaFromSSR;
+        const pr = { owner: 'acktopus-comment-fixture', repo: 'demo', pr: '5' };
+        const prUrl = 'https://api.github.com/repos/acktopus-comment-fixture/demo/pulls/5';
+        const head = 'c'.repeat(40);
+        const mount = document.createElement('div');
+        mount.innerHTML = '<div class="js-line-comments">' +
+            '<div class="review-comment"><a id="discussion_r1-permalink" href="https://github.com/acktopus-comment-fixture/demo/pull/5#discussion_r1"></a><div class="markdown-body">Please guard the bound.</div></div>' +
+            '<div class="review-comment"><a id="discussion_r2-permalink" href="https://github.com/acktopus-comment-fixture/demo/pull/5#discussion_r2"></a><div class="markdown-body">Done.</div></div>' +
+            '</div>';
+        const reply = mount.querySelectorAll('.review-comment')[1];
+        const body = reply.querySelector('.markdown-body');
+        const patch = `From ${head} Thu Jan 1 00:00:00 1970\n` +
+            'diff --git a/src/a.cpp b/src/a.cpp\n@@ -1 +1 @@\n-old\n+guarded\n';
+        let publicAllowed = false;
+        let githubGets = 0;
+        let anonymousGets = 0;
+        let publicReply = true;
+        let publicRoot = true;
+        let wrongPR = false;
+        let staleBody = false;
+        let multipleReplies = false;
+        let listTruncated = false;
+        try {
+            jevAnonymousCommentLists.clear();
+            jevPublicRepository = () => Promise.resolve(publicAllowed);
+            readHeadShaFromSSR = () => head;
+            jevAnonymousCommentJson = async (url) => {
+                anonymousGets++;
+                if (url.endsWith('/comments/2')) return publicReply
+                    ? { id: 2, body: staleBody ? 'Not done.' : 'Done.', in_reply_to_id: 1,
+                        pull_request_url: wrongPR ? `${prUrl}0` : prUrl } : null;
+                if (url.endsWith('/comments/1')) return publicRoot ? { id: 1, body: 'Please guard the bound.',
+                    pull_request_url: prUrl, path: 'src/a.cpp', original_commit_id: 'a'.repeat(40),
+                    diff_hunk: '@@ -1 +1 @@\n-old\n+guarded' } : null;
+                if (url.includes('/pulls/5/comments?')) {
+                    if (listTruncated) return Array.from({ length: 100 }, (_, index) => ({ id: index + 1000 }));
+                    const rows = [];
+                    if (publicRoot) rows.push({ id: 1, body: 'Please guard the bound.',
+                        pull_request_url: prUrl, path: 'src/a.cpp', original_commit_id: 'a'.repeat(40),
+                        diff_hunk: '@@ -1 +1 @@\n-old\n+guarded' });
+                    if (publicReply) rows.push({ id: 2, body: staleBody ? 'Not done.' : 'Done.',
+                        in_reply_to_id: 1, pull_request_url: wrongPR ? `${prUrl}0` : prUrl });
+                    if (multipleReplies) rows.push({ id: 3, body: 'Also please add a test.',
+                        in_reply_to_id: 1, pull_request_url: prUrl });
+                    return rows;
+                }
+                if (url.includes('/issues/5/comments?')) return [{ id: 9, body: 'The relevant code is gone.',
+                    issue_url: 'https://api.github.com/repos/acktopus-comment-fixture/demo/issues/5' }];
+                return null;
+            };
+            gmFetch = async (url) => {
+                githubGets++;
+                return { head: { sha: head }, changed_files: 1, additions: 1, deletions: 1 };
+            };
+            fetchPatch = async () => patch;
+            fetchRawFile = async () => 'int guarded = 1;\n';
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'private or unverified repositories cannot start evidence fetches');
+            ackEq(githubGets, 0, 'no GitHub comment/patch fetch precedes the public gate');
+            ackEq(anonymousGets, 0, 'no exact-comment fetch precedes the public gate');
+            publicAllowed = true;
+            publicReply = false;
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'a comment not visible through anonymous GitHub API must never reach Jev');
+            ackEq(githubGets, 0, 'private comment text never starts code evidence fetches');
+            publicReply = true;
+            jevAnonymousCommentLists.clear();
+            wrongPR = true;
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'a public comment from another PR cannot be used as the selected comment');
+            wrongPR = false;
+            jevAnonymousCommentLists.clear();
+            staleBody = true;
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'a clearly edited API comment cannot annotate stale visible plain text');
+            staleBody = false;
+            jevAnonymousCommentLists.clear();
+            publicRoot = false;
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'a reply cannot transmit a root request that is not anonymously public');
+            publicRoot = true;
+            jevAnonymousCommentLists.clear();
+            reply.classList.add('js-pending-review-comment');
+            const beforePending = anonymousGets;
+            ackEq(await jevCommentReviewState(pr, reply, body), null,
+                'pending review comments are rejected before any TypeSafe state is formed');
+            ackEq(anonymousGets, beforePending, 'pending review comments make no exact-comment API request');
+            reply.classList.remove('js-pending-review-comment');
+            const prBody = document.createElement('div');
+            prBody.id = 'pullrequest-123';
+            prBody.className = 'timeline-comment';
+            prBody.innerHTML = `<a id="discussion_r2-permalink" href="https://github.com/${pr.owner}/${pr.repo}/pull/5#discussion_r2"></a>` +
+                '<div class="markdown-body">Private PR description draft</div>';
+            ackEq(await jevCommentReviewState(pr, prBody, prBody.querySelector('.markdown-body')), null,
+                'a PR description is not a posted review comment');
+            const state = await jevCommentReviewState(pr, reply, body);
+            ackEq(state.comment_id, '2', 'the selected reply gets its own ID, not the root permalink');
+            ackEq(state.thread_request, 'Please guard the bound.');
+            ackEq(state.anchor.path, 'src/a.cpp');
+            ackEq(state.head, head);
+            ackAssert(state.evidence_complete && state.exact_request && state.head_file_complete,
+                'a complete exact thread and current file can support a strong claim check');
+            ackAssert(state.code_evidence.includes('+guarded') && state.current_head_file.includes('guarded'));
+            ackAssert(!Object.hasOwn(state, 'prior_visible_thread'),
+                'unverified visible thread text is never included in the TypeSafe state');
+            ackEq(githubGets, 2, 'one validated PR snapshot uses two metadata reads');
+            multipleReplies = true;
+            jevAnonymousCommentLists.clear();
+            const ambiguous = await jevCommentReviewState(pr, reply, body);
+            ackAssert(!ambiguous.exact_request && !ambiguous.evidence_complete,
+                'a later reply makes root-request attribution ambiguous and blocks a strong verdict');
+            ackEq(githubGets, 2, 'nearby comments reuse the validated PR evidence snapshot');
+            multipleReplies = false;
+            jevAnonymousCommentLists.clear();
+            listTruncated = true;
+            const largeThread = await jevCommentReviewState(pr, reply, body);
+            ackAssert(largeThread && !largeThread.exact_request && !largeThread.evidence_complete,
+                'exact anonymous fallback can classify a large thread but cannot claim sole-reply proof');
+            ackEq(largeThread.thread_request, 'Please guard the bound.');
+            listTruncated = false;
+            jevAnonymousCommentLists.clear();
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            jevCommentEvidenceSnapshots.clear();
+            fetchPatch = async () => `From ${'d'.repeat(40)} Thu Jan 1 00:00:00 1970\n` +
+                'diff --git a/src/a.cpp b/src/a.cpp\n@@ -1 +1 @@\n-old\n+wrong\n';
+            const stalePatch = await jevCommentReviewState(pr, reply, body);
+            ackAssert(!stalePatch.evidence_complete && stalePatch.evidence_note.includes('does not match'),
+                'a patch whose final commit differs from the API head cannot yield a fact verdict');
+            jevCommentEvidenceSnapshots.clear();
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            fetchPatch = async () => `From ${head} Thu Jan 1 00:00:00 1970\n` +
+                'diff --git a/src/deleted.cpp b/src/deleted.cpp\n' +
+                'deleted file mode 100644\n@@ deleted file contents omitted @@\n';
+            const issueComment = document.createElement('div');
+            issueComment.className = 'timeline-comment';
+            issueComment.innerHTML = `<a id="issuecomment-9-permalink" href="https://github.com/${pr.owner}/${pr.repo}/pull/5#issuecomment-9"></a>` +
+                '<div class="markdown-body">The relevant code is gone.</div>';
+            const issueState = await jevCommentReviewState(pr, issueComment, issueComment.querySelector('.markdown-body'));
+            ackAssert(issueState && !issueState.evidence_complete && issueState.evidence_note.includes('excerpt only'),
+                'a deleted-file placeholder makes an unanchored PR patch incomplete');
+            const broad = document.createElement('div');
+            broad.className = 'review-comment';
+            broad.innerHTML = '<a href="#discussion_r1"></a><div class="markdown-body">Root</div><div class="markdown-body">Done</div>';
+            ackEq(jevCommentOwnPermalink(broad.querySelectorAll('.markdown-body')[1]), '',
+                'a broad multi-comment wrapper cannot lend its first permalink to a reply');
+        } finally {
+            jevPublicRepository = oldPublic;
+            jevAnonymousCommentJson = oldAnonymous;
+            gmFetch = oldFetch;
+            fetchPatch = oldPatch;
+            fetchRawFile = oldRaw;
+            readHeadShaFromSSR = oldSSR;
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            jevCommentEvidenceSnapshots.clear();
+            jevAnonymousCommentLists.clear();
+        }
+    });
+
     ackTest('Jev stack result requires every independent evidence signal', () => {
         const response = { model: 'jev-test', answers: {
             executable_oracle: { type: 'noul', noul: 0.91 },
@@ -27845,9 +29112,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const kind = JSON.parse(opts.data).state.kind;
                 opts.onload(kind === 'stack'
                     ? { status: 422, responseText: 'stack too large' }
-                    : { status: 200, responseText: JSON.stringify({ model: 'jev-test', answers: {
-                        intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } },
-                    } }) });
+                    : { status: 200, responseText: JSON.stringify({ model: 'jev-test', answers: jevMockCommentAnswers() }) });
             };
             const stackError = await jevPost('stack', { kind: 'stack', commits: [] }).catch((e) => e);
             ackAssert(stackError.message.includes('stack review paused'));
@@ -27976,7 +29241,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } else {
                     posts++;
                     opts.onload({ status: 200, responseText: JSON.stringify({
-                        model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+                        model: 'jev-test', answers: jevMockCommentAnswers(),
                     }) });
                 }
             };
@@ -28032,7 +29297,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } else {
                     posts++;
                     opts.onload({ status: 200, responseText: JSON.stringify({
-                        model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+                        model: 'jev-test', answers: jevMockCommentAnswers(),
                     }) });
                 }
             };
@@ -28207,6 +29472,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = { owner: 'acktopus-epoch-fixture', repo: 'example', pr: '10' };
         const state = { selected_comment: 'response after disable' };
         let post = null;
+        let postReady;
+        const postStarted = new Promise((resolve) => { postReady = resolve; });
         let cacheWrites = 0;
         try {
             jevCacheMemory = [];
@@ -28217,15 +29484,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_setValue = () => { cacheWrites++; };
             GM_xmlhttpRequest = (opts) => {
                 if (opts.method === 'GET') opts.onload({ status: 200, responseText: '{"private":false}' });
-                else post = opts;
+                else { post = opts; postReady(); }
             };
             const pending = jevEvaluate(pr, 'comment', state);
-            for (let i = 0; i < 4 && !post; i++) await Promise.resolve();
+            await Promise.race([postStarted, new Promise((resolve) => setTimeout(resolve, 100))]);
             ackAssert(post, 'the TypeSafe request is in flight');
             jevEpoch++;
             jevConfigured = false;
             post.onload({ status: 200, responseText: JSON.stringify({
-                model: 'jev-test', answers: { intent: { type: 'choice', choice: 'concern', probabilities: { concern: 0.95 } } },
+                model: 'jev-test', answers: jevMockCommentAnswers(),
             }) });
             ackEq(await pending, null);
             ackEq(cacheWrites, 0, 'the disabled request cannot restore a cleared cache');
@@ -28300,6 +29567,98 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('queueJevDiffFile(file)'), 'watched files are re-scanned when rows change');
     });
 
+    ackTest('Jev commit badge stays with the React commit title', () => {
+        const oldParsePR = parsePR;
+        const oldPublicRepository = jevPublicRepository;
+        const row = document.createElement('div');
+        row.setAttribute('data-testid', 'commit-row-item');
+        row.innerHTML = '<div data-testid="commit-row-grid"><div data-listview-item-title-container>' +
+            '<h4><a href="/bitcoin/bitcoin/pull/36280/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">Fix bounds</a></h4>' +
+            '<span class="Title-module__trailingBadgesContainer__INeSa"></span>' +
+            '</div><span data-testid="commit-row-metadata">authored yesterday</span></div>';
+        try {
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
+            jevPublicRepository = () => Promise.resolve(false);
+            queueJevCommitRow({ sha: 'a'.repeat(40), msg: 'Fix bounds', el: row });
+            const title = row.querySelector('[data-listview-item-title-container]');
+            const badge = row.querySelector('.ack-jev-badges');
+            ackAssert(badge && title.contains(badge), 'commit badge belongs beside the title');
+            ackEq(badge.parentElement, title.querySelector('[class*="trailingBadgesContainer"]'),
+                'React badge uses GitHub’s title badge container');
+            ackAssert(!row.querySelector(':scope > .ack-jev-badges'), 'commit badge must not become a row grid item');
+            ackEq(row.querySelector('[data-testid="commit-row-metadata"]').textContent, 'authored yesterday',
+                'placement leaves the metadata cell intact');
+        } finally {
+            parsePR = oldParsePR;
+            jevPublicRepository = oldPublicRepository;
+        }
+    });
+
+    ackTest('Jev comment badge stays beside the author, away from header actions', () => {
+        const header = document.createElement('div');
+        header.className = 'timeline-comment-header d-flex';
+        header.innerHTML = '<h3><div class="d-flex"><strong><a class="author" href="/reviewer">reviewer</a></strong>' +
+            '<span>commented</span></div></h3><div class="timeline-comment-actions"><button>More</button></div>';
+        const target = jevCommentBadgeTarget(header);
+        const slot = jevSlot(target, 'comment-fixture');
+        ackAssert(header.querySelector('strong').contains(slot), 'badge follows the author name');
+        ackAssert(!header.querySelector(':scope > .ack-jev-badges'), 'badge is not an action-row flex item');
+        ackEq(header.querySelector('.timeline-comment-actions').textContent, 'More', 'action menu stays intact');
+        header.innerHTML = '<h3><a data-hovercard-type="user" href="/reviewer"><img alt="" src="avatar.png"></a>' +
+            '<a data-hovercard-type="user" href="/reviewer">reviewer</a></h3>';
+        ackEq(jevCommentBadgeTarget(header).textContent, 'reviewer',
+            'a generic React user link with an avatar does not steal the badge');
+    });
+
+    ackTest('Jev requeues a React commit whose title badge container is replaced', () => {
+        const replacement = document.createElement('div');
+        replacement.setAttribute('data-listview-item-title-container', '');
+        ackAssert(mutationRootMayNeedDocInjectors(replacement), 'title replacement triggers a document injector pass');
+        replacement.removeAttribute('data-listview-item-title-container');
+        replacement.className = 'Title-module__trailingBadgesContainer__INeSa';
+        ackAssert(mutationRootMayNeedDocInjectors(replacement), 'badge-container replacement also triggers it');
+    });
+
+    ackTest('Jev stack summary does not become a React commit row grid item', () => {
+        const oldTesting = _ackTesting;
+        const oldEnabled = jevEnabled;
+        const oldMode = getAnalysisMode;
+        const oldParsePR = parsePR;
+        const oldParseCommits = parseCommitsFromPage;
+        const oldHead = getImmediatePRHeadSHA;
+        const oldPublicRepository = jevPublicRepository;
+        const mount = document.createElement('div');
+        mount.innerHTML = '<div data-testid="commit-row-item"><div data-testid="commit-row-grid">' +
+            '<div data-listview-item-title-container><a>Fix bounds</a></div>' +
+            '<span data-testid="commit-row-metadata">authored yesterday</span></div></div>';
+        const row = mount.firstElementChild;
+        try {
+            _ackTesting = false;
+            jevEnabled = () => true;
+            getAnalysisMode = () => ANALYSIS_MODES.commits;
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
+            parseCommitsFromPage = () => [{ sha: 'a'.repeat(40), msg: 'Fix bounds', el: row }];
+            getImmediatePRHeadSHA = () => '';
+            jevPublicRepository = () => Promise.resolve(false);
+            queueJevStackSummary();
+            const summary = mount.querySelector('.ack-jev-stack-summary');
+            const title = row.querySelector('[data-listview-item-title-container]');
+            ackAssert(summary, 'a stack summary placeholder is created');
+            ackAssert(!row.contains(summary) || title.contains(summary),
+                'the summary is outside the row grid or within the title area');
+            ackAssert(!row.querySelector(':scope > .ack-jev-stack-summary'),
+                'the summary must not become an extra row grid item');
+        } finally {
+            _ackTesting = oldTesting;
+            jevEnabled = oldEnabled;
+            getAnalysisMode = oldMode;
+            parsePR = oldParsePR;
+            parseCommitsFromPage = oldParseCommits;
+            getImmediatePRHeadSHA = oldHead;
+            jevPublicRepository = oldPublicRepository;
+        }
+    });
+
     ackTest('Jev classifies changed diff rows without changing code text', () => {
         const host = document.createElement('div');
         host.setAttribute('data-path', 'src/example.cpp');
@@ -28311,12 +29670,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(meta?.lineNum, '7');
         ackEq(meta?.fileName, 'src/example.cpp');
         const codeBefore = changed.cell.textContent;
-        const slot = jevSlot(row.querySelector('[data-line-number]'), 'fixture');
+        const numberCell = row.querySelector('[data-line-number]');
+        const slot = jevHunkBadgeSlot(numberCell, 'fixture');
         jevRender(slot, 'hunk', { model: 'jev-test', answers: {
             topic: { type: 'choice', choice: 'arithmetic', probability: 0.98 },
             concern: { type: 'noul', noul: 0.95 },
         } }, 'src/example.cpp:R7');
         ackEq(changed.cell.textContent, codeBefore, 'line annotation must not pollute copied code');
+        ackAssert(numberCell.classList.contains('ack-jev-line-anchor') && numberCell.style.position === 'relative',
+            'hunk badges stay in their line-number gutter without changing the code cell');
+        ackAssert(_ackSource.includes('padding-inline-end:34px!important') &&
+            _ackSource.includes('right:2px;z-index:2'), 'gutter reserves room so badges do not cover line numbers');
         ackEq(slot.textContent, '🧮🔎');
         host.innerHTML = '<table><tr><td data-line-number="6" id="diff-abcL6"></td><td class="blob-code blob-code-deletion">return old;</td><td data-line-number="7" id="diff-abcR7"></td><td class="blob-code blob-code-addition">return updated;</td></tr></table>';
         const split = jevChangedRow(host.querySelector('tr'));
@@ -32288,6 +33652,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'arms a capture-phase click swallower while a quick action is pressed',
         );
         ackAssert(press.includes('ev.isTrusted'), 'programmatic menu-automation clicks pass through');
+        ackAssert(press.includes("document.addEventListener('pointerdown', unarm"),
+            'a separate physical press disarms the click swallower before GitHub handles its menu click');
         const quick = sourceSection(source, 'function addQuickCommentActions', 'function getCommentMenuRoots');
         ackAssert(quick.includes('beginQuickActionPress(btn)'), 'pointerdown registers the press');
         ackAssert(
@@ -32427,6 +33793,181 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('scheduleDeleteConfirmDefault()'), 'delete action schedules default Delete focus');
     });
 
+    ackTest('delete actions stay bound to the chosen comment when nearby comments share text', async () => {
+        const host = document.createElement('div');
+        host.style.cssText = 'position:absolute;left:-10000px;top:0;width:400px';
+        const makeComment = (id, text) => {
+            const comment = document.createElement('div');
+            comment.id = id;
+            comment.className = 'timeline-comment current-user';
+            comment.innerHTML = `<div class="timeline-comment-header"><a class="author">me</a>` +
+                `<div class="timeline-comment-actions"><details class="details-overlay">` +
+                `<summary class="timeline-comment-action">Actions</summary>` +
+                `<details-menu><button type="button" role="menuitem">Delete</button></details-menu>` +
+                `</details></div></div><div class="markdown-body"></div>`;
+            comment.querySelector('.markdown-body').textContent = text;
+            return comment;
+        };
+        const first = makeComment('ack-delete-first', 'Done.');
+        const second = makeComment('ack-delete-second', 'Done.');
+        host.append(first, second);
+        document.body.appendChild(host);
+        const firstItem = first.querySelector('[role="menuitem"]');
+        const secondItem = second.querySelector('[role="menuitem"]');
+        const visibleRect = () => ({ left: 0, top: 0, right: 60, bottom: 20, width: 60, height: 20 });
+        firstItem.getBoundingClientRect = visibleRect;
+        secondItem.getBoundingClientRect = visibleRect;
+        let firstDeletes = 0;
+        let secondDeletes = 0;
+        firstItem.addEventListener('click', () => firstDeletes++);
+        secondItem.addEventListener('click', () => secondDeletes++);
+        try {
+            addQuickCommentActions(host);
+            const icon = second.querySelector('.ack-quick-actions button[title="Delete comment"]');
+            ackAssert(icon, 'second comment has a delete icon');
+            icon.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true }));
+            ackEq(second.querySelector('.timeline-comment-actions').style.opacity, '',
+                'icon automation leaves GitHub native comment actions visible');
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            ackEq(firstDeletes, 0, 'icon must not choose an earlier identical comment');
+            ackEq(secondDeletes, 1, 'icon chooses the second comment menu');
+
+            // GitHub's own menu must remain usable after ACKtopus has handled
+            // a different comment, including when the comment text is equal.
+            first.querySelector('summary.timeline-comment-action').click();
+            firstItem.click();
+            ackEq(firstDeletes, 1, 'native menu still deletes its own comment');
+            ackEq(secondDeletes, 1, 'native menu leaves the other comment alone');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('failed delete icon lookup closes only the menu it opened', () => {
+        const host = document.createElement('div');
+        host.style.cssText = 'position:absolute;left:-10000px;top:0;width:400px';
+        host.innerHTML = '<div class="timeline-comment current-user"><div class="timeline-comment-header">' +
+            '<div class="timeline-comment-actions"><details class="details-overlay">' +
+            '<summary class="timeline-comment-action">Actions</summary>' +
+            '<details-menu><button type="button" role="menuitem">Edit</button></details-menu>' +
+            '</details></div></div></div>';
+        document.body.appendChild(host);
+        const comment = host.querySelector('.timeline-comment');
+        const header = host.querySelector('.timeline-comment-header');
+        const details = host.querySelector('details');
+        const actions = host.querySelector('.timeline-comment-actions');
+        const previousTimer = ackSetTimeout;
+        try {
+            // Exhaust retries synchronously so this test does not add a long
+            // timer chain to the rest of the harness.
+            ackSetTimeout = (fn) => { fn(); return 0; };
+            triggerMenuAction(comment, header, 'delete');
+            ackAssert(!details.hasAttribute('open'), 'failed icon lookup closes its own overlay');
+            ackEq(actions.style.opacity, '', 'failed lookup leaves the native menu visible');
+
+            details.setAttribute('open', '');
+            triggerMenuAction(comment, header, 'delete');
+            ackAssert(details.hasAttribute('open'), 'manual menu already open remains under user control');
+        } finally {
+            ackSetTimeout = previousTimer;
+            host.remove();
+        }
+    });
+
+    ackTest('closed React comment menu stops a queued delete retry before nearby menus', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
+            '<button type="button" data-component="IconButton" aria-label="Open comment actions" ' +
+            'aria-controls="ack-test-delete-portal-a" aria-expanded="false">Actions</button>' +
+            '</div></div>';
+        const portalA = document.createElement('div');
+        portalA.id = 'ack-test-delete-portal-a';
+        portalA.setAttribute('role', 'menu');
+        portalA.innerHTML = '<button type="button" role="menuitem">Copy link</button>';
+        const portalB = document.createElement('div');
+        portalB.id = 'ack-test-delete-portal-b';
+        portalB.setAttribute('role', 'menu');
+        portalB.innerHTML = '<button type="button" role="menuitem">Delete comment</button>';
+        const box = (top) => ({ left: 100, top, right: 180, bottom: top + 30, width: 80, height: 30 });
+        const trigger = host.querySelector('button');
+        trigger.getBoundingClientRect = () => box(100);
+        portalA.getBoundingClientRect = () => box(130);
+        portalB.getBoundingClientRect = () => box(130);
+        portalB.querySelector('button').getBoundingClientRect = () => box(135);
+        trigger.addEventListener('click', () => {
+            const open = trigger.getAttribute('aria-expanded') !== 'true';
+            trigger.setAttribute('aria-expanded', String(open));
+            portalA.hidden = !open;
+        });
+        portalA.hidden = true;
+        portalB.hidden = true;
+        document.body.append(host, portalA, portalB);
+        const pending = [];
+        const previousTimer = ackSetTimeout;
+        let nearbyDeletes = 0;
+        portalB.querySelector('button').addEventListener('click', () => nearbyDeletes++);
+        try {
+            ackSetTimeout = (fn) => { pending.push(fn); return pending.length; };
+            const comment = host.querySelector('.timeline-comment');
+            triggerMenuAction(comment, comment.querySelector('.timeline-comment-header'), 'delete');
+            ackEq(trigger.getAttribute('aria-expanded'), 'true', 'icon opened its controlled React menu');
+            ackEq(pending.length, 1, 'delete lookup is queued');
+
+            // Simulate a manual native action closing this portal while the
+            // lookup is pending. A different comment's menu then appears nearby.
+            trigger.setAttribute('aria-expanded', 'false');
+            portalA.hidden = true;
+            portalB.hidden = false;
+            ackAssert(getCommentMenuRoots(trigger, comment, { includeDocument: false, includeNearby: true })
+                .includes(portalB), 'nearby menu would be included if a stale retry searched');
+            ackAssert(isVisible(portalB.querySelector('button')), 'unrelated Delete item is visible');
+            pending.shift()();
+            ackEq(nearbyDeletes, 0, 'retry does not click the unrelated Delete item');
+            ackEq(pending.length, 0, 'closed menu does not schedule another retry');
+        } finally {
+            ackSetTimeout = previousTimer;
+            host.remove();
+            portalA.remove();
+            portalB.remove();
+        }
+    });
+
+    ackTest('delete icon never uses a different comment menu visible before its own opens', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
+            '<button type="button" data-component="IconButton" aria-label="Open comment actions" ' +
+            'aria-expanded="false">Actions</button></div></div>';
+        const otherMenu = document.createElement('div');
+        otherMenu.setAttribute('role', 'menu');
+        otherMenu.innerHTML = '<button type="button" role="menuitem">Delete comment</button>';
+        const box = (top) => ({ left: 100, top, right: 180, bottom: top + 30, width: 80, height: 30 });
+        const trigger = host.querySelector('button');
+        trigger.getBoundingClientRect = () => box(100);
+        otherMenu.getBoundingClientRect = () => box(130);
+        otherMenu.querySelector('button').getBoundingClientRect = () => box(135);
+        trigger.addEventListener('click', () => {
+            trigger.setAttribute('aria-expanded', trigger.getAttribute('aria-expanded') === 'true' ? 'false' : 'true');
+        });
+        document.body.append(host, otherMenu);
+        const previousTimer = ackSetTimeout;
+        let otherDeletes = 0;
+        otherMenu.querySelector('button').addEventListener('click', () => otherDeletes++);
+        try {
+            ackAssert(getNearbyCommentMenuRoots(trigger).includes(otherMenu),
+                'unrelated Delete menu is visible before target icon is pressed');
+            ackSetTimeout = (fn) => { fn(); return 0; };
+            const comment = host.querySelector('.timeline-comment');
+            triggerMenuAction(comment, comment.querySelector('.timeline-comment-header'), 'delete');
+            ackEq(otherDeletes, 0, 'icon never clicks the pre-existing nearby Delete item');
+            ackEq(trigger.getAttribute('aria-expanded'), 'false',
+                'failed icon lookup closes the target menu it opened');
+        } finally {
+            ackSetTimeout = previousTimer;
+            host.remove();
+            otherMenu.remove();
+        }
+    });
+
     ackTest('menu actions ensure details-based menus are opened, not toggled closed', () => {
         const source = _ackSource;
         const helper = source.slice(
@@ -32480,7 +34021,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'PR-body edit only uses the header menu trigger',
         );
         ackAssert(reqFn.includes('include-fragment'), 'has include-fragment fallback for edit form');
-        ackAssert(fallbackFn.includes('GM_xmlhttpRequest'), 'can load edit fragment via GM_xmlhttpRequest');
+        ackAssert(fallbackFn.includes('gmFetchPageText(url, { force: true })'),
+            'edit fragments use the shared GitHub transport with fresh content');
         ackAssert(
             fn.includes('edit item missing') && fn.includes('kebab missing'),
             'falls back even when the menu item never appears',
@@ -35853,7 +37395,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function refreshQueuePanel'),
         );
         ackAssert(fn.includes('function searchGitHub'), 'searchGitHub function exists');
-        ackAssert(fn.includes('GM_xmlhttpRequest'), 'uses GM_xmlhttpRequest to bypass CSP');
+        ackAssert(fn.includes('gmFetch('), 'search uses the shared cached GitHub request helper');
         ackAssert(fn.includes('api.github.com/repos/'), 'fetches PR by number directly');
         ackAssert(fn.includes('api.github.com/search/issues'), 'searches by text via search API');
         ackAssert(fn.includes('renderSearchResults'), 'renders search results');
@@ -37161,7 +38703,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fn.includes('application/vnd.github.groot-preview+json'),
             'uses pulls-for-commit preview accept header',
         );
-        ackAssert(fn.includes('tryHeaders[attempt].Authorization'), 'retries without auth when PAT-auth request fails');
+        ackAssert(fn.includes('gmFetch(url,'), 'uses the shared cached GitHub API helper and its PAT fallback');
         ackAssert(fn.includes('/commits/${sha}/pulls'), 'queries the commits/{sha}/pulls endpoint');
     });
 
@@ -37760,7 +39302,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function toggleQueuePanel'),
         );
         ackAssert(!fn.includes('api.github.com'), 'does NOT use rate-limited API');
-        ackAssert(fn.includes('fetch(`https://github.com/'), 'uses same-origin HTML fetch');
+        ackAssert(fn.includes('gmFetchPageText(`https://github.com/'), 'uses shared cached same-origin HTML fetch');
         ackAssert(fn.includes('<title>'), 'extracts title from HTML page title');
     });
 
@@ -38115,6 +39657,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'octo/demo#42',
             'maps issue-comment endpoints to the same PR',
         );
+        ackEq(
+            githubHttpCachePRKey('https://github.com/octo/demo/pull/42.patch'),
+            'octo/demo#42',
+            'maps the web patch to its PR for invalidation',
+        );
+        ackEq(
+            githubHttpCachePRKey('https://github.com/octo/demo/pull/42/changes'),
+            'octo/demo#42',
+            'maps the changes HTML to its PR for invalidation',
+        );
         ackEq(githubHttpCachePRKey('https://api.github.com/repos/octo/demo/commits/abc'), '', 'ignores repo-wide endpoints');
         const key = githubHttpCacheKey('https://api.github.com/repos/octo/demo/pulls/42', {
             Accept: 'application/vnd.github+json',
@@ -38182,13 +39734,117 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 requestedHeaders = opts.headers;
                 opts.onload?.({ status: 304, responseText: '', responseHeaders: 'etag: "comments-v1"' });
             };
-            ackDeepEq(await gmFetch(url), cachedData, 'returns the previously parsed response after 304');
+            ackDeepEq(await gmFetch(url, { freshForMs: 0 }), cachedData, 'returns the previously parsed response after 304');
             ackEq(requestedHeaders?.['If-None-Match'], '"comments-v1"', 'asks GitHub to validate the cached ETag');
             ackEq(writes, 0, 'unchanged responses do not rewrite the body or cache index');
         } finally {
             GM_xmlhttpRequest = originalRequest;
             GM_setValue = originalSetValue;
             invalidateGithubHttpCacheForPR('ack-cache-test/demo#77');
+        }
+    });
+
+    ackTest('gmFetch serves fresh JSON locally and revalidates it when requested', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/91/comments?per_page=100';
+        const originalRequest = GM_xmlhttpRequest;
+        let calls = 0;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                calls++;
+                const unchanged = opts.headers['If-None-Match'] === '"comment-91"';
+                opts.onload({
+                    status: unchanged ? 304 : 200,
+                    responseText: unchanged ? '' : '[{"id":91}]',
+                    responseHeaders: 'etag: "comment-91"',
+                });
+            };
+            ackDeepEq(await gmFetch(url), [{ id: 91 }], 'loads the first response');
+            ackDeepEq(await gmFetch(url), [{ id: 91 }], 'returns a fresh cached response');
+            ackEq(calls, 1, 'fresh data avoids the second GitHub call');
+            ackDeepEq(await gmFetch(url, { freshForMs: 0 }), [{ id: 91 }], 'validates on demand');
+            ackEq(calls, 2, 'a forced refresh sends one conditional request');
+            ackDeepEq(await gmFetch(url), [{ id: 91 }], 'uses the recently validated response');
+            ackEq(calls, 2, '304 validation also restores the local freshness window');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#91');
+        }
+    });
+
+    ackTest('anonymous gmFetch strips credentials and separates cache scope', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/pulls/92';
+        const originalRequest = GM_xmlhttpRequest;
+        let sent = null;
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                sent = opts;
+                opts.onload({ status: 200, responseText: '{"private":false}', responseHeaders: 'etag: "public-92"' });
+            };
+            ackDeepEq(await gmFetch(url, {
+                anonymous: true,
+                headers: { Authorization: 'Bearer must-not-send' },
+            }), { private: false }, 'parses the anonymous response');
+            ackEq(sent?.anonymous, true, 'asks Tampermonkey to omit browser credentials');
+            ackAssert(!Object.keys(sent?.headers || {}).some((key) => key.toLowerCase() === 'authorization'),
+                'omits the caller-provided PAT');
+            ackAssert(githubHttpCacheKey(url, {}, true) !== githubHttpCacheKey(url, {}),
+                'keeps anonymous and default request bodies separate');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#92');
+        }
+    });
+
+    ackTest('gmFetch keeps custom Accept when a rejected PAT falls back', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/commits/abc/pulls';
+        const accept = 'application/vnd.github.groot-preview+json, application/vnd.github+json';
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPat = GM_getValue('github_pat', null);
+        const previousBadPat = _githubBadPat;
+        const previousWarned = _patInvalidWarned;
+        const requests = [];
+        try {
+            GM_setValue('github_pat', 'github-cache-fallback-token');
+            _patInvalidWarned = 'github-cache-fallback-token';
+            GM_xmlhttpRequest = (opts) => {
+                requests.push(opts);
+                opts.onload?.(requests.length === 1
+                    ? { status: 401, responseText: '{"message":"Bad credentials"}' }
+                    : { status: 200, responseText: '[]', responseHeaders: '' });
+            };
+            ackDeepEq(await gmFetch(url, { headers: { Accept: accept } }), [], 'uses public fallback');
+            ackEq(requests.length, 2, 'tries once with and once without the rejected PAT');
+            ackEq(requests[1].headers.Accept, accept, 'retains the preview media type');
+            ackAssert(!requests[1].headers.Authorization, 'omits the rejected PAT');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            if (originalPat === null) GM_deleteValue('github_pat');
+            else GM_setValue('github_pat', originalPat);
+            _githubBadPat = previousBadPat;
+            _patInvalidWarned = previousWarned;
+        }
+    });
+
+    ackTest('PR invalidation rejects a late JSON response and starts a new request', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/93/comments';
+        const originalRequest = GM_xmlhttpRequest;
+        const completions = [];
+        try {
+            GM_xmlhttpRequest = (opts) => completions.push(opts.onload);
+            const stale = gmFetch(url);
+            const staleResult = stale.then(() => null, (error) => error);
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#93');
+            const current = gmFetch(url);
+            ackEq(completions.length, 2, 'the new generation does not share the old request');
+            completions[0]({ status: 200, responseText: '[{"id":"old"}]', responseHeaders: 'etag: "old"' });
+            ackAssert(/changed while loading/.test((await staleResult)?.message || ''), 'late pre-edit data is discarded');
+            completions[1]({ status: 200, responseText: '[{"id":"new"}]', responseHeaders: 'etag: "new"' });
+            ackDeepEq(await current, [{ id: 'new' }], 'uses the post-edit response');
+            ackDeepEq(readGithubHttpCache(url, ghApiHeaders())?.data, [{ id: 'new' }],
+                'late response did not repopulate the cache');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#93');
         }
     });
 
@@ -38217,6 +39873,45 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             GM_xmlhttpRequest = originalRequest;
             _githubJsonRequests.clear();
+        }
+    });
+
+    ackTest('resetInMemoryCaches rejects older JSON and GraphQL responses', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPat = GM_getValue('github_pat', null);
+        const jsonUrl = 'https://api.github.com/repos/ack-cache-test/demo/issues/98/comments';
+        const gqlQuery = 'query ($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } } }';
+        const variables = { owner: 'ack-cache-test', repo: 'demo', number: 98 };
+        const requests = [];
+        try {
+            GM_setValue('github_pat', 'github-reset-race-test-token');
+            GM_xmlhttpRequest = (opts) => requests.push(opts);
+            const oldJson = gmFetch(jsonUrl);
+            const oldGraphQL = patGraphQL(gqlQuery, variables);
+            const oldResults = [oldJson.catch((error) => error), oldGraphQL.catch((error) => error)];
+            ackEq(requests.length, 2, 'both reads start before the reset');
+            resetInMemoryCaches();
+            const newJson = gmFetch(jsonUrl);
+            const newGraphQL = patGraphQL(gqlQuery, variables);
+            ackEq(requests.length, 4, 'new reads do not join pre-reset requests');
+            requests[0].onload({ status: 200, responseText: '[{"id":"old"}]', responseHeaders: 'etag: "old"' });
+            requests[1].onload({ status: 200, responseText: '{"data":{"old":true}}' });
+            const rejected = await Promise.all(oldResults);
+            ackAssert(rejected.every((error) => /changed while loading/.test(error?.message || '')),
+                'late pre-reset responses are rejected');
+            requests[2].onload({ status: 200, responseText: '[{"id":"new"}]', responseHeaders: 'etag: "new"' });
+            requests[3].onload({ status: 200, responseText: '{"data":{"new":true}}' });
+            ackDeepEq(await newJson, [{ id: 'new' }], 'current JSON resolves');
+            ackDeepEq((await newGraphQL).data, { new: true }, 'current GraphQL resolves');
+            ackDeepEq(readGithubHttpCache(jsonUrl, ghApiHeaders())?.data, [{ id: 'new' }],
+                'old JSON did not refill the cleared cache');
+            ackEq(_githubGraphQLResults.size, 1, 'only current GraphQL populated the result cache');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            if (originalPat === null) GM_deleteValue('github_pat');
+            else GM_setValue('github_pat', originalPat);
+            resetInMemoryCaches();
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#98');
         }
     });
 
@@ -38312,7 +40007,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 ackEq(opts.headers['If-None-Match'], '"reviews-v1"', 'still validates the retained response');
                 opts.onload({ status: 200, ...response('reviews-v2', [{ id: 4 }]) });
             };
-            ackDeepEq(await gmFetch(reviewsUrl), [{ id: 4 }], 'returns updated data instead of the retained snapshot');
+            ackDeepEq(await gmFetch(reviewsUrl, { freshForMs: 0 }), [{ id: 4 }], 'returns updated data instead of the retained snapshot');
         } finally {
             GM_xmlhttpRequest = previousRequest;
             invalidateGithubHttpCacheForPR('ack-cache-test/demo#78');
@@ -38333,15 +40028,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 statuses.push(status);
                 opts.onload({ status, responseText: status === 304 ? '' : responseText, responseHeaders: `etag: ${etag}` });
             };
-            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'fills the cache on the first visit');
+            const validatePage = (url) => gmFetch(url, { freshForMs: 0 });
+            ackDeepEq(await fetchPagedGithubRows(urlForPage, 50, validatePage), rows, 'fills the cache on the first visit');
             statuses.length = 0;
-            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'reuses validated comment pages');
+            ackDeepEq(await fetchPagedGithubRows(urlForPage, 50, validatePage), rows, 'reuses validated comment pages');
             ackDeepEq(statuses, [304, 304, 304], 'unchanged comments need no response bodies');
             rows[0] = { id: 1, body: 'Edited comment' };
             rows = rows.filter((row) => row.id !== 151);
-            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'reflects edits and deletions across page boundaries');
+            ackDeepEq(await fetchPagedGithubRows(urlForPage, 50, validatePage), rows, 'reflects edits and deletions across page boundaries');
             rows = rows.slice(0, 50);
-            ackDeepEq(await fetchPagedGithubRows(urlForPage), rows, 'does not append old cached pages after the list shrinks');
+            ackDeepEq(await fetchPagedGithubRows(urlForPage, 50, validatePage), rows, 'does not append old cached pages after the list shrinks');
         } finally {
             GM_xmlhttpRequest = previousRequest;
             invalidateGithubHttpCacheForPR('ack-cache-test/demo#79');
@@ -38420,7 +40116,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('gmFetch fails fast after known rate limits and disables bad PATs', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
-        ackAssert(fn.includes('const baseHeaders = ghApiHeaders()'), 'captures request headers once');
+        ackAssert(fn.includes('ghApiHeaders()'), 'captures request headers once');
         ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips known rate-limited auth bucket');
         ackAssert(fn.includes('rememberGithubBadPat(r)'), 'memoizes invalid PAT before retrying anonymously');
         ackAssert(fn.includes('fallbackPreflight'), 'checks anonymous rate limit before fallback request');
@@ -39724,6 +41420,191 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             fetchCommit.includes('stripDeletedFileBodiesFromPatch'),
             'fetchCommitPatch strips deleted-file bodies',
         );
+    });
+
+    ackTest('GitHub text cache reuses immutable revisions and refreshes mutable patches after edits', async () => {
+        const sha = 'a'.repeat(40);
+        const commitUrl = `https://github.com/ack-text-test/demo/commit/${sha}.patch`;
+        const patchUrl = 'https://github.com/ack-text-test/demo/pull/91.patch';
+        const originalRequest = GM_xmlhttpRequest;
+        const calls = [];
+        try {
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            GM_xmlhttpRequest = (options) => {
+                calls.push(options);
+                const patchCalls = calls.filter((call) => call.url === patchUrl).length;
+                options.onload?.(options.url === commitUrl
+                    ? { status: 200, responseText: 'commit patch', responseHeaders: '' }
+                    : patchCalls === 2
+                        ? { status: 304, responseText: '', responseHeaders: 'etag: "patch-v1"' }
+                        : { status: 200, responseText: patchCalls === 3 ? 'edited patch' : 'original patch', responseHeaders: 'etag: "patch-v1"' });
+            };
+            ackEq(await gmFetchText(commitUrl), 'commit patch', 'loads the immutable commit once');
+            ackEq(await gmFetchText(commitUrl), 'commit patch', 'reuses the full-SHA commit without another GET');
+            ackEq(calls.length, 1, 'one immutable transport request');
+
+            ackEq(await gmFetchText(patchUrl), 'original patch', 'loads the mutable PR patch');
+            ackEq(await gmFetchText(patchUrl), 'original patch', 'reuses the brief fresh window');
+            ackEq(calls.length, 2, 'no duplicate GET inside the fresh window');
+            const patchKey = `${githubHttpCacheKey(patchUrl, { ...ghApiHeaders(), Accept: 'text/plain' })}:${_githubTextResetGeneration}:${githubHttpCacheGeneration(patchUrl)}:0`;
+            _githubTextResponses.get(patchKey).ts -= GITHUB_TEXT_PATCH_FRESH_MS + 1;
+            ackEq(await gmFetchText(patchUrl), 'original patch', 'uses the cached body after 304 validation');
+            ackEq(calls[2].headers['If-None-Match'], '"patch-v1"', 'conditionally validates after freshness expires');
+
+            invalidateGithubHttpCacheForPR('ack-text-test/demo#91');
+            ackEq(await gmFetchText(patchUrl), 'edited patch', 'loads a changed patch after PR invalidation');
+            ackAssert(!calls[3].headers['If-None-Match'], 'does not validate against the invalidated ETag');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            invalidateGithubHttpCacheForPR('ack-text-test/demo#91');
+        }
+    });
+
+    ackTest('GitHub page HTML validates in session and force reload bypasses cached bodies', async () => {
+        const url = 'https://github.com/ack-text-test/demo/pull/92/changes';
+        const originalRequest = GM_xmlhttpRequest;
+        const originalSetValue = GM_setValue;
+        const calls = [];
+        let persistentWrites = 0;
+        try {
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            GM_setValue = (key, value) => {
+                if (String(key).startsWith(GITHUB_HTTP_CACHE_PREFIX)) persistentWrites++;
+                return originalSetValue(key, value);
+            };
+            GM_xmlhttpRequest = (options) => {
+                calls.push(options);
+                const count = calls.length;
+                options.onload?.(count === 2 || count === 4
+                    ? { status: 304, responseText: '', responseHeaders: 'etag: "html-v1"' }
+                    : { status: 200, responseText: count === 3 ? 'new HTML' : 'old HTML', responseHeaders: 'etag: "html-v1"' });
+            };
+            ackEq(await gmFetchPageText(url), 'old HTML', 'loads the page');
+            ackEq(await gmFetchPageText(url), 'old HTML', 'validates before reusing HTML');
+            ackEq(calls[1].headers['If-None-Match'], '"html-v1"', 'sends the session ETag');
+            ackEq(await gmFetchPageText(url, { force: true }), 'new HTML', 'force reloads nonce-bearing HTML');
+            ackAssert(!calls[2].headers['If-None-Match'], 'force does not accept a stale 304');
+            ackEq(calls[2].headers['Cache-Control'], 'no-cache', 'force requests fresh page data');
+            ackEq(await gmFetchPageText(url), 'new HTML', 'a later 304 reuses the refreshed HTML');
+            ackEq(persistentWrites, 0, 'does not persist cookie-specific HTML');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            GM_setValue = originalSetValue;
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+        }
+    });
+
+    ackTest('GitHub text requests started before a PR edit cannot refill its cache', async () => {
+        const url = 'https://github.com/ack-text-test/demo/pull/93.patch';
+        const originalRequest = GM_xmlhttpRequest;
+        const requests = [];
+        try {
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            GM_xmlhttpRequest = (options) => requests.push(options);
+            const old = gmFetchText(url);
+            invalidateGithubHttpCacheForPR('ack-text-test/demo#93');
+            const current = gmFetchText(url);
+            ackEq(requests.length, 2, 'post-edit read starts a new transport request');
+            requests[0].onload?.({ status: 200, responseText: 'old patch', responseHeaders: 'etag: "old"' });
+            requests[1].onload?.({ status: 200, responseText: 'new patch', responseHeaders: 'etag: "new"' });
+            let staleError = null;
+            try { await old; } catch (error) { staleError = error; }
+            ackAssert(staleError?.message?.includes('changed while loading'), 'rejects the old response');
+            ackEq(await current, 'new patch', 'returns the post-edit patch');
+            ackEq(await gmFetchText(url), 'new patch', 'reuses only the post-edit body');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            invalidateGithubHttpCacheForPR('ack-text-test/demo#93');
+        }
+    });
+
+    ackTest('GitHub patch cache briefly reuses responses without ETags and then refetches', async () => {
+        const url = 'https://github.com/ack-text-test/demo/pull/94.patch';
+        const originalRequest = GM_xmlhttpRequest;
+        const requests = [];
+        try {
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            GM_xmlhttpRequest = (options) => {
+                requests.push(options);
+                options.onload?.({ status: 200, responseText: requests.length === 1 ? 'first patch' : 'edited patch', responseHeaders: '' });
+            };
+            ackEq(await gmFetchText(url), 'first patch', 'loads a patch without an ETag');
+            ackEq(await gmFetchText(url), 'first patch', 'reuses it briefly without another GET');
+            ackEq(requests.length, 1, 'one transport request within the fresh window');
+            const key = `${githubHttpCacheKey(url, { ...ghApiHeaders(), Accept: 'text/plain' })}:${_githubTextResetGeneration}:${githubHttpCacheGeneration(url)}:0`;
+            _githubTextResponses.get(key).ts -= GITHUB_TEXT_PATCH_FRESH_MS + 1;
+            ackEq(await gmFetchText(url), 'edited patch', 'refetches after the fresh window');
+            ackAssert(!requests[1].headers['If-None-Match'], 'does not attempt validation without an ETag');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            invalidateGithubHttpCacheForPR('ack-text-test/demo#94');
+        }
+    });
+
+    ackTest('raw branch files are refetched after deletion while commit files remain cached', async () => {
+        const branchUrl = 'https://raw.githubusercontent.com/ack-text-test/demo/main/src/file.cpp';
+        const commitUrl = `https://raw.githubusercontent.com/ack-text-test/demo/${'b'.repeat(40)}/src/file.cpp`;
+        const originalRequest = GM_xmlhttpRequest;
+        const requests = [];
+        try {
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            _rawFileCache.clear();
+            GM_xmlhttpRequest = (options) => {
+                requests.push(options);
+                const branchCalls = requests.filter((request) => request.url === branchUrl).length;
+                options.onload?.(options.url === branchUrl && branchCalls === 2
+                    ? { status: 404, responseText: 'Not Found', responseHeaders: '' }
+                    : { status: 200, responseText: 'file contents', responseHeaders: '' });
+            };
+            ackEq(await fetchRawFile(branchUrl), 'file contents', 'loads the branch file');
+            ackEq(await fetchRawFile(branchUrl), '', 'observes a deleted branch file');
+            ackEq(requests.filter((request) => request.url === branchUrl).length, 2, 'rechecks a mutable branch URL');
+            ackEq(await fetchRawFile(commitUrl), 'file contents', 'loads the commit file');
+            ackEq(await fetchRawFile(commitUrl), 'file contents', 'keeps immutable commit content');
+            ackEq(requests.filter((request) => request.url === commitUrl).length, 1, 'does not refetch a full-SHA URL');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            _githubTextRequests.clear();
+            _githubTextResponses.clear();
+            _rawFileCache.clear();
+        }
+    });
+
+    ackTest('clearing caches discards immutable text and rejects older pending reads', async () => {
+        const url = `https://github.com/ack-text-test/demo/commit/${'c'.repeat(40)}.patch`;
+        const originalRequest = GM_xmlhttpRequest;
+        const requests = [];
+        try {
+            resetInMemoryCaches();
+            GM_xmlhttpRequest = (options) => requests.push(options);
+            const old = gmFetchText(url);
+            resetInMemoryCaches();
+            const current = gmFetchText(url);
+            ackEq(requests.length, 2, 'a cleared cache starts a new GET');
+            requests[0].onload?.({ status: 200, responseText: 'old patch', responseHeaders: '' });
+            requests[1].onload?.({ status: 200, responseText: 'current patch', responseHeaders: '' });
+            let staleError = null;
+            try { await old; } catch (error) { staleError = error; }
+            ackAssert(staleError?.message?.includes('changed while loading'), 'drops the pre-clear response');
+            ackEq(await current, 'current patch', 'uses the post-clear response');
+            ackEq(await gmFetchText(url), 'current patch', 'caches the new immutable body');
+            ackEq(requests.length, 2, 'no additional GET after the fresh response');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            resetInMemoryCaches();
+        }
     });
 
     ackTest('no standalone GM_xmlhttpRequest GET wrappers outside shared GET helpers', () => {
@@ -42704,17 +44585,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(!helper.includes('execCommand('), 'never uses execCommand insertion');
     });
 
-    ackTest('queue searchGitHub uses ghApiHeaders for PAT support', () => {
+    ackTest('queue searchGitHub uses the shared GitHub request helper', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function searchGitHub'),
-            source.indexOf('function searchGitHub') + 1200,
+            source.indexOf('function searchGitHub') + 2000,
         );
-        ackAssert(fn.includes('ghApiHeaders()'), 'uses ghApiHeaders');
-        ackAssert(
-            !fn.includes("{ Accept: 'application/vnd.github+json' }"),
-            'does not use hardcoded Accept-only header',
-        );
+        ackAssert(fn.includes('gmFetch('), 'uses the cached helper that handles PAT auth');
     });
 
     ackTest('setTextareaValue dispatches both input and change with composed: true', () => {
@@ -42791,13 +44668,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('GM_deleteValue'), 'actually deletes GM values');
     });
 
-    ackTest('factoryReset deletes everything except API keys', () => {
+    ackTest('factoryReset keeps API keys and explicitly turns off default-enabled Jev', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function factoryReset'), source.indexOf('// --- Config Panel'));
         ackAssert(fn.includes('providerKeyStorageKeys()'), 'keeps provider API keys through provider metadata');
         ackAssert(fn.includes('github_pat'), 'keeps GitHub PAT');
         ackAssert(fn.includes("'jev_api_key'"), 'keeps the TypeSafe key like the other API keys');
-        ackAssert(fn.includes('jevConfigured = false'), 'stops Jev once its opt-in flag is gone');
+        ackAssert(fn.includes('jevConfigured = false'), 'stops Jev immediately after reset');
+        ackAssert(fn.includes("GM_setValue('jev_enabled', false)"), 'reset keeps Jev disabled across reloads');
         ackAssert(fn.includes('GM_deleteValue'), 'deletes GM values');
         ackAssert(fn.includes('keep.has'), 'uses keep set to filter');
     });
@@ -47145,6 +49023,36 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
+    ackTest('patGraphQL shares read-only queries and invalidates PR results after edits', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPat = GM_getValue('github_pat', null);
+        const token = 'graphql-cache-test-token';
+        const variables = { owner: 'ack-cache-test', repo: 'demo', number: 94 };
+        const query = 'query($number: Int!) { viewer { login } }';
+        let calls = 0;
+        try {
+            GM_setValue('github_pat', token);
+            GM_xmlhttpRequest = ({ onload }) => {
+                calls++;
+                onload?.({ status: 200, responseText: '{"data":{"viewer":{"login":"octocat"}}}' });
+            };
+            ackDeepEq(await patGraphQL(query, variables), { data: { viewer: { login: 'octocat' } } }, 'loads the query');
+            await patGraphQL(query, variables);
+            ackEq(calls, 1, 'a repeated read-only query uses the memory cache');
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#94');
+            await patGraphQL(query, variables);
+            ackEq(calls, 2, 'PR invalidation refreshes the GraphQL query');
+            await patGraphQL('mutation { addComment(input: {}) { clientMutationId } }', variables);
+            await patGraphQL('mutation { addComment(input: {}) { clientMutationId } }', variables);
+            ackEq(calls, 4, 'mutations are never reused');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            if (originalPat === null) GM_deleteValue('github_pat');
+            else GM_setValue('github_pat', originalPat);
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#94');
+        }
+    });
+
     ackTest('config panel documents read-only GitHub PAT use', () => {
         ackAssert(_ackSource.includes('authenticated API reads'), 'limits the PAT to API reads');
         ackAssert(_ackSource.includes('does not need write access'), 'does not request write access');
@@ -47374,12 +49282,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('connection closed'), 'retry helper treats connection closes as transient');
         ackAssert(fn.includes('502, 503, 504'), 'retry helper retries transient gateway statuses');
         ackAssert(fn.includes('fetchVerifiedFetchMetaFromChanges'), 'has /changes meta helper');
-        ackAssert(fn.includes('gmFetchPageText(url)'), 'prefers userscript GET for /changes meta');
+        ackAssert(fn.includes('gmFetchPageText(url, { force, pageSessionFallback: true })'),
+            'prefers shared GitHub GET with explicit nonce freshness');
         ackAssert(
             fn.includes("cache: 'no-store'") || fn.includes('cache:"no-store"'),
             'forces no-store when fetching /changes meta',
         );
-        ackAssert(fn.includes('pageFetchWithRetry(pageFetch, url'), 'keeps retry fallback when fetching /changes meta');
+        ackAssert(sourceSection(_ackSource, 'async function gmFetchPageText', 'function fetchCommitPullRequests')
+            .includes('pageFetchWithRetry(pageFetch, url'), 'shared GitHub text helper keeps the page-session fallback');
         const createFn = _ackSource.slice(
             _ackSource.indexOf('function createReviewCommentViaPageData'),
             _ackSource.indexOf('function findReviewThreadPathForReplyForm'),
