@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.258
+// @version      1.259
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16442,7 +16442,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = { commit: 3, hunk: 3, comment: 4, stack: 3 };
+    const JEV_SCHEMA = { commit: 3, hunk: 3, comment: 5, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -16501,13 +16501,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 explanation: 'Explains behavior or context without requesting action',
                 other: 'None of these is clearly supported',
             } },
-            claim_type: { type: 'choice', instructions: 'Classify the selected comment itself. A short reply such as "done" is an implementation claim only when the supplied exact earlier thread request makes its meaning clear. Do not turn a question, suggestion, or quoted claim into an assertion by its author.', criteria: {
+            claim_type: { type: 'choice', instructions: 'Classify the selected comment in its exact review thread. A terse direct reply such as "done", "removed", "fixed", "applied", or "updated" claims that the earlier request was addressed when that request clearly identifies an action. A fenced diff suggestion can identify the exact old and proposed new line. Resolve the reply against thread_request before choosing none or unclear. Do not turn a question, suggestion, or quoted claim into an assertion by its author.', criteria: {
                 applied: 'The author claims that a specific earlier review request was implemented or fixed',
                 factual: 'The author makes a checkable claim about the shown code, patch, or test',
                 none: 'No checkable code or implementation claim is made',
                 unclear: 'A claim may be present, but its meaning or referent is unclear',
             } },
-            claim_support: { type: 'choice', instructions: 'Compare the selected claim with only the supplied exact thread and current-head code evidence. A reply saying "done" is contradicted only if the specific earlier request is clear and the complete relevant current-head evidence directly shows it remains unimplemented. A file absent from a PR patch, missing context, tests not run, and omitted code are insufficient evidence, never proof of a false claim. For multiple claims with different outcomes choose mixed. Do not infer correctness from an ACK.', criteria: {
+            claim_support: { type: 'choice', instructions: 'Compare the selected claim with only the supplied exact thread and current-head code evidence. For a terse implementation reply to a fenced diff suggestion, compare the proposed replacement with the current-head file and relevant PR patch. A reply is contradicted only if the specific earlier request is clear and complete relevant current-head evidence directly shows it remains unimplemented. A file absent from a PR patch, missing context, tests not run, and omitted code are insufficient evidence, never proof of a false claim. For multiple claims with different outcomes choose mixed. Do not infer correctness from an ACK.', criteria: {
                 supported: 'The specific checkable claim is directly supported by the supplied code evidence',
                 contradicted: 'The specific checkable claim is directly contradicted by the supplied code evidence',
                 mixed: 'The selected comment makes multiple checkable claims with differing support',
@@ -16870,6 +16870,47 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             signals.push(['❔', 'The supplied evidence cannot decide this comment claim', `${Math.round(support.probability * 100)}% insufficient-evidence signal`]);
         }
         return signals;
+    }
+
+    function jevExactSuggestionApplied(state) {
+        // A terse reply to a sole, exact review request can sometimes be
+        // verified without asking Jev to infer the referent of one word.
+        if (!state?.exact_request || !state.evidence_complete || !state.head_file_complete ||
+            !/^(?:done|removed|fixed|applied|updated|implemented)[.!]?$/i.test(state.selected_comment?.trim() || '')) return null;
+        const suggestions = [...String(state.thread_request || '').matchAll(/```diff[ \t]*\r?\n([\s\S]*?)```/gi)];
+        if (suggestions.length !== 1) return null;
+        const removed = [];
+        const added = [];
+        for (const line of suggestions[0][1].split(/\r?\n/)) {
+            if (line.startsWith('---') || line.startsWith('+++')) continue;
+            if (line.startsWith('-')) removed.push(line.slice(1));
+            else if (line.startsWith('+')) added.push(line.slice(1));
+        }
+        if (removed.length !== 1 || added.length !== 1 || !removed[0].trim() ||
+            !added[0].trim() || removed[0] === added[0]) return null;
+        const oldLine = removed[0];
+        const newLine = added[0];
+        const anchoredLines = new Set(String(state.anchor?.diff_hunk || '').split(/\r?\n/)
+            .map((line) => /^[ +\-]/.test(line) ? line.slice(1) : line));
+        if (!anchoredLines.has(oldLine)) return null;
+        const headLines = new Set(String(state.current_head_file || '').split(/\r?\n/));
+        const patchLines = new Set(String(state.code_evidence || '').split(/\r?\n/));
+        if (!headLines.has(newLine) || headLines.has(oldLine) || !patchLines.has(`+${newLine}`)) return null;
+        return { oldLine, newLine };
+    }
+
+    function jevRenderExactSuggestion(slot, state) {
+        slot.replaceChildren();
+        const badge = document.createElement('span');
+        badge.className = 'ack-jev-badge';
+        badge.textContent = '✅';
+        badge.title = `The exact one-line review suggestion is present in the current PR head file, and its old line is absent.\n` +
+            `Evidence: ${state.anchor?.path || 'reviewed file'} at ${state.head?.slice(0, 12) || 'current head'}\n` +
+            'Method: exact line comparison of the public review suggestion, current PR patch, and full head file; no Jev model call.\n' +
+            'This checks the requested edit, not overall correctness.';
+        badge.setAttribute('role', 'img');
+        badge.setAttribute('aria-label', badge.title);
+        slot.appendChild(badge);
     }
 
     function jevCommentPatchForFile(patch, path, maxChars = 12000) {
@@ -17446,14 +17487,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (!slot) return;
                 slot.classList.add('ack-jev-comment-badges');
                 const evidence = `${state.selected_permalink || `${pr.owner}/${pr.repo}#comment`}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`;
-                return jevEvaluate(pr, 'comment', state).then((result) => {
+                const exactSuggestion = jevExactSuggestionApplied(state);
+                const evaluation = exactSuggestion ? Promise.resolve(exactSuggestion) : jevEvaluate(pr, 'comment', state);
+                return evaluation.then((result) => {
                     const currentHead = getImmediatePRHeadSHA();
                     if (slot.isConnected && slot.dataset.ackJevId === id &&
                         hashPrompt(body.textContent?.trim() || '') === originalHash &&
                         (jevCommentThreadVersions.get(thread) || 0) === threadVersion &&
                         (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) === prVersion &&
                         (!currentHead || !state.head || currentHead === state.head)) {
-                        jevRender(slot, 'comment', result, evidence, !state.evidence_complete || text.length > 1800, state);
+                        if (exactSuggestion) jevRenderExactSuggestion(slot, state);
+                        else jevRender(slot, 'comment', result, evidence, !state.evidence_complete || text.length > 1800, state);
                         if (result && slot.childElementCount) {
                             jevCommentSeenBodies.set(body, { hash: originalHash, head: readHeadShaFromSSR(),
                                 epoch: jevEpoch, slot, ts: Date.now() });
@@ -28589,6 +28633,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(jevValidatedResult('comment', { model: 'jev-test', answers: jevMockCommentAnswers() })?.answers.claim_type.choice, 'none');
         ackEq(jevValidatedResult('comment', { model: 'jev-test', answers: { intent: jevMockCommentAnswers().intent } }), null,
             'partial TypeSafe answers must not create a fact badge');
+    });
+
+    ackTest('Jev checks a sole Removed reply to an exact one-line suggestion at the PR head', async () => {
+        const oldLine = '        self.nodes[0].createwallet("target", load_on_startup=False)';
+        const newLine = '        self.nodes[0].createwallet("target")';
+        const state = {
+            selected_comment: 'Removed', exact_request: true, evidence_complete: true,
+            head_file_complete: true, head: 'f'.repeat(40),
+            thread_request: `\`\`\`diff\n-${oldLine}\n+${newLine}\n\`\`\`\n\nThis argument doesn't seem necessary.`,
+            anchor: { path: 'test/functional/wallet_chain_reprocess.py', diff_hunk: `@@ -0,0 +1,71 @@\n+${oldLine}` },
+            current_head_file: `#!/usr/bin/env python3\n${newLine}\n`,
+            code_evidence: `diff --git a/test/functional/wallet_chain_reprocess.py b/test/functional/wallet_chain_reprocess.py\n+${newLine}\n`,
+        };
+        ackAssert(jevExactSuggestionApplied(state), 'the public PR #35294 reply has an exact supported edit');
+        ackEq(jevExactSuggestionApplied({ ...state, exact_request: false }), null,
+            'another reply in the thread makes the reference ambiguous');
+        ackEq(jevExactSuggestionApplied({ ...state, selected_comment: 'Maybe removed' }), null,
+            'a qualified reply needs Jev interpretation');
+        ackEq(jevExactSuggestionApplied({ ...state, current_head_file: `${oldLine}\n${newLine}\n` }), null,
+            'the old line still present in the file blocks direct support');
+        ackEq(jevExactSuggestionApplied({ ...state, code_evidence: '-unrelated\n+unrelated\n' }), null,
+            'the confirmed PR patch must contain the proposed replacement');
+        ackEq(jevExactSuggestionApplied({ ...state, anchor: { ...state.anchor, diff_hunk: '+unrelated' } }), null,
+            'the suggestion must refer to the anchored old line');
+        ackEq(jevExactSuggestionApplied({ ...state, thread_request: `${state.thread_request}\n\`\`\`diff\n-x\n+y\n\`\`\`` }), null,
+            'multiple suggestions need contextual review');
+        const slot = document.createElement('span');
+        jevRenderExactSuggestion(slot, state);
+        ackEq(slot.textContent, '✅');
+        ackAssert(slot.firstChild.title.includes('exact line comparison') &&
+            slot.firstChild.title.includes('no Jev model call'), 'tooltip identifies the direct method');
+
+        const oldTesting = _ackTesting;
+        const oldEnabled = jevEnabled;
+        const oldParsePR = parsePR;
+        const oldSSRHead = readHeadShaFromSSR;
+        const oldImmediateHead = getImmediatePRHeadSHA;
+        const oldReviewState = jevCommentReviewState;
+        const oldEvaluate = jevEvaluate;
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="review-comment"><div class="review-comment-header">' +
+            '<a class="author" href="/achow101">achow101</a></div>' +
+            '<a href="#discussion_r3268872561"></a><div class="markdown-body">Removed</div></div>';
+        document.body.appendChild(host);
+        let modelCalls = 0;
+        try {
+            jevEnabled = () => true;
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '35294' });
+            readHeadShaFromSSR = () => state.head;
+            getImmediatePRHeadSHA = () => state.head;
+            jevCommentReviewState = async () => ({ ...state,
+                selected_permalink: 'https://github.com/bitcoin/bitcoin/pull/35294#discussion_r3268872561' });
+            jevEvaluate = () => { modelCalls++; return Promise.resolve(null); };
+            _ackTesting = false;
+            queueJevComment(host);
+            _ackTesting = oldTesting;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(host.querySelector('.ack-jev-comment-badges .ack-jev-badge')?.textContent, '✅',
+                'the visible reply gets an immediate verified-edit badge');
+            ackEq(modelCalls, 0, 'the exact edit does not spend a Jev request');
+        } finally {
+            _ackTesting = oldTesting;
+            jevEnabled = oldEnabled;
+            parsePR = oldParsePR;
+            readHeadShaFromSSR = oldSSRHead;
+            getImmediatePRHeadSHA = oldImmediateHead;
+            jevCommentReviewState = oldReviewState;
+            jevEvaluate = oldEvaluate;
+            jevCommentKnownPermalinks.delete('https://github.com/bitcoin/bitcoin/pull/35294#discussion_r3268872561');
+            host.remove();
+        }
     });
 
     ackTest('Jev comment patch evidence selects exact file across commits and marks clips', () => {
