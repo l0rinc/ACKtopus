@@ -6730,15 +6730,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         jevCacheMemory = null;
         resetInMemoryCaches();
         jevEpoch++;
-        document.querySelectorAll('.ack-jev-badges, .ack-jev-stack-summary').forEach((badge) => badge.remove());
-        resetJevTrackers();
-        if (jevEnabled() && parsePR()) {
-            queueJevPageAnnotations();
-            for (const container of leafLazyCommentContainers()) {
-                const bounds = container.getBoundingClientRect();
-                if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
-            }
-        }
+        clearJevAnnotations();
+        jevRequeueEmptyAnnotations();
         console.log(`ACKtopus: clearAllCaches - removed ${count} GM entries + in-memory caches`);
         return count;
     }
@@ -6786,9 +6779,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         jevConfigured = false;
         jevStackRejected = false;
         jevEpoch++;
-        document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
-        document.querySelectorAll('.ack-jev-stack-summary').forEach((summary) => summary.remove());
-        resetJevTrackers();
+        clearJevAnnotations();
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
         return count;
     }
@@ -7583,14 +7574,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     resetJevTrackers();
                 }
                 queueJevPageAnnotations();
-                for (const container of leafLazyCommentContainers()) {
-                    const bounds = container.getBoundingClientRect();
-                    if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
-                }
+                queueVisibleJevComments();
             } else {
-                document.querySelectorAll('.ack-jev-badges').forEach((badge) => badge.remove());
-                document.querySelectorAll('.ack-jev-stack-summary').forEach((summary) => summary.remove());
-                resetJevTrackers();
+                clearJevAnnotations();
             }
         });
 
@@ -16678,15 +16664,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         catch (_) { return false; }
     }
 
+    function queueVisibleJevComments() {
+        for (const container of leafLazyCommentContainers()) {
+            const bounds = container.getBoundingClientRect();
+            if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+        }
+    }
+
+    // Remove every Jev badge and stack summary and forget what was annotated.
+    function clearJevAnnotations() {
+        document.querySelectorAll('.ack-jev-badges, .ack-jev-stack-summary').forEach((element) => element.remove());
+        resetJevTrackers();
+    }
+
     function jevRequeueEmptyAnnotations(root = document) {
         if (!jevEnabled() || !parsePR()) return;
         root.querySelectorAll('.ack-jev-badges:empty').forEach((slot) => slot.remove());
         resetJevTrackers();
         queueJevPageAnnotations();
-        for (const container of leafLazyCommentContainers()) {
-            const bounds = container.getBoundingClientRect();
-            if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
-        }
+        queueVisibleJevComments();
     }
 
     function jevRetryPublicCheck(key, root = document) {
@@ -17078,11 +17074,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (current && jevCommentPRKey(current) === prefix) {
                 document.querySelectorAll('.ack-jev-comment-badges').forEach((slot) => slot.remove());
                 setTimeout(() => {
-                    if (!jevEnabled() || jevCommentPRKey(parsePR() || {}) !== prefix) return;
-                    for (const container of leafLazyCommentContainers()) {
-                        const bounds = container.getBoundingClientRect();
-                        if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
-                    }
+                    if (jevEnabled() && jevCommentPRKey(parsePR() || {}) === prefix) queueVisibleJevComments();
                 }, 150);
             }
         }
