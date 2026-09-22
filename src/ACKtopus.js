@@ -17387,8 +17387,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         for (const mutation of mutations) {
             const target = mutation.target?.nodeType === 3 ? mutation.target.parentElement : mutation.target;
-            if (!target?.closest || isAckOwnedMutationRoot(target)) continue;
+            if (!target?.closest) continue;
             const body = target.closest(MARKDOWN_BODY_SELECTOR);
+            // Updates inside ACKtopus's own in-body badges are never edits.
+            if (body && isAckOwnedMutationRoot(target)) continue;
             const root = jevCommentThreadRoot(body || target, target.closest(COMMENT_CONTAINER_BASE_SELECTOR));
             if (body) {
                 const previous = jevCommentSeenBodies.get(body);
