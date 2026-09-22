@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.259
+// @version      1.260
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -3331,6 +3331,10 @@
                 method: 'GET',
                 url,
                 headers,
+                // Text reads keep the current GitHub session. In particular,
+                // page HTML must include a just-created pending review comment.
+                // Public-proof callers use gmFetch(..., { anonymous: true }).
+                anonymous: false,
                 onload: (response) => {
                     if (_githubTextResetGeneration !== resetGeneration ||
                         githubHttpCacheGeneration(url) !== generation ||
@@ -15017,7 +15021,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return false;
             }
 
-            const html = await gmFetchPageText(location.href, { force: true });
+            const html = await gmFetchPageText(location.href, { force: true, pageSessionFallback: true });
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const freshThread =
                 doc
@@ -16573,7 +16577,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevCommentResetGeneration = 0;
     const JEV_COMMENT_LIST_PAGE_SIZE = 100;
     const JEV_COMMENT_LIST_MAX_PAGES = 10;
-    const JEV_COMMENT_LIST_TTL_MS = 60 * 1000;
+    // Public comment pages are expensive under GitHub's anonymous 60 req/hr
+    // limit. Visible edits, additions, deletions, and ACKtopus writes explicitly
+    // mark these pages stale, so unchanged lists can be shared much longer.
+    const JEV_COMMENT_LIST_TTL_MS = 10 * 60 * 1000;
+    const JEV_COMMENT_EVIDENCE_TTL_MS = 60 * 1000;
+    const JEV_COMMENT_BADGE_REUSE_MS = 10 * 60 * 1000;
     let jevAnonymousCommentWarned = false;
 
     function resetJevCommentCaches() {
@@ -16807,7 +16816,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const epoch = jevEpoch;
         const id = jevCacheId(kind, state);
         const cached = jevReadCache(id);
-        if (cached) return jevPublicRepository(pr).then((isPublic) => isPublic && epoch === jevEpoch && jevEnabled() ? cached : null);
+        // A local result sends no repository content anywhere. Public proof is
+        // required immediately before a new TypeSafe request, not to display a
+        // result already stored in this browser.
+        if (cached) return Promise.resolve(epoch === jevEpoch && jevEnabled() ? cached : null);
         if (jevPending.has(id)) return jevPending.get(id);
         const pageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
         if (pageKey !== jevPageKey) { jevPageKey = pageKey; jevPageRequests = 0; }
@@ -17140,7 +17152,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const immediateHead = readHeadShaFromSSR();
         const key = `${pr.owner}/${pr.repo}#${pr.pr}:${immediateHead}`;
         const snapshot = jevCommentEvidenceSnapshots.get(key);
-        if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_LIST_TTL_MS) return snapshot.evidence;
+        if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) return snapshot.evidence;
         if (jevCommentEvidenceRequests.has(key)) return jevCommentEvidenceRequests.get(key);
         const request = (async () => {
             const info = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
@@ -17201,7 +17213,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             exact_request: false, head_file_complete: false,
             evidence_note: 'Current-head code evidence unavailable',
         };
-        // The public gate runs before fetching evidence for a TypeSafe request.
+        // Fail closed before any authenticated evidence fetch. jevEvaluate
+        // checks again immediately before a new TypeSafe request.
         if (!(await jevPublicRepository(pr))) return null;
         let snapshot = await jevCommentPublicSnapshot(pr, identity.kind);
         const truncated = !!snapshot?.truncated;
@@ -17484,7 +17497,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const ssrHead = readHeadShaFromSSR();
             if (previous?.hash === originalHash && previous.head === ssrHead &&
                 previous.epoch === jevEpoch && previous.slot?.isConnected &&
-                previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_LIST_TTL_MS) continue;
+                previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_BADGE_REUSE_MS) continue;
             if (previous && (previous.head !== ssrHead || previous.epoch !== jevEpoch)) {
                 previous.slot?.remove();
                 jevCommentSeenBodies.delete(body);
@@ -17828,11 +17841,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const alias = jevCacheId('commit', { repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg });
         const cached = jevReadCache(alias);
         if (cached) {
-            jevPublicRepository(pr).then((isPublic) => {
-                if (isPublic && slot.isConnected && slot.dataset.ackJevId === id) {
-                    jevRender(slot, 'commit', cached, `${sha.slice(0, 12)} parent-relative patch`, cached.partial);
-                }
-            });
+            if (slot.isConnected && slot.dataset.ackJevId === id) {
+                jevRender(slot, 'commit', cached, `${sha.slice(0, 12)} parent-relative patch`, cached.partial);
+            }
             return;
         }
         // The patch comes from the shared per-commit cache (also used by the
@@ -28772,6 +28783,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let edited = false;
         let incomplete = false;
         try {
+            ackEq(JEV_COMMENT_LIST_TTL_MS, 10 * 60 * 1000,
+                'unchanged anonymous lists are reused for ten minutes');
+            ackEq(JEV_COMMENT_EVIDENCE_TTL_MS, 60 * 1000,
+                'mutable current-head evidence keeps its shorter freshness window');
             jevAnonymousCommentJson = async (url) => {
                 calls++;
                 if (url.includes('/pulls/8/comments?') && url.endsWith('page=1')) return firstPage;
@@ -29432,7 +29447,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const pr = { owner: 'acktopus-public-fixture', repo: 'example', pr: '8' };
+        const publicKey = 'acktopus-public-fixture/example';
         const values = new Map([['jev_enabled', true], ['jev_api_key', 'synthetic-key']]);
+        let gets = 0;
         let posts = 0;
         try {
             jevCacheMemory = null;
@@ -29441,6 +29458,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_setValue = (key, value) => values.set(key, value);
             GM_xmlhttpRequest = (opts) => {
                 if (opts.method === 'GET') {
+                    gets++;
                     ackAssert(opts.anonymous, 'public check must be anonymous');
                     opts.onload({ status: 200, responseText: '{"private":false}' });
                 } else {
@@ -29453,14 +29471,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const before = { selected_comment: 'The old bound looks wrong' };
             const after = { selected_comment: 'The revised overflow check looks wrong' };
             ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
+            ackEq(gets, 1, 'a new TypeSafe request proves the repository is public');
+            jevPublicChecks.delete(publicKey);
             ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
+            ackEq(gets, 1, 'displaying the local result performs no public GitHub request');
             ackEq((await jevEvaluate(pr, 'comment', after))?.answers.intent.choice, 'concern');
+            ackEq(gets, 2, 'edited evidence requires a new public check before upload');
             ackEq(posts, 2, 'the edit must miss the old evidence cache');
         } finally {
             GM_getValue = oldGet;
             GM_setValue = oldSet;
             GM_xmlhttpRequest = oldRequest;
-            jevPublicChecks.delete('acktopus-public-fixture/example');
+            jevPublicChecks.delete(publicKey);
             jevPageKey = oldPageKey;
             jevPageRequests = oldPageRequests;
             jevCacheMemory = oldCacheMemory;
@@ -41770,6 +41792,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                     : { status: 200, responseText: count === 3 ? 'new HTML' : 'old HTML', responseHeaders: 'etag: "html-v1"' });
             };
             ackEq(await gmFetchPageText(url), 'old HTML', 'loads the page');
+            ackEq(calls[0].anonymous, false, 'page HTML carries the current GitHub session');
             ackEq(await gmFetchPageText(url), 'old HTML', 'validates before reusing HTML');
             ackEq(calls[1].headers['If-None-Match'], '"html-v1"', 'sends the session ETag');
             ackEq(await gmFetchPageText(url, { force: true }), 'new HTML', 'force reloads nonce-bearing HTML');
@@ -49605,6 +49628,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(!fn.includes('location.reload'), 'does not reload');
         ackAssert(!fn.includes('location.href ='), 'does not assign location.href');
+        ackAssert(fn.includes('pageSessionFallback: true'),
+            'falls back to the page session if the centralized userscript request fails');
     });
 
     ackTest('startReviewFromReplyForm clears draft before reload fallback', () => {
