@@ -17004,8 +17004,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function jevPlainCommentTextDiffers(source, visible) {
         // Markdown changes its rendered text, but plain prose should match. If
         // GitHub has edited a simple comment since this page rendered, wait
-        // for the visible comment to update before annotating it.
-        if (/[`*_~\[\]<>#|\\]/.test(source)) return false;
+        // for the visible comment to update before annotating it. GitHub also
+        // rewrites plain text: full commit SHAs render as 7-character links,
+        // PR URLs as #N, :shortcodes: as emoji, and &entities; as characters.
+        if (/[`*_~\[\]<>#|\\:&]/.test(source) || /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/i.test(source)) return false;
         const normalized = (text) => String(text || '').replace(/\s+/g, ' ').trim();
         return normalized(source) !== normalized(visible);
     }
@@ -28848,6 +28850,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCommentCacheVersions.set(versionKey, oldVersion);
             jevConfigured = oldConfigured;
         }
+    });
+
+    ackTest('Jev staleness check skips text GitHub rewrites when rendering', () => {
+        const sha = '0123456789abcdef0123456789abcdef01234567';
+        ackEq(jevPlainCommentTextDiffers(`ACK ${sha}`, 'ACK 0123456'), false, 'full SHAs render shortened');
+        ackEq(jevPlainCommentTextDiffers('see https://github.com/bitcoin/bitcoin/pull/1', 'see #1'), false,
+            'PR URLs render as references');
+        ackEq(jevPlainCommentTextDiffers('Thanks :+1:', 'Thanks 👍'), false, 'emoji shortcodes render as emoji');
+        ackEq(jevPlainCommentTextDiffers('Please add a test', 'Please add a regression test'), true,
+            'a real edit of plain prose is still detected');
+        ackEq(jevPlainCommentTextDiffers('This was defaced', 'This was repaired'), true,
+            'hex-looking words without digits are still compared');
     });
 
     ackTest('Jev ignores ACKtopus decorations inside a comment body', () => {
