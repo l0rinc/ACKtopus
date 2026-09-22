@@ -16946,6 +16946,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return commits.at(-1)?.[1] || '';
     }
 
+    // Comment text as GitHub rendered it. ACKtopus decorations inside a body,
+    // such as PGP signature badges, must not read as an edit or a stale page.
+    function jevCommentText(body) {
+        if (!body) return '';
+        if (!body.querySelector?.(ACK_MUTATION_OWNED_SELECTOR)) return body.textContent?.trim() || '';
+        const clone = body.cloneNode(true);
+        clone.querySelectorAll(ACK_MUTATION_OWNED_SELECTOR).forEach((element) => element.remove());
+        return clone.textContent?.trim() || '';
+    }
+
+    function jevCommentTextHash(body) {
+        return hashPrompt(jevCommentText(body));
+    }
+
     function jevCommentOwnPermalink(body) {
         const own = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [id^="discussion_r"], [data-testid="review-comment"]');
         if (!own || own.querySelectorAll(MARKDOWN_BODY_SELECTOR).length !== 1) return '';
@@ -17162,7 +17176,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const cacheVersion = jevCommentCacheVersions.get(cacheKey) || 0;
         const currentVersion = () => resetGeneration === jevCommentResetGeneration &&
             (jevCommentCacheVersions.get(cacheKey) || 0) === cacheVersion;
-        const visibleText = body.textContent?.trim() || '';
+        const visibleText = jevCommentText(body);
         const permalink = jevCommentOwnPermalink(body);
         const identity = jevCommentPublicIdentity(pr, permalink);
         if (!identity || body.closest('.js-pending-review-comment, [id^="pullrequest-"]') ||
@@ -17361,14 +17375,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         for (const mutation of mutations) {
             const target = mutation.target?.nodeType === 3 ? mutation.target.parentElement : mutation.target;
-            if (!target?.closest) continue;
+            if (!target?.closest || isAckOwnedMutationRoot(target)) continue;
             const body = target.closest(MARKDOWN_BODY_SELECTOR);
             const root = jevCommentThreadRoot(body || target, target.closest(COMMENT_CONTAINER_BASE_SELECTOR));
             if (body) {
                 const previous = jevCommentSeenBodies.get(body);
                 const expected = previous?.hash ?? jevCommentPendingHashes.get(body) ??
                     jevCommentObservedHashes.get(body);
-                if (expected !== undefined && expected !== hashPrompt(body.textContent?.trim() || '') ||
+                if (expected !== undefined && expected !== jevCommentTextHash(body) ||
                     expected === undefined && mutation.type === 'characterData' &&
                     !!root?.querySelector?.('.ack-jev-comment-badges')) {
                     add(root, body);
@@ -17383,14 +17397,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const replacement = permalink && [...(root?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])]
                         .find((candidate) => candidate !== removed &&
                             jevCommentOwnPermalink(candidate) === permalink &&
-                            hashPrompt(candidate.textContent?.trim() || '') ===
-                            hashPrompt(removed.textContent?.trim() || ''));
+                            jevCommentTextHash(candidate) === jevCommentTextHash(removed));
                     if (replacement) {
                         stableBodies.add(replacement);
                         const record = jevCommentSeenBodies.get(removed);
                         if (record) jevCommentSeenBodies.set(replacement, record);
                         jevCommentSeenBodies.delete(removed);
-                        jevCommentObservedHashes.set(replacement, hashPrompt(replacement.textContent?.trim() || ''));
+                        jevCommentObservedHashes.set(replacement, jevCommentTextHash(replacement));
                         continue;
                     }
                     if (jevCommentSeenBodies.has(removed) || jevCommentPendingBodies.has(removed) ||
@@ -17403,7 +17416,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         if (stableBodies.has(added)) continue;
                         const permalink = jevCommentOwnPermalink(added);
                         const known = permalink && jevCommentKnownPermalinks.get(permalink);
-                        if (known?.hash === hashPrompt(added.textContent?.trim() || '')) continue;
+                        if (known?.hash === jevCommentTextHash(added)) continue;
                         add(root, added);
                     }
                 }
@@ -17419,7 +17432,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const previous = jevCommentSeenBodies.get(body);
                 previous?.slot?.remove();
                 jevCommentSeenBodies.delete(body);
-                jevCommentObservedHashes.set(body, hashPrompt(body.textContent?.trim() || ''));
+                jevCommentObservedHashes.set(body, jevCommentTextHash(body));
             }
             const oldTimer = jevCommentRefreshTimers.get(root);
             if (oldTimer) clearTimeout(oldTimer);
@@ -17437,7 +17450,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!pr) return;
         const prVersion = jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0;
         for (const body of container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || []) {
-            const text = body.textContent?.trim();
+            const text = jevCommentText(body);
             if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
             const originalHash = hashPrompt(text);
             let previous = jevCommentSeenBodies.get(body);
@@ -17479,7 +17492,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     jevCommentSeenBodies.delete(body);
                     return;
                 }
-                if (!jevEnabled() || !body.isConnected || hashPrompt(body.textContent?.trim() || '') !== originalHash ||
+                if (!jevEnabled() || !body.isConnected || jevCommentTextHash(body) !== originalHash ||
                     (jevCommentThreadVersions.get(thread) || 0) !== threadVersion ||
                     (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) !== prVersion) return;
                 const id = jevCacheId('comment', state);
@@ -17492,7 +17505,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return evaluation.then((result) => {
                     const currentHead = getImmediatePRHeadSHA();
                     if (slot.isConnected && slot.dataset.ackJevId === id &&
-                        hashPrompt(body.textContent?.trim() || '') === originalHash &&
+                        jevCommentTextHash(body) === originalHash &&
                         (jevCommentThreadVersions.get(thread) || 0) === threadVersion &&
                         (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) === prVersion &&
                         (!currentHead || !state.head || currentHead === state.head)) {
@@ -17514,7 +17527,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }).finally(() => {
                 jevCommentPendingBodies.delete(body);
                 jevCommentPendingHashes.delete(body);
-                if (body.isConnected && (hashPrompt(body.textContent?.trim() || '') !== originalHash ||
+                if (body.isConnected && (jevCommentTextHash(body) !== originalHash ||
                     (jevCommentThreadVersions.get(thread) || 0) !== threadVersion ||
                     (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) !== prVersion)) {
                     setTimeout(() => { if (thread.isConnected) queueJevComment(thread); }, 0);
@@ -28833,6 +28846,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCommentRefreshTimers.delete(root);
             jevAnonymousCommentLists.delete(listKey);
             jevCommentCacheVersions.set(versionKey, oldVersion);
+            jevConfigured = oldConfigured;
+        }
+    });
+
+    ackTest('Jev ignores ACKtopus decorations inside a comment body', () => {
+        const oldConfigured = jevConfigured;
+        const pr = parsePR();
+        const prKey = `${pr.owner}/${pr.repo}#${pr.pr}`;
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment"><div class="comment-body markdown-body"><p>ACK abc</p>' +
+            '<details><summary>Show Signature</summary><pre>sig</pre></details></div></div>';
+        document.body.appendChild(host);
+        const body = host.querySelector('.comment-body');
+        const before = _githubHttpPrGenerations.get(prKey) || 0;
+        try {
+            jevConfigured = true;
+            jevCommentObservedHashes.set(body, jevCommentTextHash(body));
+            const summary = host.querySelector('summary');
+            const badge = document.createElement('span');
+            badge.className = 'ack-pgp-badge';
+            badge.textContent = '⏳';
+            summary.appendChild(badge);
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: summary, addedNodes: [badge], removedNodes: [] }]);
+            const pending = badge.firstChild;
+            badge.textContent = '✅';
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: badge, addedNodes: [badge.firstChild], removedNodes: [pending] }]);
+            ackEq(_githubHttpPrGenerations.get(prKey) || 0, before, 'a PGP badge is not a comment edit');
+            ackEq(jevCommentText(body), 'ACK abcShow Signaturesig', 'visible text excludes ACKtopus badges');
+            ackAssert(badge.isConnected, 'the badge itself is untouched');
+            host.querySelector('p').textContent = 'ACK abc, retested';
+            jevInvalidateChangedCommentBadges([{ type: 'childList', target: host.querySelector('p'), addedNodes: [], removedNodes: [] }]);
+            ackEq(_githubHttpPrGenerations.get(prKey) || 0, before + 1, 'a real text edit still invalidates');
+        } finally {
+            const timer = jevCommentRefreshTimers.get(jevCommentThreadRoot(body));
+            if (timer) clearTimeout(timer);
+            jevCommentObservedHashes.delete(body);
+            host.remove();
             jevConfigured = oldConfigured;
         }
     });
