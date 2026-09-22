@@ -16839,15 +16839,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return pending;
     }
 
-    function jevBadge(slot, emoji, meaning, signal, result, evidence) {
+    // An emoji badge whose tooltip doubles as its accessible name.
+    function jevAppendBadge(slot, emoji, detail) {
         const badge = document.createElement('span');
         badge.className = 'ack-jev-badge';
         badge.textContent = emoji;
-        const detail = `${meaning}\nJev signal: ${signal}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; check the full code and tests.`;
         badge.title = detail;
         badge.setAttribute('role', 'img');
         badge.setAttribute('aria-label', detail);
         slot.appendChild(badge);
+    }
+
+    function jevBadge(slot, emoji, meaning, signal, result, evidence) {
+        jevAppendBadge(slot, emoji,
+            `${meaning}\nJev signal: ${signal}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; check the full code and tests.`);
     }
 
     function jevCommentFactSignals(result, state) {
@@ -16915,16 +16920,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevRenderExactSuggestion(slot, state) {
         slot.replaceChildren();
-        const badge = document.createElement('span');
-        badge.className = 'ack-jev-badge';
-        badge.textContent = '✅';
-        badge.title = `The exact one-line review suggestion is present in the current PR head file, and its old line is absent.\n` +
+        jevAppendBadge(slot, '✅',
+            `The exact one-line review suggestion is present in the current PR head file, and its old line is absent.\n` +
             `Evidence: ${state.anchor?.path || 'reviewed file'} at ${state.head?.slice(0, 12) || 'current head'}\n` +
             'Method: exact line comparison of the public review suggestion, current PR patch, and full head file; no Jev model call.\n' +
-            'This checks the requested edit, not overall correctness.';
-        badge.setAttribute('role', 'img');
-        badge.setAttribute('aria-label', badge.title);
-        slot.appendChild(badge);
+            'This checks the requested edit, not overall correctness.');
     }
 
     function jevCommentPatchForFile(patch, path, maxChars = 12000) {
@@ -17665,13 +17665,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function jevRenderStack(slot, result, evidence, partial = false) {
         slot.replaceChildren();
         if (partial) {
-            const badge = document.createElement('span');
-            badge.className = 'ack-jev-badge';
-            badge.textContent = '📎';
-            badge.title = `Stack evidence is incomplete; inspect the full commit sequence and patches\nEvidence: ${evidence}\nNo stack-level conclusion was drawn.`;
-            badge.setAttribute('role', 'img');
-            badge.setAttribute('aria-label', badge.title);
-            slot.appendChild(badge);
+            jevAppendBadge(slot, '📎',
+                `Stack evidence is incomplete; inspect the full commit sequence and patches\nEvidence: ${evidence}\nNo stack-level conclusion was drawn.`);
             if (slot.parentElement) slot.parentElement.hidden = false;
             return;
         }
