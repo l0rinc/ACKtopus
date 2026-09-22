@@ -3072,19 +3072,38 @@
     }
 
     const _githubHttpPrGenerations = new Map();
+    const _githubHttpPrStaleAfter = new Map();
 
     function githubHttpCacheGeneration(url) {
         return _githubHttpPrGenerations.get(githubHttpCachePRKey(url)) || 0;
     }
 
-    function invalidateGithubHttpCacheForPR(prKey) {
-        if (!prKey) return 0;
+    // A stored response may skip revalidation only while it is fresh and was
+    // last confirmed after its PR was last marked stale.
+    function githubHttpCacheIsFresh(url, cached, freshness) {
+        const checkedAt = Math.max(cached.ts, _githubHttpValidationTimes.get(cached.key) || 0);
+        return Date.now() - checkedAt < freshness &&
+            checkedAt > (_githubHttpPrStaleAfter.get(githubHttpCachePRKey(url)) || 0);
+    }
+
+    // After an edit or write, keep the PR's stored bodies as ETag validators:
+    // unchanged pages come back as 304s instead of full downloads. Every reader
+    // revalidates first, and responses already in flight are discarded.
+    function markGithubHttpCacheStaleForPR(prKey) {
+        if (!prKey) return;
         _githubHttpPrGenerations.set(prKey, (_githubHttpPrGenerations.get(prKey) || 0) + 1);
+        _githubHttpPrStaleAfter.set(prKey, Date.now());
         invalidateGithubGraphQLForPR(prKey);
         if (_reviewCommitMap?.prKey === prKey) _reviewCommitMap = null;
         if (_reviewCommitMapRequest?.prKey === prKey) _reviewCommitMapRequest = null;
         const contextKey = prKey.replace('#', '/');
         if (_prContextKey.startsWith(`${contextKey}:`) || _prReplyRowsKey === contextKey) invalidatePRContext();
+    }
+
+    // Explicit cache clearing also drops the stored bodies.
+    function invalidateGithubHttpCacheForPR(prKey) {
+        if (!prKey) return 0;
+        markGithubHttpCacheStaleForPR(prKey);
         const entries = readGithubHttpCacheIndex();
         const kept = [];
         let removed = 0;
@@ -3163,7 +3182,7 @@
         const cached = readGithubHttpCache(url, baseHeaders, Date.now(), anonymous);
         const freshness = freshForMs === undefined ? githubHttpFreshForMs(url) :
             Math.max(0, Math.min(GITHUB_HTTP_CACHE_MAX_AGE_MS, Number(freshForMs) || 0));
-        if (cached && Date.now() - Math.max(cached.ts, _githubHttpValidationTimes.get(cached.key) || 0) < freshness) {
+        if (cached && githubHttpCacheIsFresh(url, cached, freshness)) {
             return Promise.resolve(cached.data);
         }
 
@@ -3206,8 +3225,7 @@
                         delete fallbackBaseHeaders.Authorization;
                         const fallbackCached = readGithubHttpCache(url, fallbackBaseHeaders);
                         const fallbackHeaders = githubConditionalHeaders(fallbackBaseHeaders, fallbackCached);
-                        if (fallbackCached && Date.now() - Math.max(fallbackCached.ts,
-                            _githubHttpValidationTimes.get(fallbackCached.key) || 0) < freshness) {
+                        if (fallbackCached && githubHttpCacheIsFresh(url, fallbackCached, freshness)) {
                             resolve(fallbackCached.data);
                             return;
                         }
@@ -14684,7 +14702,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const msg = json?.error || json?.message || resp.statusText || 'request failed';
             throw new Error(`create_review_comment HTTP ${resp.status}: ${msg}`);
         }
-        invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        markGithubHttpCacheStaleForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         jevInvalidateCommentCachesForPR(pr);
         return json;
     }
@@ -17426,7 +17444,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         if (!changed.size) return;
         jevInvalidateCommentCachesForPR(pr, false);
-        invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
+        markGithubHttpCacheStaleForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         for (const [root, changedBodies] of changed) {
             jevCommentThreadVersions.set(root, (jevCommentThreadVersions.get(root) || 0) + 1);
             root.querySelectorAll?.('.ack-jev-comment-badges').forEach((slot) => slot.remove());
@@ -40075,6 +40093,32 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             else GM_setValue('github_pat', originalPat);
             _githubBadPat = previousBadPat;
             _patInvalidWarned = previousWarned;
+        }
+    });
+
+    ackTest('a PR edit revalidates cached pages instead of downloading them again', async () => {
+        const url = 'https://api.github.com/repos/ack-cache-test/demo/issues/95/comments';
+        const originalRequest = GM_xmlhttpRequest;
+        const sentEtags = [];
+        try {
+            GM_xmlhttpRequest = (opts) => {
+                sentEtags.push(opts.headers['If-None-Match'] || '');
+                if (opts.headers['If-None-Match'] === '"v1"') {
+                    opts.onload({ status: 304, responseText: '', responseHeaders: 'etag: "v1"' });
+                } else {
+                    opts.onload({ status: 200, responseText: '[{"id":1}]', responseHeaders: 'etag: "v1"' });
+                }
+            };
+            ackDeepEq(await gmFetch(url), [{ id: 1 }]);
+            ackDeepEq(await gmFetch(url), [{ id: 1 }]);
+            ackEq(sentEtags.length, 1, 'a fresh response is reused without a request');
+            markGithubHttpCacheStaleForPR('ack-cache-test/demo#95');
+            ackAssert(readGithubHttpCache(url, ghApiHeaders()), 'the stored body stays as a validator');
+            ackDeepEq(await gmFetch(url), [{ id: 1 }], 'an unchanged page is served after a 304');
+            ackDeepEq(sentEtags, ['', '"v1"'], 'the edit forces one conditional request inside the fresh window');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            invalidateGithubHttpCacheForPR('ack-cache-test/demo#95');
         }
     });
 
