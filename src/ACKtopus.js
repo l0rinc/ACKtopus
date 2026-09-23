@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.260
+// @version      1.261
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -16972,14 +16972,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return commits.at(-1)?.[1] || '';
     }
 
+    function textWithoutAcktopusDecorations(element) {
+        if (!element) return '';
+        if (!element.querySelector?.(ACK_MUTATION_OWNED_SELECTOR)) return element.textContent?.trim() || '';
+        const clone = element.cloneNode(true);
+        clone.querySelectorAll(ACK_MUTATION_OWNED_SELECTOR).forEach((element) => element.remove());
+        return clone.textContent?.trim() || '';
+    }
+
     // Comment text as GitHub rendered it. ACKtopus decorations inside a body,
     // such as PGP signature badges, must not read as an edit or a stale page.
     function jevCommentText(body) {
-        if (!body) return '';
-        if (!body.querySelector?.(ACK_MUTATION_OWNED_SELECTOR)) return body.textContent?.trim() || '';
-        const clone = body.cloneNode(true);
-        clone.querySelectorAll(ACK_MUTATION_OWNED_SELECTOR).forEach((element) => element.remove());
-        return clone.textContent?.trim() || '';
+        return textWithoutAcktopusDecorations(body);
     }
 
     function jevCommentTextHash(body) {
@@ -18588,10 +18592,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const header = document.querySelector(
             '.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2',
         );
-        // Clone header and remove our injected elements before reading text
-        const headerClone = header?.cloneNode(true);
-        headerClone?.querySelectorAll('.ack-commit-explain, .ack-commit-proofread').forEach((el) => el.remove());
-        const msg = headerClone?.textContent?.trim()?.split('\n')[0]?.trim() || '';
+        // Read only GitHub's title. Jev badges and every other ACKtopus control
+        // are descendants of this heading and must not become comment text.
+        const msg = textWithoutAcktopusDecorations(header).split('\n')[0]?.trim() || '';
         return `> [${shortSha}](${url}) _${msg}_:\n\n`;
     }
 
@@ -49742,6 +49745,33 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackAssert(result.startsWith('> [abc1234]('), 'should start with blockquote and short SHA link');
             ackAssert(result.includes('/pull/42/changes/abc1234def'), 'should include full URL');
             ackAssert(result.includes('_test: example commit_'), 'should include italicized commit title');
+        } finally {
+            document.querySelector = origQs;
+        }
+    });
+
+    ackTest('buildCommitPrefix excludes Jev and ACKtopus commit-title suffixes', () => {
+        const origQs = document.querySelector;
+        try {
+            const heading = document.createElement('h2');
+            heading.className = 'commit-title ack-commit-heading';
+            heading.innerHTML = '<span data-component="Text">move-only: Extract ProcessSendTxRcncl() helper</span>' +
+                '<span class="ack-commit-heading-actions"><button class="ack-commit-proofread">Proofread</button></span>' +
+                '<span class="ack-jev-badges"><span class="ack-jev-badge">🧹</span></span>';
+            document.querySelector = (selector) => selector.includes('commit-title')
+                ? heading : origQs.call(document, selector);
+            const result = buildCommitPrefix(
+                '/bitcoin/bitcoin/pull/35502/changes/6bba1fc96b4aa6a80a84f1654ea4994958e57414',
+            );
+            ackEq(
+                result,
+                '> [6bba1fc](https://github.com/bitcoin/bitcoin/pull/35502/changes/' +
+                    '6bba1fc96b4aa6a80a84f1654ea4994958e57414) ' +
+                    '_move-only: Extract ProcessSendTxRcncl() helper_:\n\n',
+                'only the GitHub commit title is inserted',
+            );
+            ackAssert(!result.includes('🧹') && !result.includes('Proofread'),
+                'ACKtopus controls never leak into the comment prefix');
         } finally {
             document.querySelector = origQs;
         }
