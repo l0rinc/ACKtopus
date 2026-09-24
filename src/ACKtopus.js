@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.263
+// @version      1.264
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -325,7 +325,7 @@
         if (branchLinks.length < 2) return false;
         const headLink = branchLinks[branchLinks.length - 1];
         const currentText = headLink.textContent?.trim() || '';
-        const branchOnly = readHeadBranchFromSSR() || currentText.replace(/^[^:]+:/, '').trim();
+        const branchOnly = (readHeadBranchFromSSR() || currentText).replace(/^[^:]+:/, '').trim();
         if (!branchOnly) return false;
 
         headLink.textContent = branchOnly;
@@ -38276,7 +38276,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let copied = '';
         try {
             isPRPage = () => true;
-            readHeadBranchFromSSR = () => '';
+            readHeadBranchFromSSR = () => 'l0rinc:l0rinc/mempool-mined-witness-weight-demo';
             GM_setClipboard = (text) => {
                 copied = text;
             };
@@ -38287,8 +38287,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 <span class="PullRequestHeaderSummary-module__summaryContainer__dA7dP">
                     <a href="/bitcoin/bitcoin/tree/master">bitcoin:master</a>
                     <div>
-                        <a id="ack-head-branch" href="/octo/demo/tree/topic/test-macos-bind-netutil" aria-describedby="ack-head-tip">octo:topic/test-macos-bind-netutil</a>
-                        <span id="ack-head-tip">octo/demo:topic/test-macos-bind-netutil</span>
+                        <a id="ack-head-branch" href="/l0rinc/bitcoin/tree/l0rinc/mempool-mined-witness-weight-demo" aria-describedby="ack-head-tip">l0rinc:l0rinc/mempool-mined-witness-weight-demo</a>
+                        <span id="ack-head-tip">l0rinc:l0rinc/mempool-mined-witness-weight-demo</span>
                         <button type="button" data-component="IconButton" aria-labelledby="ack-copy-tip">copy</button>
                         <span id="ack-copy-tip">Copy head branch name to clipboard</span>
                     </div>
@@ -38299,12 +38299,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ackEq(normalizePRHeaderHeadBranch(host), true, 'normalizes PR header branch summary');
                 ackEq(
                     host.querySelector('#ack-head-branch').textContent.trim(),
-                    'topic/test-macos-bind-netutil',
-                    'removes owner prefix from displayed head branch',
+                    'l0rinc/mempool-mined-witness-weight-demo',
+                    'removes owner prefix from the SSR head branch',
                 );
                 ackEq(
                     host.querySelector('#ack-head-tip').textContent.trim(),
-                    'topic/test-macos-bind-netutil',
+                    'l0rinc/mempool-mined-witness-weight-demo',
                     'updates branch tooltip to branch-only text',
                 );
                 ackEq(
@@ -38315,7 +38315,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 host.querySelector('button[data-component="IconButton"]').dispatchEvent(
                     new MouseEvent('click', { bubbles: true, cancelable: true }),
                 );
-                ackEq(copied, 'topic/test-macos-bind-netutil', 'copies branch name without owner prefix');
+                ackEq(
+                    copied,
+                    'l0rinc/mempool-mined-witness-weight-demo',
+                    'copies the repository-qualified branch without GitHub\'s owner prefix',
+                );
             } finally {
                 host.remove();
             }
