@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.262
+// @version      1.263
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -409,6 +409,7 @@
             tip: 'Copy gh CLI command to check out this PR without rebasing it',
             alternateTip: 'Check out this PR and rebase it on the configured base branch',
             alternateHint: '🔁',
+            requiresSha: false,
             fmt: (_sha, pr) =>
                 `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force`,
             alternateFmt: (_sha, pr) => {
@@ -422,6 +423,7 @@
             emoji: '📊',
             label: 'range-diff',
             tip: 'Copy git range-diff since your last ACK (or last force-push)',
+            requiresSha: () => !!userAckSha,
             fmt: (sha) => {
                 if (userAckSha && sha) {
                     return `B=${userAckSha} A=${sha} && git fetch origin $B $A && git range-diff --creation-factor=95 $B...$A`;
@@ -439,6 +441,7 @@
             emoji: '📊',
             label: 'rebase + diff',
             tip: 'Rebase both versions on the base branch and diff (cleanest comparison)',
+            requiresSha: () => !!userAckSha,
             fmt: (sha) => {
                 const base = shellQuoteIfNeeded(getReviewBaseBranch());
                 const command = (before, after) =>
@@ -461,6 +464,7 @@
             tip: 'Copy command to compare the pushed tracking branch with local HEAD before pushing',
             alternateTip: 'Compare the combined effect of the pushed and local stacks as one commit each',
             alternateHint: '🗜️',
+            requiresSha: false,
             fmt: () => prePushRangeDiffCommand(),
             alternateFmt: () => prePushRangeDiffCommand(true),
         },
@@ -471,6 +475,7 @@
             label: 'Run benchmarks',
             tip: 'Build and run changed benchmarks (Release)',
             cond: 'bench',
+            requiresSha: false,
             fmt: (_sha, pr) => {
                 const b = prFileCategories?.bench;
                 if (!b?.length) return null;
@@ -491,6 +496,7 @@
             label: 'Run tests',
             tip: 'Build and run changed unit test suites (Debug)',
             cond: 'test',
+            requiresSha: false,
             fmt: (_sha, pr) => {
                 const t = prFileCategories?.test;
                 if (!t?.length) return null;
@@ -514,6 +520,7 @@
             label: 'Run fuzzers',
             tip: 'Build and run changed fuzz targets',
             cond: 'fuzz',
+            requiresSha: false,
             fmt: () => {
                 const f = prFileCategories?.fuzz;
                 if (!f?.length) return null;
@@ -529,6 +536,7 @@
             label: 'Run functional tests',
             tip: 'Build and run changed functional tests (Debug)',
             cond: 'functional',
+            requiresSha: false,
             fmt: () => {
                 const f = prFileCategories?.functional;
                 return f?.length
@@ -543,6 +551,7 @@
             label: 'clang-format-diff',
             tip: 'Apply clang-format only to changed lines in this PR (uses merge-base vs the upstream base branch)',
             cond: 'cpp',
+            requiresSha: false,
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
@@ -557,6 +566,7 @@
             label: 'clang-tidy-diff',
             tip: 'Run clang-tidy only on changed lines in this PR (configures a separate clang build first)',
             cond: 'cpp',
+            requiresSha: false,
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
@@ -571,6 +581,7 @@
             label: 'IWYU report (changed)',
             tip: 'Report include-what-you-use findings for changed src/*.h,*.cpp files without editing them',
             cond: 'cpp',
+            requiresSha: false,
             fmt: () => {
                 const files = getChangedCppPathArgs();
                 if (!files) return null;
@@ -1847,16 +1858,11 @@
         return new Promise((resolve) => ackRaf(() => resolve()));
     }
 
-    async function copyTextWithSpinner(btn, text, { successContent = '✓', restoreMs = 1000 } = {}) {
+    function copyTextWithFeedback(btn, text, { successContent = '✓', restoreMs = 1000 } = {}) {
         if (!btn || btn.dataset.ackCopyBusy === '1' || !text) return false;
         btn.dataset.ackCopyBusy = '1';
         const origHTML = btn.innerHTML;
-        const stopSpin = startBrailleAnimation((frame) => {
-            btn.textContent = frame;
-        });
-        await waitForNextPaint();
         GM_setClipboard(text);
-        stopSpin();
         if (/<[^>]+>/.test(String(successContent || ''))) btn.innerHTML = String(successContent);
         else btn.textContent = String(successContent || '✓');
         ackSetTimeout(() => {
@@ -1872,12 +1878,23 @@
         const useAlternate = usesAlternateToolbarMode() && typeof fmt.alternateFmt === 'function';
         const formatter = useAlternate ? fmt.alternateFmt : fmt.fmt;
         const compareFmt = fmt.key === 'rdiff' || fmt.key === 'rebasediff';
+        const specialAsync = fmt.key === 'parent' || fmt.key === 'hashes';
+        const requiresSha = !specialAsync && (typeof fmt.requiresSha === 'function'
+            ? fmt.requiresSha()
+            : fmt.requiresSha !== false);
+        // Reading a head already embedded in the page is synchronous. Only show
+        // the waiting animation when this action will actually await GitHub.
+        const immediateSha = requiresSha ? getImmediatePRHeadSHA() : '';
+        const needsAckResolution = compareFmt && !!userAckSha && userAckSha.length < 40;
+        const instantCopy = !specialAsync && (!requiresSha || !!immediateSha) && !needsAckResolution;
         if (mainBtn.dataset.ackCopyBusy === '1') return;
         mainBtn.dataset.ackCopyBusy = '1';
-        const stopSpin = startBrailleAnimation((frame) => {
-            mainBtn.textContent = frame;
-        });
-        await waitForNextPaint();
+        const stopSpin = instantCopy
+            ? () => {}
+            : startBrailleAnimation((frame) => {
+                mainBtn.textContent = frame;
+            });
+        if (!instantCopy) await waitForNextPaint();
         try {
             let text = null;
             if (fmt.key === 'parent' && pr) {
@@ -1885,12 +1902,11 @@
             } else if (fmt.key === 'hashes' && pr) {
                 text = await getPRCommitHashesClipboardText(pr);
             } else {
-                const immediateSha = getImmediatePRHeadSHA();
-                const sha = immediateSha || (await fetchSHA());
+                const sha = requiresSha ? immediateSha || (await fetchSHA()) : '';
                 if (compareFmt && userAckSha && userAckSha.length < 40 && pr) {
                     userAckSha = await resolveFullCommitSha(pr, userAckSha);
                 }
-                text = sha && pr ? await formatter(sha, pr) : null;
+                text = pr && (sha || !requiresSha) ? await formatter(sha, pr) : null;
             }
             stopSpin();
             if (text) {
@@ -11457,7 +11473,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 copyBtn.addEventListener('click', async () => {
                     const text = msg.dataset.ackRawContent || msg._ackBody?.innerText || '';
                     if (!text.trim()) return;
-                    await copyTextWithSpinner(copyBtn, text);
+                    await copyTextWithFeedback(copyBtn, text);
                 });
                 const body = document.createElement('div');
                 body.style.paddingRight = '20px';
@@ -12090,7 +12106,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             renderMarkdown(`Copied the ${recipeCfg.label} prompt to clipboard.`),
                             prompt,
                         );
-                        await copyTextWithSpinner(assistantMsg._ackCopyBtn, prompt);
+                        await copyTextWithFeedback(assistantMsg._ackCopyBtn, prompt);
                         setAssistantPromptDetails(
                             assistantMsg,
                             recipeCfg.promptOnlyDetailsTitle || recipeCfg.promptDetailsTitle,
@@ -12151,7 +12167,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             renderMarkdown(`Copied the ${recipeCfg.label} request prompt to clipboard.`),
                             generatedPrompt,
                         );
-                        await copyTextWithSpinner(assistantMsg._ackCopyBtn, generatedPrompt);
+                        await copyTextWithFeedback(assistantMsg._ackCopyBtn, generatedPrompt);
                         setAssistantPromptDetails(assistantMsg, recipeCfg.promptDetailsTitle, generatedPrompt, {
                             open: true,
                         });
@@ -12319,7 +12335,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         copyBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            await copyTextWithSpinner(copyBtn, text);
+            await copyTextWithFeedback(copyBtn, text);
         });
         wrap.appendChild(copyBtn);
 
@@ -12496,7 +12512,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (result.prompt) {
                     actions.appendChild(
                         renderButton('Copy prompt', 'Copy image-generation prompt', async (e) => {
-                            await copyTextWithSpinner(e.currentTarget, result.prompt);
+                            await copyTextWithFeedback(e.currentTarget, result.prompt);
                         }),
                     );
                 }
@@ -12531,12 +12547,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const actions = document.createElement('div');
                 Object.assign(actions.style, { display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' });
                 const copyBtn = renderButton('Copy prompt', 'Copy image-generation prompt', async (e) => {
-                    await copyTextWithSpinner(e.currentTarget, prompt);
+                    await copyTextWithFeedback(e.currentTarget, prompt);
                 });
                 actions.appendChild(copyBtn);
                 body.appendChild(actions);
                 addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt, { open: true });
-                await copyTextWithSpinner(copyBtn, prompt);
+                await copyTextWithFeedback(copyBtn, prompt);
             },
         };
     }
@@ -26926,19 +26942,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         btn._running = true;
         const startedAt = Date.now();
         const origText = btn.textContent;
-        const stopSpin = startBrailleAnimation((frame) => {
-            btn.textContent = frame;
-        });
         const popup = makeStatusPopup('Gathering comment context...');
         ackLogEvent('copy comment context: started', {
             target: container?.id || container?.className || 'unknown',
             pathname: location.pathname,
         });
         try {
-            await waitForNextPaint();
             const context = gatherCommentContext(container);
             if (!context) {
-                stopSpin();
                 btn.textContent = '❌';
                 popup.textContent = '❌ No comment context found';
                 ackLogEvent('copy comment context: no context found', {
@@ -26947,7 +26958,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }, 'warn');
             } else {
                 GM_setClipboard(context);
-                stopSpin();
                 btn.textContent = '✅';
                 popup.textContent = `✅ Copied ${(context.length / 1024).toFixed(1)}KB to clipboard`;
                 ackLogEvent('copy comment context: copied', {
@@ -26956,7 +26966,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
             }
         } catch (e) {
-            stopSpin();
             btn.textContent = '❌';
             popup.textContent = `❌ Error: ${e.message}`;
             ackLogEvent('copy comment context: failed', {
@@ -30309,10 +30318,159 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('ghco default format checks out without rebasing', () => {
         const ghco = SHA_FORMATS.find((format) => format.key === 'ghco');
         const result = ghco.fmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+        ackEq(ghco.requiresSha, false, 'checkout command depends only on the PR URL');
         ackEq(result, 'gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force');
         ackAssert(!result.includes('git pull'), 'does not pull after checkout');
         ackAssert(!result.includes('rebase'), 'does not rebase');
         ackAssert(!result.includes('REMOTE='), 'does not resolve an unused remote');
+    });
+
+    ackTest('ghco copy never waits for PR head discovery', async () => {
+        const oldParsePR = parsePR;
+        const oldGetFormat = getFormat;
+        const oldAlternateMode = usesAlternateToolbarMode;
+        const oldImmediateHead = getImmediatePRHeadSHA;
+        const oldFetchSHA = fetchSHA;
+        const oldClipboard = GM_setClipboard;
+        const oldSpinner = startBrailleAnimation;
+        const ghco = SHA_FORMATS.find((format) => format.key === 'ghco');
+        let alternate = false;
+        let headReads = 0;
+        let fetches = 0;
+        let spinners = 0;
+        let copied = '';
+        try {
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+            getFormat = () => ghco;
+            usesAlternateToolbarMode = () => alternate;
+            getImmediatePRHeadSHA = () => { headReads++; return ''; };
+            fetchSHA = async () => { fetches++; return 'a'.repeat(40); };
+            GM_setClipboard = (text) => { copied = text; };
+            startBrailleAnimation = () => { spinners++; return () => {}; };
+
+            await copySHA(document.createElement('button'), () => {});
+            ackEq(copied, 'gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force');
+            ackEq(headReads, 0, 'default checkout does not inspect the head');
+            ackEq(fetches, 0, 'default checkout performs no GitHub request');
+            ackEq(spinners, 0, 'default checkout shows no waiting animation');
+
+            alternate = true;
+            await copySHA(document.createElement('button'), () => {});
+            ackAssert(copied.includes('gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force'));
+            ackAssert(copied.includes('git pull --rebase'), 'Shift mode still includes the rebase');
+            ackEq(headReads, 0, 'Shift checkout does not inspect the head');
+            ackEq(fetches, 0, 'Shift checkout performs no GitHub request');
+            ackEq(spinners, 0, 'Shift checkout shows no waiting animation');
+        } finally {
+            parsePR = oldParsePR;
+            getFormat = oldGetFormat;
+            usesAlternateToolbarMode = oldAlternateMode;
+            getImmediatePRHeadSHA = oldImmediateHead;
+            fetchSHA = oldFetchSHA;
+            GM_setClipboard = oldClipboard;
+            startBrailleAnimation = oldSpinner;
+        }
+    });
+
+    ackTest('head-based toolbar copy uses an embedded SHA immediately', async () => {
+        const oldParsePR = parsePR;
+        const oldGetFormat = getFormat;
+        const oldImmediateHead = getImmediatePRHeadSHA;
+        const oldFetchSHA = fetchSHA;
+        const oldClipboard = GM_setClipboard;
+        const oldSpinner = startBrailleAnimation;
+        const sha = 'a'.repeat(40);
+        let fetches = 0;
+        let spinners = 0;
+        let copied = '';
+        try {
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+            getFormat = () => SHA_FORMATS.find((format) => format.key === 'ack');
+            getImmediatePRHeadSHA = () => sha;
+            fetchSHA = async () => { fetches++; return 'b'.repeat(40); };
+            GM_setClipboard = (text) => { copied = text; };
+            startBrailleAnimation = () => { spinners++; return () => {}; };
+
+            await copySHA(document.createElement('button'), () => {});
+            ackEq(copied, `ACK ${sha}`);
+            ackEq(fetches, 0, 'embedded PR head avoids a GitHub request');
+            ackEq(spinners, 0, 'embedded PR head avoids a waiting animation');
+        } finally {
+            parsePR = oldParsePR;
+            getFormat = oldGetFormat;
+            getImmediatePRHeadSHA = oldImmediateHead;
+            fetchSHA = oldFetchSHA;
+            GM_setClipboard = oldClipboard;
+            startBrailleAnimation = oldSpinner;
+        }
+    });
+
+    ackTest('local toolbar commands skip needless PR head discovery', () => {
+        const localKeys = [
+            'ghco', 'pushrdiff', 'bench', 'test', 'fuzz', 'functional',
+            'formatdiff', 'tidydiff', 'iwyu',
+        ];
+        for (const key of localKeys) {
+            ackEq(SHA_FORMATS.find((format) => format.key === key)?.requiresSha, false,
+                `${key} is generated from local page state`);
+        }
+
+        const oldUserAckSha = userAckSha;
+        try {
+            const rangeDiff = SHA_FORMATS.find((format) => format.key === 'rdiff');
+            const rebaseDiff = SHA_FORMATS.find((format) => format.key === 'rebasediff');
+            userAckSha = null;
+            ackEq(rangeDiff.requiresSha(), false, 'force-push range-diff already has both endpoints');
+            ackEq(rebaseDiff.requiresSha(), false, 'force-push rebase-diff already has both endpoints');
+            userAckSha = 'a'.repeat(40);
+            ackEq(rangeDiff.requiresSha(), true, 'last-ACK range-diff needs the current PR head');
+            ackEq(rebaseDiff.requiresSha(), true, 'last-ACK rebase-diff needs the current PR head');
+        } finally {
+            userAckSha = oldUserAckSha;
+        }
+    });
+
+    ackTest('force-push range-diff copies without PR head discovery', async () => {
+        const oldParsePR = parsePR;
+        const oldGetFormat = getFormat;
+        const oldImmediateHead = getImmediatePRHeadSHA;
+        const oldFetchSHA = fetchSHA;
+        const oldClipboard = GM_setClipboard;
+        const oldSpinner = startBrailleAnimation;
+        const oldUserAckSha = userAckSha;
+        const oldForcePush = lastForcePush;
+        const oldForcePushRange = lastForcePushRange;
+        let headReads = 0;
+        let fetches = 0;
+        let spinners = 0;
+        let copied = '';
+        try {
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+            getFormat = () => SHA_FORMATS.find((format) => format.key === 'rdiff');
+            getImmediatePRHeadSHA = () => { headReads++; return ''; };
+            fetchSHA = async () => { fetches++; return 'c'.repeat(40); };
+            GM_setClipboard = (text) => { copied = text; };
+            startBrailleAnimation = () => { spinners++; return () => {}; };
+            userAckSha = null;
+            lastForcePushRange = null;
+            lastForcePush = { fromFull: 'a'.repeat(40), toFull: 'b'.repeat(40) };
+
+            await copySHA(document.createElement('button'), () => {});
+            ackAssert(copied.includes(`B=${'a'.repeat(40)} A=${'b'.repeat(40)}`));
+            ackEq(headReads, 0, 'known force-push endpoints do not inspect the head');
+            ackEq(fetches, 0, 'known force-push endpoints perform no GitHub request');
+            ackEq(spinners, 0, 'known force-push endpoints show no waiting animation');
+        } finally {
+            parsePR = oldParsePR;
+            getFormat = oldGetFormat;
+            getImmediatePRHeadSHA = oldImmediateHead;
+            fetchSHA = oldFetchSHA;
+            GM_setClipboard = oldClipboard;
+            startBrailleAnimation = oldSpinner;
+            userAckSha = oldUserAckSha;
+            lastForcePush = oldForcePush;
+            lastForcePushRange = oldForcePushRange;
+        }
     });
 
     ackTest('rdiff format returns null when no force-push', () => {
@@ -44098,8 +44256,9 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function waitForNextPaint'),
             source.indexOf('async function copySHA'),
         );
-        ackAssert(copyHelper.includes('ackRaf'), 'clipboard helper yields until next paint');
-        ackAssert(copyHelper.includes('copyTextWithSpinner'), 'shared clipboard spinner helper exists');
+        ackAssert(copyHelper.includes('copyTextWithFeedback'), 'shared clipboard feedback helper exists');
+        ackAssert(copyHelper.includes('GM_setClipboard(text)'), 'precomputed clipboard text is copied immediately');
+        ackAssert(!copyHelper.includes('copyTextWithSpinner'), 'precomputed clipboard text has no artificial spinner wait');
 
         const fullFn = source.slice(
             source.indexOf('async function copyPRContext'),
@@ -44456,7 +44615,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(copyFn.includes('gatherCommentContext(container)'), 'copyCommentContext gathers per-comment context');
         ackAssert(copyFn.includes('GM_setClipboard'), 'copyCommentContext writes to clipboard');
-        ackAssert(copyFn.includes('startBrailleAnimation'), 'copyCommentContext shows spinner while copying');
+        ackAssert(!copyFn.includes('startBrailleAnimation'), 'local comment context copy has no artificial spinner wait');
+        ackAssert(!copyFn.includes('waitForNextPaint'), 'local comment context copy runs immediately');
 
         const menuFns = source.slice(
             source.indexOf('function getCommentMenuRoots'),
@@ -46856,7 +47016,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(card.includes('addPromptDetails(body, `Manual ${OPENAI_IMAGE_MODEL} prompt`, prompt'), 'shows manual prompt fallback on errors');
         ackAssert(card.includes('resolvePrompt: async'), 'infographic card can render prompt-only copy results');
         ackAssert(card.includes('Copied the image-generation prompt to clipboard'), 'prompt-only infographic reports clipboard copy');
-        ackAssert(card.includes('copyTextWithSpinner(copyBtn, prompt)'), 'prompt-only infographic copies the visual prompt');
+        ackAssert(card.includes('copyTextWithFeedback(copyBtn, prompt)'), 'prompt-only infographic copies the visual prompt');
         const configHelper = source.slice(
             source.indexOf('function openConfigForProvider'),
             source.indexOf('// --- LLM API Callers ---'),
@@ -46924,7 +47084,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('copyPromptOnly'), 'recipe send path can copy prompt instead of running');
         ackAssert(fn.includes('isCopyableRecipe(recipe)'), 'prompt-only mode includes maintainer view');
         ackAssert(fn.includes('Copied the ${recipeCfg.label} request prompt to clipboard'), 'prompt-only mode reports clipboard copy');
-        ackAssert(fn.includes('copyTextWithSpinner(assistantMsg._ackCopyBtn, generatedPrompt)'), 'prompt-only mode copies generated request prompt');
+        ackAssert(fn.includes('copyTextWithFeedback(assistantMsg._ackCopyBtn, generatedPrompt)'), 'prompt-only mode copies generated request prompt');
         ackAssert(fn.includes('open: true'), 'prompt-only mode shows the copied prompt details');
     });
 
