@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.261
+// @version      1.262
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -405,16 +405,16 @@
             hotkey: 'g',
             emoji: '⬇️',
             label: 'gh pr co',
-            alternateLabel: 'gh pr co (no rebase)',
-            tip: 'Copy gh CLI command to checkout this PR and rebase on the base branch',
-            alternateTip: 'Check out this PR without rebasing it',
-            alternateHint: '⏭️',
-            fmt: (_sha, pr) => {
+            alternateLabel: 'gh pr co + rebase',
+            tip: 'Copy gh CLI command to check out this PR without rebasing it',
+            alternateTip: 'Check out this PR and rebase it on the configured base branch',
+            alternateHint: '🔁',
+            fmt: (_sha, pr) =>
+                `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force`,
+            alternateFmt: (_sha, pr) => {
                 const base = getReviewBaseBranch();
                 return `${preferredRemoteCommand()} && gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force && git pull --rebase "$REMOTE" ${shellQuoteIfNeeded(base)}`;
             },
-            alternateFmt: (_sha, pr) =>
-                `gh pr co https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr} --force`,
         },
         {
             key: 'rdiff',
@@ -30306,9 +30306,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('ghco alternate format checks out without rebasing', () => {
+    ackTest('ghco default format checks out without rebasing', () => {
         const ghco = SHA_FORMATS.find((format) => format.key === 'ghco');
-        const result = ghco.alternateFmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
+        const result = ghco.fmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '123' });
         ackEq(result, 'gh pr co https://github.com/bitcoin/bitcoin/pull/123 --force');
         ackAssert(!result.includes('git pull'), 'does not pull after checkout');
         ackAssert(!result.includes('rebase'), 'does not rebase');
@@ -30932,7 +30932,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(group.includes('format.alternateLabel'), 'shows each format-specific alternate label');
         ackEq(SHA_FORMATS.find((format) => format.key === 'ack').alternateLabel, 'commit hash');
         ackEq(SHA_FORMATS.find((format) => format.key === 'parent').alternateLabel, 'parent hash');
-        ackEq(SHA_FORMATS.find((format) => format.key === 'ghco').alternateLabel, 'gh pr co (no rebase)');
+        ackEq(SHA_FORMATS.find((format) => format.key === 'ghco').alternateLabel, 'gh pr co + rebase');
         ackEq(SHA_FORMATS.find((format) => format.key === 'pushrdiff').alternateLabel, 'collapsed range-diff');
         ackAssert(group.includes('ALTERNATE_MODE_TOGGLE_HINT'), 'explains how to switch modes');
         ackAssert(group.includes('copySHA(mainBtn, updateMainLabel)'), 'uses the current mode when copying');
@@ -32090,12 +32090,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('ghco format produces gh pr co command with rebase', () => {
+    ackTest('ghco alternate format produces gh pr co command with rebase', () => {
         const f = SHA_FORMATS.find((f) => f.key === 'ghco');
         const origBase = getReviewBaseBranch;
         getReviewBaseBranch = () => 'main';
         try {
-            const result = f.fmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '42' });
+            const result = f.alternateFmt('abc', { owner: 'bitcoin', repo: 'bitcoin', pr: '42' });
             ackAssert(result.includes('gh pr co'), 'has gh pr co');
             ackAssert(result.includes('https://github.com/bitcoin/bitcoin/pull/42'), 'has full PR URL');
             ackAssert(result.includes('--force'), 'has --force flag');

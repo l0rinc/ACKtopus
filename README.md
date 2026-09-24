@@ -136,7 +136,7 @@ Copies useful snippets based on the PR head commit, such as:
 - `ACK <sha>`
 - `git fetch ... && git switch --detach FETCH_HEAD`
 - all PR commit hashes copied as one oldest-first, space-separated string
-- checkout-parent and `gh pr co ... && git pull --rebase "$REMOTE" <base>` helpers, with `upstream`/`origin` remote fallback
+- checkout-parent and `gh pr co ...` helpers; the normal `gh pr co` action does not rebase, while alternate mode adds `git pull --rebase "$REMOTE" <base>` with `upstream`/`origin` fallback
 - `git range-diff` from your last ACK or the latest quick force-push burst
 - rebase-both-sides-and-diff commands for cleaner force-push burst comparisons
 - pre-push `git range-diff "$BASE..@{u}" "$BASE..HEAD"` for comparing the pushed tracking branch with local `HEAD`
