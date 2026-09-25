@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.268
+// @version      1.269
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18515,18 +18515,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const cells = [...row.querySelectorAll('td.blob-code, td.diff-text, td.diff-text-cell')];
         if (!cells.length) cells.push(...row.querySelectorAll('[data-testid="diff-line-content"]'));
         const rowSignal = `${row.className || ''} ${row.getAttribute('data-diff-line-type') || ''}`;
-        const cellSignal = (cell) => `${cell.className || ''} ${cell.getAttribute('data-diff-line-type') || ''}`;
-        const addition = cells.find((cell) => /addition|\badd\b/i.test(cellSignal(cell)));
-        const deletion = cells.find((cell) => /deletion|\bdelete\b/i.test(cellSignal(cell)));
-        const cell = addition || deletion || (/(?:addition|deletion|\badd\b|\bdelete\b)/i.test(rowSignal) ? cells[0] : null);
-        if (!cell) return null;
-        const changedCells = cells.filter((candidate) => /addition|deletion|\badd\b|\bdelete\b/i.test(cellSignal(candidate)));
-        const parts = (changedCells.length ? changedCells : [cell]).map((candidate) => {
-            const rawText = String(candidate.textContent || '').replace(/\r\n/g, '\n');
+        const kindFromSignal = (signal) => {
+            if (/addition|\badd\b/i.test(signal)) return 'addition';
+            if (/deletion|\bdelete\b/i.test(signal)) return 'deletion';
+            return '';
+        };
+        const cellKind = (cell) => {
+            // GitHub's React diff puts the change class on a nested <code>
+            // while the surrounding td only says diff-text-cell.
+            const line = cell.matches?.('code.diff-text, [data-testid="diff-line-content"]')
+                ? cell : cell.querySelector?.('code.diff-text, [data-testid="diff-line-content"]');
+            const signal = [
+                cell.className || '',
+                cell.getAttribute?.('data-diff-line-type') || '',
+                line?.className || '',
+                line?.getAttribute?.('data-diff-line-type') || '',
+            ].join(' ');
+            const signaled = kindFromSignal(signal);
+            if (signaled) return signaled;
+            const marker = line?.querySelector?.('.diff-text-marker')?.textContent?.trim();
+            if (marker === '+') return 'addition';
+            if (marker === '-') return 'deletion';
+            return '';
+        };
+        let changedCells = cells.map((cell) => ({ cell, kind: cellKind(cell) })).filter((entry) => entry.kind);
+        if (!changedCells.length) {
+            const rowKind = kindFromSignal(rowSignal);
+            if (rowKind && cells[0]) changedCells = [{ cell: cells[0], kind: rowKind }];
+        }
+        if (!changedCells.length) return null;
+        const parts = changedCells.map(({ cell: candidate, kind }) => {
+            // Exclude GitHub's visual +/- marker from the source text. The
+            // excerpt below adds a stable marker of its own.
+            const textRoot = candidate.querySelector?.('.diff-text-inner, .blob-code-inner') || candidate;
+            const rawText = String(textRoot.textContent || '').replace(/\r\n/g, '\n');
             const text = rawText.trim() ? rawText.slice(0, 500) : rawText ? '[whitespace-only line]' : '[blank line]';
-            const signal = /addition|deletion|\badd\b|\bdelete\b/i.test(cellSignal(candidate))
-                ? cellSignal(candidate) : rowSignal;
-            const deleted = /deletion|delete/i.test(signal);
+            const deleted = kind === 'deletion';
             return {
                 row,
                 cell: candidate,
@@ -18542,7 +18566,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Keep the hunk classifier's paired before/after view while the
             // line guide classifies each changed side independently.
             excerpt: parts.map((part) => part.excerpt).join('\n'),
-            fullText: cells.map((part) => part.textContent).join('\n'),
+            fullText: parts.map((part) => `${part.deleted ? '-' : '+'}\0${part.fullText}`).join('\n'),
             parts,
         };
     }
@@ -18717,7 +18741,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     const JEV_DESCRIPTION_ROOT_SELECTOR =
-        '[data-testid="issue-body"], #issue-body, #issue-body-viewer, [data-testid="issue-body-viewer"]';
+        '[data-testid="issue-body"], #issue-body, #issue-body-viewer, [data-testid="issue-body-viewer"], ' +
+        '.js-command-palette-pull-body, [id^="pullrequest-"]';
     const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
     let jevReadingQuickTooltip = null;
     let jevReadingExplainTimer = null;
@@ -18983,6 +19008,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 pullRequestParsed: !!pr,
                 descriptionFound: !!body,
                 descriptionConnected: !!body?.isConnected,
+                pullBodyRootsInDOM: document.querySelectorAll(JEV_DESCRIPTION_ROOT_SELECTOR).length,
+                markdownBodiesInDOM: document.querySelectorAll(MARKDOWN_BODY_SELECTOR).length,
             }, { key: 'description-dom', intervalMs: 3000, level: 'warn' });
             return;
         }
@@ -19115,7 +19142,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         const head = getImmediatePRHeadSHA() || pathCommitSha();
-        const changed = [...file.querySelectorAll('tr')].map(jevChangedRow).filter(Boolean);
+        const rows = [...file.querySelectorAll('tr')];
+        const changed = rows.map(jevChangedRow).filter(Boolean);
+        const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
+        const signaledCells = new Set(qsa(file,
+            'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
+            .map((node) => node.closest?.('td.blob-code, td.diff-text, td.diff-text-cell') || node));
+        for (const marker of qsa(file, '.diff-text-marker')) {
+            if (/^[+-]$/.test(marker.textContent?.trim() || '')) {
+                signaledCells.add(marker.closest?.('td.diff-text-cell') || marker);
+            }
+        }
+        const changeSignals = signaledCells.size;
         const groups = [];
         for (const line of changed) {
             const last = groups[groups.length - 1];
@@ -19136,11 +19174,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         jevDiagnostic('diff file scanned', {
             path,
+            rows: rows.length,
             changedRows: changed.length,
+            changedSides,
+            changeSignals,
             hunks: groups.length,
             newlyObservedHunks: observed,
-            state: observed ? 'waiting for hunks to enter the viewport' : 'already queued or annotated',
-        }, { key: path, intervalMs: 1500 });
+            state: observed
+                ? 'waiting for hunks to enter the viewport'
+                : changeSignals && !changed.length
+                    ? 'change markers found but no changed rows parsed'
+                    : 'already queued or annotated',
+        }, { key: path, intervalMs: 1500, level: changeSignals && !changed.length ? 'warn' : 'log' });
     }
 
     function queueJevPageAnnotations() {
@@ -31074,6 +31119,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(splitMeta?.lineEl?.id, 'diff-abcR7', 'badge slot is the new-side line-number cell');
     });
 
+    ackTest('Jev recognizes changed rows in the current React diff DOM', () => {
+        // Reduced from PR #36156. The td has no change class; GitHub puts it
+        // on the nested code.diff-text element and renders +/- separately.
+        const host = document.createElement('div');
+        host.setAttribute('data-path', 'src/node/miner.cpp');
+        host.innerHTML = `<table aria-label="Diff for: src/node/miner.cpp"><tbody>
+            <tr class="diff-line-row" data-diff-line-key="4">
+              <td data-diff-side="left" data-line-number="250"></td>
+              <td class="diff-text-cell left-side-diff-cell" data-diff-side="left" data-line-number="250">
+                <code class="diff-text syntax-highlighted-line deletion"><span class="diff-text-marker">-</span><div class="diff-text-inner">    if (weight &gt;= limit) {</div></code>
+              </td>
+              <td data-diff-side="right" data-line-number="250"></td>
+              <td class="diff-text-cell right-side-diff-cell" data-diff-side="right" data-line-number="250">
+                <code class="diff-text syntax-highlighted-line addition"><span class="diff-text-marker">+</span><div class="diff-text-inner">    if (weight &gt; limit) {</div></code>
+              </td>
+            </tr>
+        </tbody></table>`;
+        const changed = jevChangedRow(host.querySelector('tr'));
+        ackEq(changed?.parts?.length, 2, 'keeps both sides of the React split row');
+        ackEq(changed?.excerpt, '-     if (weight >= limit) {\n+     if (weight > limit) {',
+            'reads source text without duplicating GitHub’s visual +/- markers');
+        ackEq(changed?.text, '    if (weight > limit) {', 'uses the added side as the primary line');
+        ackEq(getDiffSelectionLineMeta(changed.parts[0].cell)?.side, 'L', 'resolves the old-side gutter');
+        ackEq(getDiffSelectionLineMeta(changed.parts[1].cell)?.side, 'R', 'resolves the new-side gutter');
+    });
+
     ackTest('Jev line guide applies three review levels without changing code text', () => {
         const oldLineEnabled = jevLineReadingEnabled;
         const host = document.createElement('div');
@@ -31143,6 +31214,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'head and hunk edits produce a new line cache key');
         host.querySelector('.blob-code').textContent = '';
         ackEq(jevChangedRow(host.querySelector('tr'))?.text, '[blank line]', 'blank changed lines are still classified');
+    });
+
+    ackTest('Jev finds the PR description in the current GitHub Conversation DOM', () => {
+        // Reduced from a saved React Conversation page. GitHub does not add an
+        // issue-body id or data-testid to this server-rendered PR body.
+        const oldConversation = isPRConversationPage;
+        const host = document.createElement('div');
+        host.innerHTML = `<div class="TimelineItem js-comment-container js-command-palette-pull-body">
+            <div id="pullrequest-2876629729" class="timeline-comment current-user">
+              <div class="edit-comment-hide">
+                <div class="comment-body markdown-body js-comment-body"><p>Problem: exact-limit chunks are rejected.</p></div>
+              </div>
+            </div>
+          </div>
+          <div id="issuecomment-1" class="timeline-comment">
+            <div class="comment-body markdown-body js-comment-body"><p>An ordinary comment.</p></div>
+          </div>`;
+        document.body.appendChild(host);
+        try {
+            isPRConversationPage = () => true;
+            const description = host.querySelector('[id^="pullrequest-"] .markdown-body');
+            ackEq(jevPRDescriptionBody(host), description, 'finds the body within GitHub’s pull-body timeline item');
+            ackEq(jevPRDescriptionBody(description), description, 'a mutation inside the description resolves the same body');
+            ackAssert(jevPRDescriptionBody(host) !== host.querySelector('#issuecomment-1 .markdown-body'),
+                'does not mistake a later issue comment for the PR description');
+        } finally {
+            isPRConversationPage = oldConversation;
+            host.remove();
+        }
     });
 
     ackTest('Jev PR description guide uses the line algorithm without changing copied text', () => {
