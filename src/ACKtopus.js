@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.265
+// @version      1.266
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -88,6 +88,9 @@
         '.ack-jev-reading-essence,.ack-jev-reading-essence *{font-weight:700!important}',
         '.ack-jev-line-priority-anchor{padding-inline-start:20px!important}',
         '.ack-jev-line-priority{position:absolute;top:1px;left:2px;z-index:3;font-size:12px;line-height:1.2;cursor:help;white-space:nowrap}',
+        '.ack-jev-description-priority{display:inline-block;margin-right:3px;font-style:normal!important;font-weight:400!important;cursor:help;white-space:nowrap}',
+        '.ack-jev-description-priority::before{content:attr(data-emoji)}',
+        '.ack-jev-reading-quick-tooltip{position:fixed;z-index:1000000;max-width:360px;padding:5px 7px;border:1px solid var(--borderColor-default,#30363d);border-radius:6px;background:var(--bgColor-emphasis,#25292e);color:var(--fgColor-onEmphasis,#fff);font-size:11px;line-height:1.35;white-space:pre-line;pointer-events:none;box-shadow:0 3px 10px rgba(0,0,0,.35)}',
     ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
@@ -6804,6 +6807,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         jevConfigured = false;
         jevStackRejected = false;
         jevLineRejected = false;
+        jevDescriptionRejected = false;
         jevEpoch++;
         clearJevAnnotations();
         console.log(`ACKtopus: factoryReset - removed ${count} GM entries (kept API keys)`);
@@ -7044,7 +7048,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         jevToggle.checked = !!GM_getValue('jev_enabled', true);
         jevTitle.prepend(jevToggle);
         const jevDescription = document.createElement('div');
-        jevDescription.textContent = 'Advisory emoji categories for commits, visible diff hunks and lines, and comments. Saving a TypeSafe key enables them by default; uncheck this box to disable them. Diff pages also have a quick Jev line guide checkbox. ACKtopus sends bounded excerpts only after an anonymous GitHub check confirms the repository is public. Private repositories are skipped.';
+        jevDescription.textContent = 'Advisory emoji categories for commits, PR-description sentences, visible diff hunks and lines, and comments. Saving a TypeSafe key enables them by default; uncheck this box to disable them. PR conversation and diff pages also have a quick Jev reading guide checkbox. ACKtopus sends bounded excerpts only after an anonymous GitHub check confirms the repository is public. Private repositories are skipped.';
         Object.assign(jevDescription.style, { fontSize: '11px', color: '#8b949e', marginBottom: '5px' });
         panel.appendChild(jevDescription);
         const jevInput = document.createElement('input');
@@ -7592,6 +7596,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             jevSchemaRejected = false;
             jevStackRejected = false;
             jevLineRejected = false;
+            jevDescriptionRejected = false;
             jevPauseUntil = 0;
             closePanel();
             updateGithubReviewOptions();
@@ -16053,8 +16058,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function renderGithubReviewOptions(host) {
         const showWhitespace = isDiffReviewPage();
         const showComments = isTimelineFilterPage();
-        const showJevLines = showWhitespace && jevConfigured && !!parsePR();
-        const state = `${location.pathname}${location.search}|${showWhitespace}:${whitespaceOnlyHidden()}|${showComments}:${timelineCommentsMinimized()}|${showJevLines}:${jevLineReadingPreferred()}`;
+        const showJevReading = jevConfigured && !!parsePR() && (showWhitespace || isPRConversationPage());
+        const state = `${location.pathname}${location.search}|${showWhitespace}:${whitespaceOnlyHidden()}|${showComments}:${timelineCommentsMinimized()}|${showJevReading}:${jevLineReadingPreferred()}`;
         if (host.dataset.ackState === state) return;
         host.dataset.ackState = state;
         host.replaceChildren();
@@ -16067,13 +16072,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }),
             );
         }
-        if (showJevLines) {
+        if (showJevReading) {
             host.appendChild(
                 makeGithubReviewOption({
-                    label: 'Jev line guide',
+                    label: 'Jev reading guide',
                     checked: jevLineReadingPreferred(),
                     onChange: setJevLineReadingPreferred,
-                    title: 'Mute background lines and bold the essence of each changed line; important lines receive a category emoji',
+                    title: 'Mute background text and bold the essence of PR-description sentences and changed lines; important units receive a category emoji',
                 }),
             );
         }
@@ -16526,7 +16531,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = { commit: 3, hunk: 3, line: 1, comment: 5, stack: 3 };
+    const JEV_SCHEMA = { commit: 3, hunk: 3, line: 1, description: 1, comment: 5, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 2400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -16595,6 +16600,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 other: 'No more specific essence category is supported',
             } },
             concern: { type: 'noul', instructions: 'Does the target line, in the supplied changed-line context, show a specific apparent bug or inconsistency that deserves immediate review? Do not infer a bug from novelty, risk, missing callers, or incomplete context alone.' },
+        },
+        description: {
+            priority: { type: 'choice', instructions: 'How should a code reviewer prioritize the target sentence in this pull-request description after reading its nearby sentences? Use the same three-level reading guide as changed code: classify the sentence itself, not the whole description.', criteria: {
+                background: 'Low-information review background: routine setup, boilerplate, administrative notes, minor documentation detail, repeated context, mechanical test commands, links, or an obvious consequence of another sentence',
+                foreground: 'Non-trivial supporting context worth reading normally, such as motivation, scope, an implementation detail, a limitation, or validation information that helps explain the change',
+                essence: 'The core purpose or semantic center of the pull request: the problem, main behavior, calculation, invariant, policy, test oracle, result, or fix a reviewer should understand first',
+            } },
+            category: { type: 'choice', instructions: 'If the target sentence is essence-level, use the same compact review categories as changed lines. Choose other when no category is clearly supported.', criteria: {
+                behavior: 'Core behavior, policy, or externally visible effect',
+                calculation: 'Arithmetic, bounds, accounting, comparison, or derived value',
+                state: 'State, ownership, lifetime, persistence, or mutation',
+                control_flow: 'Branching, iteration, dispatch, ordering, or error propagation',
+                validation: 'Input validation, assertions, failure handling, or defensive checks',
+                performance: 'Repeated work, algorithmic cost, allocation, caching, or performance-sensitive behavior',
+                test: 'A test setup, assertion, or result that directly expresses the intended behavior',
+                interface: 'An API, type, callback, or cross-component contract',
+                other: 'No more specific essence category is supported',
+            } },
+            concern: { type: 'noul', instructions: 'Does the target sentence show a specific apparent factual or internal inconsistency against the supplied nearby description? Do not infer a problem from missing patch context, uncertainty, novelty, or risk alone.' },
         },
         comment: {
             intent: { type: 'choice', instructions: 'What is the main review purpose of the selected comment? Classify what it says, without deciding whether its claim is correct.', criteria: {
@@ -16711,6 +16735,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevSchemaRejected = false;
     let jevStackRejected = false;
     let jevLineRejected = false;
+    let jevDescriptionRejected = false;
     let jevPauseUntil = 0;
     let jevPauseRetryTimer = null;
     let jevConfigured = !!GM_getValue('jev_enabled', true) && !!GM_getValue('jev_api_key', '');
@@ -16728,8 +16753,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return jevEnabled() && jevLineReadingPreferred() && !jevLineRejected;
     }
 
+    function jevDescriptionReadingEnabled() {
+        return jevEnabled() && jevLineReadingPreferred() && !jevDescriptionRejected;
+    }
+
     function clearJevLineAnnotations(root = document) {
-        qsa(root, '.ack-jev-reading-background, .ack-jev-reading-essence, [data-ack-jev-line-id]').forEach((cell) => {
+        dismissJevReadingHover();
+        qsa(root, '[data-ack-jev-line-id], .ack-jev-reading-background:not(.ack-jev-description-segment), .ack-jev-reading-essence:not(.ack-jev-description-segment)').forEach((cell) => {
             cell.classList.remove('ack-jev-reading-background', 'ack-jev-reading-essence');
             delete cell.dataset.ackJevLinePriority;
             delete cell.dataset.ackJevLineId;
@@ -16738,12 +16768,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         qsa(root, '.ack-jev-line-priority-anchor').forEach((cell) => cell.classList.remove('ack-jev-line-priority-anchor'));
     }
 
+    let jevDescriptionRecords = new WeakMap();
+
+    function clearJevDescriptionAnnotations(root = document) {
+        dismissJevReadingHover();
+        qsa(root, '.ack-jev-description-priority').forEach((marker) => marker.remove());
+        const parents = new Set();
+        qsa(root, '.ack-jev-description-segment').forEach((segment) => {
+            if (segment.parentNode) parents.add(segment.parentNode);
+            segment.replaceWith(document.createTextNode(segment.textContent || ''));
+        });
+        for (const parent of parents) parent.normalize?.();
+        jevDescriptionRecords = new WeakMap();
+    }
+
     function setJevLineReadingPreferred(enabled) {
         GM_setValue(JEV_LINE_READING_KEY, !!enabled);
         clearJevLineAnnotations();
+        clearJevDescriptionAnnotations();
         resetJevTrackers();
         updateGithubReviewOptions();
-        if (enabled && jevLineReadingEnabled()) queueJevPageAnnotations();
+        if (enabled && (jevLineReadingEnabled() || jevDescriptionReadingEnabled())) queueJevPageAnnotations();
     }
 
     function jevCacheId(kind, state) {
@@ -16816,6 +16861,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function clearJevAnnotations() {
         document.querySelectorAll('.ack-jev-badges, .ack-jev-stack-summary').forEach((element) => element.remove());
         clearJevLineAnnotations();
+        clearJevDescriptionAnnotations();
         resetJevTrackers();
     }
 
@@ -16893,6 +16939,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
         if (kind === 'stack' && jevStackRejected) return Promise.reject(new Error('Jev stack review paused after a rejected request'));
         if (kind === 'line' && jevLineRejected) return Promise.reject(new Error('Jev line guide paused after a rejected request'));
+        if (kind === 'description' && jevDescriptionRejected) return Promise.reject(new Error('Jev description guide paused after a rejected request'));
         const key = GM_getValue('jev_api_key', '').trim();
         if (!key) return Promise.reject(new Error('Jev API key missing'));
         const body = JSON.stringify({ state, model: JEV_MODEL, questions: JEV_QUESTIONS[kind] });
@@ -16917,12 +16964,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (r.status === 422) {
                         if (kind === 'stack') jevStackRejected = true;
                         else if (kind === 'line') jevLineRejected = true;
+                        else if (kind === 'description') jevDescriptionRejected = true;
                         else jevSchemaRejected = true;
                     }
                     if (r.status < 200 || r.status >= 300) {
                         const reason = r.status === 422
                             ? kind === 'stack' ? ' (stack review paused)'
                                 : kind === 'line' ? ' (line guide paused)'
+                                    : kind === 'description' ? ' (description guide paused)'
                                     : ' (request shape rejected; annotations paused)'
                             : '';
                         return reject(new Error(`Jev HTTP ${r.status}${reason}: ${String(r.responseText || '').slice(0, 160)}`));
@@ -16951,8 +17000,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevEvaluate(pr, kind, state) {
         const epoch = jevEpoch;
-        const lineRequest = kind === 'line';
-        if (kind === 'line' && !jevLineReadingEnabled()) return Promise.resolve(null);
+        const readingRequest = kind === 'line' || kind === 'description';
+        const readingEnabled = () => kind === 'line' ? jevLineReadingEnabled()
+            : kind === 'description' ? jevDescriptionReadingEnabled() : true;
+        if (!readingEnabled()) return Promise.resolve(null);
         const id = jevCacheId(kind, state);
         const cached = jevReadCache(id);
         // A local result sends no repository content anywhere. Public proof is
@@ -16966,7 +17017,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevPageRequests = 0;
             jevPageLineRequests = 0;
         }
-        if (lineRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
+        if (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
             return Promise.resolve(null);
         }
         const routePath = location.pathname;
@@ -16974,19 +17025,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const run = async () => {
                 try {
                     if (location.pathname !== routePath) return resolve(null);
-                    if (kind === 'line' && !jevLineReadingEnabled()) return resolve(null);
+                    if (!readingEnabled()) return resolve(null);
                     if (!jevEnabled() || !(await jevPublicRepository(pr))) return resolve(null);
                     if (location.pathname !== routePath) return resolve(null);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
-                    if (kind === 'line' && !jevLineReadingEnabled()) return resolve(null);
-                    if (lineRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
+                    if (!readingEnabled()) return resolve(null);
+                    if (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
                         return resolve(null);
                     }
-                    if (lineRequest) jevPageLineRequests++;
+                    if (readingRequest) jevPageLineRequests++;
                     else jevPageRequests++;
                     const result = await jevPost(kind, state);
                     if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
-                    if (kind === 'line' && !jevLineReadingEnabled()) return resolve(null);
+                    if (!readingEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
                     resolve(result);
                 } catch (e) {
@@ -16997,10 +17048,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             };
             run.jevKind = kind;
-            // Line-by-line reading aids are intentionally lower priority than
+            // Sentence and line reading aids are intentionally lower priority than
             // commit, hunk, stack, and comment claim checks.
-            const firstLineJob = jevJobs.findIndex((job) => job.jevKind === 'line');
-            if (!lineRequest && firstLineJob >= 0) jevJobs.splice(firstLineJob, 0, run);
+            const firstReadingJob = jevJobs.findIndex((job) => job.jevKind === 'line' || job.jevKind === 'description');
+            if (!readingRequest && firstReadingJob >= 0) jevJobs.splice(firstReadingJob, 0, run);
             else jevJobs.push(run);
             jevPump();
         });
@@ -17133,6 +17184,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!element) return '';
         if (!element.querySelector?.(ACK_MUTATION_OWNED_SELECTOR)) return element.textContent?.trim() || '';
         const clone = element.cloneNode(true);
+        // Description reading-guide wrappers contain GitHub's original text;
+        // unwrap them before removing the remaining ACKtopus decorations.
+        clone.querySelectorAll('.ack-jev-description-segment').forEach((segment) =>
+            segment.replaceWith(document.createTextNode(segment.textContent || '')),
+        );
         clone.querySelectorAll(ACK_MUTATION_OWNED_SELECTOR).forEach((element) => element.remove());
         return clone.textContent?.trim() || '';
     }
@@ -18162,39 +18218,92 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    function jevReadingGuideDecision(result) {
+        const priority = result.answers.priority;
+        const concern = result.answers.concern.noul;
+        let level = priority.probability >= 0.58 ? priority.choice : 'foreground';
+        if (concern >= 0.85) level = 'essence';
+        const category = result.answers.category;
+        const categoryLabel = JEV_LINE_CATEGORY_LABELS[category.choice] || JEV_LINE_CATEGORY_LABELS.other;
+        return {
+            level,
+            priority,
+            concern,
+            emoji: concern >= 0.85 ? '🐛' : categoryLabel[0],
+            meaning: concern >= 0.85
+                ? 'Possible bug or inconsistency to inspect'
+                : categoryLabel[1],
+        };
+    }
+
+    function jevReadingGuideTitle(decision, result, evidence, essenceLabel) {
+        const meaning = decision.concern >= 0.85
+            ? `${decision.meaning} in this ${essenceLabel}`
+            : `${decision.meaning}; Jev classified this as an essence ${essenceLabel}`;
+        return `${meaning}\nJev priority: ${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; read the surrounding context.`;
+    }
+
+    function jevLineSelectionContext(line, marker) {
+        const meta = getDiffSelectionLineMeta(line.cell);
+        const text = String(line.cell?.textContent || '').replace(/\r\n/g, '\n');
+        if (!meta || !text.trim()) return null;
+        const nearby = [];
+        let row = meta.row;
+        for (let i = 0; i < 2 && row?.previousElementSibling; i++) row = row.previousElementSibling;
+        for (let i = 0; i < 6 && row; i++, row = row.nextElementSibling) {
+            const code = row.querySelector(
+                'td.blob-code, td.diff-text, td.diff-text-cell, code.diff-text, [data-testid="diff-line-content"]',
+            )?.textContent;
+            if (code?.trim()) nearby.push(code.replace(/\r\n/g, '\n'));
+        }
+        const label = `${meta.side || (line.deleted ? 'L' : 'R')}${meta.lineNum || ''}`;
+        return {
+            kind: 'diff',
+            text,
+            file: meta.fileName || '',
+            startLabel: label,
+            endLabel: label,
+            commitSha: pathCommitSha() || '',
+            pr: parsePR(),
+            rect: marker.getBoundingClientRect(),
+            contextLines: nearby.join('\n'),
+            source: location.href,
+            parentText: findSelectionParentText(line.cell),
+            isPRDescription: false,
+            threadText: '',
+            syntheticSelection: true,
+        };
+    }
+
     function jevApplyLineReading(line, result, evidence) {
         if (!line?.cell || !result || !jevLineReadingEnabled()) return;
         const meta = getDiffSelectionLineMeta(line.cell);
         const lineNumberCell = meta?.lineEl || meta?.row?.firstElementChild;
         clearJevLineCell(line.cell, lineNumberCell);
 
-        const priority = result.answers.priority;
-        const concern = result.answers.concern.noul;
-        let level = priority.probability >= 0.58 ? priority.choice : 'foreground';
-        if (concern >= 0.85) level = 'essence';
-        line.cell.dataset.ackJevLinePriority = level;
-        if (level === 'background') {
+        const decision = jevReadingGuideDecision(result);
+        line.cell.dataset.ackJevLinePriority = decision.level;
+        if (decision.level === 'background') {
             line.cell.classList.add('ack-jev-reading-background');
             return;
         }
-        if (level !== 'essence') return;
+        if (decision.level !== 'essence') return;
 
         line.cell.classList.add('ack-jev-reading-essence');
         if (!lineNumberCell || lineNumberCell === line.cell) return;
         lineNumberCell.classList.add('ack-jev-line-priority-anchor');
         const position = window.getComputedStyle(lineNumberCell).position;
         if (!position || position === 'static') lineNumberCell.style.position = 'relative';
-        const category = result.answers.category;
-        const categoryLabel = JEV_LINE_CATEGORY_LABELS[category.choice] || JEV_LINE_CATEGORY_LABELS.other;
         const marker = document.createElement('span');
         marker.className = 'ack-jev-line-priority';
-        marker.textContent = concern >= 0.85 ? '🐛' : categoryLabel[0];
-        const meaning = concern >= 0.85
-            ? 'Possible bug or inconsistency to inspect on this line'
-            : `${categoryLabel[1]}; Jev classified this as an essence line`;
-        marker.title = `${meaning}\nJev priority: ${Math.round(priority.probability * 100)}% ${priority.choice}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; read the surrounding code.`;
-        marker.setAttribute('role', 'img');
-        marker.setAttribute('aria-label', marker.title);
+        marker.textContent = decision.emoji;
+        const explanation = jevReadingGuideTitle(decision, result, evidence, 'line');
+        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice} · pause for AI explanation`;
+        marker.title = explanation;
+        marker.setAttribute('role', 'button');
+        marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
+        marker.tabIndex = 0;
+        bindJevReadingHover(marker, () => jevLineSelectionContext(line, marker));
         lineNumberCell.prepend(marker);
     }
 
@@ -18212,6 +18321,315 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 jevApplyLineReading(line, result, review.location);
             });
         });
+    }
+
+    const JEV_DESCRIPTION_ROOT_SELECTOR =
+        '[data-testid="issue-body"], #issue-body, #issue-body-viewer, [data-testid="issue-body-viewer"]';
+    const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
+    let jevReadingQuickTooltip = null;
+    let jevReadingExplainTimer = null;
+
+    function dismissJevReadingHover() {
+        if (jevReadingExplainTimer !== null) {
+            ackClearTimeout(jevReadingExplainTimer);
+            jevReadingExplainTimer = null;
+        }
+        jevReadingQuickTooltip?.remove();
+        jevReadingQuickTooltip = null;
+    }
+
+    function showJevReadingQuickTooltip(marker) {
+        dismissJevReadingHover();
+        const tooltip = document.createElement('div');
+        tooltip.className = 'ack-jev-reading-quick-tooltip';
+        tooltip.textContent = marker.dataset.quickExplanation || 'Essence sentence';
+        document.body.appendChild(tooltip);
+        const anchor = marker.getBoundingClientRect();
+        const box = tooltip.getBoundingClientRect();
+        const pad = 6;
+        const left = Math.max(pad, Math.min(anchor.left, window.innerWidth - box.width - pad));
+        const below = anchor.bottom + 4;
+        const top = below + box.height <= window.innerHeight - pad
+            ? below : Math.max(pad, anchor.top - box.height - 4);
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${top}px`;
+        jevReadingQuickTooltip = tooltip;
+    }
+
+    function bindJevReadingHover(marker, contextFactory) {
+        const showExplanation = () => {
+            if (!marker.isConnected) return;
+            dismissJevReadingHover();
+            const context = contextFactory();
+            if (context) updateDiffSelectionToolbar(context);
+        };
+        const previewThenExplain = () => {
+            showJevReadingQuickTooltip(marker);
+            jevReadingExplainTimer = ackSetTimeout(() => {
+                jevReadingExplainTimer = null;
+                showExplanation();
+            }, 450);
+        };
+        marker.addEventListener('mouseenter', previewThenExplain);
+        marker.addEventListener('mouseleave', dismissJevReadingHover);
+        marker.addEventListener('focus', previewThenExplain);
+        marker.addEventListener('blur', dismissJevReadingHover);
+        marker.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showExplanation();
+        });
+    }
+
+    function jevPRDescriptionBody(root = document) {
+        if (!isPRConversationPage()) return null;
+        const roots = [];
+        const add = (candidate) => {
+            if (candidate && !roots.includes(candidate)) roots.push(candidate);
+        };
+        if (root?.nodeType === 1) {
+            add(root.matches?.(JEV_DESCRIPTION_ROOT_SELECTOR) ? root : null);
+            add(root.closest?.(JEV_DESCRIPTION_ROOT_SELECTOR));
+        }
+        for (const candidate of qsa(root, JEV_DESCRIPTION_ROOT_SELECTOR)) add(candidate);
+        if (root !== document) {
+            for (const candidate of qsa(document, JEV_DESCRIPTION_ROOT_SELECTOR)) add(candidate);
+        }
+        for (const issueBody of roots) {
+            if (issueBody.matches?.('textarea, form, [contenteditable="true"]')) continue;
+            const body = issueBody.matches?.(MARKDOWN_BODY_SELECTOR)
+                ? issueBody : issueBody.querySelector?.(MARKDOWN_BODY_SELECTOR);
+            if (body && !body.closest?.(EDIT_FORM_SELECTOR)) return body;
+        }
+        return null;
+    }
+
+    function jevDescriptionText(body) {
+        return textWithoutAcktopusDecorations(body).replace(/\r\n/g, '\n');
+    }
+
+    function jevSentenceRanges(text) {
+        const ranges = [];
+        const add = (segment, index) => {
+            const leading = segment.search(/\S/);
+            if (leading < 0) return;
+            const trailing = segment.match(/\s*$/)?.[0]?.length || 0;
+            const end = index + segment.length - trailing;
+            if (end > index + leading) ranges.push({ start: index + leading, end, text: segment.slice(leading, segment.length - trailing) });
+        };
+        if (typeof Intl?.Segmenter === 'function') {
+            for (const part of new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(text)) {
+                add(part.segment, part.index);
+            }
+            return ranges;
+        }
+        const re = /[^.!?]+(?:[.!?]+(?=\s|$)|$)\s*/g;
+        let match;
+        while ((match = re.exec(text))) add(match[0], match.index);
+        return ranges;
+    }
+
+    function jevDescriptionTextNodes(block, blockSet) {
+        const nodes = [];
+        const walker = document.createTreeWalker(block, window.NodeFilter?.SHOW_TEXT || 4);
+        let node;
+        while ((node = walker.nextNode())) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest('pre, script, style, textarea, button, select, [contenteditable="true"]')) continue;
+            if (parent.closest('.ack-jev-description-priority')) continue;
+            let nested = parent;
+            let ownedByNestedBlock = false;
+            while (nested && nested !== block) {
+                if (blockSet.has(nested)) {
+                    ownedByNestedBlock = true;
+                    break;
+                }
+                nested = nested.parentElement;
+            }
+            if (!ownedByNestedBlock) nodes.push(node);
+        }
+        return nodes;
+    }
+
+    function jevWrapDescriptionSentences(body) {
+        const blocks = qsa(body, JEV_DESCRIPTION_BLOCK_SELECTOR).filter((block) =>
+            !block.closest('pre, script, style, textarea, [contenteditable="true"]'),
+        );
+        const blockSet = new Set(blocks);
+        const sentences = [];
+        for (const block of blocks) {
+            const nodes = jevDescriptionTextNodes(block, blockSet);
+            const entries = [];
+            let offset = 0;
+            for (const node of nodes) {
+                const value = node.nodeValue || '';
+                entries.push({ node, value, start: offset, end: offset + value.length });
+                offset += value.length;
+            }
+            if (!offset) continue;
+            const text = entries.map((entry) => entry.value).join('');
+            const local = jevSentenceRanges(text).map((range) => ({
+                ...range,
+                block,
+                text: range.text.replace(/\s+/g, ' ').trim(),
+                spans: [],
+                marker: null,
+            })).filter((sentence) => sentence.text);
+            if (!local.length) continue;
+            const plans = new Map();
+            for (const sentence of local) {
+                for (const entry of entries) {
+                    const start = Math.max(sentence.start, entry.start);
+                    const end = Math.min(sentence.end, entry.end);
+                    if (end <= start) continue;
+                    if (!plans.has(entry.node)) plans.set(entry.node, []);
+                    plans.get(entry.node).push({ sentence, start: start - entry.start, end: end - entry.start });
+                }
+            }
+            for (const entry of entries) {
+                const pieces = plans.get(entry.node);
+                if (!pieces?.length || !entry.node.parentNode) continue;
+                pieces.sort((a, b) => a.start - b.start);
+                const fragment = document.createDocumentFragment();
+                let cursor = 0;
+                for (const piece of pieces) {
+                    if (piece.start > cursor) fragment.appendChild(document.createTextNode(entry.value.slice(cursor, piece.start)));
+                    const span = document.createElement('span');
+                    span.className = 'ack-jev-description-segment';
+                    span.textContent = entry.value.slice(piece.start, piece.end);
+                    piece.sentence.spans.push(span);
+                    fragment.appendChild(span);
+                    cursor = piece.end;
+                }
+                if (cursor < entry.value.length) fragment.appendChild(document.createTextNode(entry.value.slice(cursor)));
+                entry.node.replaceWith(fragment);
+            }
+            sentences.push(...local.filter((sentence) => sentence.spans.length));
+        }
+        return sentences;
+    }
+
+    function jevDescriptionReviewState(pr, head, bodyHash, sentences, index) {
+        const start = Math.max(0, index - 2);
+        const end = Math.min(sentences.length, index + 3);
+        return {
+            kind: 'description',
+            repository: `${pr.owner}/${pr.repo}`,
+            pr: pr.pr,
+            head,
+            description_hash: bodyHash,
+            sentence_index: index + 1,
+            target_sentence: sentences[index].text,
+            nearby_sentences: sentences.slice(start, end).map((sentence, offset) =>
+                `${start + offset === index ? 'TARGET ' : '       '}${sentence.text}`).join('\n'),
+        };
+    }
+
+    function jevDescriptionSelectionContext(sentence, marker, pr, parentText) {
+        return {
+            kind: 'text',
+            text: sentence.text,
+            file: '',
+            startLabel: '',
+            endLabel: '',
+            // Match an ordinary selection in the PR description: it is not
+            // scoped to the final commit merely because that is the PR head.
+            commitSha: '',
+            pr,
+            rect: marker.getBoundingClientRect(),
+            contextLines: '',
+            source: `${location.origin}${location.pathname}#issue-body`,
+            parentText,
+            isPRDescription: true,
+            threadText: '',
+            syntheticSelection: true,
+        };
+    }
+
+    function jevApplyDescriptionReading(sentence, result, evidence, pr, parentText) {
+        if (!sentence?.spans?.length || !result || !jevDescriptionReadingEnabled()) return;
+        sentence.marker?.remove();
+        sentence.marker = null;
+        const decision = jevReadingGuideDecision(result);
+        for (const span of sentence.spans) {
+            span.classList.remove('ack-jev-reading-background', 'ack-jev-reading-essence');
+            span.dataset.ackJevDescriptionPriority = decision.level;
+            if (decision.level === 'background') span.classList.add('ack-jev-reading-background');
+            if (decision.level === 'essence') span.classList.add('ack-jev-reading-essence');
+        }
+        if (decision.level !== 'essence') return;
+        const marker = document.createElement('span');
+        marker.className = 'ack-jev-description-priority';
+        marker.dataset.emoji = decision.emoji;
+        const explanation = jevReadingGuideTitle(decision, result, evidence, 'sentence');
+        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice} · pause for AI explanation`;
+        marker.title = explanation;
+        marker.setAttribute('role', 'button');
+        marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
+        marker.tabIndex = 0;
+        bindJevReadingHover(marker, () =>
+            jevDescriptionSelectionContext(sentence, marker, pr, parentText));
+        sentence.spans[0].before(marker);
+        sentence.marker = marker;
+    }
+
+    function queueJevDescriptionReading() {
+        if (_ackTesting || !jevDescriptionReadingEnabled() || !isPRConversationPage()) return;
+        const pr = parsePR();
+        const body = jevPRDescriptionBody();
+        if (!pr || !body || !body.isConnected) return;
+        const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
+        const parentText = jevDescriptionText(body);
+        const sourceKey = hashPrompt(`${head}\0${parentText}`);
+        const previous = jevDescriptionRecords.get(body);
+        if (previous?.sourceKey === sourceKey && previous.sentences.every((sentence) =>
+            sentence.spans.every((span) => span.isConnected))) return;
+        clearJevDescriptionAnnotations(body);
+        const sentences = jevWrapDescriptionSentences(body);
+        if (!sentences.length) return;
+        const bodyHash = hashPrompt(parentText);
+        jevDescriptionRecords.set(body, { sourceKey, sentences });
+        sentences.forEach((sentence, index) => {
+            const state = jevDescriptionReviewState(pr, head, bodyHash, sentences, index);
+            const id = jevCacheId('description', state);
+            for (const span of sentence.spans) span.dataset.ackJevDescriptionId = id;
+            jevEvaluate(pr, 'description', state).then((result) => {
+                if (!sentence.spans.every((span) => span.isConnected && span.dataset.ackJevDescriptionId === id)) return;
+                jevApplyDescriptionReading(sentence, result, `PR description sentence ${index + 1}`, pr, parentText);
+            });
+        });
+    }
+
+    function scheduleJevDescriptionReading() {
+        scheduleAckBackgroundWork('jev-description-reading', () => queueJevDescriptionReading(), {
+            delayMs: 120,
+            reason: 'description-reading',
+        });
+    }
+
+    function queueJevDescriptionUpdates(root) {
+        if (_ackTesting || !jevDescriptionReadingEnabled() || !isPRConversationPage() || root === document) return;
+        const relevant = root.matches?.(JEV_DESCRIPTION_ROOT_SELECTOR) ||
+            root.closest?.(JEV_DESCRIPTION_ROOT_SELECTOR) || root.querySelector?.(JEV_DESCRIPTION_ROOT_SELECTOR);
+        if (relevant) scheduleJevDescriptionReading();
+    }
+
+    function jevInvalidateChangedDescription(mutations) {
+        if (_ackTesting || !jevDescriptionReadingEnabled() || !isPRConversationPage()) return;
+        const body = jevPRDescriptionBody();
+        if (!body) return;
+        const touchesBody = mutations.some((mutation) => {
+            const target = mutation.target?.nodeType === 1 ? mutation.target : mutation.target?.parentElement;
+            if (target && (target === body || body.contains(target))) return true;
+            return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some((node) =>
+                node?.nodeType === 1 && (node === body || node.contains?.(body) || body.contains?.(node)),
+            );
+        });
+        if (!touchesBody) return;
+        const previous = jevDescriptionRecords.get(body);
+        const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
+        const sourceKey = hashPrompt(`${head}\0${jevDescriptionText(body)}`);
+        if (!previous || previous.sourceKey !== sourceKey) scheduleJevDescriptionReading();
     }
 
     function queueJevVisibleHunk({ pr, path, head, group, signature }) {
@@ -18266,6 +18684,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackTesting || !jevEnabled()) return;
         queueJevCommitRows();
         queueJevStackSummary();
+        queueJevDescriptionReading();
         for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) observeJevDiffFile(file);
     }
 
@@ -18367,6 +18786,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Keep DOM mutations in a single ordered pipeline so both the initial inject
     // pass and the mutation observers stay consistent and idempotent.
     const ROOT_INJECTORS = [
+        { name: 'jevDescriptionUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevDescriptionUpdates },
         { name: 'jevCommentUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevCommentUpdates },
         { name: 'jevDiffUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevDiffUpdates },
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
@@ -18429,11 +18849,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         },
         { name: 'diffHeaderToggle', when: (ctx) => ctx.onToolbar, fn: installDiffHeaderToggle },
         { name: 'outOfViewMenuCloser', when: (ctx) => ctx.onToolbar, fn: installOutOfViewMenuCloser },
-        {
-            name: 'commentMenuAugmenter',
-            when: (ctx) => ctx.onToolbar && !ctx.onCompare,
-            fn: installCommentMenuAugmenter,
-        },
         { name: 'diffSelection', when: (ctx) => ctx.onPR, fn: installDiffSelectionActions },
     ];
 
@@ -18716,6 +19131,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     new MutationObserver((mutations) => {
         if (_ackTesting || !shouldRunEditorInjectors()) return;
+        jevInvalidateChangedDescription(mutations);
         jevInvalidateChangedCommentBadges(mutations);
         if (!collectDomMutationBatch(mutations)) return;
         const lt = ensureAckLifetime('dom-observer');
@@ -20693,15 +21109,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 verticalAlign: 'middle',
             });
 
-            // Pending drafts often have no native action menu, so expose the
-            // existing context-copy action directly in their quick-action row.
-            if (isPendingComment) {
-                const copyBtn = makeIconBtn('📎', 'Copy comment with thread/location context', (btn) => {
-                    copyCommentContext(btn, container);
-                });
-                copyBtn.classList.add('ack-copy-comment-btn');
-                actionContainer.appendChild(copyBtn);
-            }
+            // Keep context copy outside GitHub's React-owned action menu. DOM
+            // injection into that portal can make GitHub discard later native
+            // actions, including Delete, when React reconciles the menu.
+            const copyBtn = makeIconBtn('📎', 'Copy comment with thread/location context', (btn) => {
+                copyCommentContext(btn, container);
+            });
+            copyBtn.classList.add('ack-copy-comment-btn');
+            actionContainer.appendChild(copyBtn);
 
             if (isMine) {
                 const isEditing = editState === 'e';
@@ -20918,21 +21333,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return roots;
     }
 
-    function bindCopyCommentContextAction(btn, container) {
-        btn._ackCommentContextContainer = container;
-        btn.title = 'Copy this comment with thread/location context';
-        if (btn.dataset.ackBound === '1') return btn;
-        btn.dataset.ackBound = '1';
-        btn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            copyCommentContext(btn, btn._ackCommentContextContainer);
-            btn.closest('details')?.removeAttribute?.('open');
-            btn.closest('[popover]')?.hidePopover?.();
-        });
-        return btn;
-    }
-
     function openMenuTrigger(trigger) {
         if (!trigger) return false;
         const details = trigger.closest?.('details');
@@ -20970,106 +21370,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return false;
         const tokenAction = new RegExp(`(^|[\\s_-])${literal}([\\s_-]|$)`, 'i');
         return candidates.some((text) => tokenAction.test(text));
-    }
-
-    function buildClassicCommentContextMenuItem(container) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.role = 'menuitem';
-        btn.className = 'dropdown-item btn-link ack-copy-comment-context-item';
-        btn.textContent = 'Copy comment 📎';
-        return bindCopyCommentContextAction(btn, container);
-    }
-
-    function buildActionListCommentContextMenuItem(container) {
-        const li = document.createElement('li');
-        li.role = 'none';
-        li.className = 'ActionListItem ack-copy-comment-context-item';
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.role = 'menuitem';
-        btn.className = 'ActionListContent';
-        btn.innerHTML = `
-            <span class="ActionListItem-label">Copy comment 📎</span>
-        `;
-        bindCopyCommentContextAction(btn, container);
-        li.appendChild(btn);
-        return li;
-    }
-
-    function insertCommentContextMenuItem(host, item, itemSelector) {
-        const items = [...host.querySelectorAll(itemSelector)];
-        const copyLinkItem = items.find((el) => /^copy link(\s|$)/i.test((el.textContent || '').trim()));
-        if (!copyLinkItem) return false;
-        copyLinkItem.insertAdjacentElement('afterend', item);
-        return true;
-    }
-
-    function injectCommentContextMenuItem(menuRoot, container) {
-        if (!menuRoot || !isVisible(menuRoot)) return false;
-
-        const existing = menuRoot.querySelector('.ack-copy-comment-context-item');
-        if (existing) {
-            const btn = existing.matches('button') ? existing : existing.querySelector('button');
-            if (btn) bindCopyCommentContextAction(btn, container);
-            return true;
-        }
-
-        const actionHost =
-            menuRoot.querySelector('[data-targets="action-list.items"]') || menuRoot.querySelector('ul, ol');
-        const hasActionList = !!(
-            actionHost &&
-            (menuRoot.querySelector('.ActionListItem, .ActionListContent') ||
-                menuRoot.matches('action-list, action-menu'))
-        );
-        if (hasActionList) {
-            return insertCommentContextMenuItem(
-                actionHost,
-                buildActionListCommentContextMenuItem(container),
-                '.ActionListItem',
-            );
-        }
-
-        const hasClassicItems = !!menuRoot.querySelector(
-            '.dropdown-item, .js-comment-quote-reply, button[role="menuitem"], a[role="menuitem"]',
-        );
-        if (hasClassicItems || menuRoot.matches('details-menu, [role="menu"]')) {
-            return insertCommentContextMenuItem(
-                menuRoot,
-                buildClassicCommentContextMenuItem(container),
-                '.dropdown-item, .js-comment-quote-reply, button[role="menuitem"], a[role="menuitem"]',
-            );
-        }
-        return false;
-    }
-
-    let _commentMenuAugmenterInstalled = false;
-    function installCommentMenuAugmenter() {
-        if (_commentMenuAugmenterInstalled) return;
-        _commentMenuAugmenterInstalled = true;
-        document.addEventListener(
-            'click',
-            (e) => {
-                if (_ackTesting) return;
-                const trigger = e.target?.closest?.(COMMENT_MENU_TRIGGER_SELECTOR);
-                if (!isCommentActionMenuTrigger(trigger)) return;
-                const container =
-                    trigger.closest(COMMENT_CONTAINER_SELECTOR) || trigger.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
-                if (!container) return;
-                const lt = ensureAckLifetime('comment-menu');
-                let attempts = 0;
-                const tick = () => {
-                    if (lt.signal.aborted) return;
-                    attempts++;
-                    for (const root of getCommentMenuRoots(trigger, container)) {
-                        if (injectCommentContextMenuItem(root, container)) return;
-                    }
-                    if (attempts < 10) ackSetTimeout(tick, attempts < 3 ? 80 : 150);
-                };
-                ackSetTimeout(tick, 0);
-            },
-            true,
-        );
     }
 
     function findVisibleEditTextarea(roots) {
@@ -24815,7 +25115,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             reqId === _diffSelectionOneLinerReqId &&
             actionReqId === _diffSelectionActionReqId &&
             selectionKey === _diffSelectionCtxKey &&
-            (window.getSelection?.()?.toString?.() || '').replace(/\r\n/g, '\n') === ctx.text &&
+            (ctx.syntheticSelection
+                ? _diffSelectionCtx === ctx
+                : (window.getSelection?.()?.toString?.() || '').replace(/\r\n/g, '\n') === ctx.text) &&
             el.isConnected;
         el.style.display = 'block';
         _diffSelectionOneLinerStopAnim = startBrailleAnimation((frame) => {
@@ -24958,6 +25260,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function hideDiffSelectionToolbar() {
+        dismissJevReadingHover();
         if (_diffSelectionToolbar) _diffSelectionToolbar.style.display = 'none';
         _diffSelectionCtx = null;
         _diffSelectionCtxKey = '';
@@ -25640,14 +25943,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         hideDiffSelectionToolbar();
     }
 
-    function updateDiffSelectionToolbar() {
+    function updateDiffSelectionToolbar(providedCtx = null) {
         if (_ackTesting) return;
         if (!isPRPage()) {
             hideDiffSelectionToolbar();
             return;
         }
-        const sel = window.getSelection?.();
-        const ctx = getDiffSelectionContext(sel);
+        const sel = providedCtx ? null : window.getSelection?.();
+        const ctx = providedCtx || getDiffSelectionContext(sel);
         if (!ctx) {
             hideDiffSelectionToolbar();
             return;
@@ -25920,9 +26223,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function addSingleCommitExplainButton() {
+    function addSingleCommitExplainButton(root = document) {
         // React UI: h2 inside bgColor-inset header; Classic: .commit-title
-        const commitHeader = document.querySelector(
+        const commitHeader = root.querySelector(
             '.commit-title, [data-testid="commit-title"], ' + '.bgColor-inset h2, .tmp-p-3 h2',
         );
         if (!commitHeader) return;
@@ -30100,9 +30403,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
             jevPublicRepository = () => Promise.resolve(false);
-            addSingleCommitExplainButton();
+            addSingleCommitExplainButton(mount);
             queueJevCommitRow({ sha: '27c6a2c75bf90ef03f8b297a00853d910170a0c6', msg: title.textContent, el: heading });
-            addSingleCommitExplainButton();
+            addSingleCommitExplainButton(mount);
 
             const actions = heading.querySelector('.ack-commit-heading-actions');
             const explain = heading.querySelector('.ack-commit-explain');
@@ -30262,6 +30565,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevApplyLineReading(line, result('essence', 0.94, 'calculation'), 'src/example.cpp:R7');
             ackAssert(line.cell.classList.contains('ack-jev-reading-essence'), 'essence line is bold');
             ackEq(host.querySelector('.ack-jev-line-priority')?.textContent, '🧮', 'essence line gets its category emoji');
+            ackAssert(host.querySelector('.ack-jev-line-priority')?.dataset.quickExplanation.includes('Calculation'),
+                'line emoji has the same immediate hover explanation as a description emoji');
             ackEq(line.cell.textContent, codeBefore, 'gutter emoji does not pollute copied code');
 
             jevApplyLineReading(line, result('foreground', 0.88, 'behavior', 0.92), 'src/example.cpp:R7');
@@ -30299,6 +30604,88 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'head and hunk edits produce a new line cache key');
         host.querySelector('.blob-code').textContent = '';
         ackEq(jevChangedRow(host.querySelector('tr'))?.text, '[blank line]', 'blank changed lines are still classified');
+    });
+
+    ackTest('Jev PR description guide uses the line algorithm without changing copied text', () => {
+        const oldDescriptionEnabled = jevDescriptionReadingEnabled;
+        const oldUpdateToolbar = updateDiffSelectionToolbar;
+        const host = document.createElement('div');
+        host.className = 'markdown-body';
+        host.innerHTML = '<p><strong>Problem:</strong> The old path repeats work. The new path caches the result.</p>' +
+            '<ul><li>Run the functional test.</li></ul><pre>code.example();</pre>';
+        document.body.appendChild(host);
+        const textBefore = host.textContent;
+        let hoverContext = null;
+        const result = (priority, probability, category, concern = 0.05) => ({
+            model: 'jev-test',
+            answers: {
+                priority: { type: 'choice', choice: priority, probability },
+                category: { type: 'choice', choice: category, probability: 0.95 },
+                concern: { type: 'noul', noul: concern },
+            },
+        });
+        try {
+            jevDescriptionReadingEnabled = () => true;
+            updateDiffSelectionToolbar = (ctx) => { hoverContext = ctx; };
+            const sentences = jevWrapDescriptionSentences(host);
+            ackEq(sentences.length, 3, 'splits prose and list text into sentences while excluding code blocks');
+            ackAssert(!host.querySelector('pre .ack-jev-description-segment'), 'does not wrap preformatted code');
+            jevApplyDescriptionReading(sentences[0], result('background', 0.96, 'other'),
+                'PR description sentence 1', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }, textBefore);
+            ackAssert(sentences[0].spans.every((span) => span.classList.contains('ack-jev-reading-background')),
+                'background sentence uses the same muted style as a background line');
+            jevApplyDescriptionReading(sentences[1], result('essence', 0.94, 'behavior'),
+                'PR description sentence 2', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }, textBefore);
+            const marker = sentences[1].marker;
+            ackAssert(sentences[1].spans.every((span) => span.classList.contains('ack-jev-reading-essence')),
+                'essence sentence uses the same bold style as an essence line');
+            ackEq(marker?.dataset.emoji, '🎯', 'essence sentence uses the shared category emoji');
+            ackEq(marker?.textContent, '', 'CSS-rendered emoji does not enter copied description text');
+            ackEq(host.textContent, textBefore, 'sentence wrappers preserve the exact rendered text');
+            marker.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            ackAssert(document.querySelector('.ack-jev-reading-quick-tooltip')?.textContent.includes('Core behavior'),
+                'emoji hover shows an immediate cached explanation before an AI request');
+            marker.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
+            ackAssert(!document.querySelector('.ack-jev-reading-quick-tooltip'),
+                'moving away dismisses the cached tooltip and pending AI explanation');
+            marker.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            marker.click();
+            ackEq(hoverContext?.text, sentences[1].text, 'sustained hover or click opens the selection popup for the sentence');
+            ackEq(hoverContext?.parentText, textBefore, 'hover explanation includes the surrounding description');
+            ackAssert(hoverContext?.syntheticSelection && hoverContext?.isPRDescription,
+                'hover uses the existing PR-description selection flow');
+            clearJevDescriptionAnnotations(host);
+            ackEq(host.textContent, textBefore, 'quick disable unwraps annotations without changing text');
+            ackAssert(!host.querySelector('.ack-jev-description-segment, .ack-jev-description-priority'),
+                'quick disable removes sentence wrappers and emojis');
+        } finally {
+            jevDescriptionReadingEnabled = oldDescriptionEnabled;
+            updateDiffSelectionToolbar = oldUpdateToolbar;
+            host.remove();
+        }
+    });
+
+    ackTest('Jev PR description sentence cache changes after edits and force pushes', () => {
+        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
+        const sentences = [{ text: 'The new path caches the result.' }, { text: 'This avoids repeated work.' }];
+        const before = jevDescriptionReviewState(pr, 'a'.repeat(40), 'body-a', sentences, 0);
+        const edited = jevDescriptionReviewState(pr, 'a'.repeat(40), 'body-b',
+            [{ text: 'The new path stores the result.' }, sentences[1]], 0);
+        const pushed = jevDescriptionReviewState(pr, 'b'.repeat(40), 'body-a', sentences, 0);
+        ackAssert(before.nearby_sentences.includes('TARGET The new path caches the result.'),
+            'state identifies the exact target sentence');
+        ackNeq(jevCacheId('description', before), jevCacheId('description', edited),
+            'description edits cannot reuse a stale sentence result');
+        ackNeq(jevCacheId('description', before), jevCacheId('description', pushed),
+            'force pushes cannot reuse a stale sentence result');
+        ackAssert(jevValidatedResult('description', {
+            model: 'jev-test',
+            answers: {
+                priority: { type: 'choice', choice: 'essence', probabilities: { essence: 0.9 } },
+                category: { type: 'choice', choice: 'behavior', probabilities: { behavior: 0.8 } },
+                concern: { type: 'noul', noul: 0.1 },
+            },
+        }), 'accepts the same typed reading-guide answer shape as a changed line');
     });
 
     ackTest('sourceSection fails closed when structural-test anchors drift', () => {
@@ -34766,7 +35153,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const source = _ackSource;
         const helper = source.slice(
             source.indexOf('function openMenuTrigger'),
-            source.indexOf('function buildClassicCommentContextMenuItem'),
+            source.indexOf('function commentMenuItemTextCandidates'),
         );
         ackAssert(
             helper.includes("if (!details.hasAttribute('open')) trigger.click();"),
@@ -36892,22 +37279,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             pending.remove();
             addQuickCommentActions(root);
             ackAssert(
-                !header.querySelector('.ack-copy-comment-btn'),
-                'removes the pending-only copy button after submission',
+                header.querySelector('.ack-copy-comment-btn'),
+                'keeps direct context copy after submission without mutating GitHub’s menu',
             );
 
             badges.appendChild(pending);
             addQuickCommentActions(root);
             ackAssert(
                 header.querySelector('.ack-copy-comment-btn'),
-                'restores the copy button when a pending marker hydrates later',
+                'keeps one copy button when a pending marker hydrates later',
             );
         } finally {
             root.remove();
         }
     });
 
-    ackTest('pending quick-copy action stays on the draft instead of its published parent', () => {
+    ackTest('direct quick-copy actions stay scoped to their own published and pending comments', () => {
         const root = document.createElement('div');
         root.id = 'acktest-qactions-pending-copy-scope';
         Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
@@ -36930,8 +37317,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             addQuickCommentActions(root);
             ackAssert(
-                !root.querySelector('#acktest-published-parent .ack-copy-comment-btn'),
-                'published parent must not inherit the draft copy action',
+                root.querySelector('#acktest-published-parent .ack-copy-comment-btn'),
+                'published parent gets its own direct context-copy action',
             );
             ackAssert(
                 root.querySelector('#acktest-pending-draft .ack-copy-comment-btn'),
@@ -37666,8 +38053,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             parsePR = () => null;
             runReadOnlyCommitMessagesProofread = (button) => { proofreadTarget = button; };
             mount.addEventListener('click', () => { bubbled = true; });
-            addSingleCommitExplainButton();
-            addSingleCommitExplainButton();
+            addSingleCommitExplainButton(mount);
+            addSingleCommitExplainButton(mount);
             const title = mount.querySelector('.commit-title');
             const subject = title.querySelector('#classic-commit-subject');
             const explain = title.querySelector('.ack-commit-explain');
@@ -38485,10 +38872,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('.commit-title'), 'looks for commit title header');
         ackAssert(fn.includes('_${msg}_:'), 'wraps message in italic underscores with trailing colon');
         ackAssert(fn.includes(' _$'), 'prefixes message with markdown italic underscore');
-        // Strips our injected lightbulb/proofread button text
-        ackAssert(fn.includes('ack-commit-explain'), 'removes injected explain buttons before reading text');
-        ackAssert(fn.includes('ack-commit-proofread'), 'removes injected proofread buttons before reading text');
-        ackAssert(fn.includes('cloneNode'), 'clones header to avoid mutating DOM');
+        // The shared cleanup strips every ACKtopus-owned control, including
+        // current and future commit-title actions, before reading the title.
+        ackAssert(fn.includes('textWithoutAcktopusDecorations'), 'uses shared injected-control cleanup');
+        const cleanup = source.slice(
+            source.indexOf('function textWithoutAcktopusDecorations'),
+            source.indexOf('function jevCommentText'),
+        );
+        ackAssert(cleanup.includes('ACK_MUTATION_OWNED_SELECTOR'), 'removes ACKtopus-owned title controls');
+        ackAssert(cleanup.includes('cloneNode'), 'clones header to avoid mutating DOM');
     });
 
     ackTest('explainComment: inline code comments extract specific target line and line number', () => {
@@ -41284,9 +41676,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.includes('fn: installDiffSelectionActions'),
             'doc injector pipeline includes diff selection helper',
         );
+        const docInjectors = source.slice(source.indexOf('const DOC_INJECTORS'), source.indexOf('function currentInjectContext'));
         ackAssert(
-            source.includes('fn: installCommentMenuAugmenter'),
-            'doc injector pipeline includes comment menu augmenter',
+            !docInjectors.includes('installCommentMenuAugmenter'),
+            'doc injector pipeline leaves GitHub comment menus untouched',
         );
     });
 
@@ -44275,77 +44668,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('injectCommentContextMenuItem adds reusable menu entry to classic and action-list menus', () => {
-        const host = document.createElement('div');
-        host.style.position = 'absolute';
-        host.style.left = '-99999px';
-        host.innerHTML = `
-            <div id="comment-a" class="timeline-comment"><div class="markdown-body">A</div></div>
-            <div id="comment-b" class="timeline-comment"><div class="markdown-body">B</div></div>
-        `;
-        document.body.appendChild(host);
-
-        const classic = document.createElement('details-menu');
-        classic.style.display = 'block';
-        classic.style.width = '120px';
-        classic.style.height = '40px';
-        classic.innerHTML = '<button type="button" class="dropdown-item">Quote reply</button>';
-        document.body.appendChild(classic);
-
-        const actionMenu = document.createElement('action-list');
-        actionMenu.style.display = 'block';
-        actionMenu.style.width = '140px';
-        actionMenu.style.height = '60px';
-        actionMenu.innerHTML =
-            '<ul data-targets="action-list.items"><li class="ActionListItem"><button type="button" class="ActionListContent"><span class="ActionListItem-label">Copy link</span></button></li></ul>';
-        document.body.appendChild(actionMenu);
-        try {
-            ackEq(
-                injectCommentContextMenuItem(classic, host.querySelector('#comment-a')),
-                false,
-                'does not inject into classic menu without Copy link',
-            );
-            ackAssert(
-                !classic.querySelector('.ack-copy-comment-context-item'),
-                'classic menu stays untouched without Copy link',
-            );
-
-            classic.innerHTML =
-                '<button type="button" class="dropdown-item">Copy link</button><button type="button" class="dropdown-item">Quote reply</button>';
-            ackEq(
-                injectCommentContextMenuItem(classic, host.querySelector('#comment-a')),
-                true,
-                'injects into classic menu with Copy link',
-            );
-            const classicItems = [...classic.querySelectorAll('.dropdown-item')].map((el) => el.textContent.trim());
-            ackDeepEq(
-                classicItems,
-                ['Copy link', 'Copy comment 📎', 'Quote reply'],
-                'classic entry is inserted right after Copy link',
-            );
-
-            ackEq(
-                injectCommentContextMenuItem(actionMenu, host.querySelector('#comment-b')),
-                true,
-                'injects into action-list menu',
-            );
-            const injectedBtn = actionMenu.querySelector('.ack-copy-comment-context-item button');
-            ackAssert(injectedBtn, 'action-list menu gets copy entry');
-            ackEq(injectedBtn.textContent.trim(), 'Copy comment 📎', 'action-list entry carries ACKtopus marker');
-            ackEq(
-                injectedBtn._ackCommentContextContainer,
-                host.querySelector('#comment-b'),
-                'stores current comment container on injected action',
-            );
-            const labels = [...actionMenu.querySelectorAll('.ActionListItem-label')].map((el) => el.textContent.trim());
-            ackDeepEq(labels, ['Copy link', 'Copy comment 📎'], 'action-list entry is inserted right after Copy link');
-        } finally {
-            classic.remove();
-            actionMenu.remove();
-            host.remove();
-        }
-    });
-
     ackTest('hashPrompt is exported and produces stable hashes', () => {
         ackEq(typeof hashPrompt, 'function', 'hashPrompt exported');
         const h1 = hashPrompt('hello world');
@@ -44958,7 +45280,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('includeComments: true'), 'keeps visible comments');
     });
 
-    ackTest('comment context copy is a standalone helper wired into kebab menus', () => {
+    ackTest('comment context copy is a standalone quick action that leaves native menus untouched', () => {
         const source = _ackSource;
         const helper = source.slice(
             source.indexOf('function gatherCommentContext'),
@@ -44979,13 +45301,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(!copyFn.includes('startBrailleAnimation'), 'local comment context copy has no artificial spinner wait');
         ackAssert(!copyFn.includes('waitForNextPaint'), 'local comment context copy runs immediately');
 
-        const menuFns = source.slice(
-            source.indexOf('function getCommentMenuRoots'),
-            source.indexOf('async function waitForEditTextarea'),
+        const quickActions = source.slice(
+            source.indexOf('function addQuickCommentActions'),
+            source.indexOf('// Opens the kebab menu invisibly'),
         );
-        ackAssert(menuFns.includes('Copy comment'), 'injects copy action into menu');
-        ackAssert(menuFns.includes('installCommentMenuAugmenter'), 'installs menu augmenter');
-        ackAssert(menuFns.includes('COMMENT_MENU_ROOT_SELECTOR'), 'menu injection uses shared root selector');
+        ackAssert(quickActions.includes("makeIconBtn('📎'"), 'adds the direct copy-context icon');
+        ackAssert(quickActions.includes('copyCommentContext(btn, container)'), 'direct icon uses the local copy helper');
+        const docInjectors = source.slice(source.indexOf('const DOC_INJECTORS'), source.indexOf('function currentInjectContext'));
+        ackAssert(!docInjectors.includes('installCommentMenuAugmenter'), 'does not install native-menu mutation');
     });
 
     // --- Audit fixes (ChatGPT review) ---
@@ -48412,8 +48735,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes("name: 'diffHeaderToggle'"), 'has header-toggle injector');
         ackAssert(reviewOptions.includes('setWhitespaceOnlyHidden'), 'has whitespace checkbox setter');
         ackAssert(reviewOptions.includes('Hide whitespace-only'), 'adds GitHub-side whitespace option');
-        ackAssert(reviewOptions.includes('Jev line guide'), 'adds a visible Jev line-guide toggle');
-        ackAssert(reviewOptions.includes('setJevLineReadingPreferred'), 'quick toggle controls line annotation work');
+        ackAssert(reviewOptions.includes('Jev reading guide'), 'adds a visible shared reading-guide toggle');
+        ackAssert(reviewOptions.includes('setJevLineReadingPreferred'), 'quick toggle controls line and description annotation work');
         ackAssert(reviewOptions.includes("input.type = 'checkbox'"), 'uses checkbox state in GitHub-side options');
         ackAssert(!diff.includes('ack-first-unviewed-btn'), 'does not add viewed-checkbox navigation');
     });
