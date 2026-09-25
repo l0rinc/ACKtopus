@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.267
+// @version      1.268
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -91,6 +91,7 @@
         '.ack-jev-description-priority{display:inline-block;margin-right:3px;font-style:normal!important;font-weight:400!important;cursor:help;white-space:nowrap}',
         '.ack-jev-description-priority::before{content:attr(data-emoji)}',
         '.ack-jev-reading-quick-tooltip{position:fixed;z-index:1000000;max-width:360px;padding:5px 7px;border:1px solid var(--borderColor-default,#30363d);border-radius:6px;background:var(--bgColor-emphasis,#25292e);color:var(--fgColor-onEmphasis,#fff);font-size:11px;line-height:1.35;white-space:pre-line;pointer-events:none;box-shadow:0 3px 10px rgba(0,0,0,.35)}',
+        'html.ack-native-comment-menu-hidden [role="menu"],html.ack-native-comment-menu-hidden .ActionListWrap,html.ack-native-comment-menu-hidden details-menu,html.ack-native-comment-menu-hidden action-menu,html.ack-native-comment-menu-hidden action-list,html.ack-native-comment-menu-hidden [popover]:not([role="dialog"]):not([aria-modal="true"]){opacity:.01!important;pointer-events:none!important}',
     ].join('');
     document.head.appendChild(style);
     let lastForcePush = null; // set asynchronously after page load
@@ -1852,6 +1853,16 @@
             if (!root || !document.body.contains(root)) continue;
             if (root.classList?.contains('ack-diff-dialog-overlay')) continue;
             if (isAckOwnedReviewControl(root)) continue;
+            // A fixed child is viewport-relative only in a real top-layer
+            // dialog/popover. GitHub also uses .Overlay and role=dialog on
+            // ordinary transformed containers, which can place the proofread
+            // dialog far above or below the current viewport on tall pages.
+            let topLayer = false;
+            try { topLayer = root.matches(':modal'); } catch (_) {}
+            if (!topLayer) {
+                try { topLayer = root.matches(':popover-open'); } catch (_) {}
+            }
+            if (!topLayer) continue;
             return root;
         }
         return null;
@@ -2807,24 +2818,132 @@
     let _githubAuthBucketPat = '';
     let _githubAuthBucketId = 0;
     const _githubRateLimitedUntil = new Map();
+    const _githubPatRepoAccess = new Map();
+    const _githubPatRepoAccessRequests = new Map();
+    const _githubPatRepoAccessWarned = new Set();
+
+    function githubApiRepoKey(url) {
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname !== 'api.github.com') return '';
+            const match = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)(?:\/|$)/);
+            return match ? `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}` : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function currentGithubRepoKey() {
+        const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/(?:pull|issues)\/\d+(?:\/|$)/);
+        return match ? `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}` : '';
+    }
+
+    function githubPatRepoAccessKey(repoKey, pat = githubPatValue()) {
+        return repoKey && pat ? `${hashPrompt(pat)}:${repoKey.toLowerCase()}` : '';
+    }
+
+    function githubPatRepoAccessState(repoKey, pat = githubPatValue()) {
+        return _githubPatRepoAccess.get(githubPatRepoAccessKey(repoKey, pat)) || '';
+    }
+
+    function githubRepoAccessError(repoKey, url) {
+        const err = new Error(`Configured GitHub token cannot read ${repoKey}; skipping ${url}`);
+        err.status = 404;
+        err.githubRepoAccessDenied = true;
+        return err;
+    }
+
+    function rememberGithubPatRepoAccess(url, headers, access) {
+        if (!headers?.Authorization) return;
+        const repoKey = githubApiRepoKey(url);
+        const pat = githubPatValue();
+        const key = githubPatRepoAccessKey(repoKey, pat);
+        if (!key || repoKey.toLowerCase() !== currentGithubRepoKey().toLowerCase()) return;
+        _githubPatRepoAccess.set(key, access);
+        refreshGithubPatStatus();
+        if (access !== 'denied' || _githubPatRepoAccessWarned.has(key)) return;
+        _githubPatRepoAccessWarned.add(key);
+        ackLogEvent('GitHub token cannot read the current repository', {
+            repository: repoKey,
+            action: 'Skipping repository API reads and using page/DOM fallbacks',
+            guidance: 'Give the fine-grained token access to this repository with read access for Pull requests, Issues, and Contents.',
+        }, 'warn');
+    }
+
+    function ensureGithubPatRepoAccess(repoKey, { force = false } = {}) {
+        const pat = githubPatValue();
+        const key = githubPatRepoAccessKey(repoKey, pat);
+        if (!key || repoKey.toLowerCase() !== currentGithubRepoKey().toLowerCase()) return Promise.resolve(true);
+        const known = _githubPatRepoAccess.get(key);
+        if (!force && known === 'allowed') return Promise.resolve(true);
+        if (!force && known === 'denied') {
+            return Promise.reject(githubRepoAccessError(repoKey, `https://api.github.com/repos/${repoKey}`));
+        }
+        const existing = _githubPatRepoAccessRequests.get(key);
+        if (existing) return existing;
+        const url = `https://api.github.com/repos/${repoKey.split('/').map(encodeURIComponent).join('/')}`;
+        const request = gmFetch(url, {
+            freshForMs: force ? 0 : 30000,
+            skipRepoAccessProbe: true,
+        }).then(() => {
+            // A rejected PAT may have succeeded only through gmFetch's
+            // anonymous public-repository fallback. Let the dependent read use
+            // that same fallback without calling the PAT verified.
+            if (pat === _githubBadPat) {
+                refreshGithubPatStatus();
+                return true;
+            }
+            // A cached authenticated repository response is still valid proof
+            // for this exact PAT cache bucket, even when no network callback ran.
+            _githubPatRepoAccess.set(key, 'allowed');
+            refreshGithubPatStatus();
+            return true;
+        }).catch((error) => {
+            if (githubPatRepoAccessState(repoKey, pat) === 'denied') throw githubRepoAccessError(repoKey, url);
+            throw error;
+        });
+        const tracked = request.finally(() => {
+            if (_githubPatRepoAccessRequests.get(key) === tracked) _githubPatRepoAccessRequests.delete(key);
+        });
+        _githubPatRepoAccessRequests.set(key, tracked);
+        return tracked;
+    }
+
+    function verifyGithubPatForCurrentRepo(input, status) {
+        const repoKey = currentGithubRepoKey();
+        const saved = githubPatValue();
+        if (!repoKey || !saved || normalizeGithubPatInput(input?.value) !== saved) return;
+        updateGithubPatStatus(input, status);
+        ensureGithubPatRepoAccess(repoKey, { force: true }).catch(() => {}).finally(() => {
+            if (input?.isConnected && status?.isConnected) updateGithubPatStatus(input, status);
+        });
+    }
 
     function updateGithubPatStatus(input, status) {
         if (!input || !status) return;
         const pat = normalizeGithubPatInput(input.value);
         const invalid = !!pat && pat === _githubBadPat;
+        const repoKey = currentGithubRepoKey();
+        const repoAccess = githubPatRepoAccessState(repoKey, pat);
+        const denied = !!pat && repoAccess === 'denied';
+        const verified = !!pat && repoAccess === 'allowed';
         const [icon, color, title] = invalid
             ? ['⚠️', '#d29922', 'GitHub rejected this token. It may be expired, invalid, or missing required permissions.']
-            : pat
-              ? ['✅', '#3fb950', 'Token configured. ACKtopus will warn here if GitHub rejects it.']
+            : denied
+              ? ['⚠️', '#d29922', `Token is valid but cannot read ${repoKey}. Grant this repository and its Pull requests, Issues, and Contents read permissions.`]
+              : verified
+                ? ['✅', '#3fb950', `Token verified for ${repoKey}.`]
+                : pat
+                  ? ['●', '#8b949e', repoKey ? `Token configured; checking access to ${repoKey}.` : 'Token configured; open a repository to verify its access.']
               : ['', '', ''];
         status.textContent = icon;
         status.style.color = color;
         status.title = title;
         if (title) status.setAttribute('aria-label', title);
         else status.removeAttribute('aria-label');
-        if (invalid) input.setAttribute('aria-invalid', 'true');
+        if (invalid || denied) input.setAttribute('aria-invalid', 'true');
         else input.removeAttribute('aria-invalid');
-        input.style.borderColor = invalid ? '#d29922' : '#30363d';
+        input.style.borderColor = invalid || denied ? '#d29922' : '#30363d';
     }
 
     function refreshGithubPatStatus() {
@@ -2881,7 +3000,7 @@
     }
 
     function shouldWarnOptionalGitHubApiError(err) {
-        return !_ackTesting && !isGithubRateLimitedError(err);
+        return !_ackTesting && !isGithubRateLimitedError(err) && !err?.githubRepoAccessDenied;
     }
 
     function githubAuthBucket(headers = {}) {
@@ -3189,7 +3308,7 @@
         return new Error(`GitHub data changed while loading ${url}; retry the request`);
     }
 
-    function gmFetch(url, { anonymous = false, headers: extraHeaders = {}, freshForMs } = {}) {
+    function gmFetch(url, { anonymous = false, headers: extraHeaders = {}, freshForMs, skipRepoAccessProbe = false } = {}) {
         const resetGeneration = _githubJsonResetGeneration;
         const baseHeaders = { ...(anonymous ? { Accept: 'application/vnd.github+json' } : ghApiHeaders()) };
         for (const [name, value] of Object.entries(extraHeaders || {})) {
@@ -3197,6 +3316,23 @@
                 : name.toLowerCase() === 'accept' ? 'Accept' : name;
             if (anonymous && /^(authorization|cookie|proxy-authorization)$/i.test(normalized)) continue;
             baseHeaders[normalized] = value;
+        }
+        const repoKey = githubApiRepoKey(url);
+        const currentRepo = currentGithubRepoKey();
+        const repoRootPath = repoKey ? `/repos/${repoKey}`.toLowerCase() : '';
+        let apiPath = '';
+        try { apiPath = decodeURIComponent(new URL(url).pathname).toLowerCase(); } catch (_) {}
+        const currentRepoRequest = !!repoKey && repoKey.toLowerCase() === currentRepo.toLowerCase();
+        if (!anonymous && !skipRepoAccessProbe && currentRepoRequest && githubPatRepoAccessState(repoKey) === 'denied') {
+            return Promise.reject(githubRepoAccessError(repoKey, url));
+        }
+        if (!anonymous && !skipRepoAccessProbe && baseHeaders.Authorization && currentRepoRequest && apiPath !== repoRootPath) {
+            return ensureGithubPatRepoAccess(repoKey).then(() => gmFetch(url, {
+                anonymous,
+                headers: extraHeaders,
+                freshForMs,
+                skipRepoAccessProbe: true,
+            }));
         }
         const generation = githubHttpCacheGeneration(url);
         const requestKey = `${githubHttpCacheKey(url, baseHeaders, anonymous)}:${resetGeneration}:${generation}`;
@@ -3227,11 +3363,13 @@
                         generation !== githubHttpCacheGeneration(url)) return reject(githubHttpInvalidatedError(url));
                     if (r.status === 304 && cached) {
                         _githubHttpValidationTimes.set(cached.key, Date.now());
+                        rememberGithubPatRepoAccess(url, headers, 'allowed');
                         resolve(cached.data);
                     } else if (r.status >= 200 && r.status < 300) {
                         try {
                             const data = parseGithubJson(r, url);
                             rememberGithubHttpCache(url, baseHeaders, r, data, anonymous);
+                            rememberGithubPatRepoAccess(url, headers, 'allowed');
                             resolve(data);
                         } catch (e) {
                             reject(e);
@@ -3278,14 +3416,24 @@
                                     }
                                 } else {
                                     rememberGithubRateLimit(r2, fallbackHeaders);
-                                    reject(githubHttpError(r2, url));
+                                    if (r2.status === 404) rememberGithubPatRepoAccess(url, baseHeaders, 'denied');
+                                    const error = githubHttpError(r2, url);
+                                    if (r2.status === 404 && githubPatRepoAccessState(repoKey) === 'denied') {
+                                        error.githubRepoAccessDenied = true;
+                                    }
+                                    reject(error);
                                 }
                             },
                             ...githubGetTransportHandlers(url, reject),
                         });
                     } else {
                         rememberGithubRateLimit(r, headers);
-                        reject(githubHttpError(r, url));
+                        if (r.status === 404) rememberGithubPatRepoAccess(url, headers, 'denied');
+                        const error = githubHttpError(r, url);
+                        if (r.status === 404 && githubPatRepoAccessState(repoKey) === 'denied') {
+                            error.githubRepoAccessDenied = true;
+                        }
+                        reject(error);
                     }
                 },
                 ...githubGetTransportHandlers(url, reject),
@@ -6775,6 +6923,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         _githubJsonResetGeneration++;
         _githubJsonRequests.clear();
         _githubHttpValidationTimes.clear();
+        _githubPatRepoAccess.clear();
+        _githubPatRepoAccessRequests.clear();
+        _githubPatRepoAccessWarned.clear();
         _githubGraphQLResetGeneration++;
         _githubGraphQLRequests.clear();
         _githubGraphQLResults.clear();
@@ -6988,7 +7139,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         panel.appendChild(ghTitle);
         const ghDesc = document.createElement('div');
         ghDesc.textContent =
-            'Personal Access Token for authenticated API reads (5000/hr vs 60/hr). Public repositories do not need repository permissions. ACKtopus uses your GitHub page session for edits, replies, and reviews, so the token does not need write access.';
+            'Personal Access Token for authenticated API reads (5000/hr vs 60/hr). For a private repository, grant this token access to that repository with Pull requests, Issues, and Contents read permissions. ACKtopus uses your GitHub page session for edits, replies, and reviews, so the token does not need write access.';
         Object.assign(ghDesc.style, { fontSize: '11px', color: '#8b949e', marginBottom: '6px' });
         panel.appendChild(ghDesc);
         const ghRow = document.createElement('div');
@@ -7019,7 +7170,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const ghHelp = document.createElement('a');
         ghHelp.href = 'https://github.com/settings/tokens?type=beta';
         ghHelp.target = '_blank';
-        ghHelp.textContent = 'Create token (fine-grained, no scopes) \u2192';
+        ghHelp.textContent = 'Create fine-grained read token \u2192';
         Object.assign(ghHelp.style, {
             fontSize: '11px',
             color: '#58a6ff',
@@ -7037,6 +7188,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             marginBottom: '4px',
         });
         panel.appendChild(ghFormatHelp);
+        // A status check must test the current repository. Merely having a
+        // token string never earns the green check mark.
+        verifyGithubPatForCurrentRepo(ghInput, ghStatus);
 
         // Jev is separate from the conversational LLM providers. A saved key
         // enables its public-repository classifications by default.
@@ -7579,9 +7733,16 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             });
             const ghPat = document.getElementById('ack-github-pat');
             if (ghPat) {
+                const previousPat = githubPatValue();
                 const normalizedPat = normalizeGithubPatInput(ghPat.value);
                 if (normalizedPat) GM_setValue('github_pat', normalizedPat);
                 else GM_deleteValue('github_pat');
+                if (previousPat !== normalizedPat) {
+                    _githubBadPat = '';
+                    _githubPatRepoAccess.clear();
+                    _githubPatRepoAccessRequests.clear();
+                    _githubPatRepoAccessWarned.clear();
+                }
             }
             const maintEl = document.getElementById('ack-maintainer-logins');
             if (maintEl) GM_setValue('maintainer_logins', maintEl.value);
@@ -12954,7 +13115,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 padding: '20px',
                 width: 'min(900px, calc(100vw - 32px))',
                 maxWidth: '900px',
-                maxHeight: '70vh',
+                maxHeight: 'calc(100dvh - 32px)',
+                margin: '16px',
+                boxSizing: 'border-box',
                 overflow: 'auto',
                 outline: 'none',
                 color: '#c9d1d9',
@@ -13470,6 +13633,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
             mount.appendChild(overlay);
             focusDialogAtTop();
+            ackRaf(() => {
+                if (!overlay.isConnected || overlay.parentElement === document.body) return;
+                const rect = dialog.getBoundingClientRect();
+                if (!rect.width && !rect.height) return;
+                const viewportHeight = window.visualViewport?.height || window.innerHeight;
+                const viewportWidth = window.visualViewport?.width || window.innerWidth;
+                const outsideViewport = rect.bottom <= 0 || rect.top >= viewportHeight ||
+                    rect.right <= 0 || rect.left >= viewportWidth;
+                if (!outsideViewport) return;
+                document.body.appendChild(overlay);
+                ackLogEvent('proofread: dialog reanchored to viewport', {
+                    dialog: opts.title || 'proofreading changes',
+                    previousMount: mount.tagName?.toLowerCase() || 'unknown',
+                });
+                focusDialogAtTop();
+            });
         });
     }
 
@@ -16743,6 +16922,58 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevPauseUntil = 0;
     let jevPauseRetryTimer = null;
     let jevConfigured = !!GM_getValue('jev_enabled', true) && !!GM_getValue('jev_api_key', '');
+    const jevDiagnosticEvents = new Map();
+    const jevDiagnosticCounts = new Map();
+
+    function jevDiagnostic(stage, details = {}, { key = '', intervalMs = 1000, repeatMs = 15000, level = 'log' } = {}) {
+        if (_ackTesting) return;
+        const eventKey = `${location.pathname}:${stage}:${key}`;
+        let signature = '';
+        try { signature = JSON.stringify(details); } catch (_) { signature = String(details); }
+        const now = Date.now();
+        const previous = jevDiagnosticEvents.get(eventKey);
+        if (previous && now - previous.ts < intervalMs) return;
+        if (previous && previous.signature === signature && now - previous.ts < repeatMs) return;
+        jevDiagnosticEvents.set(eventKey, { signature, ts: now });
+        const method = typeof console[level] === 'function' ? level : 'log';
+        console[method](`ACKtopus: Jev ${stage}`, details);
+    }
+
+    function jevDiagnosticCount(stage, kind) {
+        const key = `${stage}:${kind}`;
+        const count = (jevDiagnosticCounts.get(key) || 0) + 1;
+        jevDiagnosticCounts.set(key, count);
+        return count;
+    }
+
+    function jevAvailabilityDetails() {
+        const key = String(GM_getValue('jev_api_key', '') || '').trim();
+        const pauseMs = Math.max(0, jevPauseUntil - Date.now());
+        let reason = 'ready';
+        if (!GM_getValue('jev_enabled', true)) reason = 'disabled in settings';
+        else if (!key) reason = 'TypeSafe API key missing';
+        else if (!jevConfigured) reason = 'settings are not active in this page; save Settings or reload';
+        else if (jevRejectedKey && key === jevRejectedKey) reason = 'TypeSafe rejected the saved key';
+        else if (jevSchemaRejected) reason = 'TypeSafe rejected the annotation schema';
+        else if (pauseMs) reason = `rate limited; retry in ${Math.ceil(pauseMs / 1000)}s`;
+        return {
+            state: reason,
+            enabled: jevEnabled(),
+            settingsEnabled: !!GM_getValue('jev_enabled', true),
+            keyConfigured: !!key,
+            readingGuideEnabled: jevLineReadingPreferred(),
+            lineGuideAvailable: !jevLineRejected,
+            descriptionGuideAvailable: !jevDescriptionRejected,
+            pauseMs,
+        };
+    }
+
+    function jevReadingUnavailableReason(kind) {
+        if (!jevLineReadingPreferred()) return 'reading guide disabled';
+        if (kind === 'line' && jevLineRejected) return 'TypeSafe rejected the line guide schema';
+        if (kind === 'description' && jevDescriptionRejected) return 'TypeSafe rejected the description guide schema';
+        return jevAvailabilityDetails().state;
+    }
 
     function jevEnabled() {
         return jevConfigured && !jevSchemaRejected && Date.now() >= jevPauseUntil &&
@@ -16914,7 +17145,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function jevPublicRepository(pr) {
         const key = `${pr.owner}/${pr.repo}`.toLowerCase();
         const previous = jevPublicChecks.get(key);
-        if (previous && Date.now() - previous.ts < JEV_PUBLIC_CHECK_TTL_MS) return previous.check;
+        if (previous && Date.now() - previous.ts < JEV_PUBLIC_CHECK_TTL_MS) {
+            jevDiagnostic('public check reused', {
+                repository: key,
+                state: previous.status || 'waiting',
+                ageMs: Date.now() - previous.ts,
+            }, { key, intervalMs: 2000 });
+            return previous.check;
+        }
         // An unauthenticated 200 response with private:false is proof that
         // ordinary visitors can read this repository. A 401/404/error skips it.
         const clearRetry = () => {
@@ -16922,20 +17160,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             clearTimeout(jevPublicRetryTimers.get(key));
             jevPublicRetryTimers.delete(key);
         };
+        const record = { ts: Date.now(), check: null, status: 'waiting' };
+        jevDiagnostic('public check started', {
+            repository: key,
+            access: 'anonymous',
+            purpose: 'prove repository content is public before sending an excerpt',
+        }, { key, intervalMs: 0 });
         const check = gmFetch(`https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`,
             { anonymous: true, freshForMs: 0 }).then((data) => {
             clearRetry();
-            return data?.private === false;
+            const allowed = data?.private === false;
+            record.status = allowed ? 'public' : 'blocked';
+            jevDiagnostic(allowed ? 'public check passed' : 'public content gate blocked', {
+                repository: key,
+                state: allowed ? 'public' : 'not confirmed public',
+                action: allowed ? 'Jev requests may start' : 'no repository content sent to TypeSafe',
+            }, { key, intervalMs: 0, repeatMs: JEV_PUBLIC_CHECK_TTL_MS, level: allowed ? 'log' : 'warn' });
+            return allowed;
         }).catch((error) => {
             const status = Number(error?.status || 0);
+            record.status = 'blocked';
             if (!status || status === 403 || status === 429 || (status >= 500 && status < 600)) {
                 jevSchedulePublicRetry(key, status ? `HTTP ${status}` : 'network error');
             } else {
                 clearRetry();
             }
+            jevDiagnostic('public content gate blocked', {
+                repository: key,
+                state: status === 404 ? 'private or unavailable to anonymous GitHub users' : status ? `GitHub HTTP ${status}` : 'GitHub network error',
+                action: 'no repository content sent to TypeSafe',
+                retry: !status || status === 403 || status === 429 || (status >= 500 && status < 600)
+                    ? 'scheduled in one minute' : 'not scheduled',
+            }, { key, intervalMs: 0, repeatMs: JEV_PUBLIC_CHECK_TTL_MS, level: 'warn' });
             return false;
         });
-        jevPublicChecks.set(key, { ts: Date.now(), check });
+        record.check = check;
+        jevPublicChecks.set(key, record);
         return check;
     }
 
@@ -17007,14 +17267,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const readingRequest = kind === 'line' || kind === 'description';
         const readingEnabled = () => kind === 'line' ? jevLineReadingEnabled()
             : kind === 'description' ? jevDescriptionReadingEnabled() : true;
-        if (!readingEnabled()) return Promise.resolve(null);
+        if (!readingEnabled()) {
+            jevDiagnostic('work skipped', { kind, reason: jevReadingUnavailableReason(kind) }, { key: kind, intervalMs: 2000 });
+            return Promise.resolve(null);
+        }
         const id = jevCacheId(kind, state);
         const cached = jevReadCache(id);
         // A local result sends no repository content anywhere. Public proof is
         // required immediately before a new TypeSafe request, not to display a
         // result already stored in this browser.
-        if (cached) return Promise.resolve(epoch === jevEpoch && jevEnabled() ? cached : null);
-        if (jevPending.has(id)) return jevPending.get(id);
+        if (cached) {
+            const count = jevDiagnosticCount('cache', kind);
+            jevDiagnostic('cached result reused', { kind, reused: count }, { key: kind, intervalMs: 2000 });
+            return Promise.resolve(epoch === jevEpoch && jevEnabled() ? cached : null);
+        }
+        if (jevPending.has(id)) {
+            jevDiagnostic('pending result reused', { kind, active: jevActive, waiting: jevJobs.length }, { key: kind, intervalMs: 2000 });
+            return jevPending.get(id);
+        }
         const pageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
         if (pageKey !== jevPageKey) {
             jevPageKey = pageKey;
@@ -17022,6 +17292,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevPageLineRequests = 0;
         }
         if (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
+            jevDiagnostic('page request cap reached', {
+                kind,
+                used: readingRequest ? jevPageLineRequests : jevPageRequests,
+                limit: readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE,
+            }, { key: kind, intervalMs: 0, repeatMs: 60000, level: 'warn' });
             return Promise.resolve(null);
         }
         const routePath = location.pathname;
@@ -17030,6 +17305,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 try {
                     if (location.pathname !== routePath) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
+                    jevDiagnostic('work waiting for public check', {
+                        kind,
+                        active: jevActive,
+                        waiting: jevJobs.length,
+                    }, { key: kind, intervalMs: 2000 });
                     if (!jevEnabled() || !(await jevPublicRepository(pr))) return resolve(null);
                     if (location.pathname !== routePath) return resolve(null);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
@@ -17039,13 +17319,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                     if (readingRequest) jevPageLineRequests++;
                     else jevPageRequests++;
+                    const started = jevDiagnosticCount('started', kind);
+                    jevDiagnostic('request started', {
+                        kind,
+                        started,
+                        active: jevActive,
+                        waiting: jevJobs.length,
+                    }, { key: kind, intervalMs: 2000 });
                     const result = await jevPost(kind, state);
                     if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
+                    const completed = jevDiagnosticCount('completed', kind);
+                    jevDiagnostic('request completed', {
+                        kind,
+                        completed,
+                        active: jevActive,
+                        waiting: jevJobs.length,
+                    }, { key: kind, intervalMs: 2000 });
                     resolve(result);
                 } catch (e) {
-                    console.warn('ACKtopus: Jev annotation skipped:', e?.message || e);
+                    jevDiagnostic('request failed', {
+                        kind,
+                        error: e?.message || String(e),
+                        ...jevAvailabilityDetails(),
+                    }, { key: kind, intervalMs: 0, level: 'warn' });
                     resolve(null);
                 } finally {
                     jevPending.delete(id);
@@ -17057,6 +17355,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const firstReadingJob = jevJobs.findIndex((job) => job.jevKind === 'line' || job.jevKind === 'description');
             if (!readingRequest && firstReadingJob >= 0) jevJobs.splice(firstReadingJob, 0, run);
             else jevJobs.push(run);
+            const queued = jevDiagnosticCount('queued', kind);
+            jevDiagnostic('work queued', {
+                kind,
+                queued,
+                active: jevActive,
+                waiting: jevJobs.length,
+            }, { key: kind, intervalMs: 1500 });
             jevPump();
         });
         jevPending.set(id, pending);
@@ -17695,11 +18000,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function queueJevComment(container) {
         if (_ackTesting || !jevEnabled()) return;
         const pr = parsePR();
-        if (!pr) return;
+        if (!pr) {
+            jevDiagnostic('comment trigger skipped', { reason: 'pull request URL was not parsed' }, {
+                key: 'comment-no-pr', intervalMs: 3000, level: 'warn',
+            });
+            return;
+        }
         const prVersion = jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0;
-        for (const body of container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || []) {
+        const bodies = [...(container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
+        const stats = { bodiesFound: bodies.length, eligible: 0, queued: 0, pending: 0, reused: 0 };
+        for (const body of bodies) {
             const text = jevCommentText(body);
             if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            stats.eligible++;
             const originalHash = hashPrompt(text);
             let previous = jevCommentSeenBodies.get(body);
             const observedHash = jevCommentObservedHashes.get(body);
@@ -17714,11 +18027,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 jevCommentSeenBodies.delete(body);
                 continue;
             }
-            if (jevCommentPendingBodies.has(body)) continue;
+            if (jevCommentPendingBodies.has(body)) {
+                stats.pending++;
+                continue;
+            }
             const ssrHead = readHeadShaFromSSR();
             if (previous?.hash === originalHash && previous.head === ssrHead &&
                 previous.epoch === jevEpoch && previous.slot?.isConnected &&
-                previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_BADGE_REUSE_MS) continue;
+                previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_BADGE_REUSE_MS) {
+                stats.reused++;
+                continue;
+            }
             if (previous && (previous.head !== ssrHead || previous.epoch !== jevEpoch)) {
                 previous.slot?.remove();
                 jevCommentSeenBodies.delete(body);
@@ -17734,10 +18053,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 : body.parentElement) || comment;
             jevCommentPendingBodies.add(body);
             jevCommentPendingHashes.set(body, originalHash);
+            stats.queued++;
             void jevCommentReviewState(pr, comment, body).then((state) => {
                 if (!state) {
                     previous?.slot?.remove();
                     jevCommentSeenBodies.delete(body);
+                    jevDiagnostic('comment evidence skipped', {
+                        reason: 'comment was pending, unanchored, private, stale, or unavailable anonymously',
+                    }, { key: 'comment-evidence', intervalMs: 2000 });
                     return;
                 }
                 if (!jevEnabled() || !body.isConnected || jevCommentTextHash(body) !== originalHash ||
@@ -17768,6 +18091,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 jevCommentKnownPermalinks.delete(jevCommentKnownPermalinks.keys().next().value);
                             }
                         }
+                        jevDiagnostic('comment annotation completed', {
+                            exactComparison: !!exactSuggestion,
+                            renderedBadges: slot.childElementCount,
+                            evidenceComplete: !!state.evidence_complete,
+                            head: state.head?.slice(0, 12) || '',
+                        }, { key: exactSuggestion ? 'comment-exact' : 'comment-jev', intervalMs: 1500 });
                     }
                 });
             }).catch((error) => {
@@ -17782,6 +18111,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             });
         }
+        jevDiagnostic('comment trigger scanned', stats, { key: 'visible-comments', intervalMs: 1500 });
     }
 
     function queueJevCommentUpdates(root) {
@@ -17818,6 +18148,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 commits.push({ sha, msg: clean.textContent.trim(), el: header });
             }
         }
+        let newlyObserved = 0;
         for (const commit of commits) {
             if (!commit.el) continue;
             const id = `${commit.sha}:${commit.msg}`;
@@ -17825,7 +18156,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCommitObserved.set(commit.el, id);
             jevCommitRecords.set(commit.el, commit);
             jevCommitObserver.observe(commit.el);
+            newlyObserved++;
         }
+        jevDiagnostic('commit trigger scanned', {
+            mode,
+            commitsFound: commits.length,
+            newlyObserved,
+            state: newlyObserved ? 'waiting for commits to enter the viewport' : 'already queued or no commit DOM found',
+        }, { key: mode, intervalMs: 1500 });
     }
 
     function jevPatchFileExcerpt(file, maxChars) {
@@ -18091,6 +18429,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (jevDiffPending.has(file)) return;
         jevDiffPending.add(file);
         jevVisibleDiffQueue.push(file);
+        jevDiagnostic('diff file entered viewport', {
+            path: readDiffFilePath(file) || '(path not rendered yet)',
+            pendingFiles: jevVisibleDiffQueue.length,
+            state: 'waiting for background DOM scan',
+        }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1000 });
         scheduleJevDiffProcessing();
     }
     function scheduleJevDiffProcessing() {
@@ -18143,12 +18486,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (file) {
             // Rows added inside a watched file (Load diff, expanded context)
             // re-scan it; a file whose rows only arrived now starts being watched.
-            if (!observeJevDiffFile(file) && jevDiffObserved.has(file)) queueJevDiffFile(file);
+            const newlyObserved = observeJevDiffFile(file);
+            if (!newlyObserved && jevDiffObserved.has(file)) queueJevDiffFile(file);
+            jevDiagnostic('diff DOM update', {
+                path: readDiffFilePath(file) || '(path not rendered yet)',
+                rows: file.querySelectorAll('tr').length,
+                state: newlyObserved ? 'waiting to enter viewport' : jevDiffObserved.has(file) ? 'queued for rescan' : 'waiting for diff rows',
+            }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1500 });
             return;
         }
         // GitHub streams later files in as new subtrees; the document-level pass
         // does not run again on bulk diff pages, so watch them from here.
-        for (const nested of root.querySelectorAll?.(DIFF_FILE_SELECTOR) || []) observeJevDiffFile(nested);
+        const nestedFiles = [...(root.querySelectorAll?.(DIFF_FILE_SELECTOR) || [])];
+        let observed = 0;
+        for (const nested of nestedFiles) {
+            if (observeJevDiffFile(nested)) observed++;
+        }
+        if (nestedFiles.length) {
+            jevDiagnostic('streamed diff DOM update', {
+                filesFound: nestedFiles.length,
+                newlyObservedFiles: observed,
+                state: observed ? 'waiting for files to enter viewport' : 'files still waiting for rows or already observed',
+            }, { key: 'streamed-files', intervalMs: 1500 });
+        }
     }
 
     function jevChangedRow(row) {
@@ -18280,7 +18640,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevApplyLineReading(line, result, evidence) {
-        if (!line?.cell || !result || !jevLineReadingEnabled()) return;
+        if (!line?.cell || !result || !jevLineReadingEnabled()) return '';
         const meta = getDiffSelectionLineMeta(line.cell);
         const lineNumberCell = meta?.lineEl || meta?.row?.firstElementChild;
         clearJevLineCell(line.cell, lineNumberCell);
@@ -18289,12 +18649,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         line.cell.dataset.ackJevLinePriority = decision.level;
         if (decision.level === 'background') {
             line.cell.classList.add('ack-jev-reading-background');
-            return;
+            return decision.level;
         }
-        if (decision.level !== 'essence') return;
+        if (decision.level !== 'essence') return decision.level;
 
         line.cell.classList.add('ack-jev-reading-essence');
-        if (!lineNumberCell || lineNumberCell === line.cell) return;
+        if (!lineNumberCell || lineNumberCell === line.cell) {
+            jevDiagnostic('line marker placement skipped', {
+                evidence,
+                reason: 'line-number cell unavailable',
+            }, { key: 'line-marker', intervalMs: 2000, level: 'warn' });
+            return decision.level;
+        }
         lineNumberCell.classList.add('ack-jev-line-priority-anchor');
         const position = window.getComputedStyle(lineNumberCell).position;
         if (!position || position === 'static') lineNumberCell.style.position = 'relative';
@@ -18309,22 +18675,45 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.tabIndex = 0;
         bindJevReadingHover(marker, () => jevLineSelectionContext(line, marker));
         lineNumberCell.prepend(marker);
+        return decision.level;
     }
 
     function queueJevLineReading(pr, path, head, group, signature) {
-        if (!jevLineReadingEnabled()) return;
+        const stats = { eligible: 0, alreadyAnnotated: 0, cacheHits: 0, queued: 0 };
+        if (!jevLineReadingEnabled()) return stats;
         const lines = group.flatMap((line) => line.parts?.length ? line.parts : [line]);
+        const tasks = [];
         lines.forEach((line, index) => {
             const review = jevLineReviewState(pr, path, head, lines, index, signature);
             if (!review) return;
+            stats.eligible++;
             const id = jevCacheId('line', review.state);
-            if (line.cell.dataset.ackJevLineId === id) return;
+            if (line.cell.dataset.ackJevLineId === id) {
+                stats.alreadyAnnotated++;
+                return;
+            }
+            if (jevReadCache(id)) stats.cacheHits++;
+            else stats.queued++;
             line.cell.dataset.ackJevLineId = id;
-            jevEvaluate(pr, 'line', review.state).then((result) => {
+            tasks.push(jevEvaluate(pr, 'line', review.state).then((result) => {
                 if (!line.cell.isConnected || line.cell.dataset.ackJevLineId !== id) return;
-                jevApplyLineReading(line, result, review.location);
-            });
+                return jevApplyLineReading(line, result, review.location);
+            }));
         });
+        if (tasks.length) {
+            Promise.all(tasks).then((levels) => {
+                const rendered = levels.filter(Boolean);
+                jevDiagnostic('visible hunk lines completed', {
+                    path,
+                    evaluated: tasks.length,
+                    rendered: rendered.length,
+                    background: rendered.filter((level) => level === 'background').length,
+                    foreground: rendered.filter((level) => level === 'foreground').length,
+                    essence: rendered.filter((level) => level === 'essence').length,
+                }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
+            });
+        }
+        return stats;
     }
 
     const JEV_DESCRIPTION_ROOT_SELECTOR =
@@ -18551,7 +18940,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevApplyDescriptionReading(sentence, result, evidence, pr, parentText) {
-        if (!sentence?.spans?.length || !result || !jevDescriptionReadingEnabled()) return;
+        if (!sentence?.spans?.length || !result || !jevDescriptionReadingEnabled()) return '';
         sentence.marker?.remove();
         sentence.marker = null;
         const decision = jevReadingGuideDecision(result);
@@ -18561,7 +18950,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (decision.level === 'background') span.classList.add('ack-jev-reading-background');
             if (decision.level === 'essence') span.classList.add('ack-jev-reading-essence');
         }
-        if (decision.level !== 'essence') return;
+        if (decision.level !== 'essence') return decision.level;
         const marker = document.createElement('span');
         marker.className = 'ack-jev-description-priority';
         marker.dataset.emoji = decision.emoji;
@@ -18575,32 +18964,79 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevDescriptionSelectionContext(sentence, marker, pr, parentText));
         sentence.spans[0].before(marker);
         sentence.marker = marker;
+        return decision.level;
     }
 
     function queueJevDescriptionReading() {
-        if (_ackTesting || !jevDescriptionReadingEnabled() || !isPRConversationPage()) return;
+        if (_ackTesting || !isPRConversationPage()) return;
+        if (!jevDescriptionReadingEnabled()) {
+            jevDiagnostic('description skipped', {
+                reason: jevReadingUnavailableReason('description'),
+                ...jevAvailabilityDetails(),
+            }, { key: 'description-disabled', intervalMs: 2000 });
+            return;
+        }
         const pr = parsePR();
         const body = jevPRDescriptionBody();
-        if (!pr || !body || !body.isConnected) return;
+        if (!pr || !body || !body.isConnected) {
+            jevDiagnostic('description waiting for DOM', {
+                pullRequestParsed: !!pr,
+                descriptionFound: !!body,
+                descriptionConnected: !!body?.isConnected,
+            }, { key: 'description-dom', intervalMs: 3000, level: 'warn' });
+            return;
+        }
         const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
         const parentText = jevDescriptionText(body);
         const sourceKey = hashPrompt(`${head}\0${parentText}`);
         const previous = jevDescriptionRecords.get(body);
         if (previous?.sourceKey === sourceKey && previous.sentences.every((sentence) =>
-            sentence.spans.every((span) => span.isConnected))) return;
+            sentence.spans.every((span) => span.isConnected))) {
+            jevDiagnostic('description already current', {
+                sentences: previous.sentences.length,
+                sourceKey,
+            }, { key: sourceKey, intervalMs: 3000 });
+            return;
+        }
         clearJevDescriptionAnnotations(body);
         const sentences = jevWrapDescriptionSentences(body);
-        if (!sentences.length) return;
+        if (!sentences.length) {
+            jevDiagnostic('description skipped', {
+                reason: 'no prose sentences found in the rendered PR description',
+                characters: parentText.length,
+            }, { key: sourceKey, intervalMs: 0, level: 'warn' });
+            return;
+        }
         const bodyHash = hashPrompt(parentText);
         jevDescriptionRecords.set(body, { sourceKey, sentences });
+        let cacheHits = 0;
+        const tasks = [];
         sentences.forEach((sentence, index) => {
             const state = jevDescriptionReviewState(pr, head, bodyHash, sentences, index);
             const id = jevCacheId('description', state);
+            if (jevReadCache(id)) cacheHits++;
             for (const span of sentence.spans) span.dataset.ackJevDescriptionId = id;
-            jevEvaluate(pr, 'description', state).then((result) => {
+            tasks.push(jevEvaluate(pr, 'description', state).then((result) => {
                 if (!sentence.spans.every((span) => span.isConnected && span.dataset.ackJevDescriptionId === id)) return;
-                jevApplyDescriptionReading(sentence, result, `PR description sentence ${index + 1}`, pr, parentText);
-            });
+                return jevApplyDescriptionReading(sentence, result, `PR description sentence ${index + 1}`, pr, parentText);
+            }));
+        });
+        jevDiagnostic('description queued', {
+            sentences: sentences.length,
+            cacheHits,
+            newRequests: sentences.length - cacheHits,
+            sourceKey,
+        }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
+        Promise.all(tasks).then((levels) => {
+            const rendered = levels.filter(Boolean);
+            jevDiagnostic('description completed', {
+                sentences: sentences.length,
+                rendered: rendered.length,
+                background: rendered.filter((level) => level === 'background').length,
+                foreground: rendered.filter((level) => level === 'foreground').length,
+                essence: rendered.filter((level) => level === 'essence').length,
+                sourceKey,
+            }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
         });
     }
 
@@ -18656,14 +19092,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             }
         }
-        queueJevLineReading(pr, path, head, group, signature);
+        const lineStats = queueJevLineReading(pr, path, head, group, signature);
+        jevDiagnostic('visible hunk queued', {
+            path,
+            changedRows: group.length,
+            hunkBadge: !!meta?.lineNum,
+            lineGuide: jevLineReadingEnabled(),
+            ...lineStats,
+        }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
     }
 
     function queueJevDiffHunks(file) {
         if (_ackTesting || !jevEnabled() || !file.isConnected) return;
         const pr = parsePR();
         const path = readDiffFilePath(file);
-        if (!pr || !path) return;
+        if (!pr || !path) {
+            jevDiagnostic('diff file skipped', {
+                pullRequestParsed: !!pr,
+                filePathFound: !!path,
+                connected: !!file?.isConnected,
+            }, { key: 'diff-file-dom', intervalMs: 3000, level: 'warn' });
+            return;
+        }
         const head = getImmediatePRHeadSHA() || pathCommitSha();
         const changed = [...file.querySelectorAll('tr')].map(jevChangedRow).filter(Boolean);
         const groups = [];
@@ -18672,6 +19122,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (last && last[last.length - 1].row.nextElementSibling === line.row) last.push(line);
             else groups.push([line]);
         }
+        let observed = 0;
         for (const group of groups) {
             const first = group.find((line) => !line.deleted) || group[0];
             const signature = hashPrompt(head + group.map((line) => line.fullText).join('\n'));
@@ -18681,15 +19132,55 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevHunkObserved.set(first.cell, signature);
             jevHunkRecords.set(first.cell, { pr, path, head, group, signature });
             jevHunkObserver.observe(first.cell);
+            observed++;
         }
+        jevDiagnostic('diff file scanned', {
+            path,
+            changedRows: changed.length,
+            hunks: groups.length,
+            newlyObservedHunks: observed,
+            state: observed ? 'waiting for hunks to enter the viewport' : 'already queued or annotated',
+        }, { key: path, intervalMs: 1500 });
     }
 
     function queueJevPageAnnotations() {
-        if (_ackTesting || !jevEnabled()) return;
+        if (_ackTesting) return;
+        if (!jevEnabled()) {
+            jevDiagnostic('page trigger skipped', {
+                pathname: location.pathname,
+                ...jevAvailabilityDetails(),
+            }, { key: 'page-disabled', intervalMs: 2000 });
+            return;
+        }
+        const pr = parsePR();
+        const files = [...document.querySelectorAll(DIFF_FILE_SELECTOR)];
+        let newlyObservedFiles = 0;
+        jevDiagnostic('page trigger started', {
+            pathname: location.pathname,
+            pullRequest: pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : '',
+            page: isPRConversationPage() ? 'conversation' : files.length ? 'diff' : 'pull request',
+            diffFilesInDOM: files.length,
+            readingGuideEnabled: jevLineReadingPreferred(),
+            active: jevActive,
+            waiting: jevJobs.length,
+        }, { key: 'page', intervalMs: 1000 });
         queueJevCommitRows();
         queueJevStackSummary();
         queueJevDescriptionReading();
-        for (const file of document.querySelectorAll(DIFF_FILE_SELECTOR)) observeJevDiffFile(file);
+        for (const file of files) {
+            if (observeJevDiffFile(file)) newlyObservedFiles++;
+        }
+        jevDiagnostic('page scan complete', {
+            pathname: location.pathname,
+            diffFilesInDOM: files.length,
+            newlyObservedFiles,
+            visibleComments: leafLazyCommentContainers().filter((container) => {
+                const bounds = container.getBoundingClientRect();
+                return bounds.bottom >= 0 && bounds.top <= window.innerHeight;
+            }).length,
+            active: jevActive,
+            waiting: jevJobs.length,
+        }, { key: 'page-scan', intervalMs: 1000 });
     }
 
     // --- Lazy Visibility Observer for Comment-Level Work ---
@@ -18845,7 +19336,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'hideNativeCommitNav', when: (ctx) => ctx.onPR, fn: hideNativeCommitNav },
         { name: 'normalizePRHeaderHeadBranch', when: (ctx) => ctx.onPR, fn: normalizePRHeaderHeadBranch },
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
-        { name: 'jevAnnotations', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevPageAnnotations },
+        // Run on every PR so the console explains why Jev is disabled or
+        // blocked instead of making a missing badge look like a dead trigger.
+        { name: 'jevAnnotations', when: (ctx) => ctx.onPR, fn: queueJevPageAnnotations },
         {
             name: 'githubReviewOptions',
             when: (ctx) => ctx.onToolbar,
@@ -19127,8 +19620,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return;
             }
         }
-        // If a "Delete comment" dialog popped, focus the Delete button so Enter confirms.
-        focusVisibleDeleteCommentConfirmButton();
         if (docRefreshNeeded && shouldRunDocInjectorsAfterMutation(ctx)) scheduleDocInjectorsAfterMutation();
         if (ctx.onPR && reviewUiChanged) resyncPendingReviewUi(document);
     }
@@ -20420,35 +20911,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
-    function focusVisibleDeleteCommentConfirmButton() {
-        const btn = findVisibleDeleteCommentConfirmButton();
-        if (!btn) return false;
-        const dialog = btn.closest(
-            'details-dialog[open], dialog[open], [role="dialog"][aria-modal="true"], [role="alertdialog"], [popover], [aria-modal="true"]',
-        );
-        if (dialog?.dataset.ackDeleteConfirmFocused) return false;
-        try {
-            btn.focus({ preventScroll: true });
-        } catch (_) {
-            try {
-                btn.focus();
-            } catch {}
-        }
-        if (dialog?.dataset) dialog.dataset.ackDeleteConfirmFocused = 'true';
-        return true;
-    }
-
-    function scheduleDeleteConfirmDefault() {
-        for (const delay of [0, 120, 300]) {
-            ackSetTimeout(() => {
-                focusVisibleDeleteCommentConfirmButton();
-            }, delay);
-        }
-    }
-
-    // Make "Delete" the default action in comment deletion dialogs:
-    // - Esc already cancels natively.
-    // - Enter should confirm deletion without requiring Cmd/Ctrl modifiers.
+    // Esc already cancels natively. Plain Enter confirms deletion while the
+    // dialog is open, without moving focus onto the destructive button.
     document.addEventListener(
         'keydown',
         (e) => {
@@ -21890,6 +22354,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
+    let hiddenNativeCommentMenuCount = 0;
+
+    function concealNativeCommentMenu(kebab, details) {
+        const visualHost = details || kebab.closest?.(
+            '.timeline-comment-actions, .comment-actions, [data-testid*="comment-actions" i]',
+        ) || kebab;
+        const oldOpacity = visualHost?.style?.getPropertyValue('opacity') || '';
+        const oldPriority = visualHost?.style?.getPropertyPriority('opacity') || '';
+        hiddenNativeCommentMenuCount++;
+        document.documentElement.classList.add('ack-native-comment-menu-hidden');
+        visualHost?.style?.setProperty('opacity', '0.01', 'important');
+        let restored = false;
+        return () => {
+            if (restored) return;
+            restored = true;
+            if (visualHost?.style) {
+                if (oldOpacity) visualHost.style.setProperty('opacity', oldOpacity, oldPriority);
+                else visualHost.style.removeProperty('opacity');
+            }
+            hiddenNativeCommentMenuCount = Math.max(0, hiddenNativeCommentMenuCount - 1);
+            if (!hiddenNativeCommentMenuCount) {
+                document.documentElement.classList.remove('ack-native-comment-menu-hidden');
+            }
+        };
+    }
+
     function triggerMenuAction(container, header, actionName) {
         // DOM-first for writes — clicking native menu
         if (!SAFE_MENU_ACTIONS.has(actionName.toLowerCase())) {
@@ -21902,6 +22392,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const kebab = findCommentMenuTrigger(header, container);
         if (!kebab) return;
         const details = kebab.closest('details');
+        const restoreNativeMenu = concealNativeCommentMenu(kebab, details);
+        const pageScrollX = window.scrollX ?? window.pageXOffset ?? 0;
+        const pageScrollY = window.scrollY ?? window.pageYOffset ?? 0;
+        const restorePageScroll = () => {
+            const currentX = window.scrollX ?? window.pageXOffset ?? 0;
+            const currentY = window.scrollY ?? window.pageYOffset ?? 0;
+            if (currentX === pageScrollX && currentY === pageScrollY) return;
+            try { window.scrollTo(pageScrollX, pageScrollY); } catch (_) {}
+        };
         const wasOpen = !!details?.hasAttribute('open');
         const controlledMenuId = kebab.getAttribute('aria-controls') || kebab.getAttribute('popovertarget');
         const nearbyBeforeOpen = new Set(getNearbyCommentMenuRoots(kebab));
@@ -21909,13 +22408,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let sawReactMenuOpen = wasReactOpen;
         let clickedAction = false;
         let cleanedUp = false;
-        const cleanup = () => {
-            if (cleanedUp) return;
+        const cleanup = (deferVisualRestore = false) => {
+            if (cleanedUp) {
+                // A page-lifetime abort must still clear a deferred global CSS
+                // concealment even if its animation frames were canceled.
+                if (!deferVisualRestore) restoreNativeMenu();
+                return;
+            }
             cleanedUp = true;
             // A failed lookup must not leave GitHub's fullscreen overlay open.
             if (!clickedAction && !wasOpen) details?.removeAttribute('open');
             if (!clickedAction && !details && !wasReactOpen && kebab.isConnected &&
                 kebab.getAttribute('aria-expanded') === 'true') kebab.click();
+            if (deferVisualRestore) {
+                requestAnimationFrame(() => requestAnimationFrame(restoreNativeMenu));
+            } else {
+                restoreNativeMenu();
+            }
+            restorePageScroll();
         };
         const menuWasClosed = () => {
             if (details) return !details.hasAttribute('open');
@@ -21967,9 +22477,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             return roots;
         };
-        // Keep GitHub's native menu visible so the user can choose the action
-        // manually if our targeted lookup misses a new menu variant.
-        lt.onAbort(cleanup);
+        lt.onAbort(() => cleanup());
         openMenuTrigger(kebab);
         const tryFind = (attempt) => {
             if (shouldStop()) {
@@ -21997,9 +22505,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             if (!isVisible(item)) continue;
                             if (commentMenuItemMatchesAction(item, actionName)) {
                                 clickedAction = true;
-                                cleanup();
                                 item.click();
-                                if (/delete/i.test(actionName)) scheduleDeleteConfirmDefault();
+                                cleanup(true);
+                                // Native menu activation and dialog focus can both
+                                // try to reveal an off-screen anchor. Keep the page
+                                // at the user's review position.
+                                for (const delay of [0, 120, 300]) ackSetTimeout(restorePageScroll, delay);
                                 if (/edit/i.test(actionName)) schedulePostEditRefresh(container);
                                 return;
                             }
@@ -28085,7 +28596,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         // Fallback: scrape commits from PR commits page (same-origin, no rate limit)
         try {
-            const html = await gmFetchPageText(`https://github.com/${owner}/${repo}/pull/${prNum}/commits`);
+            const html = await gmFetchPageText(`https://github.com/${owner}/${repo}/pull/${prNum}/commits`, {
+                pageSessionFallback: true,
+            });
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const commits = [];
             for (const a of doc.querySelectorAll('a.markdown-title, a[href*="/commits/"], a[href*="/changes/"]')) {
@@ -30360,6 +30873,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('observeJevDiffFile(file)'), 'a file whose rows arrived later starts being watched');
         ackAssert(fn.includes('root.querySelectorAll?.(DIFF_FILE_SELECTOR)'), 'newly streamed files under a mutation root are watched');
         ackAssert(fn.includes('queueJevDiffFile(file)'), 'watched files are re-scanned when rows change');
+    });
+
+    ackTest('Jev diagnostics expose triggers, privacy gates, queues, caches, and rendered work', () => {
+        const publicCheck = sourceSection(_ackSource, 'function jevPublicRepository', 'function jevPost');
+        ackAssert(publicCheck.includes("jevDiagnostic('public check started'"), 'logs the anonymous public check');
+        ackAssert(publicCheck.includes("'public content gate blocked'"), 'logs private or unavailable repositories');
+        ackAssert(publicCheck.includes('no repository content sent to TypeSafe'), 'states the privacy outcome');
+        const evaluate = sourceSection(_ackSource, 'function jevEvaluate', 'function jevAppendBadge');
+        ackAssert(evaluate.includes("jevDiagnostic('work queued'"), 'logs queued classification work');
+        ackAssert(evaluate.includes("jevDiagnostic('cached result reused'"), 'logs local cache reuse');
+        ackAssert(evaluate.includes("jevDiagnostic('request completed'"), 'logs completed TypeSafe work');
+        const comments = sourceSection(_ackSource, 'function queueJevComment', 'function queueJevCommentUpdates');
+        ackAssert(comments.includes("jevDiagnostic('comment trigger scanned'"), 'logs visible comment discovery');
+        ackAssert(comments.includes("jevDiagnostic('comment evidence skipped'"), 'logs unverifiable comments');
+        const description = sourceSection(_ackSource, 'function queueJevDescriptionReading', 'function scheduleJevDescriptionReading');
+        ackAssert(description.includes("jevDiagnostic('description queued'"), 'logs PR-description sentence counts');
+        ackAssert(description.includes("jevDiagnostic('description completed'"), 'logs rendered sentence levels');
+        const diff = sourceSection(_ackSource, 'function queueJevDiffHunks', 'function queueJevPageAnnotations');
+        ackAssert(diff.includes("jevDiagnostic('diff file scanned'"), 'logs changed rows and visible-hunk waits');
+        const page = sourceSection(_ackSource, 'function queueJevPageAnnotations', '// --- Lazy Visibility Observer');
+        ackAssert(page.includes("jevDiagnostic('page trigger skipped'"), 'logs disabled or rejected settings');
+        ackAssert(page.includes("jevDiagnostic('page scan complete'"), 'logs DOM discovery totals');
     });
 
     ackTest('Jev commit badge stays with the React commit title', () => {
@@ -33940,6 +34475,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
+    ackTest('proofread dialog mounts only in real top-layer UI and reanchors if off-screen', () => {
+        const mountFn = sourceSection(_ackSource, 'function closestNativeDialogRoot', 'function waitForNextPaint');
+        ackAssert(mountFn.includes("root.matches(':modal')"), 'recognizes modal dialogs in the top layer');
+        ackAssert(mountFn.includes("root.matches(':popover-open')"), 'recognizes open popovers in the top layer');
+        ackAssert(mountFn.includes('if (!topLayer) continue'), 'rejects ordinary transformed overlay containers');
+        const dialogFn = sourceSection(_ackSource, 'function showDiffDialog', 'async function runProofreadOnComment');
+        ackAssert(dialogFn.includes('outsideViewport'), 'checks final dialog geometry against the viewport');
+        ackAssert(dialogFn.includes('document.body.appendChild(overlay)'), 'reanchors an off-screen dialog to the body');
+        ackAssert(dialogFn.includes("maxHeight: 'calc(100dvh - 32px)'"), 'keeps actions inside the visible viewport');
+    });
+
     ackTest('toolbar proofread remains edit-only instead of draft-generation mode', () => {
         const source = _ackSource;
         const toolbarFn = source.slice(
@@ -34979,12 +35525,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('[container,'), 'does not search container for menu items');
     });
 
-    ackTest('triggerMenuAction schedules Delete as the default popup action', () => {
+    ackTest('triggerMenuAction hides native menu automation without focusing Delete', () => {
         const source = _ackSource;
         const fnStart = source.indexOf('function triggerMenuAction');
         const fnEnd = source.indexOf('\n    function ', fnStart + 1);
         const fn = source.slice(fnStart, fnEnd);
-        ackAssert(fn.includes('scheduleDeleteConfirmDefault()'), 'delete action schedules default Delete focus');
+        ackAssert(fn.includes('concealNativeCommentMenu(kebab, details)'), 'native menu is concealed during automation');
+        ackAssert(fn.includes('cleanup(true)'), 'menu remains concealed through native item activation');
+        ackAssert(!fn.includes('focusVisibleDeleteCommentConfirmButton'), 'does not visually select the destructive action');
     });
 
     ackTest('delete actions stay bound to the chosen comment when nearby comments share text', async () => {
@@ -35020,9 +35568,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const icon = second.querySelector('.ack-quick-actions button[title="Delete comment"]');
             ackAssert(icon, 'second comment has a delete icon');
             icon.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true }));
+            ackAssert(document.documentElement.classList.contains('ack-native-comment-menu-hidden'),
+                'native menu is hidden while the quick action resolves');
+            ackEq(second.querySelector('details').style.opacity, '0.01',
+                'the details trigger does not visibly enter its open state');
             ackEq(second.querySelector('.timeline-comment-actions').style.opacity, '',
-                'icon automation leaves GitHub native comment actions visible');
+                'quick action does not permanently alter the action container');
             await new Promise((resolve) => setTimeout(resolve, 100));
+            ackAssert(!document.documentElement.classList.contains('ack-native-comment-menu-hidden'),
+                'native menu concealment is removed after activation');
+            ackEq(second.querySelector('details').style.opacity, '', 'native trigger visibility is restored');
             ackEq(firstDeletes, 0, 'icon must not choose an earlier identical comment');
             ackEq(secondDeletes, 1, 'icon chooses the second comment menu');
 
@@ -40757,7 +41312,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         // Doc injectors should be OUTSIDE the for-of-roots loop so expensive
         // global scans (commit nav / commit explain / force-push links) only run once.
         const loopStart = obsBlock.indexOf('for (const root of roots)');
-        const afterLoopStart = obsBlock.indexOf('focusVisibleDeleteCommentConfirmButton', loopStart);
+        const afterLoopStart = obsBlock.indexOf('if (docRefreshNeeded', loopStart);
         const insideLoop = obsBlock.slice(loopStart, afterLoopStart);
         const afterLoop = obsBlock.slice(afterLoopStart);
         ackAssert(
@@ -41321,10 +41876,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackEq(patAuthHeaderValue(), '', 'does not reuse the rejected token for GraphQL requests');
     });
 
-    ackTest('GitHub PAT status warns for the rejected token and recovers for a replacement', () => {
+    ackTest('GitHub PAT status distinguishes configured, verified, and denied tokens', () => {
         const input = document.createElement('input');
         const status = document.createElement('span');
         const previousBadPat = _githubBadPat;
+        const previousAccess = new Map(_githubPatRepoAccess);
         try {
             _githubBadPat = 'expired-token';
             input.value = 'expired-token';
@@ -41336,15 +41892,28 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
             input.value = 'replacement-token';
             updateGithubPatStatus(input, status);
-            ackEq(status.textContent, '✅', 'replacement token is no longer marked as the rejected value');
+            ackEq(status.textContent, '●', 'an untested replacement token is shown as configured');
             ackEq(input.hasAttribute('aria-invalid'), false, 'clears invalid state for the replacement');
             ackEq(input.style.borderColor, 'rgb(48, 54, 61)', 'restores the normal field border');
+
+            const repoKey = currentGithubRepoKey();
+            if (repoKey) {
+                _githubPatRepoAccess.set(githubPatRepoAccessKey(repoKey, input.value), 'allowed');
+                updateGithubPatStatus(input, status);
+                ackEq(status.textContent, '✅', 'green check requires verified current-repository access');
+                _githubPatRepoAccess.set(githubPatRepoAccessKey(repoKey, input.value), 'denied');
+                updateGithubPatStatus(input, status);
+                ackEq(status.textContent, '⚠️', 'repository-specific denial is visible');
+                ackAssert(status.title.includes(repoKey), 'denial names the inaccessible repository');
+            }
 
             input.value = '';
             updateGithubPatStatus(input, status);
             ackEq(status.textContent, '', 'empty optional token has no status icon');
         } finally {
             _githubBadPat = previousBadPat;
+            _githubPatRepoAccess.clear();
+            for (const [key, value] of previousAccess) _githubPatRepoAccess.set(key, value);
         }
     });
 
@@ -41356,6 +41925,54 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('rememberGithubBadPat(r)'), 'memoizes invalid PAT before retrying anonymously');
         ackAssert(fn.includes('fallbackPreflight'), 'checks anonymous rate limit before fallback request');
         ackAssert(fn.includes('rememberGithubRateLimit(r2, fallbackHeaders)'), 'memoizes anonymous fallback rate limit');
+    });
+
+    ackTest('private-repository API readers share one PAT access probe and stop after denial', async () => {
+        const repoKey = currentGithubRepoKey();
+        if (!repoKey) return;
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPat = GM_getValue('github_pat', null);
+        let calls = 0;
+        try {
+            GM_setValue('github_pat', 'repo-access-test-token');
+            _githubBadPat = '';
+            _githubPatRepoAccess.clear();
+            _githubPatRepoAccessRequests.clear();
+            GM_xmlhttpRequest = (options) => {
+                calls++;
+                options.onload({ status: 200, responseText: JSON.stringify({ private: true }), responseHeaders: '' });
+            };
+            await Promise.all([
+                ensureGithubPatRepoAccess(repoKey, { force: true }),
+                ensureGithubPatRepoAccess(repoKey, { force: true }),
+            ]);
+            ackEq(calls, 1, 'concurrent readers share the repository access request');
+            ackEq(githubPatRepoAccessState(repoKey), 'allowed', 'successful authenticated probe records access');
+
+            _githubPatRepoAccess.clear();
+            GM_xmlhttpRequest = (options) => {
+                calls++;
+                options.onload({ status: 404, responseText: JSON.stringify({ message: 'Not Found' }), responseHeaders: '' });
+            };
+            let denied = null;
+            try { await ensureGithubPatRepoAccess(repoKey, { force: true }); } catch (error) { denied = error; }
+            ackAssert(denied?.githubRepoAccessDenied, '404 becomes a repository-specific access denial');
+            const callsAfterProbe = calls;
+            const [owner, repo] = repoKey.split('/');
+            try {
+                await gmFetch(`https://api.github.com/repos/${owner}/${repo}/pulls/1/comments`);
+            } catch (error) {
+                ackAssert(error.githubRepoAccessDenied, 'dependent API read gets the shared denial');
+            }
+            ackEq(calls, callsAfterProbe, 'known denial prevents another endpoint request');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            if (originalPat === null) GM_deleteValue('github_pat');
+            else GM_setValue('github_pat', originalPat);
+            _githubPatRepoAccess.clear();
+            _githubPatRepoAccessRequests.clear();
+            _githubPatRepoAccessWarned.clear();
+        }
     });
 
     ackTest('optional GitHub API callers stay quiet after shared rate-limit warning', () => {
@@ -41395,6 +42012,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('await gmFetch(url)'), 'uses shared conditional GitHub reader');
         ackAssert(fn.includes('shouldWarnOptionalGitHubApiError(e)'), 'keeps known rate-limit failures quiet');
         ackAssert(fn.includes('falling back to HTML scrape'), 'still keeps the HTML scrape fallback');
+        ackAssert(fn.includes('pageSessionFallback: true'), 'private PR fallback can use the signed-in GitHub page session');
     });
 
     ackTest('config panel has GitHub PAT field and saves it', () => {
@@ -46766,36 +47384,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('focusVisibleDeleteCommentConfirmButton focuses once per dialog', () => {
-        const host = document.createElement('details-dialog');
-        host.setAttribute('open', '');
-        host.style.position = 'absolute';
-        host.style.left = '-99999px';
-        host.style.top = '0';
-        host.style.width = '10px';
-        host.style.height = '10px';
-        host.style.display = 'block';
-        const btn = document.createElement('button');
-        btn.className = 'btn-danger';
-        btn.textContent = 'Delete comment';
-        btn.style.width = '10px';
-        btn.style.height = '10px';
-        const cancel = document.createElement('button');
-        cancel.textContent = 'Cancel';
-        cancel.style.width = '10px';
-        cancel.style.height = '10px';
-        host.appendChild(btn);
-        host.appendChild(cancel);
-        document.body.appendChild(host);
-        try {
-            ackEq(focusVisibleDeleteCommentConfirmButton(), true, 'initial dialog focus succeeds');
-            ackEq(document.activeElement, btn, 'Delete button receives initial focus');
-            cancel.focus();
-            ackEq(focusVisibleDeleteCommentConfirmButton(), false, 'same dialog is not refocused');
-            ackEq(document.activeElement, cancel, 'user focus is preserved after first focus');
-        } finally {
-            host.remove();
-        }
+    ackTest('comment delete confirmation never auto-focuses the destructive button', () => {
+        const source = _ackSource;
+        ackAssert(!source.includes('function focusVisibleDeleteCommentConfirmButton'), 'auto-focus helper is absent');
+        const drain = sourceSection(source, 'function drainDomMutationBatch', 'new MutationObserver');
+        ackAssert(!drain.includes('focusVisibleDeleteCommentConfirmButton'), 'mutation rendering does not change focus');
     });
 
     ackTest('findVisibleDeleteCommentConfirmButton also supports visible popover dialogs', () => {
@@ -51308,6 +51901,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             githubAuthBucketPat: _githubAuthBucketPat,
             githubAuthBucketId: _githubAuthBucketId,
             githubRateLimitedUntil: new Map(_githubRateLimitedUntil),
+            githubPatRepoAccess: new Map(_githubPatRepoAccess),
+            githubPatRepoAccessWarned: new Set(_githubPatRepoAccessWarned),
         };
 
         // Try to sandbox Greasemonkey/Tampermonkey storage so tests are deterministic
@@ -51385,6 +51980,9 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             _githubAuthBucketPat = '';
             _githubAuthBucketId = 0;
             _githubRateLimitedUntil.clear();
+            _githubPatRepoAccess.clear();
+            _githubPatRepoAccessRequests.clear();
+            _githubPatRepoAccessWarned.clear();
             invalidatePRContext();
             if (gmMode === 'stub') {
                 gmMem.clear();
@@ -51452,6 +52050,15 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             for (const [bucket, until] of stateSnapshot.githubRateLimitedUntil) {
                 _githubRateLimitedUntil.set(bucket, until);
             }
+            _githubPatRepoAccess.clear();
+            for (const [key, access] of stateSnapshot.githubPatRepoAccess) {
+                _githubPatRepoAccess.set(key, access);
+            }
+            _githubPatRepoAccessRequests.clear();
+            _githubPatRepoAccessWarned.clear();
+            for (const key of stateSnapshot.githubPatRepoAccessWarned) {
+                _githubPatRepoAccessWarned.add(key);
+            }
             refreshGithubPatStatus();
 
             // Restore Greasemonkey/Tampermonkey storage.
@@ -51498,6 +52105,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes("_githubBadPat = ''"), 'clears rejected PAT state between tests');
         ackAssert(fn.includes('_githubBadPat = stateSnapshot.githubBadPat'), 'restores the live rejected PAT marker');
         ackAssert(fn.includes('githubRateLimitedUntil: new Map'), 'snapshots rate-limit buckets');
+        ackAssert(fn.includes('githubPatRepoAccess: new Map'), 'snapshots repository-specific PAT access');
         ackAssert(fn.includes('refreshGithubPatStatus()'), 'refreshes the settings warning after restoration');
     });
 
@@ -51526,7 +52134,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 addFloatingCommitNav();
                 hideNativeCommitNav();
             }
-            focusVisibleDeleteCommentConfirmButton();
         } catch (e) {
             console.warn('ACKtopus: post-test re-sync failed:', e?.message || e);
         }
