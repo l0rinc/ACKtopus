@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.283
+// @version      1.284
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -9346,7 +9346,18 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (!pr?.owner || !pr?.repo || !/^\d+$/.test(String(pr.pr || ''))) return null;
         const fullSha = await resolveFullCommitSha(pr, sha);
         if (!/^[0-9a-f]{40}$/i.test(fullSha || '')) return null;
-        const key = `${pr.owner}/${pr.repo}#${pr.pr}:${fullSha.toLowerCase()}`;
+        let prInfo = null;
+        try {
+            prInfo = await gmFetch(
+                `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
+                { freshForMs: 0 },
+            );
+        } catch (_) {
+            return null;
+        }
+        const description = String(prInfo?.body || '');
+        const descriptionHash = hashPrompt(description);
+        const key = `${pr.owner}/${pr.repo}#${pr.pr}:${fullSha.toLowerCase()}:${descriptionHash}`;
         const cached = jevCommitContextCache.get(key);
         if (cached) {
             jevCommitContextCache.delete(key);
@@ -9354,14 +9365,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             return cached;
         }
         const request = (async () => {
-            const [patchResult, prResult] = await Promise.allSettled([
-                fetchFullCommitPatch(pr, fullSha),
-                gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`, { freshForMs: 0 }),
-            ]);
-            if (patchResult.status !== 'fulfilled' || !patchResult.value || prResult.status !== 'fulfilled') {
-                return null;
-            }
-            const patch = patchResult.value;
+            const patch = await fetchFullCommitPatch(pr, fullSha).catch(() => '');
+            if (!patch) return null;
             let message = commitMessageFromPatch(patch);
             if (!message) {
                 try {
@@ -9372,7 +9377,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 } catch (_) {}
             }
             if (!message) return null;
-            const description = String(prResult.value?.body || '');
             return {
                 sha: fullSha,
                 message,
@@ -9380,7 +9384,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 patch,
                 patchHash: hashPrompt(patch),
                 description,
-                descriptionHash: hashPrompt(description),
+                descriptionHash,
             };
         })();
         const tracked = request.then((context) => {
@@ -44525,7 +44529,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('fetchJevCommitReviewContext shares exact context until explicit PR invalidation', async () => {
+    ackTest('fetchJevCommitReviewContext keys derived context by the current PR description', async () => {
         const originalResolve = resolveFullCommitSha;
         const originalPatch = fetchFullCommitPatch;
         const originalFetch = gmFetch;
@@ -44552,16 +44556,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackAssert(first.patch.includes('diff --git a/file b/file'), 'uses the complete parent-relative patch');
             ackEq(first.description, description, 'uses the current PR description');
             description = 'Edited PR description.';
-            ackEq((await fetchJevCommitReviewContext(pr, sha)).description, first.description,
-                'visible files share one exact commit context without repeated GitHub reads');
-            ackEq(patchCalls, 1, 'visible files share one immutable full-patch read');
-            ackEq(prCalls, 1, 'visible files share one PR-description read');
-            clearJevCommitReviewContexts();
             const edited = await fetchJevCommitReviewContext(pr, sha);
-            ackEq(edited.description, description, 'rechecks mutable PR prose after PR context invalidation');
-            ackNeq(first.descriptionHash, edited.descriptionHash, 'an edited description gets a new exact context identity');
-            ackEq(patchCalls, 2, 'explicit invalidation rebuilds the exact context');
-            ackEq(prCalls, 2, 'explicit invalidation rechecks the PR description');
+            ackEq(edited.description, description, 'an edited PR description gets a new derived context immediately');
+            ackNeq(first.descriptionHash, edited.descriptionHash, 'the mutable description participates in context identity');
+            ackEq((await fetchJevCommitReviewContext(pr, sha)).description, description,
+                'the exact current description reuses its derived context');
+            ackEq(patchCalls, 2, 'a changed mutable input rebuilds the derived context');
+            ackEq(prCalls, 3, 'each lookup revalidates the mutable PR description');
+            clearJevCommitReviewContexts();
+            await fetchJevCommitReviewContext(pr, sha);
+            ackEq(patchCalls, 3, 'explicit invalidation rebuilds the exact context');
+            ackEq(prCalls, 4, 'explicit invalidation still rechecks the PR description');
         } finally {
             resolveFullCommitSha = originalResolve;
             fetchFullCommitPatch = originalPatch;
