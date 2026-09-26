@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.274
+// @version      1.275
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -8994,6 +8994,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         _prContextKey = '';
         _prReplyRowsKey = '';
         _prReplyRowsPromise = null;
+        clearJevCommitReviewContexts();
     }
 
     function wrapPromptBlock(label, content) {
@@ -9210,6 +9211,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     // around the same commit repeatedly. Key includes owner/repo to avoid
     // accidental cross-repo collisions.
     const _commitPatchCache = new Map(); // key -> Promise<string>
+    const _fullCommitPatchCache = new Map(); // key -> Promise<string>
     const COMMIT_PATCH_CACHE_MAX = 12;
 
     function commitPatchCacheKey(pr, sha) {
@@ -9218,6 +9220,31 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function clearCommitPatchCache() {
         _commitPatchCache.clear();
+        _fullCommitPatchCache.clear();
+        clearJevCommitReviewContexts();
+    }
+
+    function fetchFullCommitPatch(pr, sha) {
+        if (!pr?.owner || !pr?.repo || !sha) return Promise.resolve('');
+        const cacheable = /^[0-9a-f]{40}$/i.test(String(sha));
+        const key = commitPatchCacheKey(pr, sha);
+        const cached = cacheable ? _fullCommitPatchCache.get(key) : null;
+        if (cached) {
+            _fullCommitPatchCache.delete(key);
+            _fullCommitPatchCache.set(key, cached);
+            return cached;
+        }
+        const request = gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
+        const tracked = request.catch((error) => {
+            _fullCommitPatchCache.delete(key);
+            throw error;
+        });
+        if (!cacheable) return tracked;
+        _fullCommitPatchCache.set(key, tracked);
+        while (_fullCommitPatchCache.size > COMMIT_PATCH_CACHE_MAX) {
+            _fullCommitPatchCache.delete(_fullCommitPatchCache.keys().next().value);
+        }
+        return tracked;
     }
 
     function fetchCommitPatch(pr, sha) {
@@ -9231,9 +9258,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             _commitPatchCache.set(key, cached);
             return cached;
         }
-        const p = gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`).then(
-            stripDeletedFileBodiesFromPatch,
-        );
+        const p = fetchFullCommitPatch(pr, sha).then(stripDeletedFileBodiesFromPatch);
         const wrapped = p.catch((e) => {
             _commitPatchCache.delete(key);
             throw e;
@@ -9245,6 +9270,90 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             _commitPatchCache.delete(oldestKey);
         }
         return wrapped;
+    }
+
+    const jevCommitContextCache = new Map();
+    const JEV_COMMIT_CONTEXT_CACHE_MAX = 24;
+
+    function clearJevCommitReviewContexts() {
+        jevCommitContextCache.clear();
+    }
+
+    function commitMessageFromPatch(patchText) {
+        const patch = String(patchText || '').replace(/\r\n/g, '\n');
+        const headerEnd = patch.indexOf('\n\n');
+        if (headerEnd < 0) return '';
+        const headers = patch.slice(0, headerEnd).split('\n');
+        let subject = '';
+        for (let index = 0; index < headers.length; index++) {
+            if (!headers[index].startsWith('Subject:')) continue;
+            subject = headers[index].slice('Subject:'.length).trim();
+            while (index + 1 < headers.length && /^[ \t]/.test(headers[index + 1])) {
+                subject += ` ${headers[++index].trim()}`;
+            }
+            break;
+        }
+        subject = subject.replace(/^\[PATCH[^\]]*\]\s*/i, '').trim();
+        const diffStart = patch.search(/^diff --git /m);
+        const messageRegion = patch.slice(headerEnd + 2, diffStart < 0 ? patch.length : diffStart);
+        const separator = messageRegion.startsWith('---\n') ? 0 : messageRegion.lastIndexOf('\n---\n');
+        const body = (separator >= 0 ? messageRegion.slice(0, separator) : messageRegion).trim();
+        return [subject, body].filter(Boolean).join('\n\n');
+    }
+
+    async function fetchJevCommitReviewContext(pr, sha) {
+        if (!pr?.owner || !pr?.repo || !/^\d+$/.test(String(pr.pr || ''))) return null;
+        const fullSha = await resolveFullCommitSha(pr, sha);
+        if (!/^[0-9a-f]{40}$/i.test(fullSha || '')) return null;
+        const key = `${pr.owner}/${pr.repo}#${pr.pr}:${fullSha.toLowerCase()}`;
+        const cached = jevCommitContextCache.get(key);
+        if (cached) {
+            jevCommitContextCache.delete(key);
+            jevCommitContextCache.set(key, cached);
+            return cached;
+        }
+        const request = (async () => {
+            const [patchResult, prResult] = await Promise.allSettled([
+                fetchFullCommitPatch(pr, fullSha),
+                gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`, { freshForMs: 0 }),
+            ]);
+            if (patchResult.status !== 'fulfilled' || !patchResult.value || prResult.status !== 'fulfilled') {
+                return null;
+            }
+            const patch = patchResult.value;
+            let message = commitMessageFromPatch(patch);
+            if (!message) {
+                try {
+                    const commit = await gmFetch(
+                        `https://api.github.com/repos/${pr.owner}/${pr.repo}/commits/${fullSha}`,
+                    );
+                    message = String(commit?.commit?.message || '');
+                } catch (_) {}
+            }
+            if (!message) return null;
+            const description = String(prResult.value?.body || '');
+            return {
+                sha: fullSha,
+                message,
+                messageHash: hashPrompt(message),
+                patch,
+                patchHash: hashPrompt(patch),
+                description,
+                descriptionHash: hashPrompt(description),
+            };
+        })();
+        const tracked = request.then((context) => {
+            if (!context) jevCommitContextCache.delete(key);
+            return context;
+        }, (error) => {
+            jevCommitContextCache.delete(key);
+            throw error;
+        });
+        jevCommitContextCache.set(key, tracked);
+        while (jevCommitContextCache.size > JEV_COMMIT_CONTEXT_CACHE_MAX) {
+            jevCommitContextCache.delete(jevCommitContextCache.keys().next().value);
+        }
+        return tracked;
     }
 
     // --- Rendering ---
@@ -17116,7 +17225,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = { commit: 3, hunk: 3, line: 3, description: 3, comment: 5, stack: 3 };
+    const JEV_SCHEMA = { commit: 4, hunk: 4, line: 4, description: 4, comment: 5, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 2400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -17132,7 +17241,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)[_-][A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
         commit: {
-            role: { type: 'choice', instructions: 'What is the primary role of the shown parent-relative commit diff? It may sample files; judge the shown code, not just the message.', criteria: {
+            role: { type: 'choice', instructions: 'What is the primary role of this complete parent-relative commit patch within the pull request described by state.pr_description? Judge the patch together with the exact full commit message.', criteria: {
                 test: 'Adds or strengthens an executable test or characterization',
                 fix: 'Changes production behavior to fix a problem',
                 refactor: 'Restructures code without an intended behavior change',
@@ -17140,13 +17249,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 mixed: 'Mixes independent concerns that would be easier to review separately',
                 other: 'None of these is clearly supported',
             } },
-            risk: { type: 'score', instructions: 'If this change is wrong, how consequential could its behavior be? This is impact, not the probability of a bug. Use only the shown patch.', criteria: [
+            risk: { type: 'score', instructions: 'If this change is wrong, how consequential could its behavior be? This is impact, not the probability of a bug. Use the complete patch, commit message, and pull request description.', criteria: [
                 'Localized cosmetic or test-only effect', 'Localized behavior or performance effect', 'Consensus, persistence, security, concurrency, or broad runtime effect',
             ] },
             effort: { type: 'score', instructions: 'How much effort is needed to review this patch carefully, considering size, interactions, and required external context?', criteria: [
                 'Quick and self-contained', 'Moderate context or several interactions', 'Deep context, subtle invariants, or many interactions',
             ] },
-            message_match: { type: 'noul', instructions: 'Does the commit message accurately describe the shown parent-relative diff without materially overstating it? Stay uncertain when files are omitted.' },
+            message_match: { type: 'noul', instructions: 'Does the exact full commit message accurately describe the complete parent-relative patch without materially overstating it, and does it fit the pull request description?' },
             test_oracle: { type: 'choice', instructions: 'If this patch adds or changes tests, do their assertions distinguish the intended behavior from a plausible wrong implementation? Do not count assertions added only to production code as tests.', criteria: {
                 direct: 'The changed test has a discriminating assertion tied to the behavior',
                 weak: 'The changed test lacks a useful oracle, or only checks incidental execution',
@@ -17156,7 +17265,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             concern: { type: 'noul', instructions: 'Does the shown patch itself contain a specific apparent inconsistency or edge case worth checking? Do not infer a defect solely from risk or missing external context.' },
         },
         hunk: {
-            topic: { type: 'choice', instructions: 'Which review topic is most relevant to these changed lines?', criteria: {
+            topic: { type: 'choice', instructions: 'Which review topic is most relevant to these changed lines? For a commit_diff artifact, use the exact commit message, pull request description, and complete parent-relative patch to understand their role.', criteria: {
                 arithmetic: 'Bounds, signedness, overflow, or integer arithmetic',
                 lifetime: 'Ownership, object lifetime, or memory safety',
                 locking: 'Concurrency, locking, or race conditions',
@@ -17167,10 +17276,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 tests: 'Tests or test oracles',
                 other: 'No particular topic is established by this excerpt',
             } },
-            concern: { type: 'noul', instructions: 'Is there a specific apparent mistake or inconsistency in the shown before/after lines? Do not treat a risky topic or missing callers as a defect.' },
+            concern: { type: 'noul', instructions: 'Is there a specific apparent mistake or inconsistency in the shown before/after lines given the supplied complete commit context? Do not treat a risky topic or missing callers as a defect.' },
         },
         line: {
-            classification: { type: 'choice', instructions: 'Classify the changed line named by this question against the complete shared change block in state.full_patch. Return one combined reading-guide category. Classify the target line itself. Within test code, treat routine setup, fixtures, mocks, harness wiring, and input construction as background. Treat a discriminating assertion, expected result, or oracle as essence_test. Use essence_bug only for a specific apparent bug or inconsistency supported by the supplied patch. Do not infer a bug from novelty, risk, missing callers, or incomplete context.', criteria: {
+            classification: { type: 'choice', instructions: 'Classify the changed line named by this question against the complete shared change block in state.full_patch. For a commit_diff artifact, decide whether the line is the load-bearing purpose of the commit, supporting setup or glue, or redundant information by using state.commit_message and state.pr_description together with the complete parent-relative patch. Return one combined reading-guide category. Classify the target line itself. Within test code, treat routine setup, fixtures, mocks, harness wiring, and input construction as background. Treat a discriminating assertion, expected result, or oracle as essence_test. Use essence_bug only for a specific apparent bug or inconsistency supported by the supplied patch. Do not infer a bug from novelty, risk, missing callers, or incomplete context.', criteria: {
                 background: 'Low-information review background such as includes, whitespace, minor documentation, compiler accommodation, mechanical parameter plumbing, repetitive wiring, routine test setup, fixtures, mocks, harness code, input construction, or an obvious consequence of another line',
                 foreground: 'A non-trivial supporting change worth reading normally whose meaning is not purely mechanical but is not the semantic center of the patch',
                 essence_behavior: 'The core behavior, policy, or externally visible effect',
@@ -17186,7 +17295,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             } },
         },
         description: {
-            classification: { type: 'choice', instructions: 'Classify the sentence named by this question against the complete shared text in state.full_text. For a review_comment artifact, also use state.review_thread and state.pr_description to understand the sentence role in the discussion and pull request. Return one combined reading-guide category. Classify the target sentence itself. Use essence_bug only for a specific apparent factual or internal inconsistency supported by the supplied text. Do not infer a problem from omitted patch context, uncertainty, novelty, or risk.', criteria: {
+            classification: { type: 'choice', instructions: 'Classify the sentence named by this question against the complete shared text in state.full_text. For a review_comment artifact, also use state.review_thread and state.pr_description to understand the sentence role in the discussion and pull request. For a commit_message artifact, use state.commit_patch and state.pr_description to decide whether the sentence states the load-bearing purpose, useful supporting context, or redundant information. Return one combined reading-guide category. Classify the target sentence itself. Use essence_bug only for a specific apparent factual or internal inconsistency supported by the supplied text. Do not infer a problem from omitted patch context, uncertainty, novelty, or risk.', criteria: {
                 background: 'Low-information review background such as routine setup, boilerplate, administrative notes, minor documentation detail, repeated context, mechanical test commands, links, or an obvious consequence of another sentence',
                 foreground: 'Non-trivial supporting context worth reading normally, such as motivation, scope, an implementation detail, a limitation, or useful validation information',
                 essence_behavior: 'The core behavior, policy, result, or externally visible effect',
@@ -18682,9 +18791,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const header = document.querySelector('.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2');
             const sha = pathCommitSha();
             if (header && sha) {
-                const clean = header.cloneNode(true);
-                clean.querySelectorAll('[class^="ack-"], [class*=" ack-"]').forEach((element) => element.remove());
-                commits.push({ sha, msg: clean.textContent.trim(), el: header });
+                commits.push({ sha, msg: textWithoutAcktopusDecorations(header), el: header });
             }
         }
         let newlyObserved = 0;
@@ -18936,28 +19043,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const id = `commit:${sha}:${commit.msg}`;
         const slot = jevSlot(jevCommitBadgeTarget(commit), id);
         if (!slot) return;
-        const alias = jevCacheId('commit', { repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg });
-        const cached = jevReadCache(alias);
-        if (cached) {
-            if (slot.isConnected && slot.dataset.ackJevId === id) {
-                jevRender(slot, 'commit', cached, `${sha.slice(0, 12)} parent-relative patch`, cached.partial);
-            }
-            return;
-        }
-        // The patch comes from the shared per-commit cache (also used by the
-        // lightbulb and explain helpers), so a visible commit is fetched once.
-        // The excerpt cap keeps the Jev request bounded without hiding that it
-        // was clipped.
         jevPublicRepository(pr).then(async (isPublic) => {
             if (!isPublic || !slot.isConnected) return;
             try {
-                const patch = await fetchCommitPatch(pr, sha);
-                const excerpt = jevCommitPatchExcerpt(patch);
-                const state = { kind: 'commit', repository: `${pr.owner}/${pr.repo}`, sha, message: commit.msg.slice(0, 1200), patch: excerpt.text, patch_clipped: excerpt.clipped };
+                const context = await fetchJevCommitReviewContext(pr, sha);
+                if (!context) throw new Error('complete commit context unavailable');
+                const state = {
+                    kind: 'commit',
+                    repository: `${pr.owner}/${pr.repo}`,
+                    pr: String(pr.pr),
+                    sha: context.sha,
+                    message: context.message,
+                    message_hash: context.messageHash,
+                    pr_description: context.description,
+                    pr_description_hash: context.descriptionHash,
+                    patch: context.patch,
+                    full_patch_hash: context.patchHash,
+                    patch_complete: true,
+                };
                 const result = await jevEvaluate(pr, 'commit', state);
-                if (result) jevWriteCache(alias, { ...result, partial: state.patch_clipped }, `${pr.owner}/${pr.repo}#${pr.pr}`);
-                if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'commit', result, `${sha.slice(0, 12)} parent-relative patch`, state.patch_clipped);
-            } catch (e) { console.warn('ACKtopus: Jev commit patch skipped:', e?.message || e); }
+                if (slot.isConnected && slot.dataset.ackJevId === id) {
+                    jevRender(slot, 'commit', result, `${context.sha.slice(0, 12)} complete parent-relative patch`, false);
+                }
+            } catch (e) { console.warn('ACKtopus: Jev commit review skipped:', e?.message || e); }
         });
     }
 
@@ -19015,7 +19123,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (isCanceled()) { scheduleJevDiffProcessing(); return; }
             const file = jevVisibleDiffQueue.shift();
             if (file) jevDiffPending.delete(file);
-            if (file?.isConnected) queueJevDiffHunks(file);
+            if (file?.isConnected) queueJevDiffHunks(file).catch((error) => {
+                jevDiagnostic('diff file failed', {
+                    path: readDiffFilePath(file) || '(unknown file)',
+                    error: error?.message || String(error),
+                }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 0, level: 'warn' });
+            });
             if (jevVisibleDiffQueue.length) scheduleJevDiffProcessing();
         }, { delayMs: 100, reason: 'visible-diff' });
     }
@@ -19171,9 +19284,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
     }
 
-    function jevLineBatchState(pr, head, signature, allReviews, batchReviews) {
+    function jevLineBatchState(pr, head, signature, allReviews, batchReviews, context = {}) {
+        const renderedChanges = allReviews.map((review) =>
+            `${review.location}\n${review.target.change}`).join('\n');
         return {
             kind: 'line_batch',
+            artifact: context.artifact || 'rendered_diff',
             repository: `${pr.owner}/${pr.repo}`,
             pr: String(pr.pr || ''),
             head,
@@ -19182,7 +19298,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             paths: [...new Set(allReviews.map((review) =>
                 review.location.slice(0, review.location.lastIndexOf(':'))))],
             full_hunk_hash: signature,
-            full_patch: allReviews.map((review) => `${review.location}\n${review.target.change}`).join('\n'),
+            rendered_changes: renderedChanges,
+            rendered_changes_hash: hashPrompt(renderedChanges),
+            full_patch: context.fullPatch || renderedChanges,
+            full_patch_hash: context.fullPatchHash || hashPrompt(renderedChanges),
+            commit_sha: context.commitSha || '',
+            commit_message: context.commitMessage || '',
+            commit_message_hash: context.commitMessageHash || hashPrompt(context.commitMessage || ''),
+            pr_description: context.prDescription || '',
+            pr_description_hash: context.prDescriptionHash || hashPrompt(context.prDescription || ''),
             targets: batchReviews.map((review) => review.target),
         };
     }
@@ -19368,7 +19492,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return decision.level;
     }
 
-    function queueJevLineReading(pr, head, records, signature) {
+    function queueJevLineReading(pr, head, records, signature, context = {}) {
         const stats = { eligible: 0, alreadyAnnotated: 0, cacheHits: 0, queued: 0, batches: 0 };
         if (!jevLineReadingEnabled()) return stats;
         const lines = records.flatMap(({ path, line }) =>
@@ -19387,6 +19511,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 signature,
                 entries.map((entry) => entry.review),
                 batch.map((entry) => entry.review),
+                context,
             );
             const id = jevCacheId('line', state, questions);
             const current = batch.filter(({ line }, index) =>
@@ -19545,13 +19670,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return ranges;
     }
 
-    function jevDescriptionTextNodes(block, blockSet) {
+    function jevDescriptionTextNodes(block, blockSet, allowPre = false) {
         const nodes = [];
         const walker = document.createTreeWalker(block, window.NodeFilter?.SHOW_TEXT || 4);
         let node;
         while ((node = walker.nextNode())) {
             const parent = node.parentElement;
-            if (!parent || parent.closest('pre, script, style, textarea, button, select, [contenteditable="true"]')) continue;
+            if (!parent || parent.closest('script, style, textarea, button, select, [contenteditable="true"]')) continue;
+            if (!allowPre && parent.closest('pre')) continue;
+            if (parent.closest('[class^="ack-"], [class*=" ack-"]')) continue;
             if (parent.closest('.ack-jev-description-priority')) continue;
             let nested = parent;
             let ownedByNestedBlock = false;
@@ -19567,14 +19694,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return nodes;
     }
 
-    function jevWrapDescriptionSentences(body) {
-        const blocks = qsa(body, JEV_DESCRIPTION_BLOCK_SELECTOR).filter((block) =>
-            !block.closest('pre, script, style, textarea, [contenteditable="true"]'),
+    function jevWrapDescriptionSentences(body, explicitBlocks = null) {
+        const blocks = (explicitBlocks || qsa(body, JEV_DESCRIPTION_BLOCK_SELECTOR)).filter((block) =>
+            block?.isConnected && !block.closest('script, style, textarea, [contenteditable="true"]') &&
+                (explicitBlocks || !block.closest('pre')),
         );
         const blockSet = new Set(blocks);
         const sentences = [];
         for (const block of blocks) {
-            const nodes = jevDescriptionTextNodes(block, blockSet);
+            const nodes = jevDescriptionTextNodes(block, blockSet, !!explicitBlocks);
             const entries = [];
             let offset = 0;
             for (const node of nodes) {
@@ -19634,13 +19762,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             head,
             description_hash: bodyHash,
             source_identity: context.sourceIdentity || '',
-            full_text: fullText,
+            full_text: context.fullText || fullText,
+            rendered_text: context.renderedText || fullText,
             review_thread: context.reviewThread || '',
             review_thread_hash: context.reviewThreadHash || hashPrompt(context.reviewThread || ''),
             review_thread_complete: context.reviewThreadComplete !== false,
             pr_description: context.prDescription || '',
             pr_description_hash: context.prDescriptionHash || hashPrompt(context.prDescription || ''),
             pr_description_complete: context.prDescriptionComplete !== false,
+            commit_sha: context.commitSha || '',
+            commit_message: context.commitMessage || '',
+            commit_message_hash: context.commitMessageHash || hashPrompt(context.commitMessage || ''),
+            commit_patch: context.commitPatch || '',
+            commit_patch_hash: context.commitPatchHash || hashPrompt(context.commitPatch || ''),
+            commit_patch_complete: context.commitPatchComplete !== false,
             targets: indexes.map((index) => ({
                 sentence_index: index + 1,
                 sentence: sentences[index].text,
@@ -19657,7 +19792,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             endLabel: '',
             // Match an ordinary selection in the PR description: it is not
             // scoped to the final commit merely because that is the PR head.
-            commitSha: '',
+            commitSha: context.commitSha || '',
             pr,
             rect: marker.getBoundingClientRect(),
             contextLines: '',
@@ -19906,6 +20041,131 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    function jevCommitMessageView(root = document) {
+        if (getAnalysisMode() !== ANALYSIS_MODES.commit) return null;
+        const header = root.querySelector?.(
+            '.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2',
+        ) || (root.matches?.('.commit-title, [data-testid="commit-title"], .bgColor-inset h2, .tmp-p-3 h2')
+            ? root : null);
+        if (!header) return null;
+        const content = header.closest('.commit-desc') || header.parentElement;
+        if (!content) return null;
+        const blocks = [header];
+        const body = [...content.children].find((element) => element !== header &&
+            element.matches?.('pre, span.text-mono, span.ws-pre-wrap.f6, [data-testid="commit-message"]')) ||
+            content.querySelector?.(':scope > pre, :scope > [data-testid="commit-message"]');
+        if (body) blocks.push(body);
+        return { root: content, header, blocks };
+    }
+
+    function jevCommitMessageRenderedText(view) {
+        return view?.blocks?.map((block) => textWithoutAcktopusDecorations(block).trim())
+            .filter(Boolean).join('\n\n') || '';
+    }
+
+    function jevCommitSelectionWorkUnit(context) {
+        return [
+            wrapPromptBlock('PR DESCRIPTION', context.description),
+            wrapPromptBlock('COMMIT MESSAGE', context.message),
+            wrapPromptBlock('FULL COMMIT PATCH', context.patch),
+        ].filter(Boolean).join('\n\n');
+    }
+
+    function queueJevCommitMessageReading() {
+        if (_ackTesting || getAnalysisMode() !== ANALYSIS_MODES.commit) return;
+        if (!jevDescriptionReadingEnabled()) return;
+        const pr = jevReviewPageContext();
+        const viewedCommit = pathCommitSha();
+        const view = jevCommitMessageView();
+        if (!pr || !view || !view.root.isConnected || !viewedCommit) {
+            jevDiagnostic('commit message waiting for DOM', {
+                pullRequestParsed: !!pr,
+                commitFound: !!viewedCommit,
+                messageFound: !!view,
+                messageConnected: !!view?.root?.isConnected,
+            }, { key: 'commit-message-dom', intervalMs: 3000, level: 'warn' });
+            return;
+        }
+        const routePath = location.pathname;
+        (async () => {
+            if (!(await jevPublicRepository(pr))) return;
+            const commitContext = await fetchJevCommitReviewContext(pr, viewedCommit);
+            if (!commitContext || location.pathname !== routePath || !view.root.isConnected || !jevDescriptionReadingEnabled()) {
+                jevDiagnostic('commit message skipped', {
+                    commit: viewedCommit,
+                    reason: commitContext ? 'page changed while loading' : 'complete commit context unavailable',
+                }, { key: viewedCommit, intervalMs: 0, repeatMs: 60000, level: 'warn' });
+                return;
+            }
+            const renderedText = jevCommitMessageRenderedText(view);
+            const sourceKey = hashPrompt([
+                commitContext.sha,
+                commitContext.messageHash,
+                commitContext.patchHash,
+                commitContext.descriptionHash,
+                renderedText,
+            ].join('\0'));
+            const previous = jevDescriptionRecords.get(view.root);
+            if (previous?.sourceKey === sourceKey && previous.sentences.every((sentence) =>
+                sentence.spans.every((span) => span.isConnected))) return;
+            clearJevDescriptionAnnotations(view.root);
+            const sentences = jevWrapDescriptionSentences(view.root, view.blocks);
+            if (!sentences.length) return;
+            jevDescriptionRecords.set(view.root, { sourceKey, sentences });
+            const context = {
+                artifact: 'commit_message',
+                sourceIdentity: `${pr.owner}/${pr.repo}@${commitContext.sha}`,
+                source: location.href,
+                isPRDescription: false,
+                fullText: commitContext.message,
+                renderedText,
+                commitSha: commitContext.sha,
+                commitMessage: commitContext.message,
+                commitMessageHash: commitContext.messageHash,
+                commitPatch: commitContext.patch,
+                commitPatchHash: commitContext.patchHash,
+                commitPatchComplete: true,
+                prDescription: commitContext.description,
+                prDescriptionHash: commitContext.descriptionHash,
+                prDescriptionComplete: true,
+            };
+            const queued = jevQueueDescriptionBatches(
+                pr,
+                commitContext.sha,
+                commitContext.messageHash,
+                sentences,
+                jevCommitSelectionWorkUnit(commitContext),
+                context,
+                'Commit message sentence',
+            );
+            jevDiagnostic('commit message queued', {
+                commit: commitContext.sha,
+                sentences: sentences.length,
+                batches: queued.batches,
+                cacheHits: queued.cacheHits,
+                queued: queued.queued,
+                commitMessageCharacters: commitContext.message.length,
+                patchCharacters: commitContext.patch.length,
+                prDescriptionCharacters: commitContext.description.length,
+            }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
+            Promise.all(queued.tasks).then((levels) => {
+                const rendered = levels.flat().filter(Boolean);
+                jevDiagnostic('commit message completed', {
+                    commit: commitContext.sha,
+                    rendered: rendered.length,
+                    background: rendered.filter((level) => level === 'background').length,
+                    foreground: rendered.filter((level) => level === 'foreground').length,
+                    essence: rendered.filter((level) => level === 'essence').length,
+                }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
+            });
+        })().catch((error) => {
+            jevDiagnostic('commit message failed', {
+                commit: viewedCommit,
+                error: error?.message || String(error),
+            }, { key: viewedCommit, intervalMs: 0, level: 'warn' });
+        });
+    }
+
     function scheduleJevDescriptionDomRetry() {
         const path = location.pathname;
         if (!isPRConversationPage(path) || !jevDescriptionReadingEnabled()) return;
@@ -19993,7 +20253,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function queueJevVisibleHunk({ pr, path, head, group, signature }) {
+    function queueJevVisibleHunk({ pr, path, head, group, signature, context = {} }) {
         if (!jevEnabled()) return;
         const first = group.find((line) => !line.deleted) || group[0];
         const meta = getDiffSelectionLineMeta(first.cell);
@@ -20004,10 +20264,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (lineNumberCell && lineNumberCell !== first.cell) {
                 const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
                 const state = {
-                    kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, pr: String(pr.pr || ''), head,
+                    kind: 'hunk', artifact: context.artifact || 'rendered_diff',
+                    repository: `${pr.owner}/${pr.repo}`, pr: String(pr.pr || ''), head,
                     compare_base: pr.compareBase || '', compare_head: pr.compareHead || '',
                     path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'),
                     full_hunk_hash: signature,
+                    full_patch: context.fullPatch || '',
+                    full_patch_hash: context.fullPatchHash || '',
+                    commit_sha: context.commitSha || '',
+                    commit_message: context.commitMessage || '',
+                    commit_message_hash: context.commitMessageHash || hashPrompt(context.commitMessage || ''),
+                    pr_description: context.prDescription || '',
+                    pr_description_hash: context.prDescriptionHash || hashPrompt(context.prDescription || ''),
                 };
                 const id = jevCacheId('hunk', state);
                 const slot = jevHunkBadgeSlot(lineNumberCell, id);
@@ -20025,7 +20293,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
     }
 
-    function queueJevDiffHunks(file) {
+    async function queueJevDiffHunks(file) {
         if (_ackTesting || !jevEnabled() || !file.isConnected) return;
         const eligibility = jevCompareFileEligibility(file);
         if (!eligibility.allowed) {
@@ -20045,18 +20313,59 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }, { key: 'diff-file-dom', intervalMs: 3000, level: 'warn' });
             return;
         }
-        const head = pr.compareHead || getImmediatePRHeadSHA() || pathCommitSha();
+        const routePath = location.pathname;
+        const viewedCommit = pathCommitSha();
+        let commitContext = null;
+        let readingContext = {};
+        if (getAnalysisMode() === ANALYSIS_MODES.commit && viewedCommit) {
+            jevDiagnostic('commit diff context started', {
+                commit: viewedCommit,
+                path,
+                state: 'loading exact PR description, commit message, and full patch',
+            }, { key: viewedCommit, intervalMs: 1500 });
+            if (!(await jevPublicRepository(pr))) return;
+            commitContext = await fetchJevCommitReviewContext(pr, viewedCommit);
+            if (!commitContext || location.pathname !== routePath || !file.isConnected || !jevEnabled()) {
+                jevDiagnostic('commit diff context skipped', {
+                    commit: viewedCommit,
+                    path,
+                    reason: commitContext ? 'page changed while loading' : 'complete commit context unavailable',
+                }, { key: viewedCommit, intervalMs: 0, repeatMs: 60000, level: 'warn' });
+                return;
+            }
+            readingContext = {
+                artifact: 'commit_diff',
+                commitSha: commitContext.sha,
+                commitMessage: commitContext.message,
+                commitMessageHash: commitContext.messageHash,
+                fullPatch: commitContext.patch,
+                fullPatchHash: commitContext.patchHash,
+                prDescription: commitContext.description,
+                prDescriptionHash: commitContext.descriptionHash,
+            };
+            jevDiagnostic('commit diff context ready', {
+                commit: commitContext.sha,
+                path,
+                commitMessageCharacters: commitContext.message.length,
+                patchCharacters: commitContext.patch.length,
+                prDescriptionCharacters: commitContext.description.length,
+            }, { key: commitContext.sha, intervalMs: 1500 });
+        }
+        const head = commitContext?.sha || pr.compareHead || getImmediatePRHeadSHA() || viewedCommit;
         const rows = [...file.querySelectorAll('tr')];
         const renderedChanged = rows.map(jevChangedRow).filter(Boolean);
         const relevance = jevComparisonRelevantChanged(file, path, renderedChanged);
         const changed = relevance.changed;
         const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
-        const fileSignature = hashPrompt(head + changed.map((line) => line.fullText).join('\n'));
+        const contextSignature = commitContext
+            ? `${commitContext.messageHash}\0${commitContext.patchHash}\0${commitContext.descriptionHash}` : '';
+        const fileSignature = hashPrompt(head + contextSignature + changed.map((line) => line.fullText).join('\n'));
         const lineStats = queueJevLineReading(
             pr,
             head,
             changed.map((line) => ({ path, line })),
             fileSignature,
+            readingContext,
         );
         const signaledCells = new Set(qsa(file,
             'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
@@ -20077,12 +20386,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let immediate = 0;
         for (const group of groups) {
             const first = group.find((line) => !line.deleted) || group[0];
-            const signature = hashPrompt(head + group.map((line) => line.fullText).join('\n'));
+            const signature = hashPrompt(head + contextSignature + group.map((line) => line.fullText).join('\n'));
             const meta = getDiffSelectionLineMeta(first.cell);
             if (jevHunkObserved.get(first.cell) === signature &&
                 meta?.lineEl?.querySelector(':scope > .ack-jev-badges')) continue;
             jevHunkObserved.set(first.cell, signature);
-            const record = { pr, path, head, group, signature };
+            const record = { pr, path, head, group, signature, context: readingContext };
             if (jevElementNearViewport(first.cell, 250)) {
                 queueJevVisibleHunk(record);
                 immediate++;
@@ -20139,6 +20448,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             queueJevCommitRows();
             queueJevStackSummary();
             queueJevDescriptionReading();
+            queueJevCommitMessageReading();
         }
         for (const file of files) {
             if (!jevCompareFileEligibility(file).allowed) continue;
@@ -20464,6 +20774,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         '[data-testid="commit-row-item"]',
         '[data-listview-item-title-container]',
         '[class*="trailingBadgesContainer"]',
+        '.commit-title',
+        '[data-testid="commit-title"]',
+        '.bgColor-inset h2',
         '.js-commits-list-item',
         '.TimelineItem--condensed',
         '.file-navigation',
@@ -32340,6 +32653,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(rubric.criteria.essence_test.includes('excluding setup alone'));
     });
 
+    ackTest('Jev commit badges and hunks use complete commit review context', () => {
+        const commit = sourceSection(_ackSource, 'function queueJevCommitRow(commit)', 'let jevDiffObserved');
+        ackAssert(commit.includes('fetchJevCommitReviewContext(pr, sha)'),
+            'commit badge loads the shared exact commit context');
+        ackAssert(commit.includes('patch: context.patch') && commit.includes('pr_description: context.description'),
+            'commit badge sends the complete patch and PR description');
+        ackAssert(!commit.includes('jevCommitPatchExcerpt('), 'commit badge does not sample the patch');
+        const hunk = sourceSection(_ackSource, 'function queueJevVisibleHunk', 'async function queueJevDiffHunks');
+        ackAssert(hunk.includes("artifact: context.artifact || 'rendered_diff'") &&
+            hunk.includes('full_patch: context.fullPatch'),
+        'commit hunk state carries the same complete patch context');
+        const diff = sourceSection(_ackSource, 'async function queueJevDiffHunks', 'function queueJevPageAnnotations');
+        ackAssert(diff.includes('commitMessage: commitContext.message') &&
+            diff.includes('prDescription: commitContext.description'),
+        'commit diff lines and hunks receive the exact message and PR description');
+    });
+
     ackTest('Jev line states are exact and independently cacheable', () => {
         const host = document.createElement('div');
         host.setAttribute('data-path', 'src/example.cpp');
@@ -32369,6 +32699,45 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'the exact comparison range participates even when its rendered lines happen to match');
         host.querySelector('.blob-code').textContent = '';
         ackEq(jevChangedRow(host.querySelector('tr'))?.text, '[blank line]', 'blank changed lines are still classified');
+    });
+
+    ackTest('Jev commit line states include the exact PR, message, and full patch context', () => {
+        const host = document.createElement('div');
+        host.setAttribute('data-path', 'src/example.cpp');
+        host.innerHTML = '<table><tr class="blob-code-addition"><td data-line-number="9" id="diff-abcR9"></td>' +
+            '<td class="blob-code blob-code-addition">return total;</td></tr></table>';
+        const line = jevChangedRow(host.querySelector('tr'));
+        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
+        const review = jevLineReviewTarget('src/example.cpp', line);
+        const context = {
+            artifact: 'commit_diff',
+            commitSha: 'a'.repeat(40),
+            commitMessage: 'fix: count exact-limit chunks\n\nExplain the boundary.',
+            commitMessageHash: 'message-a',
+            fullPatch: 'complete mbox header\ndiff --git a/old.cpp b/old.cpp\n-return obsolete();',
+            fullPatchHash: 'patch-a',
+            prDescription: 'Include chunks that exactly fill the block limit.',
+            prDescriptionHash: 'description-a',
+        };
+        const state = jevLineBatchState(pr, context.commitSha, 'file-a', [review], [review], context);
+        ackEq(state.artifact, 'commit_diff', 'identifies commit-scoped line review');
+        ackEq(state.full_patch, context.fullPatch, 'supplies the complete parent-relative commit patch');
+        ackEq(state.commit_message, context.commitMessage, 'supplies the exact full commit message');
+        ackEq(state.pr_description, context.prDescription, 'supplies the exact PR description');
+        ackAssert(state.rendered_changes.includes('src/example.cpp:R9\n+ return total;'),
+            'keeps the rendered target location separate from the complete patch');
+        const questions = jevReadingQuestions('line', 1);
+        const editedDescription = { ...state, pr_description: 'A different PR purpose.',
+            pr_description_hash: 'description-b' };
+        const editedMessage = { ...state, commit_message: 'fix: different behavior',
+            commit_message_hash: 'message-b' };
+        const editedPatch = { ...state, full_patch: `${state.full_patch}\n+new behavior`, full_patch_hash: 'patch-b' };
+        ackNeq(jevCacheId('line', state, questions), jevCacheId('line', editedDescription, questions),
+            'a PR description edit cannot reuse a commit-line result');
+        ackNeq(jevCacheId('line', state, questions), jevCacheId('line', editedMessage, questions),
+            'a commit message edit cannot reuse a commit-line result');
+        ackNeq(jevCacheId('line', state, questions), jevCacheId('line', editedPatch, questions),
+            'a patch change cannot reuse a commit-line result');
     });
 
     ackTest('Jev line guide batches one classification per line against one shared rendered patch', async () => {
@@ -32505,6 +32874,62 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             jevDescriptionReadingEnabled = oldDescriptionEnabled;
             updateDiffSelectionToolbar = oldUpdateToolbar;
+            host.remove();
+        }
+    });
+
+    ackTest('Jev commit message guide annotates the subject and body with complete commit context', () => {
+        const originalMode = getAnalysisMode;
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="bgColor-inset"><div class="flex-1">' +
+            '<h2><span data-component="Text"><div>fix: count exact-limit chunks</div></span>' +
+            '<span class="ack-commit-heading-actions"><button>Explain</button></span>' +
+            '<span class="ack-jev-badges"><span class="ack-jev-badge">🛠️</span></span></h2>' +
+            '<span class="text-mono ws-pre-wrap f6">Explain the boundary. Preserve the existing behavior elsewhere.</span>' +
+            '</div></div>';
+        document.body.appendChild(host);
+        try {
+            getAnalysisMode = () => ANALYSIS_MODES.commit;
+            const view = jevCommitMessageView(host);
+            ackAssert(view && view.blocks.length === 2, 'finds the current React commit subject and body');
+            const rendered = jevCommitMessageRenderedText(view);
+            ackEq(rendered,
+                'fix: count exact-limit chunks\n\nExplain the boundary. Preserve the existing behavior elsewhere.',
+                'reads only GitHub commit prose without ACKtopus controls or badges');
+            const sentences = jevWrapDescriptionSentences(view.root, view.blocks);
+            ackEq(sentences.length, 3, 'splits the commit subject and body with the description sentence algorithm');
+            const context = {
+                artifact: 'commit_message',
+                fullText: rendered,
+                renderedText: rendered,
+                commitSha: 'a'.repeat(40),
+                commitMessage: rendered,
+                commitMessageHash: 'message-a',
+                commitPatch: 'full mbox patch including deleted-file bodies',
+                commitPatchHash: 'patch-a',
+                commitPatchComplete: true,
+                prDescription: 'Allow exact-limit chunks.',
+                prDescriptionHash: 'description-a',
+                prDescriptionComplete: true,
+            };
+            const state = jevDescriptionBatchState(
+                { owner: 'bitcoin', repo: 'bitcoin', pr: '1' },
+                context.commitSha,
+                context.commitMessageHash,
+                sentences,
+                [0, 1, 2],
+                rendered,
+                context,
+            );
+            ackEq(state.artifact, 'commit_message', 'identifies commit-message reading-guide work');
+            ackEq(state.commit_patch, context.commitPatch, 'supplies the complete commit patch once');
+            ackEq(state.pr_description, context.prDescription, 'supplies the PR description once');
+            ackEq(state.commit_message, rendered, 'supplies the exact full commit message once');
+            ackEq(state.targets.length, 3, 'asks for one combined classification per visible sentence');
+            clearJevDescriptionAnnotations(view.root);
+            ackEq(jevCommitMessageRenderedText(view), rendered, 'annotation cleanup preserves exact GitHub prose');
+        } finally {
+            getAnalysisMode = originalMode;
             host.remove();
         }
     });
@@ -43871,6 +44296,80 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
+    ackTest('fetchFullCommitPatch preserves complete immutable evidence', async () => {
+        const original = gmFetchText;
+        const fullSha = 'f'.repeat(40);
+        const patch = 'From ' + fullSha + ' Mon Sep 17 00:00:00 2001\n' +
+            'Subject: [PATCH] remove obsolete code\n\nExplain the removal.\n---\n' +
+            'diff --git a/old.cpp b/old.cpp\ndeleted file mode 100644\n--- a/old.cpp\n+++ /dev/null\n' +
+            '@@ -1 +0,0 @@\n-return obsolete();\n';
+        let calls = 0;
+        try {
+            clearCommitPatchCache();
+            gmFetchText = async () => {
+                calls++;
+                return patch;
+            };
+            const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
+            ackEq(await fetchFullCommitPatch(pr, fullSha), patch,
+                'the Jev path keeps deleted-file bodies and the mbox commit message');
+            ackEq(await fetchFullCommitPatch(pr, fullSha), patch, 'the exact full patch is cached');
+            ackEq(calls, 1, 'one immutable transport read supplies repeated full-patch callers');
+            ackAssert(!(await fetchCommitPatch(pr, fullSha)).includes('return obsolete()'),
+                'legacy bounded-context callers still receive the stripped patch');
+            ackEq(commitMessageFromPatch(patch), 'remove obsolete code\n\nExplain the removal.',
+                'the mbox fallback recovers the full subject and body');
+        } finally {
+            gmFetchText = original;
+            clearCommitPatchCache();
+        }
+    });
+
+    ackTest('fetchJevCommitReviewContext shares exact context until explicit PR invalidation', async () => {
+        const originalResolve = resolveFullCommitSha;
+        const originalPatch = fetchFullCommitPatch;
+        const originalFetch = gmFetch;
+        const sha = 'd'.repeat(40);
+        let description = 'Original PR description.';
+        let patchCalls = 0;
+        let prCalls = 0;
+        try {
+            resolveFullCommitSha = async () => sha;
+            fetchFullCommitPatch = async () => {
+                patchCalls++;
+                return 'From ' + sha + ' Mon Sep 17 00:00:00 2001\n' +
+                    'Subject: [PATCH] Subject\n\nFull commit body.\n---\n' +
+                    'diff --git a/file b/file\n+changed line\n';
+            };
+            gmFetch = async () => {
+                prCalls++;
+                return { body: description };
+            };
+            const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
+            const first = await fetchJevCommitReviewContext(pr, sha);
+            ackEq(first.sha, sha, 'uses the resolved immutable SHA');
+            ackEq(first.message, 'Subject\n\nFull commit body.', 'uses the exact full commit message');
+            ackAssert(first.patch.includes('diff --git a/file b/file'), 'uses the complete parent-relative patch');
+            ackEq(first.description, description, 'uses the current PR description');
+            description = 'Edited PR description.';
+            ackEq((await fetchJevCommitReviewContext(pr, sha)).description, first.description,
+                'visible files share one exact commit context without repeated GitHub reads');
+            ackEq(patchCalls, 1, 'visible files share one immutable full-patch read');
+            ackEq(prCalls, 1, 'visible files share one PR-description read');
+            clearJevCommitReviewContexts();
+            const edited = await fetchJevCommitReviewContext(pr, sha);
+            ackEq(edited.description, description, 'rechecks mutable PR prose after PR context invalidation');
+            ackNeq(first.descriptionHash, edited.descriptionHash, 'an edited description gets a new exact context identity');
+            ackEq(patchCalls, 2, 'explicit invalidation rebuilds the exact context');
+            ackEq(prCalls, 2, 'explicit invalidation rechecks the PR description');
+        } finally {
+            resolveFullCommitSha = originalResolve;
+            fetchFullCommitPatch = originalPatch;
+            gmFetch = originalFetch;
+            clearJevCommitReviewContexts();
+        }
+    });
+
     ackTest('fetchSHA uses gmFetch instead of bare fetch', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -44955,7 +45454,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('jevCommentPatchCache.get(patchKey)'), 'reads the exact revision patch');
     });
 
-    ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
+    ackTest('gmFetchText helper serves every patch, compare, raw-file, and commit read', () => {
         const source = _ackSource;
         ackAssert(source.includes('function gmFetchText(url,'), 'gmFetchText defined');
         const fetchPatch = source.slice(
@@ -44971,8 +45470,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function fetchPRFileCategories'),
         );
         ackAssert(fetchRaw.includes('gmFetchText('), 'fetchRawFile uses gmFetchText');
-        const fetchCommit = source.slice(source.indexOf('function fetchCommitPatch'), source.indexOf('marked.use('));
-        ackAssert(fetchCommit.includes('gmFetchText('), 'fetchCommitPatch uses gmFetchText');
+        const fetchCommit = source.slice(source.indexOf('function fetchFullCommitPatch'), source.indexOf('marked.use('));
+        ackAssert(fetchCommit.includes('gmFetchText('), 'fetchFullCommitPatch uses gmFetchText');
+        ackAssert(fetchCommit.includes('fetchFullCommitPatch(pr, sha).then(stripDeletedFileBodiesFromPatch)'),
+            'bounded commit patches derive from the shared complete patch');
         ackAssert(
             fetchCommit.includes('stripDeletedFileBodiesFromPatch'),
             'fetchCommitPatch strips deleted-file bodies',
@@ -45178,7 +45679,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function fetchPRFileCategories'),
         );
         ackAssert(!fetchRaw.includes('GM_xmlhttpRequest'), 'fetchRawFile has no raw GM_xmlhttpRequest');
-        const fetchCommit = source.slice(source.indexOf('function fetchCommitPatch'), source.indexOf('marked.use('));
+        const fetchCommit = source.slice(source.indexOf('function fetchFullCommitPatch'), source.indexOf('marked.use('));
         ackAssert(!fetchCommit.includes('GM_xmlhttpRequest'), 'fetchCommitPatch has no raw GM_xmlhttpRequest');
     });
 
@@ -52967,7 +53468,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         try {
             const heading = document.createElement('h2');
             heading.className = 'commit-title ack-commit-heading';
-            heading.innerHTML = '<span data-component="Text">move-only: Extract ProcessSendTxRcncl() helper</span>' +
+            heading.innerHTML = '<span data-component="Text"><span class="ack-jev-description-priority" data-emoji="🧹"></span>' +
+                '<span class="ack-jev-description-segment">move-only: Extract ProcessSendTxRcncl() helper</span></span>' +
                 '<span class="ack-commit-heading-actions"><button class="ack-commit-proofread">Proofread</button></span>' +
                 '<span class="ack-jev-badges"><span class="ack-jev-badge">🧹</span></span>';
             document.querySelector = (selector) => selector.includes('commit-title')
