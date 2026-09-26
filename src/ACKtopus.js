@@ -19588,17 +19588,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         '.js-command-palette-pull-body, [id^="pullrequest-"]';
     const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
     let jevReadingQuickTooltip = null;
-    let jevReadingExplainTimer = null;
     let jevDescriptionDomRetryTimer = null;
     let jevDescriptionDomRetryPath = '';
     let jevDescriptionDomRetryAttempts = 0;
     let jevLastPRDescriptionContextKey = '';
 
     function dismissJevReadingHover() {
-        if (jevReadingExplainTimer !== null) {
-            ackClearTimeout(jevReadingExplainTimer);
-            jevReadingExplainTimer = null;
-        }
         jevReadingQuickTooltip?.remove();
         jevReadingQuickTooltip = null;
     }
@@ -19621,39 +19616,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         jevReadingQuickTooltip = tooltip;
     }
 
+    // Hovering or focusing an emoji only shows its cached Jev category.
+    // Clicking it (or Enter/Space) replaces that tooltip with the LLM quick
+    // explanation popup.
     function bindJevReadingHover(marker, contextFactory) {
-        const showExplanation = () => {
+        const showCategory = () => showJevReadingQuickTooltip(marker);
+        const showExplanation = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            dismissJevReadingHover();
             if (!marker.isConnected) return;
-            if (jevReadingExplainTimer !== null) {
-                ackClearTimeout(jevReadingExplainTimer);
-                jevReadingExplainTimer = null;
-            }
             const context = contextFactory();
             if (context) updateDiffSelectionToolbar(context);
         };
-        const previewThenExplain = () => {
-            showJevReadingQuickTooltip(marker);
-            jevReadingExplainTimer = ackSetTimeout(() => {
-                jevReadingExplainTimer = null;
-                showExplanation();
-            }, 450);
-        };
-        marker.addEventListener('mouseenter', previewThenExplain);
+        marker.addEventListener('mouseenter', showCategory);
         marker.addEventListener('mouseleave', dismissJevReadingHover);
-        marker.addEventListener('focus', previewThenExplain);
+        marker.addEventListener('focus', showCategory);
         marker.addEventListener('blur', dismissJevReadingHover);
-        marker.addEventListener('click', (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            if (!jevReadingQuickTooltip) showJevReadingQuickTooltip(marker);
-            showExplanation();
-        });
+        marker.addEventListener('click', showExplanation);
         marker.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter' && event.key !== ' ') return;
-            event.preventDefault();
-            event.stopPropagation();
-            if (!jevReadingQuickTooltip) showJevReadingQuickTooltip(marker);
-            showExplanation();
+            if (event.key === 'Enter' || event.key === ' ') showExplanation(event);
         });
     }
 
@@ -32507,12 +32489,37 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('Jev emoji hover shows only the category and a click opens the explanation', async () => {
+        const oldUpdateToolbar = updateDiffSelectionToolbar;
+        const marker = document.createElement('span');
+        marker.dataset.quickExplanation = 'Calculation\n94% confidence · click for explanation';
+        document.body.appendChild(marker);
+        const opened = [];
+        try {
+            updateDiffSelectionToolbar = (ctx) => opened.push(ctx);
+            bindJevReadingHover(marker, () => ({ text: 'selected line', syntheticSelection: true }));
+            marker.dispatchEvent(new MouseEvent('mouseenter'));
+            const tooltip = () => document.querySelector('.ack-jev-reading-quick-tooltip');
+            ackEq(tooltip()?.textContent, marker.dataset.quickExplanation, 'hover shows the Jev category tooltip');
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            ackEq(opened.length, 0, 'lingering on the emoji does not open the LLM explanation');
+            marker.click();
+            ackEq(tooltip(), null, 'a click removes the category tooltip');
+            ackEq(opened.length, 1, 'a click opens the LLM quick explanation');
+            ackEq(opened[0]?.text, 'selected line', 'the explanation uses the emoji target context');
+        } finally {
+            updateDiffSelectionToolbar = oldUpdateToolbar;
+            dismissJevReadingHover();
+            marker.remove();
+        }
+    });
+
     ackTest('Jev emoji pointer events do not schedule an empty-selection dismissal', () => {
         const install = sourceSection(_ackSource, 'function installDiffSelectionActions', 'function hideDiffSelectionToolbar');
         ackAssert(install.includes("t?.closest?.('.ack-jev-line-priority, .ack-jev-description-priority')"),
             'the document pointer guard treats reading-guide emojis as selection UI');
         const bind = sourceSection(_ackSource, 'function bindJevReadingHover', 'function jevPRDescriptionBody');
-        ackAssert(bind.includes("event.key !== 'Enter' && event.key !== ' '"),
+        ackAssert(bind.includes("event.key === 'Enter' || event.key === ' '"),
             'keyboard activation opens the same explanation');
         const summary = sourceSection(_ackSource, 'function queueDiffSelectionOneLiner', 'function installDiffSelectionActions');
         ackAssert(summary.includes('updateDiffSelectionToolbar(ctx.syntheticSelection ? ctx : null)'),
@@ -32767,15 +32774,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'emoji hover shows an immediate cached explanation before an AI request');
             marker.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
             ackAssert(!document.querySelector('.ack-jev-reading-quick-tooltip'),
-                'moving away dismisses the cached tooltip and pending AI explanation');
+                'moving away dismisses the cached tooltip');
             marker.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            ackEq(hoverContext, null, 'hover alone does not open the AI popup');
             marker.click();
-            ackEq(hoverContext?.text, sentences[1].text, 'sustained hover or click opens the selection popup for the sentence');
-            ackAssert(document.querySelector('.ack-jev-reading-quick-tooltip'),
-                'the cached category tooltip remains visible beside the AI popup while hovered');
-            ackEq(hoverContext?.parentText, textBefore, 'hover explanation includes the surrounding description');
+            ackEq(hoverContext?.text, sentences[1].text, 'a click opens the selection popup for the sentence');
+            ackAssert(!document.querySelector('.ack-jev-reading-quick-tooltip'),
+                'the AI popup replaces the cached category tooltip');
+            ackEq(hoverContext?.parentText, textBefore, 'the explanation includes the surrounding description');
             ackAssert(hoverContext?.syntheticSelection && hoverContext?.isPRDescription,
-                'hover uses the existing PR-description selection flow');
+                'the click uses the existing PR-description selection flow');
             clearJevDescriptionAnnotations(host);
             ackEq(host.textContent, textBefore, 'quick disable unwraps annotations without changing text');
             ackAssert(!host.querySelector('.ack-jev-description-segment, .ack-jev-description-priority'),
