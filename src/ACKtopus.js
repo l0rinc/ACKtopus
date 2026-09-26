@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.279
+// @version      1.280
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -7210,13 +7210,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         }
         count += invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         jevInvalidateCommentCachesForPR(pr);
-        const jevEntries = jevCacheEntries();
-        const keptJevEntries = jevEntries.filter((entry) => entry.prKey !== `${pr.owner}/${pr.repo}#${pr.pr}`);
-        if (keptJevEntries.length !== jevEntries.length) {
-            jevCacheMemory = keptJevEntries;
-            GM_setValue(JEV_CACHE_KEY, keptJevEntries);
-            count++;
-        }
+        count += jevDeleteCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         count += clearRobotChatHistoryForPage();
         return count;
     }
@@ -7240,7 +7234,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('commitlist_') ||
             k.startsWith('forcepush_sig_') ||
             k.startsWith(GITHUB_HTTP_CACHE_PREFIX) ||
+            k.startsWith(JEV_CACHE_ENTRY_PREFIX) ||
             k === JEV_CACHE_KEY ||
+            k === JEV_CACHE_INDEX_KEY ||
             k === GITHUB_HTTP_CACHE_INDEX_KEY ||
             k === GITHUB_PAGED_HINTS_KEY ||
             k === 'llm_cache_timestamps';
@@ -17274,6 +17270,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_MODEL = 'jev-latest';
     const JEV_SCHEMA = { commit: 4, hunk: 4, line: 4, description: 4, comment: 5, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
+    const JEV_CACHE_INDEX_KEY = 'jev_annotations_v2:index';
+    const JEV_CACHE_ENTRY_PREFIX = 'jev_annotations_v2:entry:';
     const JEV_CACHE_LIMIT = 2400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const JEV_LINE_READING_KEY = 'jev_line_reading_mode';
@@ -17626,23 +17624,93 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevCacheEntries() {
         if (!jevCacheMemory) {
-            const stored = GM_getValue(JEV_CACHE_KEY, []);
-            jevCacheMemory = Array.isArray(stored) ? stored : [];
+            const now = Date.now();
+            const storedIndex = GM_getValue(JEV_CACHE_INDEX_KEY, []);
+            const index = Array.isArray(storedIndex) ? storedIndex : [];
+            const sharded = index
+                .filter((entry) => entry?.id && now - entry.ts < JEV_CACHE_TTL_MS)
+                .map((entry) => ({ ...entry, storage: 'shard' }));
+            if (sharded.length !== index.length) {
+                const liveIds = new Set(sharded.map((entry) => entry.id));
+                for (const entry of index) {
+                    if (entry?.id && !liveIds.has(entry.id)) GM_deleteValue(`${JEV_CACHE_ENTRY_PREFIX}${entry.id}`);
+                }
+                GM_setValue(
+                    JEV_CACHE_INDEX_KEY,
+                    sharded.map(({ id, prKey, ts }) => ({ id, prKey, ts })),
+                );
+            }
+            const shardedIds = new Set(sharded.map((entry) => entry.id));
+            const storedLegacy = GM_getValue(JEV_CACHE_KEY, []);
+            const legacy = (Array.isArray(storedLegacy) ? storedLegacy : [])
+                .filter((entry) => entry?.id && now - entry.ts < JEV_CACHE_TTL_MS && !shardedIds.has(entry.id))
+                .map((entry) => ({ ...entry, storage: 'legacy' }));
+            jevCacheMemory = [...legacy, ...sharded];
         }
         return jevCacheMemory;
     }
 
     function jevReadCache(id) {
-        return jevCacheEntries().find((entry) => entry?.id === id && Date.now() - entry.ts < JEV_CACHE_TTL_MS)?.result || null;
+        const entry = jevCacheEntries().find(
+            (candidate) => candidate?.id === id && Date.now() - candidate.ts < JEV_CACHE_TTL_MS,
+        );
+        if (!entry) return null;
+        if (Object.hasOwn(entry, 'result')) return entry.result || null;
+        const stored = GM_getValue(`${JEV_CACHE_ENTRY_PREFIX}${id}`, null);
+        if (!stored || stored.ts !== entry.ts || Date.now() - stored.ts >= JEV_CACHE_TTL_MS) return null;
+        entry.result = stored.result;
+        return entry.result || null;
     }
 
     function jevWriteCache(id, result, prKey) {
-        const kept = jevCacheEntries()
-            .filter((entry) => entry?.id !== id && Date.now() - entry.ts < JEV_CACHE_TTL_MS)
-            .slice(-(JEV_CACHE_LIMIT - 1));
-        kept.push({ id, result, prKey, ts: Date.now() });
-        jevCacheMemory = kept;
-        GM_setValue(JEV_CACHE_KEY, kept);
+        const now = Date.now();
+        const entries = jevCacheEntries();
+        const currentShards = entries
+            .filter((entry) => entry?.storage === 'shard' && entry.id !== id && now - entry.ts < JEV_CACHE_TTL_MS)
+            .sort((a, b) => a.ts - b.ts);
+        const keptShards = currentShards.slice(-(JEV_CACHE_LIMIT - 1));
+        const keptIds = new Set(keptShards.map((entry) => entry.id));
+        for (const entry of currentShards) {
+            if (!keptIds.has(entry.id)) GM_deleteValue(`${JEV_CACHE_ENTRY_PREFIX}${entry.id}`);
+        }
+        const entry = { id, result, prKey, ts: now, storage: 'shard' };
+        const legacy = entries.filter(
+            (candidate) => candidate?.storage === 'legacy' && candidate.id !== id && now - candidate.ts < JEV_CACHE_TTL_MS,
+        );
+        jevCacheMemory = [...legacy, ...keptShards, entry];
+        GM_setValue(`${JEV_CACHE_ENTRY_PREFIX}${id}`, { result, prKey, ts: now });
+        GM_setValue(
+            JEV_CACHE_INDEX_KEY,
+            [...keptShards, entry].map(({ id: cacheId, prKey: cachePR, ts }) => ({ id: cacheId, prKey: cachePR, ts })),
+        );
+    }
+
+    function jevDeleteCacheForPR(prKey) {
+        const entries = jevCacheEntries();
+        const matchingShards = entries.filter((entry) => entry?.storage === 'shard' && entry.prKey === prKey);
+        for (const entry of matchingShards) GM_deleteValue(`${JEV_CACHE_ENTRY_PREFIX}${entry.id}`);
+
+        const keptShards = entries.filter((entry) => entry?.storage === 'shard' && entry.prKey !== prKey);
+        if (matchingShards.length) {
+            GM_setValue(
+                JEV_CACHE_INDEX_KEY,
+                keptShards.map(({ id, prKey: cachePR, ts }) => ({ id, prKey: cachePR, ts })),
+            );
+        }
+
+        const storedLegacy = GM_getValue(JEV_CACHE_KEY, []);
+        const legacy = Array.isArray(storedLegacy) ? storedLegacy : [];
+        const keptLegacy = legacy.filter((entry) => entry?.prKey !== prKey);
+        if (keptLegacy.length !== legacy.length) {
+            if (keptLegacy.length) GM_setValue(JEV_CACHE_KEY, keptLegacy);
+            else GM_deleteValue(JEV_CACHE_KEY);
+        }
+
+        jevCacheMemory = [
+            ...keptLegacy.map((entry) => ({ ...entry, storage: 'legacy' })),
+            ...keptShards,
+        ];
+        return matchingShards.length + (legacy.length - keptLegacy.length);
     }
 
     function jevValidatedAnswer(question, answer) {
@@ -47658,6 +47726,34 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             else GM_setValue('llm_claude_key', oldClaudeKey);
             if (oldJevKey === undefined) GM_deleteValue('jev_api_key');
             else GM_setValue('jev_api_key', oldJevKey);
+        }
+    });
+
+    ackTest('Jev cache stores large results outside its compact index', () => {
+        const oldGet = GM_getValue;
+        const oldSet = GM_setValue;
+        const oldDelete = GM_deleteValue;
+        const oldCacheMemory = jevCacheMemory;
+        const values = new Map();
+        try {
+            GM_getValue = (key, fallback) => values.has(key) ? values.get(key) : fallback;
+            GM_setValue = (key, value) => values.set(key, value);
+            GM_deleteValue = (key) => values.delete(key);
+            jevCacheMemory = null;
+            const result = { model: 'jev-test', answers: { detail: 'large-marker-'.repeat(1000) } };
+            jevWriteCache('exact-request-id', result, 'octo/demo#12');
+            const index = values.get(JEV_CACHE_INDEX_KEY);
+            ackEq(index.length, 1, 'records one compact index entry');
+            ackAssert(!JSON.stringify(index).includes('large-marker'), 'does not copy the result into the index');
+            ackDeepEq(jevReadCache('exact-request-id'), result, 'reads the in-memory result');
+            jevCacheMemory = null;
+            ackDeepEq(jevReadCache('exact-request-id'), result, 'reads the separately stored result after reload');
+            ackAssert(!values.has(JEV_CACHE_KEY), 'does not rewrite the legacy cache blob');
+        } finally {
+            GM_getValue = oldGet;
+            GM_setValue = oldSet;
+            GM_deleteValue = oldDelete;
+            jevCacheMemory = oldCacheMemory;
         }
     });
 
