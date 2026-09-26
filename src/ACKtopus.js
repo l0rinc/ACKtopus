@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.270
+// @version      1.271
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -264,7 +264,8 @@
     }
 
     const PR_SSR_SCRIPT_SELECTOR =
-        'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"]';
+        'react-app[app-name="pull-requests"] script[type="application/json"][data-target="react-app.embeddedData"], ' +
+        'react-app[app-name="repo"] script[type="application/json"][data-target="react-app.embeddedData"]';
 
     function prSSRScriptElement() {
         return document.querySelector(PR_SSR_SCRIPT_SELECTOR);
@@ -305,6 +306,8 @@
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid ||
             data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRef?.target?.oid ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid ||
+            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headSha ||
+            data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headSha ||
             data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha ||
             '';
         return /^[0-9a-f]{40}$/i.test(sha) ? sha : '';
@@ -800,6 +803,7 @@
     // saved DOMs): container [class*="Diff-module__diff__"], header
     // [class*="DiffFileHeader-module__"]; classic selectors kept as fallback.
     const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], [class*="Diff-module__diff__"], .file';
+    const COMPARE_FILE_SELECTOR = `[data-tagsearch-path], ${DIFF_FILE_SELECTOR}`;
     const DIFF_FILE_HEADER_SELECTOR =
         '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header, ' +
         '[class*="DiffFileHeader-module__diff-file-header"]';
@@ -1523,6 +1527,31 @@
     function parsePR(path = location.pathname) {
         const m = path.match(/\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
         return m ? { owner: m[1], repo: m[2], pr: m[3] } : null;
+    }
+
+    function parseCompareReviewContext(path = location.pathname, search = location.search) {
+        const m = String(path || '').match(
+            /^\/([^/]+)\/([^/]+)\/compare\/([^/?#]+?)\.{2,3}([^/?#]+)(?:\/|$)/i,
+        );
+        if (!m) return null;
+        const decode = (value) => {
+            try { return decodeURIComponent(value); } catch (_) { return value; }
+        };
+        const base = decode(m[3]);
+        const head = decode(m[4]);
+        const linkedPR = parseComparePrParam(search);
+        return {
+            owner: decode(m[1]),
+            repo: decode(m[2]),
+            pr: linkedPR ? String(linkedPR) : `compare:${base}...${head}`,
+            compare: true,
+            compareBase: base,
+            compareHead: head,
+        };
+    }
+
+    function jevReviewPageContext(path = location.pathname, search = location.search) {
+        return parsePR(path) || parseCompareReviewContext(path, search);
     }
 
     // Pulls the commit SHA out of /commits/<sha>, /commit/<sha>, /changes/<sha>
@@ -5064,13 +5093,16 @@
         return /^\/[^/?#]+\/[^/?#]+\/pulls\/?$/.test(String(path || ''));
     }
 
-    // GitHub's list response omits diff stats. Fetch visible PRs gradually while
-    // idle, then reuse the result across list visits and full PR-context loads.
+    // GitHub's list response omits diff stats. The React page does expose the
+    // exact head and update timestamp for every row, so persisted counts are
+    // reused only for that exact row revision.
     const PULL_REQUEST_SIZE_CACHE_TTL_MS = 30 * 60 * 1000;
-    const PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 2;
+    const PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 4;
     const pullRequestSizeQueue = [];
     const pendingPullRequestSizes = new Map();
+    const pendingPullRequestSizeBatches = new Map();
     let activePullRequestSizeRequests = 0;
+    let pullRequestSizeDrainTimer = null;
     let pullRequestSizeFailureWarned = false;
 
     function pullRequestSizeIdentity(pr) {
@@ -5078,9 +5110,23 @@
         return `${pr.owner}/${pr.repo}#${pr.pr}`;
     }
 
-    function pullRequestSizeCacheKey(pr) {
+    function pullRequestSizeRevision(value) {
+        const headSha = String(value?.headSha || value?.head?.sha || value?.headRefOid || '').toLowerCase();
+        const updatedAt = String(value?.updatedAt || value?.updated_at || '');
+        if (!/^[0-9a-f]{40}$/.test(headSha) || !/^\d{4}-\d{2}-\d{2}T/.test(updatedAt)) return '';
+        return `${headSha}:${updatedAt}`;
+    }
+
+    function pullRequestSizeCacheKey(pr, revision = pullRequestSizeRevision(pr)) {
         const identity = pullRequestSizeIdentity(pr);
-        return identity ? `ack_pr_size:${identity}` : '';
+        return identity && revision ? `ack_pr_size:v2:${identity}:${revision}` : '';
+    }
+
+    // Rows without GitHub's revision fields (classic lists) are fetched live and
+    // never persisted, because no stored count can be tied to their revision.
+    function pullRequestSizePendingKey(pr) {
+        const identity = pullRequestSizeIdentity(pr);
+        return identity ? `${identity}:${pullRequestSizeRevision(pr) || 'live'}` : '';
     }
 
     function normalizePullRequestSize(value) {
@@ -5105,20 +5151,50 @@
     }
 
     function rememberPullRequestSize(pr, value, now = Date.now()) {
-        const key = pullRequestSizeCacheKey(pr);
+        const expectedRevision = pullRequestSizeRevision(pr);
+        const actualRevision = pullRequestSizeRevision(value);
+        const key = pullRequestSizeCacheKey(pr, expectedRevision);
         const stats = normalizePullRequestSize(value);
-        if (!key || !stats) return null;
+        if (!key || !stats || actualRevision !== expectedRevision) return null;
         GM_setValue(key, { ...stats, ts: now });
         return stats;
+    }
+
+    function pullRequestListMetadata(root, repo) {
+        const metadata = new Map();
+        if (!repo) return metadata;
+        const doc = root?.ownerDocument || document;
+        const scripts = new Set([
+            ...qsa(root, 'script[type="application/json"][data-target="react-app.embeddedData"]'),
+            ...(root === doc ? [] : qsa(doc, 'script[type="application/json"][data-target="react-app.embeddedData"]')),
+        ]);
+        for (const script of scripts) {
+            let data;
+            try { data = JSON.parse(script.textContent || ''); } catch (_) { continue; }
+            const results = data?.payload?.repoPullsDashboardContentRoute?.results;
+            if (!Array.isArray(results)) continue;
+            for (const item of results) {
+                if (item?.repoNameWithOwner !== repo.repoKey || !Number.isInteger(Number(item?.number))) continue;
+                const pr = { owner: repo.owner, repo: repo.repo, pr: String(item.number) };
+                const revision = pullRequestSizeRevision(item);
+                if (revision) metadata.set(pullRequestSizeIdentity(pr), {
+                    headSha: String(item.headSha).toLowerCase(),
+                    updatedAt: String(item.updatedAt),
+                });
+            }
+        }
+        return metadata;
     }
 
     function findPullRequestListEntries(root, repo) {
         if (!repo) return [];
         const entries = [];
         const seen = new Set();
+        const metadata = pullRequestListMetadata(root, repo);
         for (const link of qsa(
             root,
-            'a[data-hovercard-type="pull_request"][href], a[data-hovercard-url*="/pull/"][href], a[id^="issue_"][href*="/pull/"]',
+            'a[data-testid="listitem-title-link"][href*="/pull/"], a[data-hovercard-type="pull_request"][href], ' +
+                'a[data-hovercard-url*="/pull/"][href], a[id^="issue_"][href*="/pull/"]',
         )) {
             let url;
             try {
@@ -5132,18 +5208,23 @@
             const identity = pullRequestSizeIdentity(pr);
             if (seen.has(identity)) continue;
             const row = link.closest(
-                '.js-issue-row, [data-testid="issue-row"], [data-testid="pull-request-row"], [role="listitem"], .Box-row',
+                '.js-issue-row, [data-testid="issue-row"], [data-testid="pull-request-row"], [role="listitem"], ' +
+                    'li[class*="PullsListItem-module__listItem"], li, .Box-row',
             );
             if (!row) continue;
             seen.add(identity);
-            entries.push({ identity, link, row, pr });
+            entries.push({ identity, link, row, pr: { ...pr, ...(metadata.get(identity) || {}) } });
         }
         return entries;
     }
 
     function ensurePullRequestSizeMarker(entry) {
         let marker = entry.row.querySelector('.ack-pr-size');
-        if (marker && marker.dataset.ackPrSizeIdentity !== entry.identity) {
+        const revision = pullRequestSizeRevision(entry.pr);
+        if (
+            marker &&
+            (marker.dataset.ackPrSizeIdentity !== entry.identity || marker.dataset.ackPrSizeRevision !== revision)
+        ) {
             marker.remove();
             marker = null;
         }
@@ -5151,6 +5232,7 @@
         marker = document.createElement('span');
         marker.className = 'ack-pr-size';
         marker.dataset.ackPrSizeIdentity = entry.identity;
+        marker.dataset.ackPrSizeRevision = revision;
         marker.style.display = 'none';
         Object.assign(marker.style, {
             gap: '5px',
@@ -5160,8 +5242,11 @@
             whiteSpace: 'nowrap',
             verticalAlign: 'middle',
         });
+        const titleContainer = entry.link.closest('[data-listview-item-title-container]');
+        const trailingBadges = titleContainer?.querySelector('[class*="trailingBadgesSpacer"], [class*="trailingBadgesContainer"]');
         const metadata = entry.row.querySelector('.opened-by')?.closest('div');
-        if (metadata?.parentElement === entry.link.parentElement) metadata.insertAdjacentElement('beforebegin', marker);
+        if (titleContainer && trailingBadges) titleContainer.insertBefore(marker, trailingBadges);
+        else if (metadata?.parentElement === entry.link.parentElement) metadata.insertAdjacentElement('beforebegin', marker);
         else entry.link.insertAdjacentElement('afterend', marker);
         return marker;
     }
@@ -5188,12 +5273,11 @@
     }
 
     function schedulePullRequestSizeQueue() {
-        if (!pullRequestSizeQueue.length) return;
-        scheduleAckBackgroundWork('pull-list-sizes', drainPullRequestSizeQueue, {
-            delayMs: 250,
-            timeoutMs: 2500,
-            reason: 'pull-list-sizes',
-        });
+        if (!pullRequestSizeQueue.length || pullRequestSizeDrainTimer) return;
+        pullRequestSizeDrainTimer = ackSetTimeout(() => {
+            pullRequestSizeDrainTimer = null;
+            drainPullRequestSizeQueue();
+        }, 0);
     }
 
     function drainPullRequestSizeQueue() {
@@ -5203,13 +5287,17 @@
         ) {
             const item = pullRequestSizeQueue.shift();
             if (![...item.markers].some((marker) => marker.isConnected)) {
-                pendingPullRequestSizes.delete(item.identity);
+                pendingPullRequestSizes.delete(item.pendingKey);
                 continue;
             }
             activePullRequestSizeRequests++;
             const url = `https://api.github.com/repos/${item.pr.owner}/${item.pr.repo}/pulls/${item.pr.pr}`;
-            gmFetch(url)
-                .then((data) => rememberPullRequestSize(item.pr, data))
+            gmFetch(url, { freshForMs: 0 })
+                .then((data) =>
+                    pullRequestSizeRevision(item.pr)
+                        ? rememberPullRequestSize(item.pr, data)
+                        : normalizePullRequestSize(data),
+                )
                 .then((stats) => {
                     if (!stats) return;
                     for (const marker of item.markers) renderPullRequestSize(marker, stats);
@@ -5222,36 +5310,94 @@
                 })
                 .finally(() => {
                     activePullRequestSizeRequests--;
-                    pendingPullRequestSizes.delete(item.identity);
+                    pendingPullRequestSizes.delete(item.pendingKey);
                     schedulePullRequestSizeQueue();
                 });
         }
     }
 
-    function queuePullRequestSize(entry, marker) {
-        if (marker.dataset.ackPrSizeLoaded === 'true' || marker.dataset.ackPrSizeAttempted === 'true') return;
+    // Each marker is attempted once. Returns the pending item only when this
+    // call created it, so injector passes cannot start duplicate requests.
+    function trackPullRequestSize(entry, marker) {
+        if (marker.dataset.ackPrSizeLoaded === 'true' || marker.dataset.ackPrSizeAttempted === 'true') return null;
         marker.dataset.ackPrSizeAttempted = 'true';
-        const pending = pendingPullRequestSizes.get(entry.identity);
+        const pendingKey = pullRequestSizePendingKey(entry.pr);
+        if (!pendingKey) return null;
+        const pending = pendingPullRequestSizes.get(pendingKey);
         if (pending) {
             pending.markers.add(marker);
-            return;
+            return null;
         }
-        const item = { identity: entry.identity, pr: entry.pr, markers: new Set([marker]) };
-        pendingPullRequestSizes.set(entry.identity, item);
-        pullRequestSizeQueue.push(item);
-        schedulePullRequestSizeQueue();
+        const item = { identity: entry.identity, pendingKey, pr: entry.pr, markers: new Set([marker]), queued: false };
+        pendingPullRequestSizes.set(pendingKey, item);
+        return item;
+    }
+
+    function pullRequestSizeBatchKey(entries) {
+        return entries
+            .map((entry) => `${entry.identity}:${pullRequestSizeRevision(entry.pr)}`)
+            .sort()
+            .join('|');
+    }
+
+    function fetchPullRequestSizeBatch(entries) {
+        if (!entries.length || !patAuthHeaderValue()) return Promise.resolve(false);
+        const exact = entries.filter((entry) => pullRequestSizeRevision(entry.pr));
+        if (!exact.length) return Promise.resolve(false);
+        const key = pullRequestSizeBatchKey(exact);
+        if (pendingPullRequestSizeBatches.has(key)) return pendingPullRequestSizeBatches.get(key);
+        const aliases = exact.map((entry) =>
+            `pr_${entry.pr.pr}: pullRequest(number: ${entry.pr.pr}) { number additions deletions headRefOid updatedAt }`,
+        );
+        const query = `query ACKtopusPullRequestSizes($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${aliases.join('\n')} } }`;
+        const variables = { owner: exact[0].pr.owner, repo: exact[0].pr.repo };
+        const request = patGraphQL(query, variables).then((response) => {
+            const repository = response?.data?.repository;
+            if (!repository) return false;
+            let rendered = 0;
+            for (const entry of exact) {
+                const data = repository[`pr_${entry.pr.pr}`];
+                const stats = rememberPullRequestSize(entry.pr, data);
+                if (!stats) continue;
+                const pendingKey = pullRequestSizePendingKey(entry.pr);
+                const pending = pendingPullRequestSizes.get(pendingKey);
+                for (const marker of pending?.markers || []) renderPullRequestSize(marker, stats);
+                pendingPullRequestSizes.delete(pendingKey);
+                rendered++;
+            }
+            return rendered === exact.length;
+        }).catch(() => false).finally(() => {
+            pendingPullRequestSizeBatches.delete(key);
+        });
+        pendingPullRequestSizeBatches.set(key, request);
+        return request;
     }
 
     function addPullRequestListSizes(root = document, opts = {}) {
         const path = opts.path || location.pathname;
         if (!isPullRequestListPage(path)) return;
         const repo = parseGitHubRepoPath(path);
+        const missing = [];
         for (const entry of findPullRequestListEntries(root, repo)) {
             const marker = ensurePullRequestSizeMarker(entry);
             const cached = readPullRequestSize(entry.pr);
             if (cached) renderPullRequestSize(marker, cached);
-            else queuePullRequestSize(entry, marker);
+            else {
+                const item = trackPullRequestSize(entry, marker);
+                if (item) missing.push(item);
+            }
         }
+        if (!missing.length) return;
+        // The batch settles every row it could match. Anything still pending
+        // (no PAT, no revision, or a revision mismatch) falls back to REST.
+        fetchPullRequestSizeBatch(missing).then(() => {
+            for (const item of missing) {
+                if (item.queued || pendingPullRequestSizes.get(item.pendingKey) !== item) continue;
+                item.queued = true;
+                pullRequestSizeQueue.push(item);
+            }
+            schedulePullRequestSizeQueue();
+        });
     }
 
     function normalizePullsListQuery(query, opts = {}) {
@@ -5505,11 +5651,25 @@
         for (const mutation of mutations || []) {
             for (const node of mutation.addedNodes || []) {
                 if (node.nodeType !== 1) continue;
-                if (node.matches?.('[data-tagsearch-path]') || node.querySelector?.('[data-tagsearch-path]'))
+                if (node.matches?.(COMPARE_FILE_SELECTOR) || node.querySelector?.(COMPARE_FILE_SELECTOR))
                     return true;
             }
         }
         return false;
+    }
+
+    function compareFileElements(root = document) {
+        const candidates = qsa(root, COMPARE_FILE_SELECTOR).filter((file) => readDiffFilePath(file));
+        const candidateSet = new Set(candidates);
+        return candidates.filter((file) => {
+            const path = readDiffFilePath(file);
+            let ancestor = file.parentElement;
+            while (ancestor) {
+                if (candidateSet.has(ancestor) && readDiffFilePath(ancestor) === path) return false;
+                ancestor = ancestor.parentElement;
+            }
+            return true;
+        });
     }
 
     async function autoCollapseCompareFiles() {
@@ -5606,7 +5766,7 @@
         };
 
         // Helper: gmFetch with timeout (old force-push SHAs can hang)
-        const gmFetchTimeout = (url, ms = 10000) => withTimeout(gmFetch(url), ms);
+        const gmFetchTimeout = (url, ms = 10000, opts = {}) => withTimeout(gmFetch(url, opts), ms);
 
         // Find the PR this commit belongs to.
         // Strategy 1: explicit ?pr=1234 URL parameter.
@@ -5665,10 +5825,9 @@
         compareDiagnostics.pr = prNum;
         setCompareStatus(`Compare: fetching files for PR #${prNum}...`);
 
-        // Build comprehensive PR file set from multiple sources:
-        // 1. pulls/{pr}/files -- current PR files (may differ from old force-push)
-        // 2. compare/{baseBranch}...{headSha} -- PR files at the specific compare commit
-        // Union of both ensures we match files even if the PR was refactored between pushes.
+        // The current PR file list is authoritative. Historical compare endpoints
+        // can include files that existed before a force push but no longer exist
+        // in the latest PR, which is exactly what this filter must hide.
         const prFileSet = new Set();
         const normalizeComparePath = (value) => {
             const raw = String(value || '')
@@ -5683,8 +5842,7 @@
         };
         const addFiles = (files) => {
             for (const f of files) {
-                prFileSet.add(f.filename);
-                if (f.previous_filename) prFileSet.add(f.previous_filename);
+                if (f.filename) prFileSet.add(f.filename);
             }
         };
         const addCompareRangeFiles = (files) => {
@@ -5727,45 +5885,18 @@
             do {
                 batch = await gmFetchTimeout(
                     `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/files?per_page=100&page=${page}`,
+                    10000,
+                    { freshForMs: 0 },
                 );
                 addFiles(batch);
                 page++;
             } while (batch.length === 100 && page <= 30); // up to 3000 files
+            if (batch.length === 100 && page > 30) currentPrFilesIncomplete = true;
             compareDiagnostics.fileSources.currentPr = prFileSet.size - before;
             compareDiagnostics.fileSources.currentPrPages = page - 1;
         } catch (e) {
             currentPrFilesIncomplete = true;
             noteCompareApiError('current PR files', e);
-        }
-
-        // Source 2: PR files at the specific headSha (handles refactored PRs)
-        try {
-            const prData = await gmFetchTimeout(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}`);
-            const baseBranch = prData.base?.ref || 'master';
-            // compare/{baseBranch}...{headSha} = files the PR changed at that point in time
-            const cmp = await gmFetchTimeout(
-                `https://api.github.com/repos/${owner}/${repo}/compare/${baseBranch}...${headSha}`,
-            );
-            if (cmp.files) {
-                addFiles(cmp.files);
-                compareDiagnostics.fileSources.head = cmp.files.length;
-            }
-            // Also check baseSha side (may be a different PR version)
-            if (baseSha !== headSha) {
-                try {
-                    const cmp2 = await gmFetchTimeout(
-                        `https://api.github.com/repos/${owner}/${repo}/compare/${baseBranch}...${baseSha}`,
-                    );
-                    if (cmp2.files) {
-                        addFiles(cmp2.files);
-                        compareDiagnostics.fileSources.base = cmp2.files.length;
-                    }
-                } catch (e) {
-                    if (shouldWarnOptionalGitHubApiError(e)) noteCompareError('base commit files', e);
-                }
-            }
-        } catch (e) {
-            noteCompareApiError('PR files at commit', e);
         }
 
         if (currentPrFilesIncomplete || prFileSet.size === 0) await addPRPatchFallbackFiles();
@@ -5802,7 +5933,7 @@
             [...document.querySelectorAll('a, button')].find(
                 (el) => /files?\s*changed/i.test(el.textContent) && !el.closest('[data-tagsearch-path]'),
             );
-        if (filesTab && !document.querySelector('[data-tagsearch-path]')) {
+        if (filesTab && compareFileElements().length === 0) {
             compareDiagnostics.clickedFilesTab = true;
             filesTab.click();
         }
@@ -5816,7 +5947,8 @@
         let totalCollapsed = 0,
             totalKept = 0;
         const collapsedPaths = new Set();
-        const processed = new Set();
+        const processed = new WeakSet();
+        let processedCount = 0;
         let scrolledToFirstKeptFile = false;
         let lastStatusUpdate = 0;
 
@@ -5840,16 +5972,17 @@
         let lastActivityAt = Date.now();
 
         function collapseNewFiles() {
-            const fileEls = document.querySelectorAll('[data-tagsearch-path]');
+            const fileEls = compareFileElements();
             if (fileEls.length === 0) return false;
 
             let newCollapsed = 0,
                 newKept = 0;
             const unmatched = [];
             for (const file of fileEls) {
-                const path = file.getAttribute('data-tagsearch-path');
-                if (!path || processed.has(path)) continue;
-                processed.add(path);
+                const path = readDiffFilePath(file);
+                if (!path || processed.has(file)) continue;
+                processed.add(file);
+                processedCount++;
 
                 // Match only normalized exact PR paths. Basename fallback is too permissive on huge compares.
                 const normalizedPath = normalizeComparePath(path);
@@ -5864,6 +5997,8 @@
                     isPRFile = normalizedPrFileSet.has(normalizeComparePath(headerTitle));
                 }
                 if (isPRFile) {
+                    delete file.dataset.ackCompareHidden;
+                    file.style.display = '';
                     newKept++;
                     totalKept++;
                     // Large compares ship the kept diffs as deferred
@@ -5887,7 +6022,7 @@
                 const now = Date.now();
                 if (now - lastStatusUpdate > 150 || totalCollapsed + totalKept < 20) {
                     setCompareStatus(
-                        `Compare: kept ${totalKept}, hid ${totalCollapsed}, scanned ${processed.size} files...`,
+                        `Compare: kept ${totalKept}, hid ${totalCollapsed}, scanned ${processedCount} files...`,
                     );
                     lastStatusUpdate = now;
                 }
@@ -5901,8 +6036,8 @@
 
         function scrollToFirstKeptFile() {
             if (scrolledToFirstKeptFile) return false;
-            for (const file of document.querySelectorAll('[data-tagsearch-path]')) {
-                const path = file.getAttribute('data-tagsearch-path');
+            for (const file of compareFileElements()) {
+                const path = readDiffFilePath(file);
                 if (!path || collapsedPaths.has(path)) continue;
                 const anchor = file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info') || file;
                 anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -5928,10 +6063,10 @@
         const HARD_MAX_MS = 30 * 60 * 1000;
         let quietStatusShown = false;
         const runCompareCollapsePass = () => {
-            const before = processed.size;
+            const before = processedCount;
             collapseNewFiles();
             scrollToFirstKeptFile();
-            if (processed.size > before) quietStatusShown = false;
+            if (processedCount > before) quietStatusShown = false;
         };
         const stopWatching = (reason) => {
             if (!_compareObserver) return;
@@ -5942,7 +6077,7 @@
                 watchElapsedSeconds: elapsedS,
                 hidden: totalCollapsed,
                 kept: totalKept,
-                scanned: processed.size,
+                scanned: processedCount,
             });
             finishCompareStatus(`Compare: done - kept ${totalKept}, hid ${totalCollapsed}`);
         };
@@ -5955,7 +6090,7 @@
                 logCompareOutcome('watching lazy-loaded files', {
                     hidden: totalCollapsed,
                     kept: totalKept,
-                    scanned: processed.size,
+                    scanned: processedCount,
                     stillWatching: true,
                 });
                 finishCompareStatus(`Compare: kept ${totalKept}, hid ${totalCollapsed}; still watching lazy-loaded files`);
@@ -6883,6 +7018,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const overviewPrefix = `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const autoOpenPrefix = `llm_lightbulb_autoopen_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const infographicPrefix = prInfographicCachePrefix(pr);
+        const prSizePrefix = `ack_pr_size:v2:${pullRequestSizeIdentity(pr)}:`;
         const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
         let count = 0;
         keys.forEach((k) => {
@@ -6896,7 +7032,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 k.startsWith(explainPrefix) ||
                 k.startsWith(overviewPrefix) ||
                 k.startsWith(autoOpenPrefix) ||
-                k.startsWith(infographicPrefix)
+                k.startsWith(infographicPrefix) ||
+                k.startsWith(prSizePrefix)
             ) {
                 GM_deleteValue(k);
                 count++;
@@ -6926,6 +7063,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('llm_infographic_') ||
             k.startsWith('llm_cache_') ||
             k.startsWith('llm_prompt_') ||
+            k.startsWith('ack_pr_size:') ||
             k.startsWith('pr_comment_count_') ||
             k.startsWith('org_members_') ||
             k.startsWith('repo_members_') ||
@@ -6971,6 +7109,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         _githubTextForceGenerations.clear();
         repoDefaultBranchCache.clear();
         repoDefaultBranchRequests.clear();
+        pullRequestSizeQueue.length = 0;
+        pendingPullRequestSizes.clear();
+        pendingPullRequestSizeBatches.clear();
+        if (pullRequestSizeDrainTimer) {
+            ackClearTimeout(pullRequestSizeDrainTimer);
+            pullRequestSizeDrainTimer = null;
+        }
         reactorCache.clear();
         _rawFileCache.clear();
         _prPatchCache.clear();
@@ -8571,19 +8716,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         for (const line of String(patchText || '').split(/\r?\n/)) {
             const diff = line.match(/^diff --git a\/(.+) b\/(.+)$/);
             if (diff) {
-                paths.add(diff[1]);
                 paths.add(diff[2]);
-                continue;
             }
-            const rename = line.match(/^rename (?:from|to) (.+)$/);
-            if (rename) {
-                paths.add(rename[1]);
-                continue;
-            }
-            const marker = line.match(/^(?:---|\+\+\+) (?:a|b)\/(.+)$/);
-            if (marker) paths.add(marker[1]);
         }
-        paths.delete('/dev/null');
         return [...paths].filter(Boolean);
     }
 
@@ -17199,7 +17334,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevRequeueEmptyAnnotations(root = document) {
-        if (!jevEnabled() || !parsePR()) return;
+        if (!jevEnabled() || !jevReviewPageContext()) return;
         root.querySelectorAll('.ack-jev-badges:empty').forEach((slot) => slot.remove());
         resetJevTrackers();
         queueJevPageAnnotations();
@@ -17207,7 +17342,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevRetryPublicCheck(key, root = document) {
-        const current = parsePR();
+        const current = jevReviewPageContext();
         if (!current || `${current.owner}/${current.repo}`.toLowerCase() !== key || !jevEnabled()) return;
         jevPublicChecks.delete(key);
         jevRequeueEmptyAnnotations(root);
@@ -18531,15 +18666,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevDiffObserved = new WeakSet();
     const jevDiffPending = new WeakSet();
     const jevVisibleDiffQueue = [];
-    function queueJevDiffFile(file) {
+    function queueJevDiffFile(file, immediate = false) {
         if (jevDiffPending.has(file)) return;
         jevDiffPending.add(file);
         jevVisibleDiffQueue.push(file);
         jevDiagnostic('diff file entered viewport', {
             path: readDiffFilePath(file) || '(path not rendered yet)',
             pendingFiles: jevVisibleDiffQueue.length,
-            state: 'waiting for background DOM scan',
+            state: immediate ? 'visible DOM scan scheduled now' : 'waiting for background DOM scan',
         }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1000 });
+        if (immediate) {
+            setTimeout(() => {
+                const index = jevVisibleDiffQueue.indexOf(file);
+                if (index >= 0) jevVisibleDiffQueue.splice(index, 1);
+                jevDiffPending.delete(file);
+                if (file?.isConnected) queueJevDiffHunks(file);
+                if (jevVisibleDiffQueue.length) scheduleJevDiffProcessing();
+            }, 0);
+            return;
+        }
         scheduleJevDiffProcessing();
     }
     function scheduleJevDiffProcessing() {
@@ -18555,7 +18700,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const entry of entries) {
             if (!entry.isIntersecting) continue;
             jevDiffObserver.unobserve(entry.target);
-            queueJevDiffFile(entry.target);
+            queueJevDiffFile(entry.target, true);
         }
     }, { rootMargin: '300px' });
     const jevHunkRecords = new WeakMap();
@@ -18577,12 +18722,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }, { rootMargin: '250px' });
 
-    // Start watching a diff file once it has rendered rows. Returns false when
-    // it is already watched or has no rows yet.
+    function jevElementNearViewport(element, margin = 0) {
+        if (!element?.isConnected) return false;
+        const bounds = element.getBoundingClientRect?.();
+        return !!bounds && bounds.bottom >= -margin && bounds.top <= window.innerHeight + margin;
+    }
+
+    // Start a diff file once it has rendered rows. Already-visible files are
+    // queued synchronously so a missed or delayed IntersectionObserver callback
+    // cannot leave the page looking idle.
     function observeJevDiffFile(file) {
         if (jevDiffObserved.has(file) || !file.querySelector('tr')) return false;
         jevDiffObserved.add(file);
-        jevDiffObserver.observe(file);
+        if (jevElementNearViewport(file, 300)) queueJevDiffFile(file, true);
+        else jevDiffObserver.observe(file);
         return true;
     }
 
@@ -18593,11 +18746,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Rows added inside a watched file (Load diff, expanded context)
             // re-scan it; a file whose rows only arrived now starts being watched.
             const newlyObserved = observeJevDiffFile(file);
-            if (!newlyObserved && jevDiffObserved.has(file)) queueJevDiffFile(file);
+            if (!newlyObserved && jevDiffObserved.has(file)) queueJevDiffFile(file, jevElementNearViewport(file, 300));
             jevDiagnostic('diff DOM update', {
                 path: readDiffFilePath(file) || '(path not rendered yet)',
                 rows: file.querySelectorAll('tr').length,
-                state: newlyObserved ? 'waiting to enter viewport' : jevDiffObserved.has(file) ? 'queued for rescan' : 'waiting for diff rows',
+                state: newlyObserved
+                    ? jevDiffPending.has(file) ? 'visible file queued immediately' : 'waiting to enter viewport'
+                    : jevDiffObserved.has(file) ? 'queued for rescan' : 'waiting for diff rows',
             }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1500 });
             return;
         }
@@ -18751,14 +18906,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (code?.trim()) nearby.push(code.replace(/\r\n/g, '\n'));
         }
         const label = `${meta.side || (line.deleted ? 'L' : 'R')}${meta.lineNum || ''}`;
+        const pr = jevReviewPageContext();
         return {
             kind: 'diff',
             text,
             file: meta.fileName || '',
             startLabel: label,
             endLabel: label,
-            commitSha: pathCommitSha() || '',
-            pr: parsePR(),
+            commitSha: pathCommitSha() || pr?.compareHead || '',
+            pr,
             rect: marker.getBoundingClientRect(),
             contextLines: nearby.join('\n'),
             source: location.href,
@@ -18852,6 +19008,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
     let jevReadingQuickTooltip = null;
     let jevReadingExplainTimer = null;
+    let jevDescriptionDomRetryTimer = null;
+    let jevDescriptionDomRetryPath = '';
+    let jevDescriptionDomRetryAttempts = 0;
 
     function dismissJevReadingHover() {
         if (jevReadingExplainTimer !== null) {
@@ -19107,7 +19266,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }, { key: 'description-disabled', intervalMs: 2000 });
             return;
         }
-        const pr = parsePR();
+        const pr = jevReviewPageContext();
         const body = jevPRDescriptionBody();
         if (!pr || !body || !body.isConnected) {
             jevDiagnostic('description waiting for DOM', {
@@ -19117,8 +19276,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 pullBodyRootsInDOM: document.querySelectorAll(JEV_DESCRIPTION_ROOT_SELECTOR).length,
                 markdownBodiesInDOM: document.querySelectorAll(MARKDOWN_BODY_SELECTOR).length,
             }, { key: 'description-dom', intervalMs: 3000, level: 'warn' });
+            scheduleJevDescriptionDomRetry();
             return;
         }
+        if (jevDescriptionDomRetryTimer !== null) {
+            clearTimeout(jevDescriptionDomRetryTimer);
+            jevDescriptionDomRetryTimer = null;
+        }
+        jevDescriptionDomRetryPath = location.pathname;
+        jevDescriptionDomRetryAttempts = 0;
         const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
         const parentText = jevDescriptionText(body);
         const sourceKey = hashPrompt(`${head}\0${parentText}`);
@@ -19171,6 +19337,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 sourceKey,
             }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
         });
+    }
+
+    function scheduleJevDescriptionDomRetry() {
+        const path = location.pathname;
+        if (!isPRConversationPage(path) || !jevDescriptionReadingEnabled()) return;
+        if (jevDescriptionDomRetryPath !== path) {
+            if (jevDescriptionDomRetryTimer !== null) clearTimeout(jevDescriptionDomRetryTimer);
+            jevDescriptionDomRetryTimer = null;
+            jevDescriptionDomRetryPath = path;
+            jevDescriptionDomRetryAttempts = 0;
+        }
+        if (jevDescriptionDomRetryTimer !== null) return;
+        if (jevDescriptionDomRetryAttempts >= 20) {
+            jevDiagnostic('description DOM retry exhausted', {
+                attempts: jevDescriptionDomRetryAttempts,
+                state: 'PR description still absent after hydration retries',
+            }, { key: 'description-dom-retry-exhausted', intervalMs: 0, repeatMs: 60000, level: 'warn' });
+            return;
+        }
+        const attempt = ++jevDescriptionDomRetryAttempts;
+        const delay = Math.min(1000, 150 + attempt * 100);
+        jevDiagnostic('description DOM retry scheduled', { attempt, delayMs: delay }, {
+            key: 'description-dom-retry', intervalMs: 0, repeatMs: 0,
+        });
+        jevDescriptionDomRetryTimer = setTimeout(() => {
+            jevDescriptionDomRetryTimer = null;
+            if (location.pathname !== path || !isPRConversationPage() || !jevDescriptionReadingEnabled()) return;
+            queueJevDescriptionReading();
+        }, delay);
     }
 
     function scheduleJevDescriptionReading() {
@@ -19237,7 +19432,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function queueJevDiffHunks(file) {
         if (_ackTesting || !jevEnabled() || !file.isConnected) return;
-        const pr = parsePR();
+        const pr = jevReviewPageContext();
         const path = readDiffFilePath(file);
         if (!pr || !path) {
             jevDiagnostic('diff file skipped', {
@@ -19247,7 +19442,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }, { key: 'diff-file-dom', intervalMs: 3000, level: 'warn' });
             return;
         }
-        const head = getImmediatePRHeadSHA() || pathCommitSha();
+        const head = pr.compareHead || getImmediatePRHeadSHA() || pathCommitSha();
         const rows = [...file.querySelectorAll('tr')];
         const changed = rows.map(jevChangedRow).filter(Boolean);
         const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
@@ -19267,6 +19462,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             else groups.push([line]);
         }
         let observed = 0;
+        let immediate = 0;
         for (const group of groups) {
             const first = group.find((line) => !line.deleted) || group[0];
             const signature = hashPrompt(head + group.map((line) => line.fullText).join('\n'));
@@ -19274,9 +19470,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (jevHunkObserved.get(first.cell) === signature &&
                 meta?.lineEl?.querySelector(':scope > .ack-jev-badges')) continue;
             jevHunkObserved.set(first.cell, signature);
-            jevHunkRecords.set(first.cell, { pr, path, head, group, signature });
-            jevHunkObserver.observe(first.cell);
-            observed++;
+            const record = { pr, path, head, group, signature };
+            if (jevElementNearViewport(first.cell, 250)) {
+                queueJevVisibleHunk(record);
+                immediate++;
+            } else {
+                jevHunkRecords.set(first.cell, record);
+                jevHunkObserver.observe(first.cell);
+                observed++;
+            }
         }
         jevDiagnostic('diff file scanned', {
             path,
@@ -19286,8 +19488,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             changeSignals,
             hunks: groups.length,
             newlyObservedHunks: observed,
-            state: observed
-                ? 'waiting for hunks to enter the viewport'
+            immediatelyQueuedHunks: immediate,
+            state: immediate
+                ? 'visible hunks queued immediately'
+                : observed ? 'waiting for hunks to enter the viewport'
                 : changeSignals && !changed.length
                     ? 'change markers found but no changed rows parsed'
                     : 'already queued or annotated',
@@ -19303,28 +19507,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }, { key: 'page-disabled', intervalMs: 2000 });
             return;
         }
-        const pr = parsePR();
+        const pr = jevReviewPageContext();
         const files = [...document.querySelectorAll(DIFF_FILE_SELECTOR)];
         let newlyObservedFiles = 0;
+        let immediatelyQueuedFiles = 0;
         jevDiagnostic('page trigger started', {
             pathname: location.pathname,
             pullRequest: pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : '',
-            page: isPRConversationPage() ? 'conversation' : files.length ? 'diff' : 'pull request',
+            page: isPRConversationPage() ? 'conversation' : isComparePage() ? 'compare' : files.length ? 'diff' : 'pull request',
             diffFilesInDOM: files.length,
             readingGuideEnabled: jevLineReadingPreferred(),
             active: jevActive,
             waiting: jevJobs.length,
         }, { key: 'page', intervalMs: 1000 });
-        queueJevCommitRows();
-        queueJevStackSummary();
-        queueJevDescriptionReading();
+        if (!pr?.compare) {
+            queueJevCommitRows();
+            queueJevStackSummary();
+            queueJevDescriptionReading();
+        }
         for (const file of files) {
-            if (observeJevDiffFile(file)) newlyObservedFiles++;
+            if (observeJevDiffFile(file)) {
+                newlyObservedFiles++;
+                if (jevDiffPending.has(file)) immediatelyQueuedFiles++;
+            }
         }
         jevDiagnostic('page scan complete', {
             pathname: location.pathname,
             diffFilesInDOM: files.length,
             newlyObservedFiles,
+            immediatelyQueuedFiles,
             visibleComments: leafLazyCommentContainers().filter((container) => {
                 const bounds = container.getBoundingClientRect();
                 return bounds.bottom >= 0 && bounds.top <= window.innerHeight;
@@ -19434,7 +19645,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const ROOT_INJECTORS = [
         { name: 'jevDescriptionUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevDescriptionUpdates },
         { name: 'jevCommentUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevCommentUpdates },
-        { name: 'jevDiffUpdates', when: (ctx) => ctx.onPR && jevConfigured, fn: queueJevDiffUpdates },
+        { name: 'jevDiffUpdates', when: (ctx) => (ctx.onPR || ctx.onCompare) && jevConfigured, fn: queueJevDiffUpdates },
         { name: 'prefillCommitHash', when: (ctx) => ctx.onPR, fn: prefillCommitHash },
         { name: 'localRepoCompareLinks', when: (ctx) => ctx.onRepositoryPage, fn: rewriteLocalRepoCompareLinks },
         { name: 'pullRequestListPage', when: (ctx) => ctx.onRepositoryPage, fn: enhancePullRequestListPage },
@@ -19489,7 +19700,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
         // Run on every PR so the console explains why Jev is disabled or
         // blocked instead of making a missing badge look like a dead trigger.
-        { name: 'jevAnnotations', when: (ctx) => ctx.onPR, fn: queueJevPageAnnotations },
+        { name: 'jevAnnotations', when: (ctx) => ctx.onPR || ctx.onCompare, fn: queueJevPageAnnotations },
         {
             name: 'githubReviewOptions',
             when: (ctx) => ctx.onToolbar,
@@ -19497,7 +19708,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         },
         { name: 'diffHeaderToggle', when: (ctx) => ctx.onToolbar, fn: installDiffHeaderToggle },
         { name: 'outOfViewMenuCloser', when: (ctx) => ctx.onToolbar, fn: installOutOfViewMenuCloser },
-        { name: 'diffSelection', when: (ctx) => ctx.onPR, fn: installDiffSelectionActions },
+        { name: 'diffSelection', when: (ctx) => ctx.onPR || ctx.onCompare, fn: installDiffSelectionActions },
     ];
 
     function currentInjectContext() {
@@ -22790,7 +23001,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
             if (/\breacted with\b|\byou reacted\b|\busers? reacted\b|\bpeople reacted\b/.test(aria)) return true;
+            if (el.tagName === 'BUTTON') {
+                // Current React reaction chips may render a plain emoji inside
+                // nested spans and label it "React with ...". Treat every
+                // reaction-state control as an existing chip, even when the
+                // classic data-reaction-content and g-emoji markers are gone.
+                if (el.hasAttribute('aria-pressed') || /checkbox/i.test(el.getAttribute('role') || '')) return true;
+                if (/^react with\b/.test(aria)) return true;
+                if (/reaction/i.test(el.className || '') && !/\badd(?: or remove)? (?:your )?reactions?\b/.test(aria)) return true;
+                if (!el.querySelector('.octicon-smiley') && /\p{Extended_Pictographic}/u.test(el.textContent || '')) return true;
+            }
             return false;
+        };
+
+        const isAddReactionTrigger = (el, type) => {
+            if (!el || isExistingReactionButton(el)) return false;
+            if (type === 'details') return true;
+            const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+            return /\badd(?: or remove)? (?:your )?reactions?\b/.test(aria) || !!el.querySelector?.('.octicon-smiley');
         };
 
         // Classic UI: <details> with reaction classes
@@ -22826,7 +23054,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const { el: trigger, type } of triggers) {
             // Re-check in case a details/summary entry somehow resolved to an
             // existing reaction button.
-            if (isExistingReactionButton(trigger)) continue;
+            if (!isAddReactionTrigger(trigger, type)) continue;
             if (isOwnReactionTrigger(trigger)) continue;
             if (trigger.dataset.ackReactionHover) continue;
             trigger.dataset.ackReactionHover = 'true';
@@ -22837,6 +23065,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             let hoverTimer = null;
             openTarget.addEventListener('mouseenter', () => {
                 hoverTimer = setTimeout(() => {
+                    if (!isAddReactionTrigger(trigger, type)) return;
                     if (type === 'details') {
                         trigger.setAttribute('open', '');
                     } else {
@@ -24677,7 +24906,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function gatherCompareFileElements() {
         const entries = [];
-        for (const file of document.querySelectorAll('[data-tagsearch-path]')) {
+        for (const file of compareFileElements()) {
             if (file.dataset.ackCompareHidden === '1' || file.style.display === 'none') continue;
             if (!isVisible(file)) continue;
             const anchor = file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info') || file;
@@ -26147,12 +26376,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const rect = rects.length ? rects[0] : range.getBoundingClientRect?.();
         if (!rect) return null;
 
-        const pr = parsePR();
+        const pr = jevReviewPageContext();
         const rootEl =
             range.commonAncestorContainer?.nodeType === 1
                 ? range.commonAncestorContainer
                 : range.commonAncestorContainer?.parentElement;
-        const commitSha = pathCommitSha() || findCommitShaNearSelection(rootEl) || '';
+        const commitSha = pathCommitSha() || pr?.compareHead || findCommitShaNearSelection(rootEl) || '';
         const isPRDescription = !!rootEl?.closest?.(
             '#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]',
         );
@@ -26599,7 +26828,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function updateDiffSelectionToolbar(providedCtx = null) {
         if (_ackTesting) return;
-        if (!isPRPage()) {
+        if (!isPRPage() && !isComparePage()) {
             hideDiffSelectionToolbar();
             return;
         }
@@ -31055,7 +31284,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fn = sourceSection(_ackSource, 'function queueJevDiffUpdates', 'function jevChangedRow');
         ackAssert(fn.includes('observeJevDiffFile(file)'), 'a file whose rows arrived later starts being watched');
         ackAssert(fn.includes('root.querySelectorAll?.(DIFF_FILE_SELECTOR)'), 'newly streamed files under a mutation root are watched');
-        ackAssert(fn.includes('queueJevDiffFile(file)'), 'watched files are re-scanned when rows change');
+        ackAssert(fn.includes('queueJevDiffFile(file, jevElementNearViewport(file, 300))'),
+            'watched files are re-scanned immediately when visible');
+    });
+
+    ackTest('Jev queues an already-visible diff file without waiting for IntersectionObserver', () => {
+        const file = document.createElement('div');
+        file.className = 'js-file';
+        file.setAttribute('data-path', 'src/visible.cpp');
+        file.innerHTML = '<table><tr><td data-line-number="1"></td><td class="blob-code blob-code-addition">+value</td></tr></table>';
+        file.getBoundingClientRect = () => ({ top: 10, bottom: 80, left: 0, right: 100, width: 100, height: 70 });
+        document.body.appendChild(file);
+        const queueLength = jevVisibleDiffQueue.length;
+        try {
+            resetJevTrackers();
+            ackAssert(observeJevDiffFile(file), 'new rendered file starts observation');
+            ackAssert(jevDiffPending.has(file), 'visible file is queued synchronously');
+            ackEq(jevVisibleDiffQueue.at(-1), file, 'the immediate queue contains this exact file node');
+        } finally {
+            const index = jevVisibleDiffQueue.indexOf(file);
+            if (index >= queueLength) jevVisibleDiffQueue.splice(index, 1);
+            jevDiffPending.delete(file);
+            file.remove();
+            resetJevTrackers();
+        }
+    });
+
+    ackTest('Jev reading guide runs on immutable comparison routes', () => {
+        const base = 'a'.repeat(40);
+        const head = 'b'.repeat(40);
+        const context = parseCompareReviewContext(`/bitcoin/bitcoin/compare/${base}...${head}`, '?pr=36156');
+        ackEq(context?.owner, 'bitcoin');
+        ackEq(context?.repo, 'bitcoin');
+        ackEq(context?.pr, '36156');
+        ackEq(context?.compareHead, head);
+        const rootInjectors = sourceSection(_ackSource, 'const ROOT_INJECTORS', 'const DOC_INJECTORS');
+        const docInjectors = sourceSection(_ackSource, 'const DOC_INJECTORS', 'function currentInjectContext');
+        ackAssert(rootInjectors.includes("(ctx.onPR || ctx.onCompare) && jevConfigured"),
+            'streamed compare diff rows enter the Jev pipeline');
+        ackAssert(docInjectors.includes("name: 'jevAnnotations', when: (ctx) => ctx.onPR || ctx.onCompare"),
+            'the initial compare DOM is scanned for Jev work');
+        ackAssert(docInjectors.includes("name: 'diffSelection', when: (ctx) => ctx.onPR || ctx.onCompare"),
+            'compare pages retain the selection explanation UI');
     });
 
     ackTest('Jev diagnostics expose triggers, privacy gates, queues, caches, and rendered work', () => {
@@ -31073,6 +31343,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const description = sourceSection(_ackSource, 'function queueJevDescriptionReading', 'function scheduleJevDescriptionReading');
         ackAssert(description.includes("jevDiagnostic('description queued'"), 'logs PR-description sentence counts');
         ackAssert(description.includes("jevDiagnostic('description completed'"), 'logs rendered sentence levels');
+        ackAssert(description.includes('scheduleJevDescriptionDomRetry()'), 'retries when the PR body has not hydrated yet');
         const diff = sourceSection(_ackSource, 'function queueJevDiffHunks', 'function queueJevPageAnnotations');
         ackAssert(diff.includes("jevDiagnostic('diff file scanned'"), 'logs changed rows and visible-hunk waits');
         const page = sourceSection(_ackSource, 'function queueJevPageAnnotations', '// --- Lazy Visibility Observer');
@@ -31166,7 +31437,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(header.querySelector('strong').contains(slot), 'badge follows the author name');
         ackAssert(!header.querySelector(':scope > .ack-jev-badges'), 'badge is not an action-row flex item');
         ackEq(header.querySelector('.timeline-comment-actions').textContent, 'More', 'action menu stays intact');
-        header.innerHTML = '<h3><a data-hovercard-type="user" href="/reviewer"><img alt="" src="avatar.png"></a>' +
+        header.innerHTML = '<h3><a data-hovercard-type="user" href="/reviewer"><img alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="></a>' +
             '<a data-hovercard-type="user" href="/reviewer">reviewer</a></h3>';
         ackEq(jevCommentBadgeTarget(header).textContent, 'reviewer',
             'a generic React user link with an avatar does not steal the badge');
@@ -36497,26 +36768,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('reacted with'), 'skips buttons whose aria-label describes an existing reaction');
     });
 
-    ackTest('autoOpenReactionPopup does not attach handlers to React-UI existing reaction buttons', () => {
+    ackTest('autoOpenReactionPopup hover opens only the add selector and never toggles an existing reaction', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
         host.style.left = '-99999px';
         host.innerHTML = `
             <div class="reactions">
-                <button id="existing" aria-label="1 user reacted with 👍 emoji"><g-emoji>👍</g-emoji> 1</button>
+                <button id="existing" aria-label="React with thumbs up"><span>👍</span><span>1</span></button>
                 <button id="trigger" aria-label="Add your reaction"><svg class="octicon-smiley"></svg></button>
             </div>
         `;
         document.body.appendChild(host);
         try {
-            autoOpenReactionPopup(host);
             const existing = host.querySelector('#existing');
             const trigger = host.querySelector('#trigger');
+            let existingClicks = 0;
+            let triggerClicks = 0;
+            existing.addEventListener('click', () => existingClicks++);
+            trigger.addEventListener('click', () => triggerClicks++);
+            autoOpenReactionPopup(host);
             ackAssert(!existing.dataset.ackReactionHover, 'existing reaction button is not marked as a hover target');
             ackAssert(trigger.dataset.ackReactionHover === 'true', 'add-reaction trigger is marked as a hover target');
-            let existingClicks = 0;
-            existing.addEventListener('click', () => existingClicks++);
             existing.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            trigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            await new Promise((resolve) => setTimeout(resolve, 240));
+            ackEq(existingClicks, 0, 'hovering an existing reaction never synthesizes a reaction click');
+            ackEq(triggerClicks, 1, 'hovering the add selector opens its native popup once');
             existing.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             ackEq(
                 existingClicks,
@@ -40365,31 +40642,111 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('pull request list supports current React rows and revision-bound size keys', () => {
+        const host = document.createElement('div');
+        host.innerHTML = [
+            '<script type="application/json" data-target="react-app.embeddedData">',
+            '{"payload":{"repoPullsDashboardContentRoute":{"results":[',
+            '{"number":14,"repoNameWithOwner":"octo/demo","headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",',
+            '"updatedAt":"2026-09-25T20:30:28Z"}]}}}',
+            '</script>',
+            '<ul data-listview-component="items-list"><li class="PullsListItem-module__listItem__abc">',
+            '<div data-listview-item-title-container="true"><h3>',
+            '<a data-testid="listitem-title-link" href="/octo/demo/pull/14">Current PR</a>',
+            '</h3><span class="Title-module__trailingBadgesSpacer__abc"></span></div>',
+            '</li></ul>',
+        ].join('');
+        document.body.appendChild(host);
+        try {
+            const entries = findPullRequestListEntries(host, { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' });
+            ackEq(entries.length, 1);
+            ackEq(entries[0].row.tagName, 'LI');
+            ackAssert(pullRequestSizeRevision(entries[0].pr).includes('2026-09-25T20:30:28Z'));
+            const marker = ensurePullRequestSizeMarker(entries[0]);
+            ackAssert(marker.nextElementSibling?.className.includes('trailingBadgesSpacer'), 'places stats in title row');
+            ackAssert(
+                pullRequestSizeCacheKey(entries[0].pr).includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+                'cache key includes exact head',
+            );
+            const revisedEntry = {
+                ...entries[0],
+                pr: { ...entries[0].pr, headSha: 'b'.repeat(40), updatedAt: '2026-09-25T20:31:00Z' },
+            };
+            ackNeq(
+                pullRequestSizePendingKey(entries[0].pr),
+                pullRequestSizePendingKey(revisedEntry.pr),
+                'in-flight work is also revision-bound',
+            );
+            const revisedMarker = ensurePullRequestSizeMarker(revisedEntry);
+            ackNeq(revisedMarker, marker, 'a row revision replaces its old marker instead of preserving stale counts');
+        } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('pull request sizes fetch classic rows once and never persist them', async () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-issue-row"><a data-hovercard-type="pull_request" href="/octo/demo/pull/15">Classic PR</a></div>';
+        document.body.appendChild(host);
+        const originalGmFetch = gmFetch;
+        const fetched = [];
+        gmFetch = async (url) => {
+            fetched.push(url);
+            return { additions: 4, deletions: 1, head: { sha: 'c'.repeat(40) }, updated_at: '2026-09-25T20:30:28Z' };
+        };
+        const storedSizes = () => GM_listValues().filter((key) => key.startsWith('ack_pr_size:')).length;
+        const storedBefore = storedSizes();
+        try {
+            addPullRequestListSizes(host, { path: '/octo/demo/pulls' });
+            addPullRequestListSizes(host, { path: '/octo/demo/pulls' });
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            ackDeepEq(fetched, ['https://api.github.com/repos/octo/demo/pulls/15'], 'repeated passes fetch the row once');
+            ackEq(host.querySelector('.ack-pr-size')?.textContent, '+4-1', 'a row without revision data shows live counts');
+            ackEq(storedSizes(), storedBefore, 'counts without an exact row revision are not persisted');
+        } finally {
+            gmFetch = originalGmFetch;
+            host.remove();
+        }
+    });
+
     ackTest('pull request size cache expires and rejects invalid counts', () => {
-        const pr = { owner: 'octo', repo: 'demo', pr: '12' };
+        const pr = {
+            owner: 'octo', repo: 'demo', pr: '12',
+            headSha: 'b'.repeat(40), updatedAt: '2026-09-25T20:30:28Z',
+        };
         const key = pullRequestSizeCacheKey(pr);
         const old = GM_getValue(key, null);
         try {
-            ackEq(rememberPullRequestSize(pr, { additions: 7, deletions: 3 }, 10_000)?.additions, 7);
+            const matching = {
+                additions: 7, deletions: 3,
+                head: { sha: 'b'.repeat(40) }, updated_at: '2026-09-25T20:30:28Z',
+            };
+            ackEq(rememberPullRequestSize(pr, matching, 10_000)?.additions, 7);
             ackDeepEq(readPullRequestSize(pr, 10_001), { additions: 7, deletions: 3 });
             ackEq(readPullRequestSize(pr, 10_000 + PULL_REQUEST_SIZE_CACHE_TTL_MS + 1), null, 'expires stale size');
-            ackEq(rememberPullRequestSize(pr, { additions: -1, deletions: 3 }), null, 'rejects negative count');
-            ackEq(rememberPullRequestSize(pr, { additions: 1.5, deletions: 3 }), null, 'rejects fractional count');
+            ackEq(rememberPullRequestSize(pr, { ...matching, additions: -1 }), null, 'rejects negative count');
+            ackEq(rememberPullRequestSize(pr, { ...matching, additions: 1.5 }), null, 'rejects fractional count');
+            ackEq(
+                rememberPullRequestSize(pr, { ...matching, head: { sha: 'c'.repeat(40) } }),
+                null,
+                'rejects a response for a different head',
+            );
         } finally {
             if (old === null || old === undefined) GM_deleteValue(key);
             else GM_setValue(key, old);
         }
     });
 
-    ackTest('pull request sizes load through a bounded idle queue before Mine-filter requirements', () => {
+    ackTest('pull request sizes batch current React rows and use an immediate bounded fallback', () => {
         const source = _ackSource;
         const queueSection = sourceSection(
             source,
             'const PULL_REQUEST_SIZE_CACHE_TTL_MS',
             'function normalizePullsListQuery',
         );
-        ackAssert(queueSection.includes('PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 2'), 'limits requests to two at a time');
-        ackAssert(queueSection.includes("scheduleAckBackgroundWork('pull-list-sizes'"), 'uses idle background scheduler');
+        ackAssert(queueSection.includes('PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 4'), 'limits fallback requests');
+        ackAssert(queueSection.includes('fetchPullRequestSizeBatch(missing)'), 'batches visible rows with GraphQL');
+        ackAssert(queueSection.includes('pullRequestSizeDrainTimer = ackSetTimeout'), 'starts fallback without an idle wait');
         ackAssert(queueSection.includes('readPullRequestSize(entry.pr)'), 'uses persistent cache before fetching');
         const enhancer = sourceSection(_ackSource, 'function enhancePullRequestListPage', 'function isComparePullRequestButton');
         ackAssert(
@@ -40645,7 +41002,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('for (const sha of [headSha, baseSha]'), 'tries both SHAs for API lookup');
         ackAssert(fn.includes('gmFetchTimeout'), 'uses timeout wrapper for API calls');
         ackAssert(fn.includes('#files_bucket'), 'uses correct Files changed tab selector');
-        ackAssert(fn.includes('processed.has(path)'), 'tracks processed files for progressive loading');
+        ackAssert(fn.includes('processed.has(file)'), 'tracks rendered file nodes so replacement cards are rechecked');
         ackAssert(fn.includes('collapseNewFiles'), 'uses incremental collapse function');
         ackAssert(fn.includes('_compareDebounceTimer'), 'debounces observer for burst loading');
         ackAssert(fn.includes('ack-compare-collapse'), 'injects CSS style element for collapse');
@@ -40668,23 +41025,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('ack-compare-collapse'), 'uses CSS style element');
     });
 
-    ackTest('autoCollapseCompareFiles fetches PR files from multiple sources', () => {
+    ackTest('autoCollapseCompareFiles uses only the latest PR files as relevance evidence', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function autoCollapseCompareFiles'),
             source.indexOf('// Auto-click'),
         );
         ackAssert(fn.includes('pulls/${prNum}/files'), 'fetches current PR files');
-        ackAssert(fn.includes('pulls/${prNum}'), 'fetches PR details for base branch');
-        ackAssert(fn.includes('base?.ref'), 'extracts base branch from PR data');
-        ackAssert(fn.includes('compare/${baseBranch}...${headSha}'), 'fetches PR files at head SHA via compare API');
-        ackAssert(fn.includes('compare/${baseBranch}...${baseSha}'), 'fetches PR files at base SHA too');
+        ackAssert(!fn.includes('compare/${baseBranch}...${headSha}'), 'does not re-add files from an old compare head');
+        ackAssert(!fn.includes('compare/${baseBranch}...${baseSha}'), 'does not re-add files from the old base version');
         ackAssert(fn.includes('fetchPRPatchFilePaths'), 'falls back to the same-origin PR patch when REST API is unavailable');
         ackAssert(fn.includes('fileSources.patch'), 'records patch fallback path count');
         ackAssert(fn.includes('noteCompareApiError'), 'keeps optional compare API failures quiet when rate-limited');
         ackAssert(fn.includes('currentPrFilesIncomplete'), 'patch fallback supplements partial REST file lists');
-        ackAssert(fn.includes('addFiles'), 'uses helper to build union of file sets');
-        ackAssert(fn.includes('previous_filename'), 'includes renamed file paths');
+        ackAssert(fn.includes('addFiles'), 'uses one helper for the authoritative current file list');
+        const currentFiles = sourceSection(fn, 'const addFiles', 'const addCompareRangeFiles');
+        ackAssert(!currentFiles.includes('previous_filename'), 'does not preserve a historical rename source as current');
         ackAssert(fn.includes('uniquePrFilePaths'), 'records total unique paths');
     });
 
@@ -40785,6 +41141,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             true,
             'accepts a subtree containing file cards',
         );
+    });
+
+    ackTest('compare file discovery supports classic and current React diff cards', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div data-tagsearch-path="src/classic.cpp"></div>' +
+            '<div data-testid="diff-file" data-path="src/react.cpp"><table aria-label="Diff for: src/react.cpp"></table></div>';
+        document.body.appendChild(host);
+        try {
+            ackDeepEq(
+                compareFileElements().filter((file) => host.contains(file)).map(readDiffFilePath),
+                ['src/classic.cpp', 'src/react.cpp'],
+                'both GitHub generations are eligible for filtering and navigation',
+            );
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('config panel shows GitHub Token before AI provider section', () => {
@@ -43500,7 +43872,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
-    ackTest('extractPatchFilePaths reads current, renamed, and deleted patch paths', () => {
+    ackTest('extractPatchFilePaths keeps only current displayed rename and deletion paths', () => {
         const paths = extractPatchFilePaths(
             [
                 'diff --git a/src/old.cpp b/src/new.cpp',
@@ -43515,7 +43887,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 '+++ /dev/null',
             ].join('\n'),
         );
-        ackDeepEq(paths.sort(), ['doc/remove.md', 'src/new.cpp', 'src/old.cpp']);
+        ackDeepEq(paths.sort(), ['doc/remove.md', 'src/new.cpp']);
     });
 
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
@@ -45608,6 +45980,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             if (oldJevKey === undefined) GM_deleteValue('jev_api_key');
             else GM_setValue('jev_api_key', oldJevKey);
         }
+    });
+
+    ackTest('PR SSR reader supports GitHub current repo app and headSha field', () => {
+        ackAssert(PR_SSR_SCRIPT_SELECTOR.includes('app-name="pull-requests"'), 'keeps the earlier PR app');
+        ackAssert(PR_SSR_SCRIPT_SELECTOR.includes('app-name="repo"'), 'accepts the current repository app');
+        const reader = sourceSection(_ackSource, 'function readHeadShaFromSSR', 'function readBaseBranchFromSummaryDom');
+        ackAssert(reader.includes('pullRequest?.headSha'), 'reads the current payload headSha');
+        ackAssert(reader.includes('mergeStatusButtonData?.headSha'), 'keeps the merge-status fallback');
     });
 
     ackTest('callLLM checks prompt cache and stores results', () => {
