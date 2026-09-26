@@ -5737,7 +5737,7 @@
                 continue;
             }
             if (!inHunk || !/^[+-]/.test(line)) continue;
-            const signature = `${line[0]}\0${line.slice(1)}`;
+            const signature = jevChangedPartSignature({ deleted: line[0] === '-', fullText: line.slice(1) });
             if (!files.has(currentPath)) files.set(currentPath, new Map());
             const counts = files.get(currentPath);
             counts.set(signature, (counts.get(signature) || 0) + 1);
@@ -17468,6 +17468,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevDiagnosticEvents = new Map();
     const jevDiagnosticCounts = new Map();
 
+    function jevReadingLevelCounts(levels) {
+        const count = (name) => levels.filter((level) => level === name).length;
+        return { rendered: levels.length, background: count('background'), foreground: count('foreground'), essence: count('essence') };
+    }
+
     function jevDiagnostic(stage, details = {}, { key = '', intervalMs = 1000, repeatMs = 15000, level = 'log' } = {}) {
         if (_ackTesting) return;
         const eventKey = `${location.pathname}:${stage}:${key}`;
@@ -19321,13 +19326,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 deleted,
             };
         });
+        return jevCombineChangedParts(parts);
+    }
+
+    // Keep the hunk classifier's paired before/after view while the line
+    // guide classifies each changed side independently.
+    function jevCombineChangedParts(parts) {
         const primary = parts.find((part) => !part.deleted) || parts[0];
         return {
             ...primary,
-            // Keep the hunk classifier's paired before/after view while the
-            // line guide classifies each changed side independently.
             excerpt: parts.map((part) => part.excerpt).join('\n'),
-            fullText: parts.map((part) => `${part.deleted ? '-' : '+'}\0${part.fullText}`).join('\n'),
+            fullText: parts.map(jevChangedPartSignature).join('\n'),
             parts,
         };
     }
@@ -19409,9 +19418,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const related = [];
         let unrelatedSides = 0;
         for (const line of changed) {
-            const parts = line.parts?.length ? line.parts : [line];
             const relatedParts = [];
-            for (const part of parts) {
+            for (const part of line.parts) {
                 const signature = jevChangedPartSignature(part);
                 const count = remaining.get(signature) || 0;
                 if (count > 0) {
@@ -19429,18 +19437,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             }
             if (!relatedParts.length) continue;
-            if (relatedParts.length === parts.length) {
-                related.push(line);
-                continue;
-            }
-            const primary = relatedParts.find((part) => !part.deleted) || relatedParts[0];
-            related.push({
-                ...primary,
-                row: line.row,
-                excerpt: relatedParts.map((part) => part.excerpt).join('\n'),
-                fullText: relatedParts.map((part) => `${part.deleted ? '-' : '+'}\0${part.fullText}`).join('\n'),
-                parts: relatedParts,
-            });
+            related.push(relatedParts.length === line.parts.length ? line : jevCombineChangedParts(relatedParts));
         }
         return { changed: related, unrelatedSides };
     }
@@ -19555,7 +19552,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const stats = { eligible: 0, alreadyAnnotated: 0, cacheHits: 0, queued: 0, batches: 0 };
         if (!jevLineReadingEnabled()) return stats;
         const lines = records.flatMap(({ path, line }) =>
-            (line.parts?.length ? line.parts : [line]).map((part) => ({ path, line: part })));
+            line.parts.map((part) => ({ path, line: part })));
         const entries = lines.map(({ path, line }) => ({ path, line, review: jevLineReviewTarget(path, line) }))
             .filter((entry) => entry.review);
         const statePaths = [...new Set(entries.map((entry) => entry.path))];
@@ -19602,10 +19599,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     paths: statePaths,
                     batches: tasks.length,
                     evaluated: stats.queued + stats.cacheHits,
-                    rendered: rendered.length,
-                    background: rendered.filter((level) => level === 'background').length,
-                    foreground: rendered.filter((level) => level === 'foreground').length,
-                    essence: rendered.filter((level) => level === 'essence').length,
+                    ...jevReadingLevelCounts(rendered),
                 }, { key: signature, intervalMs: 0, repeatMs: 60000 });
             });
         }
@@ -20030,10 +20024,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 comment: sourceIdentity,
                 sentences: sentences.length,
                 batches: queued.batches,
-                rendered: rendered.length,
-                background: rendered.filter((level) => level === 'background').length,
-                foreground: rendered.filter((level) => level === 'foreground').length,
-                essence: rendered.filter((level) => level === 'essence').length,
+                ...jevReadingLevelCounts(rendered),
             }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
         });
     }
@@ -20111,10 +20102,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevDiagnostic('description completed', {
                 sentences: sentences.length,
                 batches: queued.batches,
-                rendered: rendered.length,
-                background: rendered.filter((level) => level === 'background').length,
-                foreground: rendered.filter((level) => level === 'foreground').length,
-                essence: rendered.filter((level) => level === 'essence').length,
+                ...jevReadingLevelCounts(rendered),
                 sourceKey,
             }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
         });
@@ -20231,10 +20219,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const rendered = levels.flat().filter(Boolean);
                 jevDiagnostic('commit message completed', {
                     commit: commitContext.sha,
-                    rendered: rendered.length,
-                    background: rendered.filter((level) => level === 'background').length,
-                    foreground: rendered.filter((level) => level === 'foreground').length,
-                    essence: rendered.filter((level) => level === 'essence').length,
+                    ...jevReadingLevelCounts(rendered),
                 }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
             });
         })().catch((error) => {
@@ -20435,7 +20420,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const renderedChanged = rows.map(jevChangedRow).filter(Boolean);
         const relevance = jevComparisonRelevantChanged(file, path, renderedChanged);
         const changed = relevance.changed;
-        const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
+        const changedSides = changed.reduce((count, line) => count + line.parts.length, 0);
         const contextSignature = commitContext
             ? `${commitContext.messageHash}\0${commitContext.patchHash}\0${commitContext.descriptionHash}` : '';
         const fileSignature = hashPrompt(head + contextSignature + changed.map((line) => line.fullText).join('\n'));
