@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.284
+// @version      1.285
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -18430,7 +18430,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         jevCommentRevisionHints.set(prPrefix, { info, ts: Date.now() });
         const initialDescription = jevPRDescriptionEvidence(info);
         const revision = `${baseSha}...${head}`;
-        const requestKey = `${prPrefix}${revision}`;
+        const requestKey = `${prPrefix}${revision}:${initialDescription.hash}`;
         const snapshot = jevCommentEvidenceSnapshots.get(requestKey);
         if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) return snapshot.evidence;
         if (jevCommentEvidenceRequests.has(requestKey)) return jevCommentEvidenceRequests.get(requestKey);
@@ -18450,14 +18450,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
             const after = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
                 { freshForMs: 0 });
+            const afterDescription = jevPRDescriptionEvidence(after);
             if (after?.head?.sha !== head || after?.base?.sha !== baseSha ||
+                afterDescription.hash !== initialDescription.hash ||
                 (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
             jevCommentRevisionHints.set(prPrefix, { info: after, ts: Date.now() });
             jevCommentPatchCache.set(patchKey, { patch, ts: Date.now() });
             while (jevCommentPatchCache.size > 4) jevCommentPatchCache.delete(jevCommentPatchCache.keys().next().value);
             return { head, baseSha, patch, complete: !!patch && patch.length <= 60000,
                 reason: patch.length > 60000 ? 'PR patch exceeds the bounded review limit' : '',
-                prDescription: jevPRDescriptionEvidence(after) };
+                prDescription: afterDescription };
         })().catch((error) => ({
             head,
             baseSha,
@@ -45674,13 +45676,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('Jev comment evidence identities include both base and head revisions', () => {
+    ackTest('Jev comment evidence identities include base, head, and PR description', () => {
         const fn = sourceSection(
             _ackSource,
             'async function jevCommentCurrentEvidence',
             'async function jevCommentReviewState',
         );
         ackAssert(fn.includes('const revision = `${baseSha}...${head}`'), 'builds a base-head revision');
+        ackAssert(fn.includes('`${prPrefix}${revision}:${initialDescription.hash}`'),
+            'binds the snapshot to the exact mutable PR description');
+        ackAssert(fn.includes('afterDescription.hash !== initialDescription.hash'),
+            'rejects a PR description edit while code evidence is loading');
         ackAssert(fn.includes('jevCommentEvidenceSnapshots.get(requestKey)'), 'reads the exact revision snapshot');
         ackAssert(fn.includes('jevCommentPatchCache.get(patchKey)'), 'reads the exact revision patch');
     });
