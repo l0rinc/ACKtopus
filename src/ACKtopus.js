@@ -17463,7 +17463,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevPauseUntil = 0;
     let jevPauseRetryTimer = null;
     let jevConfigured = !!GM_getValue('jev_enabled', true) && !!GM_getValue('jev_api_key', '');
-    const jevDiagnosticEvents = new Map();
+    const jevDiagnosticEvents = new Map(); // current page's `${pathname}:${stage}:${key}` -> last log
+    let jevDiagnosticEventsPath = '';
     const jevDiagnosticCounts = new Map();
 
     function jevReadingLevelCounts(levels) {
@@ -17473,12 +17474,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevDiagnostic(stage, details = {}, { key = '', intervalMs = 1000, repeatMs = 15000, level = 'log' } = {}) {
         if (_ackTesting) return;
+        if (jevDiagnosticEventsPath !== location.pathname) {
+            jevDiagnosticEvents.clear();
+            jevDiagnosticEventsPath = location.pathname;
+        }
         const eventKey = `${location.pathname}:${stage}:${key}`;
-        let signature = '';
-        try { signature = JSON.stringify(details); } catch (_) { signature = String(details); }
         const now = Date.now();
         const previous = jevDiagnosticEvents.get(eventKey);
         if (previous && now - previous.ts < intervalMs) return;
+        let signature = '';
+        try { signature = JSON.stringify(details); } catch (_) { signature = String(details); }
         if (previous && previous.signature === signature && now - previous.ts < repeatMs) return;
         jevDiagnosticEvents.set(eventKey, { signature, ts: now });
         const method = typeof console[level] === 'function' ? level : 'log';
