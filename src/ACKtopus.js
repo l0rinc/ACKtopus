@@ -19913,11 +19913,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!jevDescriptionReadingEnabled() || !commentState?.selected_complete || !body?.isConnected) return;
         const parentText = jevDescriptionText(body);
         const sourceIdentity = commentState.selected_permalink || `comment-${commentState.comment_id || 'unknown'}`;
-        const reviewThread = commentState.review_thread || commentState.thread_request || '';
-        const reviewThreadHash = commentState.review_thread_hash || commentState.thread_request_hash ||
-            hashPrompt(reviewThread);
-        const reviewThreadComplete = commentState.review_thread
-            ? commentState.review_thread_complete !== false : !commentState.thread_request;
+        // review_thread always includes the root request whenever thread_request is set.
+        const reviewThread = commentState.review_thread || '';
+        const reviewThreadHash = commentState.review_thread_hash || hashPrompt(reviewThread);
+        const reviewThreadComplete = !reviewThread || commentState.review_thread_complete !== false;
         const sourceKey = hashPrompt([
             'review_comment',
             commentState.head || '',
