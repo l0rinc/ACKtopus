@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.286
+// @version      1.287
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -6309,8 +6309,8 @@
                 max_tokens: maxTokens || LLM_DEFAULT_MAX_TOKENS,
                 system,
                 messages: [{ role: 'user', content: userContent }],
-                // Claude's default effort is slow for interactive requests;
-                // high-context calls pass their own level.
+                // Claude's default effort is slow for interactive requests.
+                // High-context calls pass their own level.
                 output_config: { effort: reasoningEffort || 'low' },
             }),
             streamBody: (body) => ({ ...body, stream: true }),
@@ -6446,17 +6446,24 @@
         claude: {
             label: 'Claude',
             color: '#d4a574',
-            // Default-model (Claude Sonnet 5) prices. High-context calls cost more.
             inputPrice: 2, // $/M input tokens
             outputPrice: 10, // $/M output tokens
+            modelPrices: {
+                'claude-sonnet-5': { input: 2, output: 10 },
+                'claude-opus-5-5': { input: 4, output: 20 },
+            },
             icon: `<svg width="14" height="14" viewBox="0 0 16 16" fill="#d4a574" style="vertical-align:middle"><path d="m3.127 10.604 3.135-1.76.053-.153-.053-.085H6.11l-.525-.032-1.791-.048-1.554-.065-1.505-.08-.38-.081L0 7.832l.036-.234.32-.214.455.04 1.009.069 1.513.105 1.097.064 1.626.17h.259l.036-.105-.089-.065-.068-.064-1.566-1.062-1.695-1.121-.887-.646-.48-.327-.243-.306-.104-.67.435-.48.585.04.15.04.593.456 1.267.981 1.654 1.218.242.202.097-.068.012-.049-.109-.181-.9-1.626-.96-1.655-.428-.686-.113-.411a2 2 0 0 1-.068-.484l.496-.674L4.446 0l.662.089.279.242.411.94.666 1.48 1.033 2.014.302.597.162.553.06.17h.105v-.097l.085-1.134.157-1.392.154-1.792.052-.504.25-.605.497-.327.387.186.319.456-.045.294-.19 1.23-.37 1.93-.243 1.29h.142l.161-.16.654-.868 1.097-1.372.484-.545.565-.601.363-.287h.686l.505.751-.226.775-.707.895-.585.759-.839 1.13-.524.904.048.072.125-.012 1.897-.403 1.024-.186 1.223-.21.553.258.06.263-.218.536-1.307.323-1.533.307-2.284.54-.028.02.032.04 1.029.098.44.024h1.077l2.005.15.525.346.315.424-.053.323-.807.411-3.631-.863-.872-.218h-.12v.073l.726.71 1.331 1.202 1.667 1.55.084.383-.214.302-.226-.032-1.464-1.101-.565-.497-1.28-1.077h-.084v.113l.295.432 1.557 2.34.08.718-.112.234-.404.141-.444-.08-.911-1.28-.94-1.44-.759-1.291-.093.053-.448 4.821-.21.246-.484.186-.403-.307-.214-.496.214-.98.258-1.28.21-1.016.19-1.263.112-.42-.008-.028-.092.012-.953 1.307-1.448 1.957-1.146 1.227-.274.109-.477-.247.045-.44.266-.39 1.586-2.018.956-1.25.617-.723-.004-.105h-.036l-4.212 2.736-.75.096-.324-.302.04-.496.154-.162 1.267-.871z"/></svg>`,
         },
         openai: {
             label: 'ChatGPT',
             color: '#74d4a5',
-            // Default-model (gpt-6-luna) prices. High-context calls cost more.
             inputPrice: 0.1, // $/M input tokens
             outputPrice: 0.5, // $/M output tokens
+            modelPrices: {
+                'gpt-6-luna': { input: 0.1, output: 0.5 },
+                'gpt-6-sol': { input: 2, output: 10 },
+                'gpt-image-2': { input: 2.5, output: 15 },
+            },
             icon: `<svg width="14" height="14" viewBox="0 0 16 16" fill="#74d4a5" style="vertical-align:middle"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>`,
         },
         gemini: {
@@ -7395,12 +7402,27 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return String(n);
     }
 
-    function fmtCost(provName, inputTokens, outputTokens) {
+    function calculateUsageCost(provName, inputTokens, outputTokens, model = '') {
         const m = PROVIDER_META[provName];
-        if (!m) return '';
-        const cost = (inputTokens * m.inputPrice + outputTokens * m.outputPrice) / 1_000_000;
+        if (!m) return null;
+        const prices = m.modelPrices?.[model] || { input: m.inputPrice, output: m.outputPrice };
+        return ((inputTokens || 0) * prices.input + (outputTokens || 0) * prices.output) / 1_000_000;
+    }
+
+    function formatUsageCost(cost) {
+        if (!Number.isFinite(cost)) return '';
         if (cost < 0.005) return '$0.00';
         return `$${cost.toFixed(2)}`;
+    }
+
+    function fmtCost(provName, inputTokens, outputTokens, model = '') {
+        return formatUsageCost(calculateUsageCost(provName, inputTokens, outputTokens, model));
+    }
+
+    function fmtStoredUsageCost(provName, usage) {
+        const stored = Number(usage?.cost);
+        if (Number.isFinite(stored)) return formatUsageCost(stored);
+        return fmtCost(provName, usage?.input || 0, usage?.output || 0);
     }
 
     function buildConfigPanel() {
@@ -7890,7 +7912,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 outSpan.textContent = `↓${fmtTokens(usage.output)}`;
                 const costSpan = document.createElement('span');
                 costSpan.title = 'Estimated cost';
-                costSpan.textContent = fmtCost(provName, usage.input, usage.output);
+                costSpan.textContent = fmtStoredUsageCost(provName, usage);
                 info.append(iconSpan, ' ', labelSpan, `: ${usage.calls} calls · `, inSpan, ' · ', outSpan, ' · ', costSpan);
             };
             renderUsageRow(u);
@@ -8137,13 +8159,18 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     // --- LLM API Callers ---
 
-    function addUsage(provider, inputTokens, outputTokens) {
+    function addUsage(provider, inputTokens, outputTokens, model = '') {
         const key = `llm_usage_${provider}`;
         const prev = GM_getValue(key, { input: 0, output: 0, calls: 0 });
+        const previousCost = Number.isFinite(Number(prev.cost))
+            ? Number(prev.cost)
+            : calculateUsageCost(provider, prev.input || 0, prev.output || 0);
+        const requestCost = calculateUsageCost(provider, inputTokens, outputTokens, model);
         GM_setValue(key, {
             input: prev.input + (inputTokens || 0),
             output: prev.output + (outputTokens || 0),
             calls: prev.calls + 1,
+            cost: (previousCost || 0) + (requestCost || 0),
         });
     }
 
@@ -8152,7 +8179,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function resetUsage(provider) {
-        GM_setValue(`llm_usage_${provider}`, { input: 0, output: 0, calls: 0 });
+        GM_setValue(`llm_usage_${provider}`, { input: 0, output: 0, calls: 0, cost: 0 });
     }
 
     // String hash for cache keys, combining four cheap 32-bit mixers
@@ -8560,7 +8587,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     return;
                 }
                 settled = true;
-                if (inputTokens) addUsage(provider, inputTokens, outputTokens);
+                if (inputTokens) addUsage(provider, inputTokens, outputTokens, model);
                 if (!_ackTesting) {
                     console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
                     console.log('metadata:', meta);
@@ -8725,7 +8752,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                         }
                         const usage = imagePayload.usage || {};
                         if (usage.input_tokens || usage.output_tokens)
-                            addUsage('openai', usage.input_tokens, usage.output_tokens);
+                            addUsage('openai', usage.input_tokens, usage.output_tokens, OPENAI_IMAGE_MODEL);
                         const outputFormat = imagePayload.outputFormat || OPENAI_IMAGE_FORMAT;
                         resolve({
                             b64,
@@ -19516,7 +19543,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.classification.probability * 100)}% confidence · click for explanation`;
         marker.title = explanation;
         marker.setAttribute('role', 'button');
-        marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
+        marker.setAttribute('aria-label', `${explanation}\nClick, Enter, or Space opens the AI explanation popup.`);
         marker.tabIndex = 0;
         bindJevReadingHover(marker, () => jevLineSelectionContext(line, marker));
         lineNumberCell.prepend(marker);
@@ -19845,7 +19872,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.classification.probability * 100)}% confidence · click for explanation`;
         marker.title = explanation;
         marker.setAttribute('role', 'button');
-        marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
+        marker.setAttribute('aria-label', `${explanation}\nClick, Enter, or Space opens the AI explanation popup.`);
         marker.tabIndex = 0;
         bindJevReadingHover(marker, () =>
             jevDescriptionSelectionContext(sentence, marker, pr, parentText, context));
@@ -32458,6 +32485,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(!/background|foreground|gray|grey|bold|color/i.test(
                 host.querySelector('.ack-jev-line-priority')?.title || ''),
                 'the native tooltip does not explain presentation styles');
+            ackAssert(/Click, Enter, or Space/.test(
+                host.querySelector('.ack-jev-line-priority')?.getAttribute('aria-label') || ''),
+                'the accessible label names the actions that open the AI explanation');
+            ackAssert(!/Hover to open/.test(
+                host.querySelector('.ack-jev-line-priority')?.getAttribute('aria-label') || ''),
+                'the accessible label does not claim hover opens the AI explanation');
             ackEq(line.cell.textContent, codeBefore, 'gutter emoji does not pollute copied code');
 
             jevApplyLineReading(line, result('essence_bug', 0.92), 'src/example.cpp:R7');
@@ -33162,6 +33195,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(fmtCost('openai', 1_000_000, 100_000), '$0.15');
     });
 
+    ackTest('fmtCost uses the actual high-context model price', () => {
+        ackEq(fmtCost('openai', 1_000_000, 100_000, 'gpt-6-sol'), '$3.00');
+        ackEq(fmtCost('claude', 1_000_000, 100_000, 'claude-opus-5-5'), '$6.00');
+    });
+
+    ackTest('addUsage preserves a legacy estimate and prices new calls by model', () => {
+        const oldGet = GM_getValue;
+        const oldSet = GM_setValue;
+        let stored = { input: 1_000_000, output: 100_000, calls: 1 };
+        try {
+            GM_getValue = () => stored;
+            GM_setValue = (_key, value) => { stored = value; };
+            addUsage('openai', 1_000_000, 100_000, 'gpt-6-sol');
+            ackEq(stored.input, 2_000_000);
+            ackEq(stored.output, 200_000);
+            ackEq(stored.calls, 2);
+            ackEq(stored.cost, 3.15);
+            ackEq(fmtStoredUsageCost('openai', stored), '$3.15');
+        } finally {
+            GM_getValue = oldGet;
+            GM_setValue = oldSet;
+        }
+    });
+
     ackTest('fmtCost shows cents for small amounts', () => {
         // 10k input at $2/M = $0.02
         ackEq(fmtCost('claude', 10_000, 0), '$0.02');
@@ -33174,6 +33231,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(PROVIDER_META.openai.outputPrice > 0, 'openai has outputPrice');
         ackAssert(PROVIDER_META.gemini.inputPrice > 0, 'gemini has inputPrice');
         ackAssert(PROVIDER_META.gemini.outputPrice > 0, 'gemini has outputPrice');
+        ackEq(PROVIDER_META.claude.modelPrices[LLM_MODELS.claude_high_context].output, 20);
+        ackEq(PROVIDER_META.openai.modelPrices[LLM_MODELS.openai_high_context].output, 10);
+        ackEq(PROVIDER_META.openai.modelPrices[OPENAI_IMAGE_MODEL].output, 15);
     });
 
     // --- renderMarkdown ---
