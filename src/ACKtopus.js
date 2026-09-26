@@ -5132,7 +5132,6 @@
     const PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 4;
     const pullRequestSizeQueue = [];
     const pendingPullRequestSizes = new Map();
-    const pendingPullRequestSizeBatches = new Map();
     const latestPullRequestSizeRevisions = new Map();
     const PULL_REQUEST_SIZE_CACHE_INDEX_KEY = 'ack_pr_size:index:v2';
     let activePullRequestSizeRequests = 0;
@@ -5144,11 +5143,17 @@
         return `${pr.owner}/${pr.repo}#${pr.pr}`;
     }
 
-    function pullRequestSizeRevision(value) {
+    // Reads the head and update time from a list row, REST, or GraphQL shape.
+    function pullRequestSizeRevisionFields(value) {
         const headSha = String(value?.headSha || value?.head?.sha || value?.headRefOid || '').toLowerCase();
         const updatedAt = String(value?.updatedAt || value?.updated_at || '');
-        if (!/^[0-9a-f]{40}$/.test(headSha) || !/^\d{4}-\d{2}-\d{2}T/.test(updatedAt)) return '';
-        return `${headSha}:${updatedAt}`;
+        if (!/^[0-9a-f]{40}$/.test(headSha) || !/^\d{4}-\d{2}-\d{2}T/.test(updatedAt)) return null;
+        return { headSha, updatedAt };
+    }
+
+    function pullRequestSizeRevision(value) {
+        const fields = pullRequestSizeRevisionFields(value);
+        return fields ? `${fields.headSha}:${fields.updatedAt}` : '';
     }
 
     function pullRequestSizeCacheKey(pr, revision = pullRequestSizeRevision(pr)) {
@@ -5202,14 +5207,17 @@
     function pullRequestSizeResponse(pr, value) {
         const stats = normalizePullRequestSize(value);
         if (!stats) return null;
-        const actualRevision = pullRequestSizeRevision(value);
-        if (!actualRevision || !pullRequestSizeRevision(pr)) return { stats, revision: '' };
-        const actual = {
-            headSha: String(value?.headSha || value?.head?.sha || value?.headRefOid || '').toLowerCase(),
-            updatedAt: String(value?.updatedAt || value?.updated_at || ''),
-        };
+        const actual = pullRequestSizeRevisionFields(value);
+        if (!actual || !pullRequestSizeRevision(pr)) return { stats, revision: '' };
         latestPullRequestSizeRevisions.set(pullRequestSizeIdentity(pr), actual);
-        return { stats: rememberPullRequestSize({ ...pr, ...actual }, value) || stats, revision: actualRevision };
+        return { stats: rememberPullRequestSize({ ...pr, ...actual }, value) || stats, revision: pullRequestSizeRevision(actual) };
+    }
+
+    function renderPullRequestSizeResponse(markers, response) {
+        for (const marker of markers) {
+            if (response.revision) marker.dataset.ackPrSizeRevision = response.revision;
+            renderPullRequestSize(marker, response.stats);
+        }
     }
 
     function pullRequestListMetadata(root, repo) {
@@ -5228,11 +5236,8 @@
             for (const item of results) {
                 if (item?.repoNameWithOwner !== repo.repoKey || !Number.isInteger(Number(item?.number))) continue;
                 const pr = { owner: repo.owner, repo: repo.repo, pr: String(item.number) };
-                const revision = pullRequestSizeRevision(item);
-                if (revision) metadata.set(pullRequestSizeIdentity(pr), {
-                    headSha: String(item.headSha).toLowerCase(),
-                    updatedAt: String(item.updatedAt),
-                });
+                const revision = pullRequestSizeRevisionFields(item);
+                if (revision) metadata.set(pullRequestSizeIdentity(pr), revision);
             }
         }
         return metadata;
@@ -5350,11 +5355,7 @@
             gmFetch(url, { freshForMs: 0 })
                 .then((data) => pullRequestSizeResponse(item.pr, data))
                 .then((response) => {
-                    if (!response) return;
-                    for (const marker of item.markers) {
-                        if (response.revision) marker.dataset.ackPrSizeRevision = response.revision;
-                        renderPullRequestSize(marker, response.stats);
-                    }
+                    if (response) renderPullRequestSizeResponse(item.markers, response);
                 })
                 .catch((e) => {
                     if (!pullRequestSizeFailureWarned && shouldWarnOptionalGitHubApiError(e)) {
@@ -5382,52 +5383,33 @@
             pending.markers.add(marker);
             return null;
         }
-        const item = { identity: entry.identity, pendingKey, pr: entry.pr, markers: new Set([marker]), queued: false };
+        const item = { identity: entry.identity, pendingKey, pr: entry.pr, markers: new Set([marker]) };
         pendingPullRequestSizes.set(pendingKey, item);
         return item;
     }
 
-    function pullRequestSizeBatchKey(entries) {
-        return entries
-            .map((entry) => `${entry.identity}:${pullRequestSizeRevision(entry.pr)}`)
-            .sort()
-            .join('|');
-    }
-
+    // Settles the rows GraphQL can match in one request. Callers pass only
+    // newly tracked items, so concurrent batches never overlap.
     function fetchPullRequestSizeBatch(entries) {
-        if (!entries.length || !patAuthHeaderValue()) return Promise.resolve(false);
+        if (!entries.length || !patAuthHeaderValue()) return Promise.resolve();
         const exact = entries.filter((entry) => pullRequestSizeRevision(entry.pr));
-        if (!exact.length) return Promise.resolve(false);
-        const key = pullRequestSizeBatchKey(exact);
-        if (pendingPullRequestSizeBatches.has(key)) return pendingPullRequestSizeBatches.get(key);
+        if (!exact.length) return Promise.resolve();
         const aliases = exact.map((entry) =>
             `pr_${entry.pr.pr}: pullRequest(number: ${entry.pr.pr}) { number additions deletions headRefOid updatedAt }`,
         );
         const query = `query ACKtopusPullRequestSizes($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${aliases.join('\n')} } }`;
         const variables = { owner: exact[0].pr.owner, repo: exact[0].pr.repo };
-        const request = patGraphQL(query, variables).then((response) => {
-            const repository = response?.data?.repository;
-            if (!repository) return false;
-            let rendered = 0;
+        return patGraphQL(query, variables).then((result) => {
+            const repository = result?.data?.repository;
+            if (!repository) return;
             for (const entry of exact) {
-                const data = repository[`pr_${entry.pr.pr}`];
-                const response = pullRequestSizeResponse(entry.pr, data);
+                const response = pullRequestSizeResponse(entry.pr, repository[`pr_${entry.pr.pr}`]);
                 if (!response) continue;
                 const pendingKey = pullRequestSizePendingKey(entry.pr);
-                const pending = pendingPullRequestSizes.get(pendingKey);
-                for (const marker of pending?.markers || []) {
-                    if (response.revision) marker.dataset.ackPrSizeRevision = response.revision;
-                    renderPullRequestSize(marker, response.stats);
-                }
+                renderPullRequestSizeResponse(pendingPullRequestSizes.get(pendingKey)?.markers || [], response);
                 pendingPullRequestSizes.delete(pendingKey);
-                rendered++;
             }
-            return rendered === exact.length;
-        }).catch(() => false).finally(() => {
-            pendingPullRequestSizeBatches.delete(key);
-        });
-        pendingPullRequestSizeBatches.set(key, request);
-        return request;
+        }).catch(() => {});
     }
 
     function addPullRequestListSizes(root = document, opts = {}) {
@@ -5449,9 +5431,7 @@
         // (no PAT, no revision, or a revision mismatch) falls back to REST.
         fetchPullRequestSizeBatch(missing).then(() => {
             for (const item of missing) {
-                if (item.queued || pendingPullRequestSizes.get(item.pendingKey) !== item) continue;
-                item.queued = true;
-                pullRequestSizeQueue.push(item);
+                if (pendingPullRequestSizes.get(item.pendingKey) === item) pullRequestSizeQueue.push(item);
             }
             schedulePullRequestSizeQueue();
         });
@@ -7273,7 +7253,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         repoDefaultBranchRequests.clear();
         pullRequestSizeQueue.length = 0;
         pendingPullRequestSizes.clear();
-        pendingPullRequestSizeBatches.clear();
         if (pullRequestSizeDrainTimer) {
             ackClearTimeout(pullRequestSizeDrainTimer);
             pullRequestSizeDrainTimer = null;
