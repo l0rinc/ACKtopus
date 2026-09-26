@@ -273,14 +273,21 @@
         return document.querySelector(PR_SSR_SCRIPT_SELECTOR);
     }
 
+    let _prSSRDataCache = { element: null, text: '', data: null };
+
+    // Hot paths read the embedded PR payload (often megabytes) many times per
+    // page, so parse it once per script element and exact content.
     function readPRSSRData() {
+        const scriptEl = prSSRScriptElement();
+        const text = scriptEl?.textContent || '';
+        if (!text) return null;
+        if (_prSSRDataCache.element === scriptEl && _prSSRDataCache.text === text) return _prSSRDataCache.data;
+        let data = null;
         try {
-            const scriptEl = prSSRScriptElement();
-            if (!scriptEl?.textContent) return null;
-            return JSON.parse(scriptEl.textContent);
-        } catch (_) {
-            return null;
-        }
+            data = JSON.parse(text);
+        } catch (_) {}
+        _prSSRDataCache = { element: scriptEl, text, data };
+        return data;
     }
 
     function readBaseBranchFromSSR() {
@@ -20018,7 +20025,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         jevDescriptionDomRetryPath = location.pathname;
         jevDescriptionDomRetryAttempts = 0;
-        const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
+        const head = getImmediatePRHeadSHA();
         const parentText = jevDescriptionText(body);
         const sourceKey = hashPrompt(`${head}\0${parentText}`);
         jevLastPRDescriptionContextKey = `${location.pathname}:${sourceKey}`;
@@ -20266,7 +20273,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         if (!touchesBody) return;
         const previous = jevDescriptionRecords.get(body);
-        const head = getImmediatePRHeadSHA() || readHeadShaFromSSR() || '';
+        const head = getImmediatePRHeadSHA();
         const sourceKey = hashPrompt(`${head}\0${jevDescriptionText(body)}`);
         const pageContextKey = `${location.pathname}:${sourceKey}`;
         if (!previous || previous.sourceKey !== sourceKey) {
