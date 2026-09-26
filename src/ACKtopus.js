@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.269
+// @version      1.270
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1535,12 +1535,14 @@
     function getImmediatePRHeadSHA(path = location.pathname) {
         const pr = parsePR(path);
         if (!pr) return '';
+        const ssr = readHeadShaFromSSR();
+        if (/^[0-9a-f]{40}$/i.test(ssr)) return ssr;
         const cached =
             _prContextCache && _prContextKey.startsWith(`${pr.owner}/${pr.repo}/${pr.pr}:`)
                 ? _prContextCache.headSha || ''
                 : '';
         if (/^[0-9a-f]{40}$/i.test(cached)) return cached;
-        return readHeadShaFromSSR();
+        return '';
     }
 
     function createBtn(text, onClick, tooltip) {
@@ -3241,6 +3243,8 @@
         if (_reviewCommitMapRequest?.prKey === prKey) _reviewCommitMapRequest = null;
         const contextKey = prKey.replace('#', '/');
         if (_prContextKey.startsWith(`${contextKey}:`) || _prReplyRowsKey === contextKey) invalidatePRContext();
+        const match = prKey.match(/^([^/]+)\/([^#]+)#(\d+)$/);
+        if (match) GM_deleteValue(prCommentCountCacheKey({ owner: match[1], repo: match[2], pr: match[3] }));
     }
 
     // Explicit cache clearing also drops the stored bodies.
@@ -3473,7 +3477,7 @@
         }
     }
 
-    function gmFetchGithubText(url, baseHeaders, { force = false, persistent = false } = {}) {
+    function gmFetchGithubText(url, baseHeaders, { force = false, persistent = false, freshForMs } = {}) {
         const resetGeneration = _githubTextResetGeneration;
         const generation = githubHttpCacheGeneration(url);
         const baseKey = githubHttpCacheKey(url, baseHeaders);
@@ -3488,7 +3492,10 @@
         const patch = /\.patch(?:\?|$)/.test(url);
         const cached = !force && (_githubTextResponses.get(key) || (persistent ? readGithubHttpCache(url, baseHeaders) : null));
         if (cached && immutable) return Promise.resolve(cached.data);
-        if (cached && patch && Date.now() - cached.ts < GITHUB_TEXT_PATCH_FRESH_MS) {
+        const patchFreshness = freshForMs === undefined
+            ? GITHUB_TEXT_PATCH_FRESH_MS
+            : Math.max(0, Number(freshForMs) || 0);
+        if (cached && patch && Date.now() - cached.ts < patchFreshness) {
             return Promise.resolve(cached.data);
         }
         const headers = force ? { ...baseHeaders, 'Cache-Control': 'no-cache' } : githubConditionalHeaders(baseHeaders, cached);
@@ -3539,10 +3546,11 @@
     }
 
     // Like gmFetch, but returns text. Web patches can rely on GitHub cookies, so keep their bodies in this page session.
-    function gmFetchText(url) {
+    function gmFetchText(url, { freshForMs } = {}) {
         const headers = { ...ghApiHeaders(), Accept: 'text/plain' };
         return gmFetchGithubText(url, headers, {
             persistent: !!headers.Authorization && new URL(url).hostname === 'raw.githubusercontent.com',
+            freshForMs,
         });
     }
 
@@ -4238,12 +4246,19 @@
     }
 
     // Review comment commit and author metadata, cached per PR.
-    let _reviewCommitMap = null; // { prKey, map: { commentId: commitSha }, authors: { commentId: login } }
+    const REVIEW_COMMIT_MAP_FRESH_MS = 10 * 1000;
+    let _reviewCommitMap = null; // { prKey, map, authors, ts }
     let _reviewCommitMapRequest = null; // { prKey, promise }
 
     async function fetchReviewCommentCommits(owner, repo, prNum, apiSnapshots = {}) {
         const prKey = `${owner}/${repo}#${prNum}`;
-        if (_reviewCommitMap && _reviewCommitMap.prKey === prKey) return _reviewCommitMap.map;
+        if (
+            _reviewCommitMap &&
+            _reviewCommitMap.prKey === prKey &&
+            Date.now() - Number(_reviewCommitMap.ts || 0) < REVIEW_COMMIT_MAP_FRESH_MS
+        ) {
+            return _reviewCommitMap.map;
+        }
         if (_reviewCommitMapRequest?.prKey === prKey) return _reviewCommitMapRequest.promise;
 
         const request = { prKey, promise: null };
@@ -4279,7 +4294,7 @@
                 return _reviewCommitMapRequest === request ? map : {};
             }
             if (_reviewCommitMapRequest !== request) return {};
-            _reviewCommitMap = { prKey, map, authors };
+            _reviewCommitMap = { prKey, map, authors, ts: Date.now() };
             return map;
         })();
         try {
@@ -5009,21 +5024,24 @@
 
     const repoDefaultBranchCache = new Map();
     const repoDefaultBranchRequests = new Map();
+    const REPO_DEFAULT_BRANCH_FRESH_MS = 30 * 1000;
 
     async function fetchGitHubRepoDefaultBranch(repo) {
         const repoKey = repo?.repoKey || (repo?.owner && repo?.repo ? `${repo.owner}/${repo.repo}` : '');
         if (!repoKey) return '';
-        if (repoDefaultBranchCache.has(repoKey)) return repoDefaultBranchCache.get(repoKey) || '';
+        const cached = repoDefaultBranchCache.get(repoKey);
+        if (cached && Date.now() - cached.ts < REPO_DEFAULT_BRANCH_FRESH_MS) return cached.branch || '';
+        if (cached) repoDefaultBranchCache.delete(repoKey);
         const embedded = repo?.owner && repo?.repo ? readEmbeddedGitHubRepoInfo(document, `/${repo.owner}/${repo.repo}`) : null;
         if (embedded?.defaultBranch) {
-            repoDefaultBranchCache.set(repoKey, embedded.defaultBranch);
+            repoDefaultBranchCache.set(repoKey, { branch: embedded.defaultBranch, ts: Date.now() });
             return embedded.defaultBranch;
         }
         if (repoDefaultBranchRequests.has(repoKey)) return repoDefaultBranchRequests.get(repoKey);
         const request = gmFetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`)
             .then((data) => {
                 const branch = normalizeBranchName(data?.default_branch || '');
-                if (branch) repoDefaultBranchCache.set(repoKey, branch);
+                if (branch) repoDefaultBranchCache.set(repoKey, { branch, ts: Date.now() });
                 return branch;
             })
             .catch((e) => {
@@ -6750,11 +6768,25 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return `llm_infographic_${pr.owner}_${pr.repo}_${pr.pr}_`;
     }
 
-    function prInfographicCacheKey(pr, headSha, scope = 'pr') {
+    function prInfographicCacheKey(pr, headSha, scope = 'pr', prompt = '') {
         const version = `v${PR_INFOGRAPHIC_PROMPT_VERSION}`;
         const sha = /^[0-9a-f]{7,40}$/i.test(String(headSha || '')) ? String(headSha).toLowerCase() : 'unknown';
         const scopeKey = scope === 'commit' ? 'commit' : 'pr';
-        return `${prInfographicCachePrefix(pr)}${scopeKey}_${OPENAI_IMAGE_MODEL}_${OPENAI_IMAGE_SIZE}_${OPENAI_IMAGE_QUALITY}_${OPENAI_IMAGE_FORMAT}_${OPENAI_IMAGE_BACKGROUND}_${OPENAI_IMAGE_MODERATION}_${version}_${sha}`;
+        const exactPrompt = String(prompt || '');
+        if (!exactPrompt) return '';
+        const request = JSON.stringify({
+            endpoint: 'https://api.openai.com/v1/images/generations',
+            credentialScope: hashPrompt(String(getLLMConfig().openai?.key || '')),
+            model: OPENAI_IMAGE_MODEL,
+            prompt: exactPrompt,
+            n: 1,
+            size: OPENAI_IMAGE_SIZE,
+            quality: OPENAI_IMAGE_QUALITY,
+            outputFormat: OPENAI_IMAGE_FORMAT,
+            background: OPENAI_IMAGE_BACKGROUND,
+            moderation: OPENAI_IMAGE_MODERATION,
+        });
+        return `${prInfographicCachePrefix(pr)}${scopeKey}_${version}_${sha}_${hashPrompt(request)}`;
     }
 
     function robotChatHistoryKeyForPage(ctx = parsePageContext() || currentCommitRepoContext?.() || null) {
@@ -6779,17 +6811,19 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return null;
     }
 
-    function getInfographicCache(pr, headSha, scope = 'pr') {
+    function getInfographicCache(pr, headSha, scope = 'pr', prompt = '') {
         if (!getLLMConfig().cacheEnabled) return null;
-        const key = prInfographicCacheKey(pr, headSha, scope);
+        const key = prInfographicCacheKey(pr, headSha, scope, prompt);
+        if (!key) return null;
         const cached = normalizeInfographicCacheValue(GM_getValue(key, null));
         if (cached) recordCacheTimestamp(key);
         return cached;
     }
 
-    function setInfographicCache(pr, headSha, value, scope = 'pr') {
+    function setInfographicCache(pr, headSha, value, scope = 'pr', prompt = '') {
         if (!getLLMConfig().cacheEnabled) return;
-        const key = prInfographicCacheKey(pr, headSha, scope);
+        const key = prInfographicCacheKey(pr, headSha, scope, prompt);
+        if (!key) return;
         GM_setValue(key, value);
         recordCacheTimestamp(key);
     }
@@ -6838,6 +6872,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (!pr) return 0;
         const kind = pageKind() || 'pull';
         const prefix = `llm_cache_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_`;
+        const promptPrefixV2 = `llm_prompt_v${LLM_PROMPT_CACHE_SCHEMA}_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const promptPrefix = `llm_prompt_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_`;
         // Also clear legacy keys without kind prefix
         const legacyPrefix = `llm_cache_${pr.owner}_${pr.repo}_${pr.pr}_`;
@@ -6853,6 +6888,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         keys.forEach((k) => {
             if (
                 k.startsWith(prefix) ||
+                k.startsWith(promptPrefixV2) ||
                 k.startsWith(promptPrefix) ||
                 k.startsWith(legacyPrefix) ||
                 k.startsWith(legacyPromptPrefix) ||
@@ -6933,7 +6969,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         _githubTextRequests.clear();
         _githubTextResponses.clear();
         _githubTextForceGenerations.clear();
+        repoDefaultBranchCache.clear();
+        repoDefaultBranchRequests.clear();
+        reactorCache.clear();
         _rawFileCache.clear();
+        _prPatchCache.clear();
         clearCommitPatchCache();
         commitListCache.clear();
         invalidatePRContext();
@@ -7863,12 +7903,33 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         );
     }
 
-    // Build a deterministic cache key for an LLM prompt (provider + model + page + content hash).
-    function buildPromptCacheKey(provider, model, system, userContent, reasoningEffort = '') {
+    const LLM_PROMPT_CACHE_SCHEMA = 2;
+
+    // Every option that can change a successful response participates in the
+    // key. Timeout and streaming only affect transport, not response semantics.
+    function buildPromptCacheKey(
+        provider,
+        model,
+        system,
+        userContent,
+        reasoningEffort = '',
+        maxTokens = LLM_DEFAULT_MAX_TOKENS,
+    ) {
         const pr = parsePageContext();
         if (!pr) return null;
         const kind = pageKind() || 'pull';
-        return `llm_prompt_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${reasoningEffort || 'default'}_${hashPrompt(system + '\0' + userContent)}`;
+        const limit = Number(maxTokens) || LLM_DEFAULT_MAX_TOKENS;
+        const request = JSON.stringify({
+            schema: LLM_PROMPT_CACHE_SCHEMA,
+            provider,
+            credentialScope: hashPrompt(String(getLLMConfig()[provider]?.key || '')),
+            model,
+            system,
+            userContent,
+            reasoningEffort: reasoningEffort || '',
+            maxTokens: limit,
+        });
+        return `llm_prompt_v${LLM_PROMPT_CACHE_SCHEMA}_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${reasoningEffort || 'default'}_${limit}_${hashPrompt(request)}`;
     }
 
     function formatErrorField(value) {
@@ -8123,9 +8184,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const cfg = llmCfg[provider];
         const model = (modelOverride || cfg?.model || '').trim();
         const cacheEnabled = llmCfg.cacheEnabled;
+        const effectiveMaxTokens = maxTokens || LLM_DEFAULT_MAX_TOKENS;
         const promptKey =
             !skipCache && cacheEnabled && cfg
-                ? buildPromptCacheKey(provider, model, system, userContent, reasoningEffort)
+                ? buildPromptCacheKey(provider, model, system, userContent, reasoningEffort, effectiveMaxTokens)
                 : null;
         if (promptKey) {
             const cached = GM_getValue(promptKey, null);
@@ -8139,7 +8201,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
         const requestUrl = providerRequestUrl(api, model, cfg.key);
-        const effectiveMaxTokens = maxTokens || LLM_DEFAULT_MAX_TOKENS;
         const streaming = !!api.streamBody && shouldStreamLLMRequest(provider, { timeoutMs, maxTokens: effectiveMaxTokens });
         const rawBody = api.body(model, system, userContent, { reasoningEffort, maxTokens: effectiveMaxTokens });
         const requestBody = JSON.stringify(streaming ? api.streamBody(rawBody) : rawBody);
@@ -8480,10 +8541,29 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return out.join('\n');
     }
 
-    function fetchPatch(pr) {
-        return gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`).then(
-            stripDeletedFileBodiesFromPatch,
-        );
+    const _prPatchCache = new Map();
+    const PR_PATCH_CACHE_MAX = 6;
+
+    function fetchPatch(pr, opts = {}) {
+        const expectedHead = String(opts.expectedHead || getImmediatePRHeadSHA() || '').toLowerCase();
+        const exactHead = /^[0-9a-f]{40}$/i.test(expectedHead) ? expectedHead : '';
+        const key = exactHead ? `${pr.owner}/${pr.repo}#${pr.pr}:${exactHead}` : '';
+        if (key && _prPatchCache.has(key)) return _prPatchCache.get(key);
+        const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`;
+        const request = gmFetchText(url, { freshForMs: 0 }).then((patch) => {
+            if (exactHead && jevCommentPatchHead(patch).toLowerCase() !== exactHead) {
+                throw new Error(`PR patch head does not match ${exactHead}`);
+            }
+            return stripDeletedFileBodiesFromPatch(patch);
+        });
+        if (!key) return request;
+        const tracked = request.catch((error) => {
+            _prPatchCache.delete(key);
+            throw error;
+        });
+        _prPatchCache.set(key, tracked);
+        while (_prPatchCache.size > PR_PATCH_CACHE_MAX) _prPatchCache.delete(_prPatchCache.keys().next().value);
+        return tracked;
     }
 
     function extractPatchFilePaths(patchText) {
@@ -8521,12 +8601,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function fetchComparePatch(path = location.pathname) {
         const url = comparePatchUrl(path);
-        return url ? gmFetchText(url).then(stripDeletedFileBodiesFromPatch) : Promise.resolve('');
+        return url ? gmFetchText(url, { freshForMs: 0 }).then(stripDeletedFileBodiesFromPatch) : Promise.resolve('');
     }
 
     // Shared context helper: fetches diff, commit messages, PR description.
-    // Cached in-memory per PR. Requires explicit invalidatePRContext() on
-    // force-push detection and on page re-inject (handles edited descriptions).
+    // The transport layer reuses exact URLs and ETags. The assembled context is
+    // retained only as a head hint; it is never returned without rechecking its
+    // inputs because a title or description edit need not change the head SHA.
     let _prContextCache = null;
     let _prContextKey = '';
     let _prContextGeneration = 0;
@@ -8547,9 +8628,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     async function fetchPRContext(pr) {
         if (!pr) return emptyPRContext();
-        // Check cache first (keyed on owner/repo/pr - invalidated on force-push/submit)
-        const baseKey = `${pr.owner}/${pr.repo}/${pr.pr}`;
-        if (_prContextCache && _prContextKey.startsWith(baseKey + ':')) return _prContextCache;
         const generation = _prContextGeneration;
         let complete = false;
         const ctx = emptyPRContext();
@@ -8575,10 +8653,21 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 ctx.closedAt = prResp.value.closed_at || '';
                 ctx.draft = !!prResp.value.draft;
             }
+            if (
+                ctx.diff &&
+                /^[0-9a-f]{40}$/i.test(ctx.headSha) &&
+                jevCommentPatchHead(ctx.diff).toLowerCase() !== ctx.headSha.toLowerCase()
+            ) {
+                try {
+                    ctx.diff = await fetchPatch(pr, { expectedHead: ctx.headSha });
+                } catch (_) {
+                    ctx.diff = '';
+                }
+            }
             complete = [patchResp, commitsResp, prResp].every((response) => response.status === 'fulfilled');
         } catch (_) {}
-        // Cache key includes head SHA for diagnostics; actual invalidation
-        // happens via explicit invalidatePRContext() calls on submit/force-push/navigation
+        // The head-bound copy only helps synchronous callers identify the
+        // current revision. fetchPRContext itself always reassembles the value.
         const key = `${pr.owner}/${pr.repo}/${pr.pr}:${ctx.headSha || ''}`;
         if (complete && generation === _prContextGeneration) {
             _prContextCache = ctx;
@@ -8821,8 +8910,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function fetchCommitPatch(pr, sha) {
         if (!pr?.owner || !pr?.repo || !sha) return Promise.resolve('');
+        const cacheable = /^[0-9a-f]{40}$/i.test(String(sha));
         const key = commitPatchCacheKey(pr, sha);
-        const cached = _commitPatchCache.get(key);
+        const cached = cacheable ? _commitPatchCache.get(key) : null;
         if (cached) {
             // Refresh LRU position
             _commitPatchCache.delete(key);
@@ -8836,6 +8926,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             _commitPatchCache.delete(key);
             throw e;
         });
+        if (!cacheable) return wrapped;
         _commitPatchCache.set(key, wrapped);
         while (_commitPatchCache.size > COMMIT_PATCH_CACHE_MAX) {
             const oldestKey = _commitPatchCache.keys().next().value;
@@ -8967,7 +9058,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     function gatherChatContext(pageIndex) {
         const pr = parsePageContext();
         if (!pr) return '';
-        const provider = getActiveProvider();
         const parts = [];
 
         // PR title + description from page
@@ -8986,29 +9076,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             parts.push(
                 `Commits (${commits.length}):\n${commits.map((c) => `- ${c.sha.slice(0, 8)}: ${c.msg}`).join('\n')}`,
             );
-        }
-
-        // Cached LLM conclusions
-        const cachedPR = getCache(provider, pr, 'full');
-        if (cachedPR) parts.push(`Cached PR Analysis:\n${cachedPR.slice(0, 8000)}`);
-
-        const cachedCommits = getCache(provider, pr, 'commits_list');
-        if (cachedCommits) parts.push(`Cached Commits Analysis:\n${cachedCommits.slice(0, 5000)}`);
-
-        // Individual commit analyses
-        for (const c of commits) {
-            const cached = getCache(provider, pr, `commit_${c.sha.slice(0, 12)}`);
-            if (cached) parts.push(`Cached analysis for ${c.sha.slice(0, 8)} (${c.msg}):\n${cached.slice(0, 3000)}`);
-        }
-
-        // Batch commit explanations
-        const batchKey = commitExplainCacheKey(pr, provider);
-        const batchExplain = GM_getValue(batchKey, null);
-        if (batchExplain) {
-            const entries = Object.entries(batchExplain)
-                .map(([sha, exp]) => `${sha}: ${exp}`)
-                .join('\n');
-            parts.push(`Cached commit explanations:\n${entries}`);
         }
 
         // Visible page comments with [ref:N] markers for citation
@@ -11767,17 +11834,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     (thread) =>
                         thread.recipe === recipe &&
                         thread.messages.some((m) => m.role === 'assistant') &&
-                        ((recipePromptKey && thread.recipePromptKey === recipePromptKey) ||
-                            (recipePromptHash && thread.recipePromptHash === recipePromptHash)),
+                        (recipePromptKey
+                            ? thread.recipePromptKey === recipePromptKey
+                            : recipePromptHash && thread.recipePromptHash === recipePromptHash),
                 ) || null
             );
         }
 
-        function buildRecipePromptMeta(recipe, recipeCfg, provider, system, userContent, reasoningEffort, modelOverride) {
+        function buildRecipePromptMeta(
+            recipe,
+            recipeCfg,
+            provider,
+            system,
+            userContent,
+            reasoningEffort,
+            modelOverride,
+            maxTokens,
+        ) {
             const model = (modelOverride || getLLMConfig()[provider]?.model || '').trim();
-            const recipePromptKey = buildPromptCacheKey(provider, model, system, userContent, reasoningEffort) || '';
+            const recipePromptKey = buildPromptCacheKey(
+                provider,
+                model,
+                system,
+                userContent,
+                reasoningEffort,
+                maxTokens,
+            ) || '';
             const recipePromptHash = hashPrompt(
-                [recipe, provider, model, reasoningEffort || 'default', system, userContent].join('\0'),
+                [
+                    recipe,
+                    provider,
+                    hashPrompt(String(getLLMConfig()[provider]?.key || '')),
+                    model,
+                    reasoningEffort || 'default',
+                    maxTokens,
+                    system,
+                    userContent,
+                ].join('\0'),
             );
             return {
                 recipe,
@@ -12325,6 +12418,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const generatedPrompt = copyableRecipe ? formatLLMPromptPreview(system, userContent) : '';
                     const modelOverride = getHighContextModelOverride(provider);
                     const reasoningEffort = getHighContextReasoningEffort(provider);
+                    const recipeMaxTokens = recipeCfg.maxTokens || getHighContextMaxTokens(provider);
                     const recipePromptMeta = buildRecipePromptMeta(
                         recipe,
                         recipeCfg,
@@ -12333,6 +12427,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         userContent,
                         reasoningEffort,
                         modelOverride,
+                        recipeMaxTokens,
                     );
                     if (copyPromptOnly) {
                         stopSpin();
@@ -12377,7 +12472,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const result = await callLLM(provider, system, userContent, {
                         modelOverride,
                         reasoningEffort,
-                        maxTokens: recipeCfg.maxTokens || getHighContextMaxTokens(provider),
+                        maxTokens: recipeMaxTokens,
                         timeoutMs: getHighContextTimeoutMs(provider),
                         requestLabel: recipe,
                     });
@@ -12853,22 +12948,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             card.setStatus('Reading PR metadata...');
             const ctx = await fetchPRContext(pr);
             const target = buildInfographicTarget(pr, ctx);
-            const cached = getInfographicCache(pr, target.cacheSha, target.scope);
-            if (cached && !promptOnly) {
-                card.resolve(cached, { cached: true });
-                return;
-            }
-            if (cached?.prompt && promptOnly) {
-                await card.resolvePrompt(cached.prompt, { cached: true });
-                return;
-            }
-
             card.setStatus(`Gathering ${target.sourceLabel} context...`);
             const fullContext = await gatherInfographicContext(target, (msg) => card.setStatus(msg));
             card.setStatus('Designing visual brief...');
             prompt = await buildInfographicImagePrompt(fullContext, target.prUrl, target);
+            const cached = getInfographicCache(pr, target.cacheSha, target.scope, prompt);
+            if (cached && !promptOnly) {
+                card.resolve(cached, { cached: true });
+                return;
+            }
             if (promptOnly) {
-                await card.resolvePrompt(prompt);
+                await card.resolvePrompt(prompt, { cached: !!cached });
                 return;
             }
             card.setStatus(`Generating image with ${OPENAI_IMAGE_MODEL}...`);
@@ -12880,7 +12970,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 headSha: target.cacheSha,
                 sourceUrl: target.sourceUrl,
             };
-            setInfographicCache(pr, target.cacheSha, enriched, target.scope);
+            setInfographicCache(pr, target.cacheSha, enriched, target.scope, prompt);
             card.resolve(enriched);
         } catch (e) {
             card.reject(e, { prompt });
@@ -17027,7 +17117,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevCacheId(kind, state) {
-        return hashPrompt(JSON.stringify([JEV_SCHEMA[kind], JEV_MODEL, kind, state]));
+        return hashPrompt(JSON.stringify({
+            endpoint: 'https://api.typesafe.ai/v1/systemone',
+            credentialScope: hashPrompt(String(GM_getValue('jev_api_key', '') || '').trim()),
+            model: JEV_MODEL,
+            kind,
+            questions: JEV_QUESTIONS[kind],
+            responseSchema: JEV_SCHEMA[kind],
+            state,
+        }));
     }
 
     function jevCacheEntries() {
@@ -17676,15 +17774,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function jevCommentCurrentEvidence(pr) {
         const resetGeneration = jevCommentResetGeneration;
         const immediateHead = readHeadShaFromSSR();
-        const key = `${pr.owner}/${pr.repo}#${pr.pr}:${immediateHead}`;
-        const snapshot = jevCommentEvidenceSnapshots.get(key);
+        const prPrefix = `${pr.owner}/${pr.repo}#${pr.pr}:`;
+        const requestKey = `${prPrefix}${immediateHead || 'unconfirmed'}`;
+        // Never reuse a snapshot whose head could not be established from the
+        // current page. A force push must not inherit evidence stored under an
+        // earlier ambiguous "no SSR head" key.
+        const snapshot = immediateHead ? jevCommentEvidenceSnapshots.get(`${prPrefix}${immediateHead}`) : null;
         if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) return snapshot.evidence;
-        if (jevCommentEvidenceRequests.has(key)) return jevCommentEvidenceRequests.get(key);
+        if (jevCommentEvidenceRequests.has(requestKey)) return jevCommentEvidenceRequests.get(requestKey);
         const request = (async () => {
             const info = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
                 { freshForMs: 0 });
             const head = String(info?.head?.sha || '');
             if (!/^[0-9a-f]{40}$/i.test(head) || (immediateHead && immediateHead !== head)) return null;
+            const confirmedSnapshot = jevCommentEvidenceSnapshots.get(`${prPrefix}${head}`);
+            if (confirmedSnapshot && Date.now() - confirmedSnapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) {
+                return confirmedSnapshot.evidence;
+            }
             const changed = Number(info.changed_files);
             const lines = Number(info.additions) + Number(info.deletions);
             if (!Number.isFinite(changed) || !Number.isFinite(lines) || changed > 25 || lines > 1800) {
@@ -17707,16 +17813,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         })().catch(() => null);
         const tracked = request.then((evidence) => {
             if (evidence && resetGeneration === jevCommentResetGeneration) {
-                jevCommentEvidenceSnapshots.set(key, { evidence, ts: Date.now() });
+                jevCommentEvidenceSnapshots.set(`${prPrefix}${evidence.head}`, { evidence, ts: Date.now() });
                 while (jevCommentEvidenceSnapshots.size > 4) {
                     jevCommentEvidenceSnapshots.delete(jevCommentEvidenceSnapshots.keys().next().value);
                 }
             }
             return evidence;
         }).finally(() => {
-            if (jevCommentEvidenceRequests.get(key) === tracked) jevCommentEvidenceRequests.delete(key);
+            if (jevCommentEvidenceRequests.get(requestKey) === tracked) jevCommentEvidenceRequests.delete(requestKey);
         });
-        jevCommentEvidenceRequests.set(key, tracked);
+        jevCommentEvidenceRequests.set(requestKey, tracked);
         return tracked;
     }
 
@@ -20306,11 +20412,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             const result = await callLLM(provider, system, user);
-            if (isPRBody && prForBody) {
-                const overviewKey = prOverviewCacheKey(prForBody, provider);
-                GM_setValue(overviewKey, result.trim());
-                recordCacheTimestamp(overviewKey);
-            }
             stopSpin();
             btn.textContent = origText;
 
@@ -22845,6 +22946,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         for (const { btn } of currentButtons) {
             btn.click();
+            reactorCache.clear();
             if (await ackSleep(50, lt)) return;
         }
 
@@ -22879,6 +22981,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const opt = await waitForPopupButton(content);
                 if (opt) {
                     opt.click(); // toggles off if already reacted
+                    reactorCache.clear();
                     if (await ackSleep(80, lt)) return;
                 }
                 closeReactionPopup(trigger);
@@ -22901,6 +23004,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         opt.click();
+        reactorCache.clear();
         if (await ackSleep(50, lt)) return;
         closeReactionPopup(trigger);
         console.log(`ACKtopus: applyReactionChoice clicked ${desired}`);
@@ -22922,6 +23026,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         eyes: 'eyes',
     };
     const reactorCache = new Map();
+    const REACTOR_CACHE_FRESH_MS = 10 * 1000;
 
     function getCommentReactionMeta(el) {
         let node = el;
@@ -22948,8 +23053,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommentReactors(owner, repo, prNumber, meta) {
-        const key = `${owner}/${repo}#${prNumber}:${meta.type}:${meta.id || 'body'}`;
-        if (reactorCache.has(key)) return reactorCache.get(key);
+        const key = `${githubHttpCacheScope(ghApiHeaders())}:${owner}/${repo}#${prNumber}:${meta.type}:${meta.id || 'body'}`;
+        const cached = reactorCache.get(key);
+        if (cached && Date.now() - cached.ts < REACTOR_CACHE_FRESH_MS) return cached.data;
+        if (cached) reactorCache.delete(key);
 
         let url;
         if (meta.type === 'pr_body') {
@@ -22971,7 +23078,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         try {
             const result = groupByContent(await gmFetch(`${url}?per_page=100`));
-            reactorCache.set(key, result);
+            reactorCache.set(key, { data: result, ts: Date.now() });
             return result;
         } catch {
             return {};
@@ -25197,13 +25304,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return panel;
     }
 
-    // Cache key for the batch commits explanation
-    function commitExplainCacheKey(pr, provider) {
-        return `llm_explain_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_commits`;
+    const LLM_AGGREGATE_CACHE_SCHEMA = 2;
+
+    function llmAggregateCacheKey(prefix, pr, provider, input) {
+        if (!pr || !provider || !input) return '';
+        const model = getLLMConfig()[provider]?.model || 'default';
+        const request = JSON.stringify({
+            schema: LLM_AGGREGATE_CACHE_SCHEMA,
+            provider,
+            credentialScope: hashPrompt(String(getLLMConfig()[provider]?.key || '')),
+            model,
+            input,
+        });
+        return `${prefix}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_v${LLM_AGGREGATE_CACHE_SCHEMA}_${hashPrompt(request)}`;
     }
 
-    function commitReviewAidCacheKey(pr, provider) {
-        return `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
+    // Exact aggregate keys complement callLLM's per-prompt cache. They include
+    // every commit and contextual input used to assemble all chunk responses.
+    function commitExplainCacheKey(pr, provider, input) {
+        return llmAggregateCacheKey('llm_explain', pr, provider, input);
+    }
+
+    function commitReviewAidCacheKey(pr, provider, input) {
+        return llmAggregateCacheKey('llm_lightbulb', pr, provider, input);
     }
 
     // Batch results are keyed by 8-char SHA prefixes, but older caches and some
@@ -25215,10 +25338,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (direct) return direct;
         const key = Object.keys(map).find((k) => k.startsWith(short.slice(0, 6)));
         return key ? map[key] : undefined;
-    }
-
-    function prOverviewCacheKey(pr, provider) {
-        return `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_${provider}`;
     }
 
     function lightbulbAutoOpenKey(pr, provider, mode) {
@@ -25242,21 +25361,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const v = !!GM_getValue(k, false);
         if (v) GM_setValue(k, false);
         return v;
-    }
-
-    function getCachedPRLightbulbOverview(pr, preferredProvider = null) {
-        if (!pr) return null;
-        const providers = preferredProvider
-            ? [preferredProvider, ...Object.keys(PROVIDER_META).filter((p) => p !== preferredProvider)]
-            : Object.keys(PROVIDER_META);
-        for (const prov of providers) {
-            const k = prOverviewCacheKey(pr, prov);
-            const txt = GM_getValue(k, '');
-            if (typeof txt === 'string' && txt.trim()) {
-                return { provider: prov, text: txt.trim() };
-            }
-        }
-        return null;
     }
 
     function clampLLMContext(text, maxChars = 320000) {
@@ -25373,9 +25477,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return commitEntries;
     }
 
-    async function fetchCommitReviewAidChunk(pr, commits, { provider, extraContext = '' } = {}) {
+    async function buildCommitReviewAidRequest(pr, commits, { provider, extraContext = '' } = {}) {
         const commitEntries = await buildCommitPromptEntries(pr, commits);
-
         const config = getLLMConfig();
         const extraInstr = config.instructions.pseudocode || DEFAULT_INSTRUCTIONS.pseudocode;
         const system = `${getReviewSystemBase()}\n\n${extraInstr}\n\nReturn ONLY valid JSON. No markdown fences, no preamble.\nFormat: {"<8-char-sha>": {"summary": "...", "context": "...", "files_overview": "...", "why_care": "...", "pseudocode": "...", "verify_repro": "...", "performance_simplifications": "...", "concerns": "...", "message_check": "...", "depends": "..."}}`;
@@ -25383,18 +25486,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ? `\n\nComprehensive PR context (description, commits, responses, and patch where available):\n${extraContext}`
             : '';
         const user = `PR has ${commits.length} commit(s) in this batch. For each one, produce a structured review aid.\n\n${commitEntries.join('\n---\n')}${contextBlock}\n\nReturn JSON mapping each 8-char SHA prefix to its review aid object.`;
-        const raw = await callLLM(provider, system, user, {
+        const options = {
             modelOverride: extraContext ? getHighContextModelOverride(provider) : '',
             reasoningEffort: extraContext ? getHighContextReasoningEffort(provider) : '',
             maxTokens: extraContext ? getHighContextMaxTokens(provider) : 0,
             requestLabel: 'lightbulb-review-aid',
-        });
+        };
+        return { system, user, options };
+    }
+
+    async function fetchCommitReviewAidChunk(pr, commits, { provider, extraContext = '', request = null } = {}) {
+        const exactRequest = request || (await buildCommitReviewAidRequest(pr, commits, { provider, extraContext }));
+        const raw = await callLLM(provider, exactRequest.system, exactRequest.user, exactRequest.options);
         return parseLLMJsonObject(raw);
     }
 
-    async function fetchCommitExplainChunk(pr, commits, { provider, extraContext = '', fullPatch = '' } = {}) {
+    async function buildCommitExplainRequest(pr, commits, { provider, extraContext = '', fullPatch = '' } = {}) {
         const commitEntries = await buildCommitPromptEntries(pr, commits, fullPatch.length);
-
         const config = getLLMConfig();
         const extra = config.instructions.commits || DEFAULT_INSTRUCTIONS.commits;
         const system = `${getReviewSystemBase()}\n\n${extra}\n\nReturn ONLY valid JSON. No markdown fences, no preamble. Format: {"<8-char-sha>": "1-2 sentence explanation of how this commit fits into the PR"}`;
@@ -25402,33 +25510,66 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ? `\n\nAdditional PR context (description, commits, and responses):\n${extraContext}`
             : '';
         const user = `PR commits:\n\n${commitEntries.join('\n---\n')}\n\n${fullPatch ? `Full PR patch for context:\n${fullPatch}` : ''}${extraContextBlock}\n\nFor each commit, explain at a high level how it fits into the whole PR. Return JSON mapping each 8-char SHA prefix to a brief explanation.`;
-        const raw = await callLLM(provider, system, user, {
+        const options = {
             modelOverride: (extraContext || fullPatch) ? getHighContextModelOverride(provider) : '',
             reasoningEffort: (extraContext || fullPatch) ? getHighContextReasoningEffort(provider) : '',
             maxTokens: (extraContext || fullPatch) ? getHighContextMaxTokens(provider) : 0,
             requestLabel: 'commit-explain',
-        });
+        };
+        return { system, user, options };
+    }
+
+    async function fetchCommitExplainChunk(
+        pr,
+        commits,
+        { provider, extraContext = '', fullPatch = '', request = null } = {},
+    ) {
+        const exactRequest =
+            request || (await buildCommitExplainRequest(pr, commits, { provider, extraContext, fullPatch }));
+        const raw = await callLLM(provider, exactRequest.system, exactRequest.user, exactRequest.options);
         return parseLLMJsonObject(raw);
     }
 
     async function fetchBatchCommitReviewAids(pr, commits, opts = {}) {
         const provider = opts.providerOverride || getActiveProvider();
         const forceRefresh = !!opts.forceRefresh;
+        if (!isProviderAvailable(provider)) return null;
         const extraContextRaw = typeof opts.extraContext === 'string' ? opts.extraContext : '';
         const extraContext = extraContextRaw.trim();
-        const ck = commitReviewAidCacheKey(pr, provider);
-        if (!forceRefresh) {
-            const cached = GM_getValue(ck, null);
-            if (cached) return cached;
-        }
-        if (!isProviderAvailable(provider)) return null;
-
-        const parsedAll = {};
         const chunkedContext = extraContext
             ? clampLLMContext(extraContext, commits.length > MAX_REVIEW_AID_BATCH_COMMITS ? 90000 : 180000)
             : '';
+        const initialChunks = [];
+        for (let i = 0; i < commits.length; i += MAX_REVIEW_AID_BATCH_COMMITS) {
+            const chunk = commits.slice(i, i + MAX_REVIEW_AID_BATCH_COMMITS);
+            initialChunks.push({
+                commits: chunk,
+                request: await buildCommitReviewAidRequest(pr, chunk, {
+                    provider,
+                    extraContext: chunkedContext,
+                }),
+            });
+        }
+        const cacheInput = {
+            chunks: initialChunks.map(({ request }) => ({
+                system: request.system,
+                user: request.user,
+                modelOverride: request.options.modelOverride,
+                reasoningEffort: request.options.reasoningEffort,
+                maxTokens: request.options.maxTokens || LLM_DEFAULT_MAX_TOKENS,
+            })),
+        };
+        const cacheable = getLLMConfig().cacheEnabled &&
+            commits.every((commit) => /^[0-9a-f]{40}$/i.test(String(commit.sha || '')));
+        const ck = cacheable ? commitReviewAidCacheKey(pr, provider, cacheInput) : '';
+        if (!forceRefresh) {
+            const cached = ck ? GM_getValue(ck, null) : null;
+            if (cached) return cached;
+        }
+        const parsedAll = {};
+        let usedFallback = false;
 
-        const fetchChunkRecursive = async (chunk) => {
+        const fetchChunkRecursive = async (chunk, request = null) => {
             if (!chunk.length) return;
             try {
                 Object.assign(
@@ -25436,6 +25577,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     await fetchCommitReviewAidChunk(pr, chunk, {
                         provider,
                         extraContext: chunkedContext,
+                        request,
                     }),
                 );
             } catch (e) {
@@ -25443,6 +25585,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     console.error('ACKtopus: commit review aid chunk failed:', chunk[0]?.sha?.slice(0, 8), e);
                     return;
                 }
+                usedFallback = true;
                 const mid = Math.ceil(chunk.length / 2);
                 await fetchChunkRecursive(chunk.slice(0, mid));
                 await fetchChunkRecursive(chunk.slice(mid));
@@ -25450,12 +25593,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         try {
-            for (let i = 0; i < commits.length; i += MAX_REVIEW_AID_BATCH_COMMITS) {
-                await fetchChunkRecursive(commits.slice(i, i + MAX_REVIEW_AID_BATCH_COMMITS));
+            for (const chunk of initialChunks) {
+                await fetchChunkRecursive(chunk.commits, chunk.request);
             }
             if (Object.keys(parsedAll).length === 0) return null;
-            GM_setValue(ck, parsedAll);
-            recordCacheTimestamp(ck);
+            if (ck && !usedFallback) {
+                GM_setValue(ck, parsedAll);
+                recordCacheTimestamp(ck);
+            }
             return parsedAll;
         } catch (e) {
             console.error('ACKtopus: batch commit review aid failed:', e);
@@ -25467,22 +25612,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function precomputeLightbulbCachesFromPRBody(pr, provider, prBodyText, prAuthor) {
         if (!pr || !provider) return;
-        const inFlightKey = `${pr.owner}/${pr.repo}/${pr.pr}:${provider}`;
+        const llmConfig = getLLMConfig();
+        const inFlightKey = `${pr.owner}/${pr.repo}/${pr.pr}:${provider}:${hashPrompt(
+            JSON.stringify({
+                headSha: getImmediatePRHeadSHA() || '',
+                prBodyText: prBodyText || '',
+                prAuthor: prAuthor || '',
+                model: llmConfig[provider]?.model || '',
+                instructions: llmConfig.instructions || {},
+                highContextModel: getHighContextModelOverride(provider),
+                highContextReasoning: getHighContextReasoningEffort(provider),
+                highContextMaxTokens: getHighContextMaxTokens(provider),
+            }),
+        )}`;
         if (_prBodyLightbulbPrecomputeInFlight.has(inFlightKey)) {
             return _prBodyLightbulbPrecomputeInFlight.get(inFlightKey);
         }
 
         const job = (async () => {
-            const commitExplainKey = commitExplainCacheKey(pr, provider);
-            const reviewAidKey = commitReviewAidCacheKey(pr, provider);
-            const hasCommitExplain = !!GM_getValue(commitExplainKey, null);
-            const hasReviewAid = !!GM_getValue(reviewAidKey, null);
-            if (hasCommitExplain && hasReviewAid) {
-                setLightbulbAutoOpen(pr, provider, 'commits', true);
-                setLightbulbAutoOpen(pr, provider, 'commit', true);
-                return;
-            }
-
             console.log('ACKtopus: PR-body lightbulb precompute started', {
                 provider,
                 pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
@@ -25511,26 +25658,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (pageContext) contextParts.push(wrapPromptBlock('FULL PR CONTEXT SNAPSHOT', pageContext));
             const fullContext = contextParts.filter(Boolean).join('\n\n');
 
-            await Promise.all([
-                hasCommitExplain
-                    ? Promise.resolve()
-                    : fetchBatchCommitExplanations(pr, commits, {
-                          providerOverride: provider,
-                          extraContext: fullContext,
-                      }),
-                hasReviewAid
-                    ? Promise.resolve()
-                    : fetchBatchCommitReviewAids(pr, commits, {
-                          providerOverride: provider,
-                          extraContext: fullContext,
-                      }),
+            const [commitExplanations, reviewAids] = await Promise.all([
+                fetchBatchCommitExplanations(pr, commits, {
+                    providerOverride: provider,
+                    extraContext: fullContext,
+                }),
+                fetchBatchCommitReviewAids(pr, commits, {
+                    providerOverride: provider,
+                    extraContext: fullContext,
+                }),
             ]);
 
-            if (GM_getValue(commitExplainKey, null)) setLightbulbAutoOpen(pr, provider, 'commits', true);
-            if (GM_getValue(reviewAidKey, null)) setLightbulbAutoOpen(pr, provider, 'commit', true);
+            if (commitExplanations) setLightbulbAutoOpen(pr, provider, 'commits', true);
+            if (reviewAids) setLightbulbAutoOpen(pr, provider, 'commit', true);
             console.log('ACKtopus: PR-body lightbulb precompute finished', {
-                commitListCached: !!GM_getValue(commitExplainKey, null),
-                singleCommitCached: !!GM_getValue(reviewAidKey, null),
+                commitListCached: !!commitExplanations,
+                singleCommitCached: !!reviewAids,
             });
         })();
 
@@ -25635,7 +25778,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const selected = String(ctx.text || '').trim().replace(/\r\n/g, '\n');
         const parent = String(ctx.parentText || '').trim().replace(/\r\n/g, '\n');
         const selectedExcerpt = selected.length > 2000 ? `${selected.slice(0, 2000)}\n[selection clipped]` : selected;
-        const overview = getCachedPRLightbulbOverview(ctx.pr, provider)?.text || '';
         const locationText = [
             ctx.commitSha ? `Commit ${ctx.commitSha.slice(0, 8)}` : '',
             ctx.file || '',
@@ -25649,7 +25791,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'In 1-2 very short lines (max 180 characters total), describe the role or purpose of the selection in the change. Add useful context or implications; do not paraphrase the selection. If the supplied context is insufficient, say so. No markdown, quotes, or preamble.';
         const user = [
             locationText,
-            overview ? `PR overview:\n${overview.slice(0, 1000)}` : '',
             parent && parent !== selected ? `Containing text block:\n${parent.slice(0, 2000)}` : '',
             ctx.threadText ? `Thread context:\n${ctx.threadText.slice(0, 1500)}` : '',
             ctx.contextLines ? `Nearby lines:\n${ctx.contextLines.slice(0, 1000)}` : '',
@@ -26232,43 +26373,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return bar;
     }
 
-    function getCachedCommitReviewAid(pr, sha) {
-        if (!pr || !sha) return null;
-        for (const prov of Object.keys(PROVIDER_META)) {
-            const data = findCommitEntryBySha(GM_getValue(commitReviewAidCacheKey(pr, prov), null), sha);
-            if (data) return { provider: prov, data };
-        }
-        return null;
-    }
-
-    function formatCommitReviewAidForPrompt(aid) {
-        if (!aid?.data) return '';
-        const d = aid.data;
-        const pick = (k, max = 6000) => {
-            const v = d?.[k];
-            if (!v) return '';
-            const s = typeof v === 'string' ? v : JSON.stringify(v);
-            return s.length > max ? s.slice(0, max) + `\n...[TRUNCATED ${s.length - max} chars]...` : s;
-        };
-        const summary = pick('summary', 3000);
-        const whyCare = pick('why_care', 4000);
-        const pseudo = pick('pseudocode', 8000);
-        const verify = pick('verify_repro', 4000);
-        const perf = pick('performance_simplifications', 4000);
-        const concerns = pick('concerns', 3000);
-        return [
-            `Commit review aid (cached, provider=${aid.provider}):`,
-            summary ? `Summary:\n${summary}` : '',
-            whyCare ? `Why this matters:\n${whyCare}` : '',
-            pseudo ? `Pseudocode:\n${pseudo}` : '',
-            verify ? `Verify/reproduce:\n${verify}` : '',
-            perf ? `Performance/simplifications:\n${perf}` : '',
-            concerns ? `Concerns:\n${concerns}` : '',
-        ]
-            .filter(Boolean)
-            .join('\n\n');
-    }
-
     async function fetchCommitPatchForSelection(ctx) {
         if (!ctx?.pr || !ctx.commitSha) return '';
         try {
@@ -26312,13 +26416,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         try {
             const prCtx = ctx.pr ? await fetchPRContext(ctx.pr) : null;
-            const aid =
-                mode === 'proofread' || mode === 'factcheck' ? null : getCachedCommitReviewAid(ctx.pr, ctx.commitSha);
-            const aidText = aid ? formatCommitReviewAidForPrompt(aid) : '';
-            const prOverview = getCachedPRLightbulbOverview(ctx.pr, provider);
-            const prOverviewText = prOverview?.text
-                ? `PR overview (cached, provider=${prOverview.provider}):\n${prOverview.text.slice(0, 3000)}`
-                : '';
             const patch = mode === 'explain' || mode === 'simplify' ? await fetchCommitPatchForSelection(ctx) : '';
 
             const loc = [
@@ -26403,7 +26500,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     selectionBlock,
                     parentTextBlock,
                     threadBlock,
-                    prOverviewText,
                     titleText ? `PR title:\n${titleText}` : '',
                     descText ? `PR description:\n${descText}` : '',
                     commitsText ? `Commit messages:\n${commitsText}` : '',
@@ -26418,8 +26514,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     parentTextBlock,
                     nearby,
                     descriptionBlock,
-                    prOverviewText ? `\n---\n\n${prOverviewText}` : '',
-                    aidText ? `\n---\n\n${aidText}` : '',
                     patchBlock ? `\n---\n\n${patchBlock}` : '',
                 ]
                     .filter(Boolean)
@@ -26583,16 +26677,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function fetchBatchCommitExplanations(pr, commits, opts = {}) {
         const provider = opts.providerOverride || getActiveProvider();
         const forceRefresh = !!opts.forceRefresh;
+        if (!isProviderAvailable(provider)) return null;
         const extraContextRaw = typeof opts.extraContext === 'string' ? opts.extraContext : '';
         const extraContext = extraContextRaw.trim();
-
-        // Check cache first (works even if provider key is currently missing).
-        const ck = commitExplainCacheKey(pr, provider);
-        if (!forceRefresh) {
-            const cached = GM_getValue(ck, null);
-            if (cached) return cached;
-        }
-        if (!isProviderAvailable(provider)) return null;
 
         let fullPatch = '';
         try {
@@ -26604,8 +26691,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             : '';
         const chunkedFullPatch =
             commits.length > MAX_COMMIT_EXPLAIN_BATCH_COMMITS ? fullPatch.slice(0, 20000) : fullPatch;
-
-        const fetchChunkRecursive = async (chunk) => {
+        const initialChunks = [];
+        for (let i = 0; i < commits.length; i += MAX_COMMIT_EXPLAIN_BATCH_COMMITS) {
+            const chunk = commits.slice(i, i + MAX_COMMIT_EXPLAIN_BATCH_COMMITS);
+            initialChunks.push({
+                commits: chunk,
+                request: await buildCommitExplainRequest(pr, chunk, {
+                    provider,
+                    extraContext: chunkedContext,
+                    fullPatch: chunkedFullPatch,
+                }),
+            });
+        }
+        const cacheInput = {
+            chunks: initialChunks.map(({ request }) => ({
+                system: request.system,
+                user: request.user,
+                modelOverride: request.options.modelOverride,
+                reasoningEffort: request.options.reasoningEffort,
+                maxTokens: request.options.maxTokens || LLM_DEFAULT_MAX_TOKENS,
+            })),
+        };
+        const cacheable = getLLMConfig().cacheEnabled &&
+            commits.every((commit) => /^[0-9a-f]{40}$/i.test(String(commit.sha || '')));
+        const ck = cacheable ? commitExplainCacheKey(pr, provider, cacheInput) : '';
+        if (!forceRefresh) {
+            const cached = ck ? GM_getValue(ck, null) : null;
+            if (cached) return cached;
+        }
+        let usedFallback = false;
+        const fetchChunkRecursive = async (chunk, request = null) => {
             if (!chunk.length) return;
             try {
                 Object.assign(
@@ -26614,6 +26729,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         provider,
                         extraContext: chunkedContext,
                         fullPatch: chunkedFullPatch,
+                        request,
                     }),
                 );
             } catch (e) {
@@ -26621,6 +26737,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     console.error('ACKtopus: commit explain chunk failed:', chunk[0]?.sha?.slice(0, 8), e);
                     return;
                 }
+                usedFallback = true;
                 const mid = Math.ceil(chunk.length / 2);
                 await fetchChunkRecursive(chunk.slice(0, mid));
                 await fetchChunkRecursive(chunk.slice(mid));
@@ -26628,12 +26745,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
 
         try {
-            for (let i = 0; i < commits.length; i += MAX_COMMIT_EXPLAIN_BATCH_COMMITS) {
-                await fetchChunkRecursive(commits.slice(i, i + MAX_COMMIT_EXPLAIN_BATCH_COMMITS));
+            for (const chunk of initialChunks) {
+                await fetchChunkRecursive(chunk.commits, chunk.request);
             }
             if (Object.keys(parsedAll).length === 0) return null;
-            GM_setValue(ck, parsedAll);
-            recordCacheTimestamp(ck);
+            if (ck && !usedFallback) {
+                GM_setValue(ck, parsedAll);
+                recordCacheTimestamp(ck);
+            }
             return parsedAll;
         } catch (e) {
             console.error('ACKtopus: batch commit explain failed:', e);
@@ -26700,13 +26819,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
 
                 if (!pr) return;
-                const cachedMap = GM_getValue(commitExplainCacheKey(pr, provider), null);
-                if (!cachedMap && !isProviderAvailable(provider)) {
+                if (!isProviderAvailable(provider)) {
                     console.warn('ACKtopus: commit explain -- no key for', provider);
                     document.body.appendChild(buildConfigPanel());
                     return;
                 }
-
                 // Spinner
                 const origText = btn.textContent;
                 const stopSpin = startBrailleAnimation((frame) => {
@@ -26714,12 +26831,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
 
                 try {
-                    const explanations =
-                        cachedMap || (await fetchBatchCommitExplanations(pr, commits, { providerOverride: provider }));
+                    const explanations = await fetchBatchCommitExplanations(pr, commits, {
+                        providerOverride: provider,
+                    });
                     stopSpin();
                     btn.textContent = origText;
 
-                    if (!explanations) return;
+                    if (!explanations) {
+                        if (!isProviderAvailable(provider)) {
+                            console.warn('ACKtopus: commit explain -- no key for', provider);
+                            document.body.appendChild(buildConfigPanel());
+                        }
+                        return;
+                    }
 
                     const provMeta = PROVIDER_META[provider];
                     for (const cc of commits) {
@@ -26772,11 +26896,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = parsePR();
         if (pr) {
             const provider = getActiveProvider();
-            const ck = commitExplainCacheKey(pr, provider);
             const shouldReopen = !!GM_getValue(commitListLightbulbOpenKey(pr, provider), false);
             const shouldAutoOpen = consumeLightbulbAutoOpen(pr, provider, 'commits');
             const anyOpen = commits.some((c) => c.el.querySelector('.ack-commit-explain-panel'));
-            if ((shouldReopen || shouldAutoOpen) && !anyOpen && GM_getValue(ck, null)) {
+            if ((shouldReopen || shouldAutoOpen) && !anyOpen) {
                 const firstBtn = commits.map((c) => c.el.querySelector('.ack-commit-explain')).find(Boolean);
                 if (firstBtn) setTimeout(() => firstBtn.click(), 0);
             }
@@ -26859,8 +26982,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!pr) return;
             const sha = pathCommitSha();
             if (!sha) return;
-            const preCached = GM_getValue(commitReviewAidCacheKey(pr, provider), null);
-            if (!preCached && !isProviderAvailable(provider)) {
+            if (!isProviderAvailable(provider)) {
                 document.body.appendChild(buildConfigPanel());
                 return;
             }
@@ -26879,16 +27001,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     msg: c.commit?.message?.split('\n')[0] || '',
                 }));
 
-                const ck = commitReviewAidCacheKey(pr, provider);
-                let explanations = preCached || GM_getValue(ck, null);
-
-                if (!explanations) {
-                    explanations = await fetchBatchCommitReviewAids(pr, commits, { providerOverride: provider });
-                }
+                const explanations = await fetchBatchCommitReviewAids(pr, commits, {
+                    providerOverride: provider,
+                });
 
                 stopSpin();
                 btn.textContent = origText;
-                if (!explanations) return;
+                if (!explanations) {
+                    if (!isProviderAvailable(provider)) document.body.appendChild(buildConfigPanel());
+                    return;
+                }
 
                 let data = findCommitEntryBySha(explanations, sha);
 
@@ -26993,10 +27115,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = parsePR();
         if (pr) {
             const provider = getActiveProvider();
-            const ck = commitReviewAidCacheKey(pr, provider);
             const shouldReopen = !!GM_getValue('lightbulb_open', false);
             const shouldAutoOpen = consumeLightbulbAutoOpen(pr, provider, 'commit');
-            if ((shouldReopen || shouldAutoOpen) && GM_getValue(ck, null)) btn.click();
+            if (shouldReopen || shouldAutoOpen) btn.click();
         }
     }
 
@@ -28209,17 +28330,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 commitListCache.clear();
                 if (pr) {
                     for (const prov of Object.keys(PROVIDER_META)) {
-                        const ck = commitExplainCacheKey(pr, prov);
-                        GM_deleteValue(ck);
-                        GM_deleteValue(commitReviewAidCacheKey(pr, prov));
-                        GM_deleteValue(prOverviewCacheKey(pr, prov));
                         GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commits'));
                         GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commit'));
                     }
                     const infographicPrefix = prInfographicCachePrefix(pr);
+                    const aggregatePrefixes = [
+                        `llm_explain_${pr.owner}_${pr.repo}_${pr.pr}_`,
+                        `llm_lightbulb_${pr.owner}_${pr.repo}_${pr.pr}_`,
+                        `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_`,
+                    ];
                     const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
                     keys.forEach((k) => {
-                        if (k.startsWith(infographicPrefix)) GM_deleteValue(k);
+                        if (k.startsWith(infographicPrefix) || aggregatePrefixes.some((prefix) => k.startsWith(prefix))) {
+                            GM_deleteValue(k);
+                        }
                     });
                     GM_setValue(sigKey, normalizedSig);
                 }
@@ -28569,7 +28693,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // the async callback checks gen !== commitNavGeneration to discard stale calls.
     let commitNavGeneration = 0;
     let commitNavTimer = null;
-    const commitListCache = new Map(); // "owner/repo/pr" -> [{sha, message}]
+    const commitListCache = new Map(); // "owner/repo/pr:head" -> [{sha, message}]
 
     function runFloatingCommitNavBuild() {
         _addFloatingCommitNavInner().catch((e) => {
@@ -28608,8 +28732,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommitList(owner, repo, prNum) {
-        const cacheKey = `${owner}/${repo}/${prNum}`;
-        if (commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
+        const pagePR = parsePR();
+        const head = pagePR && pagePR.owner === owner && pagePR.repo === repo && String(pagePR.pr) === String(prNum)
+            ? getImmediatePRHeadSHA() : '';
+        // Without a confirmed head, use the shared HTTP cache but do not create
+        // a longer-lived derived entry whose revision cannot be identified.
+        const cacheKey = head ? `${owner}/${repo}/${prNum}:${head.toLowerCase()}` : '';
+        if (cacheKey && commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
 
         // Try the validated, shared API path first.
         const apiResult = [];
@@ -28618,7 +28747,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNum}/commits?per_page=100&page=${pageNum}`;
             let batch;
             try {
-                batch = await gmFetch(url);
+                batch = await gmFetch(url, head ? { freshForMs: 0 } : {});
             } catch (e) {
                 if (shouldWarnOptionalGitHubApiError(e)) {
                     console.warn('ACKtopus: commits API failed, falling back to HTML scrape:', e.message || e);
@@ -28634,8 +28763,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (batch.length < 100) break;
         }
 
-        if (apiResult.length && !apiFailed) {
-            commitListCache.set(cacheKey, apiResult);
+        if (
+            apiResult.length &&
+            !apiFailed &&
+            (!head || apiResult.some((commit) => String(commit?.sha || '').toLowerCase() === head.toLowerCase()))
+        ) {
+            if (cacheKey) commitListCache.set(cacheKey, apiResult);
             return apiResult;
         }
 
@@ -28657,7 +28790,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     commit: { message: a.textContent.trim() },
                 });
             }
-            if (commits.length > 0) commitListCache.set(cacheKey, commits);
+            if (
+                cacheKey &&
+                commits.some((commit) => String(commit?.sha || '').toLowerCase() === head.toLowerCase())
+            ) {
+                commitListCache.set(cacheKey, commits);
+            }
             return commits;
         } catch (e) {
             console.error('ACKtopus: commit list HTML scrape failed:', e);
@@ -35442,7 +35580,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('commitExplainCacheKey includes provider', () => {
         const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '123' };
-        const k = commitExplainCacheKey(pr, 'claude');
+        const k = commitExplainCacheKey(pr, 'claude', { system: 'review', user: 'commit A' });
         ackAssert(k.includes('claude'), 'includes provider name');
         ackAssert(k.includes('bitcoin'), 'includes repo');
         ackAssert(k.includes('123'), 'includes PR number');
@@ -35450,7 +35588,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('commitExplainCacheKey differs per provider', () => {
         const pr = { owner: 'o', repo: 'r', pr: '1' };
-        ackNeq(commitExplainCacheKey(pr, 'claude'), commitExplainCacheKey(pr, 'openai'));
+        const input = { system: 'review', user: 'commit A' };
+        ackNeq(commitExplainCacheKey(pr, 'claude', input), commitExplainCacheKey(pr, 'openai', input));
+        ackNeq(
+            commitExplainCacheKey(pr, 'claude', input),
+            commitExplainCacheKey(pr, 'claude', { ...input, user: 'commit B' }),
+            'exact aggregate prompt changes the key',
+        );
     });
 
     // ============================================================================
@@ -40452,7 +40596,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(fetchedUrl.includes('/repos/octo/async-demo'), 'fetches repository metadata');
             ackEq(link.getAttribute('href'), '/octo/async-demo/compare/develop...topic/remove-foo?quick_pull=1');
             ackEq(link.dataset.localRepoPrRewritten, '1');
-            ackEq(repoDefaultBranchCache.get(repo.repoKey), 'develop');
+            ackEq(repoDefaultBranchCache.get(repo.repoKey)?.branch, 'develop');
         } finally {
             host.remove();
             gmFetch = origGmFetch;
@@ -40799,9 +40943,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(injectSection.includes('invalidatePRContext'), 'invalidated on force push detection');
         ackAssert(injectSection.includes('commitListCache.clear()'), 'commitListCache cleared on force push');
-        ackAssert(injectSection.includes('commitExplainCacheKey'), 'commit explain caches cleared on force push');
-        ackAssert(injectSection.includes('commitReviewAidCacheKey'), 'lightbulb caches cleared on force push');
-        ackAssert(injectSection.includes('prOverviewCacheKey'), 'PR overview cache cleared on force push');
+        ackAssert(injectSection.includes('llm_explain_${pr.owner}'), 'all exact commit explain caches cleared on force push');
+        ackAssert(injectSection.includes('llm_lightbulb_${pr.owner}'), 'all exact lightbulb caches cleared on force push');
+        ackAssert(injectSection.includes('llm_pr_overview_${pr.owner}'), 'all exact PR overview caches cleared on force push');
         ackAssert(injectSection.includes('lightbulbAutoOpenKey'), 'auto-open lightbulb flags cleared on force push');
         // PR navigation teardown
         const teardown = source.slice(
@@ -41538,6 +41682,20 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         });
         ackAssert(key.startsWith(GITHUB_HTTP_CACHE_PREFIX), 'uses the dedicated cache namespace');
         ackAssert(!key.includes('secret-token'), 'does not expose the token in the cache key');
+        ackNeq(
+            key,
+            githubHttpCacheKey('https://api.github.com/repos/octo/demo/pulls/42', {
+                Accept: 'application/vnd.github.diff', Authorization: 'Bearer secret-token',
+            }),
+            'representation headers change the key',
+        );
+        ackNeq(
+            key,
+            githubHttpCacheKey('https://api.github.com/repos/octo/demo/pulls/42', {
+                Accept: 'application/vnd.github+json', Authorization: 'Bearer another-token',
+            }),
+            'authorization scope changes the key without exposing the token',
+        );
     });
 
     ackTest('GitHub HTTP cache keeps response bodies and its bounded index aligned', () => {
@@ -42109,7 +42267,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('fetchCommitList shares bad-PAT and rate-limit guards', () => {
         const source = _ackSource;
         const fn = sourceSection(source, 'async function fetchCommitList', 'const COMMIT_SEARCH_JUMP_KEY');
-        ackAssert(fn.includes('await gmFetch(url)'), 'uses shared conditional GitHub reader');
+        ackAssert(fn.includes('await gmFetch(url,'), 'uses shared conditional GitHub reader');
         ackAssert(fn.includes('shouldWarnOptionalGitHubApiError(e)'), 'keeps known rate-limit failures quiet');
         ackAssert(fn.includes('falling back to HTML scrape'), 'still keeps the HTML scrape fallback');
         ackAssert(fn.includes('pageSessionFallback: true'), 'private PR fallback can use the signed-in GitHub page session');
@@ -42256,8 +42414,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
 
         const reviewAidFn = source.slice(
+            source.indexOf('async function buildCommitReviewAidRequest'),
             source.indexOf('async function fetchCommitReviewAidChunk'),
-            source.indexOf('async function fetchCommitExplainChunk'),
         );
         ackAssert(
             sourceIncludesLoose(
@@ -42279,8 +42437,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
 
         const explainFn = source.slice(
+            source.indexOf('async function buildCommitExplainRequest'),
             source.indexOf('async function fetchCommitExplainChunk'),
-            source.indexOf('async function fetchBatchCommitExplanations'),
         );
         ackAssert(
             sourceIncludesLoose(
@@ -42305,17 +42463,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
-    ackTest('selection helpers include cached PR overview from main lightbulb when available', () => {
+    ackTest('selection helpers use current source instead of an under-specified PR overview cache', () => {
         const source = _ackSource;
         const diff = source.slice(
             source.indexOf('async function runDiffSelectionLLM'),
             source.indexOf('async function openChatWithDiffSelection'),
         );
-        ackAssert(diff.includes('prOverviewText'), 'selection actions compute cached PR overview text');
-        ackAssert(diff.includes('PR overview (cached'), 'selection actions include PR overview in prompt context');
+        ackAssert(diff.includes('fetchPRContext(ctx.pr)'), 'selection actions reassemble current PR context');
+        ackAssert(!diff.includes('PR overview (cached'), 'does not inject a result selected without its exact prompt');
     });
 
-    ackTest('fetchCommitPatch caches commit patches per SHA (in-memory LRU)', async () => {
+    ackTest('fetchCommitPatch caches only immutable full-SHA patches', async () => {
         const orig = gmFetchText;
         let calls = 0;
         try {
@@ -42325,9 +42483,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
                 return `patch:${url}`;
             };
             const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
-            const first = await fetchCommitPatch(pr, 'abc123');
-            const second = await fetchCommitPatch(pr, 'abc123');
-            ackEq(calls, 1, 'second call hits cache');
+            await fetchCommitPatch(pr, 'abc1234');
+            await fetchCommitPatch(pr, 'abc1234');
+            ackEq(calls, 2, 'short SHA is revalidated');
+            const fullSha = 'a'.repeat(40);
+            const first = await fetchCommitPatch(pr, fullSha);
+            const second = await fetchCommitPatch(pr, fullSha);
+            ackEq(calls, 3, 'full immutable SHA hits cache');
             ackEq(first, second, 'cached patch matches');
         } finally {
             gmFetchText = orig;
@@ -42362,6 +42524,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const fn = source.slice(source.indexOf('function getImmediatePRHeadSHA'), source.indexOf('function createBtn'));
         ackAssert(fn.includes('_prContextCache'), 'uses cached PR context head SHA');
         ackAssert(fn.includes('readHeadShaFromSSR'), 'uses embedded SSR PR head SHA');
+        ackAssert(fn.indexOf('readHeadShaFromSSR') < fn.indexOf('_prContextCache'), 'prefers live SSR over a cached hint');
         ackAssert(!fn.includes('parseCommitsFromPage'), 'does not infer from commit list ordering');
         ackAssert(!fn.includes('querySelectorAll(\'a[href*="/commit"]\')'), 'does not infer from visible commit links');
     });
@@ -42418,7 +42581,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function getCachedCommitReviewAid'),
+            source.indexOf('async function fetchCommitPatchForSelection'),
         );
         ackAssert(fn.includes('EXPLAIN_ICON'), 'Explain button uses icon');
         ackAssert(fn.includes('FACTCHECK_ICON'), 'Fact-check button uses icon');
@@ -42438,7 +42601,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function getCachedCommitReviewAid'),
+            source.indexOf('async function fetchCommitPatchForSelection'),
         );
         ackAssert(fn.includes("flexDirection: 'column'"), 'toolbar uses column layout');
         ackAssert(fn.includes('const btnRow'), 'uses a button row container');
@@ -42456,7 +42619,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const ensure = source.slice(
             source.indexOf('function ensureDiffSelectionToolbar'),
-            source.indexOf('function getCachedCommitReviewAid'),
+            source.indexOf('async function fetchCommitPatchForSelection'),
         );
         ackAssert(ensure.includes("flexWrap: 'nowrap'"), 'buttons stay in a single row');
         ackAssert(ensure.includes("overflow: 'hidden'"), 'button row does not rely on inaccessible scrollbars');
@@ -42556,7 +42719,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             GM_setValue('llm_cache_enabled', true);
             const ctx = { text: 'selected phrase', parentText: '', pr: null };
             const { system, user } = buildDiffSelectionOneLinerRequest(ctx, 'claude');
-            GM_setValue(buildPromptCacheKey('claude', LLM_MODELS.claude, system, user), 'Purpose from cache');
+            GM_setValue(buildPromptCacheKey('claude', LLM_MODELS.claude, system, user, '', 100), 'Purpose from cache');
             _diffSelectionOneLinerEl = output;
             _diffSelectionCtxKey = 'test-selection';
             queueDiffSelectionOneLiner(ctx, 'test-selection');
@@ -42951,13 +43114,15 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('ctx.threadText'), 'uses ctx.threadText');
     });
 
-    ackTest('diff selection explain can use cached lightbulb review aid', () => {
+    ackTest('diff selection never reuses aggregate AI output without its exact original inputs', () => {
         const source = _ackSource;
         const fn = source.slice(
-            source.indexOf('function getCachedCommitReviewAid'),
-            source.indexOf('function formatCommitReviewAidForPrompt'),
+            source.indexOf('async function runDiffSelectionLLM'),
+            source.indexOf('async function openChatWithDiffSelection'),
         );
-        ackAssert(fn.includes('commitReviewAidCacheKey('), 'reads lightbulb cache key');
+        ackAssert(!fn.includes('commitReviewAidCacheKey('), 'does not select a review aid from only a commit SHA');
+        ackAssert(!fn.includes('prOverviewCacheKey('), 'does not select a PR overview without its original prompt');
+        ackAssert(fn.includes('fetchPRContext(ctx.pr)'), 'uses current source context instead');
     });
 
     ackTest('prefillCommitHash uses setTextareaValue (React-safe) and avoids execCommand', () => {
@@ -43355,7 +43520,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
         const source = _ackSource;
-        ackAssert(source.includes('function gmFetchText(url)'), 'gmFetchText defined');
+        ackAssert(source.includes('function gmFetchText(url,'), 'gmFetchText defined');
         const fetchPatch = source.slice(
             source.indexOf('function fetchPatch'),
             source.indexOf('function categorizePRFiles'),
@@ -45410,6 +45575,41 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(typeof h1 === 'string' && h1.length > 0, 'returns non-empty string');
     });
 
+    ackTest('LLM and Jev cache keys include every semantic request field', () => {
+        const previousParsePageContext = parsePageContext;
+        const oldClaudeKey = GM_getValue('llm_claude_key', undefined);
+        const oldJevKey = GM_getValue('jev_api_key', undefined);
+        try {
+            parsePageContext = () => ({ owner: 'octo', repo: 'demo', pr: '12' });
+            GM_setValue('llm_claude_key', 'credential-a');
+            const short = buildPromptCacheKey('claude', 'model-a', 'system', 'user', 'low', 100);
+            ackNeq(short, buildPromptCacheKey('claude', 'model-a', 'system', 'user', 'low', 101),
+                'LLM output limit changes the key');
+            ackNeq(short, buildPromptCacheKey('claude', 'model-a', 'system', 'user', 'high', 100),
+                'reasoning effort changes the key');
+            ackNeq(short, buildPromptCacheKey('claude', 'model-b', 'system', 'user', 'low', 100),
+                'model changes the key');
+            GM_setValue('llm_claude_key', 'credential-b');
+            ackNeq(short, buildPromptCacheKey('claude', 'model-a', 'system', 'user', 'low', 100),
+                'provider credential scope changes the key');
+            const state = { kind: 'line', text: 'x' };
+            GM_setValue('jev_api_key', 'jev-a');
+            const jevA = jevCacheId('line', state);
+            GM_setValue('jev_api_key', 'jev-b');
+            ackNeq(jevA, jevCacheId('line', state), 'TypeSafe credential scope changes the key');
+            const jevKeySource = sourceSection(_ackSource, 'function jevCacheId', 'function jevCacheEntries');
+            ackAssert(jevKeySource.includes('questions: JEV_QUESTIONS[kind]'), 'Jev question rubric participates');
+            ackAssert(jevKeySource.includes('responseSchema: JEV_SCHEMA[kind]'), 'Jev response schema participates');
+            ackAssert(jevKeySource.includes('state,'), 'Jev input state participates');
+        } finally {
+            parsePageContext = previousParsePageContext;
+            if (oldClaudeKey === undefined) GM_deleteValue('llm_claude_key');
+            else GM_setValue('llm_claude_key', oldClaudeKey);
+            if (oldJevKey === undefined) GM_deleteValue('jev_api_key');
+            else GM_setValue('jev_api_key', oldJevKey);
+        }
+    });
+
     ackTest('callLLM checks prompt cache and stores results', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function callLLM('), source.indexOf('function fetchPatch'));
@@ -45422,7 +45622,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function buildPromptCacheKey'),
             source.indexOf('function callLLM('),
         );
-        ackAssert(helper.includes('hashPrompt(system'), 'buildPromptCacheKey hashes system+user prompt');
+        ackAssert(helper.includes('hashPrompt(request)'), 'buildPromptCacheKey hashes the full semantic request');
+        ackAssert(helper.includes('maxTokens: limit'), 'prompt cache key includes the output limit');
         ackAssert(helper.includes('llm_prompt_'), 'buildPromptCacheKey uses llm_prompt_ cache prefix');
     });
 
@@ -46045,15 +46246,15 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
     // --- Audit fixes (ChatGPT review) ---
 
-    ackTest('fetchPRContext returns cached value on second call', () => {
+    ackTest('fetchPRContext rechecks mutable inputs through the shared transport cache', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function fetchPRContext'),
             source.indexOf('function invalidatePRContext'),
         );
-        ackAssert(fn.includes('_prContextCache &&'), 'checks cache before fetching');
-        ackAssert(fn.includes('return _prContextCache'), 'returns cached value early');
-        ackAssert(fn.includes("baseKey + ':'"), 'uses delimiter to prevent prefix collision (PR/1 vs PR/10)');
+        ackAssert(!fn.includes('return _prContextCache'), 'does not return a PR-number-only assembled value');
+        ackAssert(fn.includes('Promise.allSettled'), 'rechecks every mutable input through cached request helpers');
+        ackAssert(fn.includes('_prContextCache = ctx'), 'retains a head hint for synchronous consumers');
     });
 
     ackTest('PR context invalidation survives an older request finishing later', async () => {
@@ -46070,7 +46271,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             const current = await fetchPRContext(pr);
             finishOld('old patch');
             await pending;
-            ackEq(await fetchPRContext(pr), current, 'late response cannot repopulate an invalidated cache');
+            ackEq(_prContextCache, current, 'late response cannot repopulate an invalidated cache');
         } finally {
             fetchPatch = originalPatch;
             gmFetch = originalFetch;
@@ -46227,7 +46428,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function fetchCommitList'),
             source.indexOf('async function _addFloatingCommitNavInner'),
         );
-        ackAssert(commitListFn.includes('await gmFetch(url)'), 'fetchCommitList uses validated shared API reads');
+        ackAssert(commitListFn.includes('await gmFetch(url,'), 'fetchCommitList uses validated shared API reads');
         ackAssert(commitListFn.includes('pageNum <= 20'), 'fetchCommitList paginates large PR commit lists');
         ackAssert(commitListFn.includes('page=${pageNum}'), 'fetchCommitList requests explicit API pages');
         ackAssert(commitListFn.includes('apiResult.push(...batch)'), 'fetchCommitList appends each API page');
@@ -46522,7 +46723,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function buildPromptCacheKey'),
             source.indexOf('function callLLM('),
         );
-        ackAssert(buildKey.includes('llm_prompt_${kind}_'), 'prompt cache key includes kind');
+        ackAssert(buildKey.includes('llm_prompt_v${LLM_PROMPT_CACHE_SCHEMA}_${kind}_'), 'prompt cache key includes kind');
     });
 
     ackTest('clearCacheForPR handles both legacy and kind-prefixed keys', () => {
@@ -46625,7 +46826,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(inject.includes('e.preventDefault();'), 'settings/provider handlers prevent default click');
     });
 
-    ackTest('recordCacheTimestamp tracks explain/lightbulb/overview saves', () => {
+    ackTest('recordCacheTimestamp tracks exact prompt, aggregate, and infographic saves', () => {
         const source = _ackSource;
         ackAssert(source.includes('function recordCacheTimestamp'), 'helper exists');
         const cacheHelpers = sourceSection(source, 'function setInfographicCache', 'function getCache');
@@ -46643,11 +46844,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('const _prBodyLightbulbPrecomputeInFlight'),
         );
         ackAssert(lightbulbSave.includes('recordCacheTimestamp(ck)'), 'lightbulb save records timestamp');
-        const prOverviewSave = source.slice(
-            source.indexOf('async function explainComment'),
-            source.indexOf('function schedulePostEditRefresh'),
-        );
-        ackAssert(prOverviewSave.includes('recordCacheTimestamp(overviewKey)'), 'PR overview save records timestamp');
     });
 
     ackTest('findReviewThreadPathForReplyForm can find file path via diff hash link', () => {
@@ -47708,14 +47904,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
-    ackTest('fetchPRContext cache comment matches actual invalidation mechanism', () => {
+    ackTest('fetchPRContext cache comment matches revalidation behavior', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function fetchPRContext'),
             source.indexOf('function invalidatePRContext'),
         );
-        ackAssert(!fn.includes('auto-invalidate'), 'does not claim auto-invalidation');
-        ackAssert(fn.includes('explicit invalidatePRContext'), 'documents explicit invalidation');
+        ackAssert(!fn.includes('return _prContextCache'), 'does not bypass mutable-input revalidation');
+        ackAssert(fn.includes('always reassembles the value'), 'does not describe the head hint as a response cache');
     });
 
     // --- wrapSelectionInDetails behavior ---
@@ -48365,6 +48561,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(cache.includes("scope === 'commit' ? 'commit' : 'pr'"), 'cache key separates commit scope');
         ackAssert(cache.includes('PR_INFOGRAPHIC_PROMPT_VERSION'), 'cache key includes prompt version');
         ackAssert(cache.includes('OPENAI_IMAGE_MODEL'), 'cache key includes image model');
+        ackAssert(cache.includes('prompt: exactPrompt'), 'cache key hashes the exact generated image prompt');
+        ackAssert(cache.includes('credentialScope'), 'cache key scopes results to the configured account');
         ackAssert(cache.includes('OPENAI_IMAGE_BACKGROUND'), 'cache key includes image background');
         ackAssert(cache.includes('OPENAI_IMAGE_MODERATION'), 'cache key includes image moderation');
         const targetHelper = source.slice(
@@ -48388,15 +48586,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(runner.includes('buildInfographicImagePrompt'), 'uses text model to create image prompt');
         ackAssert(runner.includes('buildInfographicTarget(pr, ctx)'), 'builds PR/commit infographic target');
-        ackAssert(runner.includes('getInfographicCache(pr, target.cacheSha, target.scope)'), 'reads scope-specific cache');
+        ackAssert(runner.includes('getInfographicCache(pr, target.cacheSha, target.scope, prompt)'), 'reads exact-prompt cache');
         ackAssert(runner.includes('gatherInfographicContext(target'), 'gathers PR or commit context');
         ackAssert(runner.includes('buildInfographicImagePrompt(fullContext, target.prUrl, target)'), 'passes PR URL and target to image prompt builder');
         ackAssert(runner.includes("let prompt = ''"), 'keeps image prompt available for error fallback');
-        ackAssert(runner.includes('await card.resolvePrompt(cached.prompt'), 'alternate copy can reuse cached infographic prompt');
-        ackAssert(runner.includes('await card.resolvePrompt(prompt)'), 'alternate copy returns the visual prompt before image generation');
+        ackAssert(runner.includes('await card.resolvePrompt(prompt, { cached: !!cached })'), 'alternate copy returns the exact visual prompt');
         ackAssert(runner.includes('callOpenAIImage(prompt)'), 'generates image from the visual prompt');
         ackAssert(runner.includes('card.reject(e, { prompt })'), 'returns image prompt on generation errors');
-        ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope)'), 'stores generated image in scoped cache');
+        ackAssert(runner.includes('setInfographicCache(pr, target.cacheSha, enriched, target.scope, prompt)'), 'stores generated image by exact prompt');
         const card = source.slice(source.indexOf('function addInfographicCard'), source.indexOf('function parseCommitsFromPage'));
         ackAssert(card.includes("closeBtn.title = 'Close infographic'"), 'infographic card has close button');
         ackAssert(card.includes('closed = true'), 'infographic close marks card closed');
@@ -49037,7 +49234,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function buildLightbulbPanel'),
-            source.indexOf('// Cache key for the batch'),
+            source.indexOf('const LLM_AGGREGATE_CACHE_SCHEMA'),
         );
         ackAssert(fn.includes('highlight-source-python'), 'uses GitHub highlight class');
         ackAssert(fn.includes('notranslate'), 'pre has notranslate class');
@@ -49050,7 +49247,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function buildLightbulbPanel'),
-            source.indexOf('// Cache key for the batch'),
+            source.indexOf('const LLM_AGGREGATE_CACHE_SCHEMA'),
         );
         // Uses custom collapsible divs (not <details>/<summary>) to avoid GitHub CSP warnings
         ackAssert(!fn.includes("createElement('details')"), 'no native details elements');
@@ -49068,7 +49265,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function buildLightbulbPanel'),
-            source.indexOf('// Cache key for the batch'),
+            source.indexOf('const LLM_AGGREGATE_CACHE_SCHEMA'),
         );
         ackAssert(fn.includes("=== 'OK'"), 'skips OK message check');
         ackAssert(fn.includes("=== 'standalone'"), 'skips standalone depends');
@@ -49102,7 +49299,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function buildLightbulbPanel'),
-            source.indexOf('// Cache key for the batch'),
+            source.indexOf('const LLM_AGGREGATE_CACHE_SCHEMA'),
         );
         const calls = (fn.match(/linkifyCodeElements/g) || []).length;
         ackAssert(calls >= 2, 'linkifyCodeElements called on summary and markdown sections');
@@ -49111,8 +49308,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('LLM prompt requests structured JSON with all fields including context', () => {
         const source = _ackSource;
         const fn = source.slice(
+            source.indexOf('async function buildCommitReviewAidRequest'),
             source.indexOf('async function fetchCommitReviewAidChunk'),
-            source.indexOf('async function fetchCommitExplainChunk'),
         );
         ackAssert(fn.includes('"summary"'), 'prompt requests summary');
         ackAssert(fn.includes('"context"'), 'prompt requests context');
@@ -49222,25 +49419,40 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('// --- Co-authored-by'),
         );
         ackAssert(fn.includes("GM_getValue('lightbulb_open'"), 'checks lightbulb_open state');
-        ackAssert(fn.includes('btn.click()'), 'auto-clicks button when cached data available');
-        ackAssert(fn.includes('commitReviewAidCacheKey('), 'checks lightbulb cache before auto-click');
+        ackAssert(fn.includes('btn.click()'), 'auto-clicks the button when reopening was requested');
+        ackAssert(fn.includes('fetchBatchCommitReviewAids'), 'button resolves the exact aggregate cache through the batch helper');
         ackAssert(
             fn.includes("consumeLightbulbAutoOpen(pr, provider, 'commit')"),
             'also auto-opens from precompute flag',
         );
     });
 
-    ackTest('main PR lightbulb caches overview and starts commit-lightbulb precompute', () => {
+    ackTest('main PR lightbulb starts exact-input commit-lightbulb precompute', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function explainComment'),
             source.indexOf('function schedulePostEditRefresh'),
         );
-        ackAssert(fn.includes('prOverviewCacheKey('), 'stores PR overview under dedicated cache key');
+        ackAssert(!fn.includes('prOverviewCacheKey('), 'does not write an extra under-specified overview cache');
         ackAssert(
             fn.includes('precomputeLightbulbCachesFromPRBody'),
             'kicks off background precompute from PR body explain',
         );
+    });
+
+    ackTest('PR-body lightbulb precompute builds its in-flight key before fetching commits', async () => {
+        const originalFetchCommitList = fetchCommitList;
+        let listed = 0;
+        fetchCommitList = async () => {
+            listed++;
+            return [];
+        };
+        try {
+            await precomputeLightbulbCachesFromPRBody({ owner: 'o', repo: 'r', pr: '1' }, 'claude', 'body', 'me');
+            ackEq(listed, 1, 'reaches the commit list instead of failing on the head lookup');
+        } finally {
+            fetchCommitList = originalFetchCommitList;
+        }
     });
 
     ackTest('PR-body lightbulb precompute gathers full context and seeds both commit caches', () => {
@@ -49281,8 +49493,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             fn.includes("consumeLightbulbAutoOpen(pr, provider, 'commits')"),
             'consumes commits-view auto-open flag',
         );
-        ackAssert(fn.includes('commitExplainCacheKey(pr, provider)'), 'checks commits-view cache key');
-        ackAssert(fn.includes('!anyOpen && GM_getValue(ck, null)'), 'does not auto-click if panels are already open');
+        ackAssert(fn.includes('fetchBatchCommitExplanations'), 'button resolves the exact aggregate cache through the batch helper');
+        ackAssert(fn.includes('!anyOpen'), 'does not auto-click if panels are already open');
         ackAssert(fn.includes('firstBtn.click()'), 'opens commit-list lightbulb from cache');
     });
 
@@ -49942,9 +50154,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('// --- Co-authored-by'),
         );
         ackAssert(fn.includes('fetchCommitList'), 'fetches full commit list');
-        ackAssert(fn.includes('commitReviewAidCacheKey('), 'uses lightbulb cache key');
         ackAssert(fn.includes('fetchBatchCommitReviewAids'), 'fills cache through shared batch helper');
-        ackAssert(fn.includes('if (!explanations) return;'), 'bails out cleanly if batch helper returns nothing');
+        ackAssert(fn.includes('if (!explanations) {'), 'bails out cleanly if batch helper returns nothing');
         ackAssert(fn.includes('buildLightbulbPanel'), 'renders structured panel');
         ackAssert(fn.includes("typeof data === 'string'"), 'backward compat for plain string cache');
     });
@@ -50996,7 +51207,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackEq(second, 'cached-response', 'second call should return identical cached text');
             ackEq(networkCalls, 1, 'second call should hit prompt cache and avoid network');
 
-            const key = buildPromptCacheKey('claude', LLM_MODELS.claude, 'system prompt', 'user prompt');
+            const key = buildPromptCacheKey('claude', LLM_MODELS.claude, 'system prompt', 'user prompt', '', 4096);
             ackAssert(!!key, 'prompt cache key should be generated for PR context');
             ackEq(
                 GM_getValue(key, null),
@@ -51020,7 +51231,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             pageKind = () => 'pull';
             GM_setValue('llm_claude_key', 'test-key');
             GM_setValue('llm_cache_enabled', true);
-            const promptKey = buildPromptCacheKey('claude', LLM_MODELS.claude, 'system prompt', 'user prompt');
+            const promptKey = buildPromptCacheKey('claude', LLM_MODELS.claude, 'system prompt', 'user prompt', '', 4096);
             ackAssert(!!promptKey, 'prompt key should be available for skipCache test');
             GM_setValue(promptKey, 'stale-cache-value');
 
