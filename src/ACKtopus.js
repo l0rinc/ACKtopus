@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.271
+// @version      1.272
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -85,9 +85,10 @@
         '.ack-jev-line-anchor>.ack-jev-badges{position:absolute;top:1px;right:2px;z-index:2;margin:0;padding:0 2px;white-space:nowrap;background:var(--bgColor-default,Canvas);border-radius:3px}',
         '.ack-jev-reading-background,.ack-jev-reading-background *{color:var(--fgColor-muted,#8b949e)!important}',
         '.ack-jev-reading-background{opacity:.58}',
-        '.ack-jev-reading-essence,.ack-jev-reading-essence *{font-weight:700!important}',
+        '.ack-jev-reading-essence,.ack-jev-reading-essence *{font-weight:900!important}',
         '.ack-jev-line-priority-anchor{padding-inline-start:20px!important}',
         '.ack-jev-line-priority{position:absolute;top:1px;left:2px;z-index:3;font-size:12px;line-height:1.2;cursor:help;white-space:nowrap}',
+        '.ack-jev-hunk-badges::before{content:"H";display:inline-block;padding:0 2px;border:1px solid var(--borderColor-muted,#6e7681);border-radius:3px;color:var(--fgColor-muted,#8b949e);font-size:8px;font-weight:700;line-height:1.15;vertical-align:1px}',
         '.ack-jev-description-priority{display:inline-block;margin-right:3px;font-style:normal!important;font-weight:400!important;cursor:help;white-space:nowrap}',
         '.ack-jev-description-priority::before{content:attr(data-emoji)}',
         '.ack-jev-reading-quick-tooltip{position:fixed;z-index:1000000;max-width:360px;padding:5px 7px;border:1px solid var(--borderColor-default,#30363d);border-radius:6px;background:var(--bgColor-emphasis,#25292e);color:var(--fgColor-onEmphasis,#fff);font-size:11px;line-height:1.35;white-space:pre-line;pointer-events:none;box-shadow:0 3px 10px rgba(0,0,0,.35)}',
@@ -1552,6 +1553,10 @@
 
     function jevReviewPageContext(path = location.pathname, search = location.search) {
         return parsePR(path) || parseCompareReviewContext(path, search);
+    }
+
+    function hasConcretePullRequest(context) {
+        return !!context && /^\d+$/.test(String(context.pr || ''));
     }
 
     // Pulls the commit SHA out of /commits/<sha>, /commit/<sha>, /changes/<sha>
@@ -3490,6 +3495,8 @@
         try {
             const { hostname, pathname } = new URL(url);
             return (hostname === 'github.com' && /^\/[^/]+\/[^/]+\/commit\/[0-9a-f]{40}\.patch$/i.test(pathname)) ||
+                (hostname === 'github.com' &&
+                    /^\/[^/]+\/[^/]+\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}\.(?:diff|patch)$/i.test(pathname)) ||
                 (hostname === 'raw.githubusercontent.com' && /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\//i.test(pathname));
         } catch (_) {
             return false;
@@ -8689,26 +8696,59 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     const _prPatchCache = new Map();
     const PR_PATCH_CACHE_MAX = 6;
 
-    function fetchPatch(pr, opts = {}) {
-        const expectedHead = String(opts.expectedHead || getImmediatePRHeadSHA() || '').toLowerCase();
-        const exactHead = /^[0-9a-f]{40}$/i.test(expectedHead) ? expectedHead : '';
-        const key = exactHead ? `${pr.owner}/${pr.repo}#${pr.pr}:${exactHead}` : '';
-        if (key && _prPatchCache.has(key)) return _prPatchCache.get(key);
-        const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`;
-        const request = gmFetchText(url, { freshForMs: 0 }).then((patch) => {
-            if (exactHead && jevCommentPatchHead(patch).toLowerCase() !== exactHead) {
-                throw new Error(`PR patch head does not match ${exactHead}`);
-            }
-            return stripDeletedFileBodiesFromPatch(patch);
-        });
-        if (!key) return request;
-        const tracked = request.catch((error) => {
+    function prPatchCacheKey(pr, baseSha, headSha) {
+        const base = String(baseSha || '').toLowerCase();
+        const head = String(headSha || '').toLowerCase();
+        return pr?.owner && pr?.repo && /^\d+$/.test(String(pr.pr || '')) &&
+            /^[0-9a-f]{40}$/.test(base) && /^[0-9a-f]{40}$/.test(head)
+            ? `${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`
+            : '';
+    }
+
+    function rememberExactPRPatch(pr, baseSha, headSha, request) {
+        const key = prPatchCacheKey(pr, baseSha, headSha);
+        if (!key) return Promise.resolve(request);
+        const tracked = Promise.resolve(request).catch((error) => {
             _prPatchCache.delete(key);
             throw error;
         });
+        _prPatchCache.delete(key);
         _prPatchCache.set(key, tracked);
         while (_prPatchCache.size > PR_PATCH_CACHE_MAX) _prPatchCache.delete(_prPatchCache.keys().next().value);
         return tracked;
+    }
+
+    function exactCompareDiffUrl(pr, baseSha, headSha) {
+        if (!pr?.owner || !pr?.repo ||
+            !/^[0-9a-f]{40}$/i.test(String(baseSha || '')) ||
+            !/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return '';
+        return `https://github.com/${pr.owner}/${pr.repo}/compare/${baseSha}...${headSha}.diff`;
+    }
+
+    function fetchPatch(pr, opts = {}) {
+        const contextHint = !opts.expectedHead && _prContextCache &&
+            _prContextKey.startsWith(`${pr.owner}/${pr.repo}/${pr.pr}:`)
+            ? _prContextCache : null;
+        const expectedHead = String(opts.expectedHead || contextHint?.headSha || '').toLowerCase();
+        const exactHead = /^[0-9a-f]{40}$/i.test(expectedHead) ? expectedHead : '';
+        const expectedBase = String(opts.baseSha || contextHint?.baseSha || '').toLowerCase();
+        const exactBase = /^[0-9a-f]{40}$/i.test(expectedBase) ? expectedBase : '';
+        const key = prPatchCacheKey(pr, exactBase, exactHead);
+        if (key && _prPatchCache.has(key)) return _prPatchCache.get(key);
+        const url = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.patch`;
+        const request = gmFetchText(url, { freshForMs: 0 }).then(async (patch) => {
+            const stripped = stripDeletedFileBodiesFromPatch(patch);
+            if (!exactHead || jevCommentPatchHead(stripped).toLowerCase() === exactHead) return stripped;
+
+            // GitHub's mbox patch can omit a merge head. Use the immutable
+            // aggregate tree diff for the exact base/head pair in that case.
+            // The base belongs in the cache identity because changing only the
+            // PR base changes the aggregate diff while the head stays the same.
+            if (!exactBase) throw new Error(`PR patch does not identify head ${exactHead} and its base is unknown`);
+            const exactUrl = exactCompareDiffUrl(pr, exactBase, exactHead);
+            return stripDeletedFileBodiesFromPatch(await gmFetchText(exactUrl));
+        });
+        return key ? rememberExactPRPatch(pr, exactBase, exactHead, request) : request;
     }
 
     function extractPatchFilePaths(patchText) {
@@ -8758,11 +8798,27 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             mergedAt: '',
             closedAt: '',
             draft: false,
+            baseSha: '',
         };
     }
 
     async function fetchPRContext(pr) {
         if (!pr) return emptyPRContext();
+        if (pr.compare) {
+            const comparePatch = await fetchComparePatch(
+                `/${pr.owner}/${pr.repo}/compare/${pr.compareBase}...${pr.compareHead}`,
+            ).catch(() => '');
+            if (!hasConcretePullRequest(pr)) {
+                return {
+                    ...emptyPRContext(),
+                    diff: comparePatch,
+                    headSha: /^[0-9a-f]{40}$/i.test(pr.compareHead || '') ? pr.compareHead : '',
+                };
+            }
+            const linked = await fetchPRContext({ owner: pr.owner, repo: pr.repo, pr: pr.pr });
+            if (comparePatch) linked.diff = comparePatch;
+            return linked;
+        }
         const generation = _prContextGeneration;
         let complete = false;
         const ctx = emptyPRContext();
@@ -8783,6 +8839,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 ctx.description = prResp.value.body || '';
                 ctx.title = prResp.value.title || '';
                 ctx.headSha = prResp.value.head?.sha || '';
+                ctx.baseSha = prResp.value.base?.sha || '';
                 ctx.state = prResp.value.state || '';
                 ctx.mergedAt = prResp.value.merged_at || '';
                 ctx.closedAt = prResp.value.closed_at || '';
@@ -8794,10 +8851,16 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 jevCommentPatchHead(ctx.diff).toLowerCase() !== ctx.headSha.toLowerCase()
             ) {
                 try {
-                    ctx.diff = await fetchPatch(pr, { expectedHead: ctx.headSha });
+                    ctx.diff = await fetchPatch(pr, {
+                        expectedHead: ctx.headSha,
+                        baseSha: prResp.status === 'fulfilled' ? prResp.value.base?.sha : '',
+                    });
                 } catch (_) {
                     ctx.diff = '';
                 }
+            }
+            if (ctx.diff && /^[0-9a-f]{40}$/i.test(ctx.headSha) && /^[0-9a-f]{40}$/i.test(ctx.baseSha)) {
+                rememberExactPRPatch(pr, ctx.baseSha, ctx.headSha, ctx.diff);
             }
             complete = [patchResp, commitsResp, prResp].every((response) => response.status === 'fulfilled');
         } catch (_) {}
@@ -16939,7 +17002,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = { commit: 3, hunk: 3, line: 1, description: 1, comment: 5, stack: 3 };
+    const JEV_SCHEMA = { commit: 3, hunk: 3, line: 2, description: 2, comment: 5, stack: 3 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_LIMIT = 2400;
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
@@ -16991,42 +17054,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             concern: { type: 'noul', instructions: 'Is there a specific apparent mistake or inconsistency in the shown before/after lines? Do not treat a risky topic or missing callers as a defect.' },
         },
         line: {
-            priority: { type: 'choice', instructions: 'How should a code reviewer prioritize the target changed line after reading its nearby changed-line context? Classify the line itself, not the whole file or hunk.', criteria: {
-                background: 'Low-information review background: includes/imports, whitespace, minor documentation, compiler/header accommodation, mechanical parameter plumbing, repetitive wiring, or an obvious consequence of another line',
-                foreground: 'A non-trivial supporting change worth reading normally, such as a rename, new branch, state transition, helper call, or code whose meaning is not purely mechanical',
-                essence: 'The core purpose or semantic center of the change: the line that establishes the new behavior, calculation, invariant, policy, test oracle, or main fix a reviewer should understand first',
+            classification: { type: 'choice', instructions: 'Classify the changed line named by this question against the complete shared change block in state.full_patch. Return one combined reading-guide category. Classify the target line itself. Use essence_bug only for a specific apparent bug or inconsistency supported by the supplied patch. Do not infer a bug from novelty, risk, missing callers, or incomplete context.', criteria: {
+                background: 'Low-information review background such as includes, whitespace, minor documentation, compiler accommodation, mechanical parameter plumbing, repetitive wiring, or an obvious consequence of another line',
+                foreground: 'A non-trivial supporting change worth reading normally whose meaning is not purely mechanical but is not the semantic center of the patch',
+                essence_behavior: 'The core behavior, policy, or externally visible effect',
+                essence_calculation: 'A core arithmetic, bounds, accounting, comparison, or derived-value change',
+                essence_state: 'A core state, ownership, lifetime, persistence, or mutation change',
+                essence_control_flow: 'A core branching, iteration, dispatch, ordering, or error-propagation change',
+                essence_validation: 'A core input validation, assertion, failure-handling, or defensive check',
+                essence_performance: 'A core repeated-work, algorithmic-cost, allocation, caching, or performance-sensitive change',
+                essence_test: 'A test setup or assertion that directly expresses the intended behavior',
+                essence_interface: 'A core API, type, callback, or cross-component contract change',
+                essence_other: 'The semantic center of the patch without a more specific supported category',
+                essence_bug: 'A specific apparent bug or inconsistency in this target line that deserves immediate review',
             } },
-            category: { type: 'choice', instructions: 'If the target line is essence-level, which compact review category best explains why? Choose other when no category is clearly supported.', criteria: {
-                behavior: 'Core behavior, policy, or externally visible effect',
-                calculation: 'Arithmetic, bounds, accounting, comparison, or derived value',
-                state: 'State, ownership, lifetime, persistence, or mutation',
-                control_flow: 'Branching, iteration, dispatch, ordering, or error propagation',
-                validation: 'Input validation, assertions, failure handling, or defensive checks',
-                performance: 'Repeated work, algorithmic cost, allocation, caching, or performance-sensitive behavior',
-                test: 'A test setup or assertion that directly expresses the intended behavior',
-                interface: 'An API, type, callback, or cross-component contract',
-                other: 'No more specific essence category is supported',
-            } },
-            concern: { type: 'noul', instructions: 'Does the target line, in the supplied changed-line context, show a specific apparent bug or inconsistency that deserves immediate review? Do not infer a bug from novelty, risk, missing callers, or incomplete context alone.' },
         },
         description: {
-            priority: { type: 'choice', instructions: 'How should a code reviewer prioritize the target sentence in this pull-request description after reading its nearby sentences? Use the same three-level reading guide as changed code: classify the sentence itself, not the whole description.', criteria: {
-                background: 'Low-information review background: routine setup, boilerplate, administrative notes, minor documentation detail, repeated context, mechanical test commands, links, or an obvious consequence of another sentence',
-                foreground: 'Non-trivial supporting context worth reading normally, such as motivation, scope, an implementation detail, a limitation, or validation information that helps explain the change',
-                essence: 'The core purpose or semantic center of the pull request: the problem, main behavior, calculation, invariant, policy, test oracle, result, or fix a reviewer should understand first',
+            classification: { type: 'choice', instructions: 'Classify the sentence named by this question against the complete shared text in state.full_text. Return one combined reading-guide category. Classify the target sentence itself. Use essence_bug only for a specific apparent factual or internal inconsistency supported by the supplied text. Do not infer a problem from omitted patch context, uncertainty, novelty, or risk.', criteria: {
+                background: 'Low-information review background such as routine setup, boilerplate, administrative notes, minor documentation detail, repeated context, mechanical test commands, links, or an obvious consequence of another sentence',
+                foreground: 'Non-trivial supporting context worth reading normally, such as motivation, scope, an implementation detail, a limitation, or useful validation information',
+                essence_behavior: 'The core behavior, policy, result, or externally visible effect',
+                essence_calculation: 'A core arithmetic, bounds, accounting, comparison, or derived-value statement',
+                essence_state: 'A core state, ownership, lifetime, persistence, or mutation statement',
+                essence_control_flow: 'A core branching, iteration, dispatch, ordering, or error-propagation statement',
+                essence_validation: 'A core validation, assertion, failure-handling, or defensive-check statement',
+                essence_performance: 'A core repeated-work, algorithmic-cost, allocation, caching, or performance statement',
+                essence_test: 'A test setup, assertion, command result, or oracle that directly expresses intended behavior',
+                essence_interface: 'A core API, type, callback, or cross-component contract statement',
+                essence_other: 'The semantic center of the text without a more specific supported category',
+                essence_bug: 'A specific apparent factual or internal inconsistency in this target sentence that deserves immediate review',
             } },
-            category: { type: 'choice', instructions: 'If the target sentence is essence-level, use the same compact review categories as changed lines. Choose other when no category is clearly supported.', criteria: {
-                behavior: 'Core behavior, policy, or externally visible effect',
-                calculation: 'Arithmetic, bounds, accounting, comparison, or derived value',
-                state: 'State, ownership, lifetime, persistence, or mutation',
-                control_flow: 'Branching, iteration, dispatch, ordering, or error propagation',
-                validation: 'Input validation, assertions, failure handling, or defensive checks',
-                performance: 'Repeated work, algorithmic cost, allocation, caching, or performance-sensitive behavior',
-                test: 'A test setup, assertion, or result that directly expresses the intended behavior',
-                interface: 'An API, type, callback, or cross-component contract',
-                other: 'No more specific essence category is supported',
-            } },
-            concern: { type: 'noul', instructions: 'Does the target sentence show a specific apparent factual or internal inconsistency against the supplied nearby description? Do not infer a problem from missing patch context, uncertainty, novelty, or risk alone.' },
         },
         comment: {
             intent: { type: 'choice', instructions: 'What is the main review purpose of the selected comment? Classify what it says, without deciding whether its claim is correct.', criteria: {
@@ -17097,6 +17154,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         test: ['🧪', 'Behavior-defining test oracle'], interface: ['🔌', 'Interface or component contract'],
         other: ['✨', 'Core change'],
     };
+    const JEV_READING_BATCH_SIZE = 32;
+
+    function jevReadingQuestions(kind, targetCount) {
+        const template = JEV_QUESTIONS[kind]?.classification;
+        if (!template || !Number.isInteger(targetCount) || targetCount < 1) return null;
+        return Object.fromEntries(Array.from({ length: targetCount }, (_, index) => [
+            `target_${index + 1}`,
+            {
+                ...template,
+                instructions: `${template.instructions} The exact target is state.targets[${index}].`,
+            },
+        ]));
+    }
+
+    function jevReadingTargetResult(batchResult, index) {
+        const classification = batchResult?.answers?.[`target_${index + 1}`];
+        if (!classification) return null;
+        return { model: batchResult.model, answers: { classification } };
+    }
     const jevPending = new Map();
     const jevJobs = [];
     const jevPublicChecks = new Map();
@@ -17105,6 +17181,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevCommentEvidenceRequests = new Map();
     const jevCommentEvidenceSnapshots = new Map();
     const jevCommentPatchCache = new Map();
+    const jevCommentRevisionHints = new Map();
     const jevAnonymousCommentLists = new Map();
     const jevCommentListFreshReads = new Set();
     const jevCommentRefreshAttempts = new Map();
@@ -17118,6 +17195,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // mark these pages stale, so unchanged lists can be shared much longer.
     const JEV_COMMENT_LIST_TTL_MS = 10 * 60 * 1000;
     const JEV_COMMENT_EVIDENCE_TTL_MS = 60 * 1000;
+    const JEV_COMMENT_REVISION_HINT_MS = 2000;
     const JEV_COMMENT_BADGE_REUSE_MS = 10 * 60 * 1000;
     let jevAnonymousCommentWarned = false;
 
@@ -17126,6 +17204,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         jevCommentEvidenceRequests.clear();
         jevCommentEvidenceSnapshots.clear();
         jevCommentPatchCache.clear();
+        jevCommentRevisionHints.clear();
         jevAnonymousCommentLists.clear();
         jevCommentListFreshReads.clear();
         jevCommentRefreshAttempts.clear();
@@ -17239,7 +17318,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             segment.replaceWith(document.createTextNode(segment.textContent || ''));
         });
         for (const parent of parents) parent.normalize?.();
-        jevDescriptionRecords = new WeakMap();
+        if (root === document) jevDescriptionRecords = new WeakMap();
+        else jevDescriptionRecords.delete(root);
     }
 
     function setJevLineReadingPreferred(enabled) {
@@ -17251,13 +17331,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (enabled && (jevLineReadingEnabled() || jevDescriptionReadingEnabled())) queueJevPageAnnotations();
     }
 
-    function jevCacheId(kind, state) {
+    function jevCacheId(kind, state, questions = JEV_QUESTIONS[kind]) {
         return hashPrompt(JSON.stringify({
             endpoint: 'https://api.typesafe.ai/v1/systemone',
             credentialScope: hashPrompt(String(GM_getValue('jev_api_key', '') || '').trim()),
             model: JEV_MODEL,
             kind,
-            questions: JEV_QUESTIONS[kind],
+            questions,
             responseSchema: JEV_SCHEMA[kind],
             state,
         }));
@@ -17300,8 +17380,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ? { type: 'choice', choice, probability } : null;
     }
 
-    function jevValidatedResult(kind, response) {
-        const questions = JEV_QUESTIONS[kind];
+    function jevValidatedResult(kind, response, questions = JEV_QUESTIONS[kind]) {
         if (!questions || !response?.answers || typeof response.model !== 'string') return null;
         const answers = {};
         for (const [name, question] of Object.entries(questions)) {
@@ -17432,14 +17511,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return check;
     }
 
-    function jevPost(kind, state, attempt = 0) {
+    function jevPost(kind, state, questions = JEV_QUESTIONS[kind], attempt = 0) {
+        if (typeof questions === 'number') {
+            attempt = questions;
+            questions = JEV_QUESTIONS[kind];
+        }
         if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
         if (kind === 'stack' && jevStackRejected) return Promise.reject(new Error('Jev stack review paused after a rejected request'));
         if (kind === 'line' && jevLineRejected) return Promise.reject(new Error('Jev line guide paused after a rejected request'));
         if (kind === 'description' && jevDescriptionRejected) return Promise.reject(new Error('Jev description guide paused after a rejected request'));
         const key = GM_getValue('jev_api_key', '').trim();
         if (!key) return Promise.reject(new Error('Jev API key missing'));
-        const body = JSON.stringify({ state, model: JEV_MODEL, questions: JEV_QUESTIONS[kind] });
+        const body = JSON.stringify({ state, model: JEV_MODEL, questions });
         if (JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -17450,7 +17533,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 timeout: 15000,
                 onload: (r) => {
                     if ((r.status === 429 || r.status === 529) && attempt < 2) {
-                        setTimeout(() => jevPost(kind, state, attempt + 1).then(resolve, reject), 500 * 2 ** attempt);
+                        setTimeout(() => jevPost(kind, state, questions, attempt + 1).then(resolve, reject), 500 * 2 ** attempt);
                         return;
                     }
                     if (r.status === 429 || r.status === 529) {
@@ -17474,7 +17557,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         return reject(new Error(`Jev HTTP ${r.status}${reason}: ${String(r.responseText || '').slice(0, 160)}`));
                     }
                     try {
-                        const result = jevValidatedResult(kind, JSON.parse(r.responseText));
+                        const result = jevValidatedResult(kind, JSON.parse(r.responseText), questions);
                         result ? resolve(result) : reject(new Error('Invalid Jev response'));
                     } catch (e) { reject(e); }
                 },
@@ -17495,7 +17578,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function jevEvaluate(pr, kind, state) {
+    function jevEvaluate(pr, kind, state, questions = JEV_QUESTIONS[kind]) {
         const epoch = jevEpoch;
         const readingRequest = kind === 'line' || kind === 'description';
         const readingEnabled = () => kind === 'line' ? jevLineReadingEnabled()
@@ -17504,7 +17587,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevDiagnostic('work skipped', { kind, reason: jevReadingUnavailableReason(kind) }, { key: kind, intervalMs: 2000 });
             return Promise.resolve(null);
         }
-        const id = jevCacheId(kind, state);
+        const id = jevCacheId(kind, state, questions);
         const cached = jevReadCache(id);
         // A local result sends no repository content anywhere. Public proof is
         // required immediately before a new TypeSafe request, not to display a
@@ -17559,7 +17642,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         active: jevActive,
                         waiting: jevJobs.length,
                     }, { key: kind, intervalMs: 2000 });
-                    const result = await jevPost(kind, state);
+                    const result = await jevPost(kind, state, questions);
                     if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
@@ -17841,6 +17924,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (includeCodeEvidence) {
             for (const key of jevCommentEvidenceSnapshots.keys()) if (key.startsWith(prefix)) jevCommentEvidenceSnapshots.delete(key);
             for (const key of jevCommentPatchCache.keys()) if (key.startsWith(prefix)) jevCommentPatchCache.delete(key);
+            jevCommentRevisionHints.delete(prefix);
             const current = parsePR();
             if (current && jevCommentPRKey(current) === prefix) {
                 document.querySelectorAll('.ack-jev-comment-badges').forEach((slot) => slot.remove());
@@ -17910,45 +17994,48 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const resetGeneration = jevCommentResetGeneration;
         const immediateHead = readHeadShaFromSSR();
         const prPrefix = `${pr.owner}/${pr.repo}#${pr.pr}:`;
-        const requestKey = `${prPrefix}${immediateHead || 'unconfirmed'}`;
-        // Never reuse a snapshot whose head could not be established from the
-        // current page. A force push must not inherit evidence stored under an
-        // earlier ambiguous "no SSR head" key.
-        const snapshot = immediateHead ? jevCommentEvidenceSnapshots.get(`${prPrefix}${immediateHead}`) : null;
+        const hinted = jevCommentRevisionHints.get(prPrefix);
+        const info = hinted && Date.now() - hinted.ts < JEV_COMMENT_REVISION_HINT_MS &&
+            (!immediateHead || hinted.info?.head?.sha === immediateHead)
+            ? hinted.info
+            : await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
+                { freshForMs: 0 }).catch(() => null);
+        const head = String(info?.head?.sha || '');
+        const baseSha = String(info?.base?.sha || '');
+        if (!/^[0-9a-f]{40}$/i.test(head) || !/^[0-9a-f]{40}$/i.test(baseSha) ||
+            (immediateHead && immediateHead !== head)) return null;
+        jevCommentRevisionHints.set(prPrefix, { info, ts: Date.now() });
+        const revision = `${baseSha}...${head}`;
+        const requestKey = `${prPrefix}${revision}`;
+        const snapshot = jevCommentEvidenceSnapshots.get(requestKey);
         if (snapshot && Date.now() - snapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) return snapshot.evidence;
         if (jevCommentEvidenceRequests.has(requestKey)) return jevCommentEvidenceRequests.get(requestKey);
         const request = (async () => {
-            const info = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
-                { freshForMs: 0 });
-            const head = String(info?.head?.sha || '');
-            if (!/^[0-9a-f]{40}$/i.test(head) || (immediateHead && immediateHead !== head)) return null;
-            const confirmedSnapshot = jevCommentEvidenceSnapshots.get(`${prPrefix}${head}`);
-            if (confirmedSnapshot && Date.now() - confirmedSnapshot.ts < JEV_COMMENT_EVIDENCE_TTL_MS) {
-                return confirmedSnapshot.evidence;
-            }
             const changed = Number(info.changed_files);
             const lines = Number(info.additions) + Number(info.deletions);
             if (!Number.isFinite(changed) || !Number.isFinite(lines) || changed > 25 || lines > 1800) {
-                return { head, patch: '', complete: false, reason: 'PR patch exceeds the bounded review limit' };
+                return { head, baseSha, patch: '', complete: false, reason: 'PR patch exceeds the bounded review limit' };
             }
-            const patchKey = `${pr.owner}/${pr.repo}#${pr.pr}:${head}`;
+            const patchKey = `${pr.owner}/${pr.repo}#${pr.pr}:${revision}`;
             const cachedPatch = jevCommentPatchCache.get(patchKey);
             const patch = cachedPatch && Date.now() - cachedPatch.ts < 60000
-                ? cachedPatch.patch : await fetchPatch(pr);
+                ? cachedPatch.patch : await fetchPatch(pr, {
+                    expectedHead: head,
+                    baseSha,
+                });
             const after = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
                 { freshForMs: 0 });
-            if (after?.head?.sha !== head || (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
-            if (jevCommentPatchHead(patch) !== head) {
-                return { head, patch: '', complete: false, reason: 'Current PR diff does not match the confirmed head commit' };
-            }
+            if (after?.head?.sha !== head || after?.base?.sha !== baseSha ||
+                (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
+            jevCommentRevisionHints.set(prPrefix, { info: after, ts: Date.now() });
             jevCommentPatchCache.set(patchKey, { patch, ts: Date.now() });
             while (jevCommentPatchCache.size > 4) jevCommentPatchCache.delete(jevCommentPatchCache.keys().next().value);
-            return { head, patch, complete: !!patch && patch.length <= 60000,
+            return { head, baseSha, patch, complete: !!patch && patch.length <= 60000,
                 reason: patch.length > 60000 ? 'PR patch exceeds the bounded review limit' : '' };
         })().catch(() => null);
         const tracked = request.then((evidence) => {
             if (evidence && resetGeneration === jevCommentResetGeneration) {
-                jevCommentEvidenceSnapshots.set(`${prPrefix}${evidence.head}`, { evidence, ts: Date.now() });
+                jevCommentEvidenceSnapshots.set(requestKey, { evidence, ts: Date.now() });
                 while (jevCommentEvidenceSnapshots.size > 4) {
                     jevCommentEvidenceSnapshots.delete(jevCommentEvidenceSnapshots.keys().next().value);
                 }
@@ -18066,7 +18153,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const labelKey = kind === 'commit' ? 'role' : kind === 'hunk' ? 'topic' : 'intent';
         const label = JEV_LABELS[labelKey][a[labelKey].choice];
         const proof = partial ? `${evidence} (excerpt only)` : evidence;
-        if (label && a[labelKey].probability >= 0.55) jevBadge(slot, label[0], label[1], `${Math.round(a[labelKey].probability * 100)}%`, result, proof);
+        if (label && a[labelKey].probability >= 0.55) {
+            const meaning = kind === 'hunk' ? `Hunk-level signal: ${label[1]}` : label[1];
+            jevBadge(slot, label[0], meaning, `${Math.round(a[labelKey].probability * 100)}%`, result, proof);
+        }
         if (kind === 'commit') {
             if (a.risk.score >= 1.5) jevBadge(slot, '🔥', 'Potential impact if wrong is high; this is not a bug probability', `${a.risk.score.toFixed(2)}/2 impact score`, result, proof);
             if (a.effort.score >= 1.5) jevBadge(slot, '🧩', 'Likely deep review effort', `${a.effort.score.toFixed(2)}/2 effort score`, result, proof);
@@ -18074,7 +18164,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (a.test_oracle.choice === 'weak' && a.test_oracle.probability >= 0.8) jevBadge(slot, '🧫', 'Changed test may lack a discriminating oracle; inspect its assertions', `${Math.round(a.test_oracle.probability * 100)}%`, result, proof);
         }
         if ((kind === 'commit' || kind === 'hunk') && a.concern.noul >= 0.9) {
-            jevBadge(slot, '🔎', 'Possible inconsistency to inspect; Jev has not verified a mistake', `${Math.round(a.concern.noul * 100)}%`, result, proof);
+            jevBadge(slot, '🔎', kind === 'hunk'
+                ? 'Hunk-level signal: possible inconsistency to inspect. Jev has not verified a mistake'
+                : 'Possible inconsistency to inspect. Jev has not verified a mistake', `${Math.round(a.concern.noul * 100)}%`, result, proof);
         }
         if (kind === 'comment') {
             for (const [emoji, meaning, signal] of jevCommentFactSignals(result, state || {})) {
@@ -18136,7 +18228,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // not add width to the narrow line-number table column.
         const position = window.getComputedStyle(lineNumberCell).position;
         if (!position || position === 'static') lineNumberCell.style.position = 'relative';
-        return jevSlot(lineNumberCell, id);
+        const slot = jevSlot(lineNumberCell, id);
+        if (slot) {
+            slot.classList.add('ack-jev-hunk-badges');
+            slot.title = 'Hunk-level badges. The line itself may still be gray background.';
+        }
+        return slot;
     }
 
     const jevCommentPendingBodies = new WeakSet();
@@ -18276,6 +18373,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (previous?.hash === originalHash && previous.head === ssrHead &&
                 previous.epoch === jevEpoch && previous.slot?.isConnected &&
                 previous.slot.childElementCount && Date.now() - previous.ts < JEV_COMMENT_BADGE_REUSE_MS) {
+                queueJevCommentSentenceReading(pr, body, previous.state);
                 stats.reused++;
                 continue;
             }
@@ -18307,6 +18405,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (!jevEnabled() || !body.isConnected || jevCommentTextHash(body) !== originalHash ||
                     (jevCommentThreadVersions.get(thread) || 0) !== threadVersion ||
                     (jevCommentCacheVersions.get(jevCommentPRKey(pr)) || 0) !== prVersion) return;
+                queueJevCommentSentenceReading(pr, body, state);
                 const id = jevCacheId('comment', state);
                 const slot = jevSlot(jevCommentBadgeTarget(header), id);
                 if (!slot) return;
@@ -18325,7 +18424,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         else jevRender(slot, 'comment', result, evidence, !state.evidence_complete || text.length > 1800, state);
                         if (result && slot.childElementCount) {
                             jevCommentSeenBodies.set(body, { hash: originalHash, head: readHeadShaFromSSR(),
-                                epoch: jevEpoch, slot, ts: Date.now() });
+                                epoch: jevEpoch, slot, state, ts: Date.now() });
                             jevCommentKnownPermalinks.set(state.selected_permalink,
                                 { prKey: jevCommentPRKey(pr), hash: originalHash });
                             while (jevCommentKnownPermalinks.size > 400) {
@@ -18832,28 +18931,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
     }
 
-    function jevLineReviewState(pr, path, head, group, index, signature) {
-        const line = group[index];
+    function jevLineReviewTarget(path, line) {
         const meta = getDiffSelectionLineMeta(line.cell);
         if (!meta?.lineNum) return null;
         const location = `${path}:${meta.side || (line.deleted ? 'L' : 'R')}${meta.lineNum}`;
-        const start = Math.max(0, index - 3);
-        const end = Math.min(group.length, index + 4);
-        const nearby = group.slice(start, end).map((entry, offset) =>
-            `${start + offset === index ? 'TARGET ' : '       '}${entry.excerpt}`).join('\n');
         return {
             meta,
             location,
-            state: {
-                kind: 'line',
-                repository: `${pr.owner}/${pr.repo}`,
-                head,
-                path,
-                line: location,
-                target_change: line.excerpt,
-                nearby_changes: nearby,
-                full_hunk_hash: signature,
-            },
+            target: { location, change: line.excerpt },
+        };
+    }
+
+    function jevLineBatchState(pr, head, signature, allReviews, batchReviews) {
+        return {
+            kind: 'line_batch',
+            repository: `${pr.owner}/${pr.repo}`,
+            head,
+            paths: [...new Set(allReviews.map((review) =>
+                review.location.slice(0, review.location.lastIndexOf(':'))))],
+            full_hunk_hash: signature,
+            full_patch: allReviews.map((review) => `${review.location}\n${review.target.change}`).join('\n'),
+            targets: batchReviews.map((review) => review.target),
         };
     }
 
@@ -18868,28 +18966,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevReadingGuideDecision(result) {
-        const priority = result.answers.priority;
-        const concern = result.answers.concern.noul;
-        let level = priority.probability >= 0.58 ? priority.choice : 'foreground';
-        if (concern >= 0.85) level = 'essence';
-        const category = result.answers.category;
-        const categoryLabel = JEV_LINE_CATEGORY_LABELS[category.choice] || JEV_LINE_CATEGORY_LABELS.other;
+        const classification = result.answers.classification;
+        const choice = classification.probability >= 0.58 ? classification.choice : 'foreground';
+        const level = choice === 'background' ? 'background'
+            : choice === 'foreground' ? 'foreground' : 'essence';
+        const category = choice.startsWith('essence_') ? choice.slice('essence_'.length) : 'other';
+        const concern = category === 'bug';
+        const categoryLabel = JEV_LINE_CATEGORY_LABELS[category] || JEV_LINE_CATEGORY_LABELS.other;
         return {
             level,
-            priority,
+            classification,
             concern,
-            emoji: concern >= 0.85 ? '🐛' : categoryLabel[0],
-            meaning: concern >= 0.85
+            emoji: concern ? '🐛' : categoryLabel[0],
+            meaning: concern
                 ? 'Possible bug or inconsistency to inspect'
                 : categoryLabel[1],
         };
     }
 
     function jevReadingGuideTitle(decision, result, evidence, essenceLabel) {
-        const meaning = decision.concern >= 0.85
+        const meaning = decision.concern
             ? `${decision.meaning} in this ${essenceLabel}`
-            : `${decision.meaning}; Jev classified this as an essence ${essenceLabel}`;
-        return `${meaning}\nJev priority: ${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only; read the surrounding context.`;
+            : `${decision.meaning}. Jev classified this as an essence ${essenceLabel}`;
+        return `${meaning}\nJev classification: ${Math.round(decision.classification.probability * 100)}% ${decision.classification.choice}\nEvidence: ${evidence}\nModel: ${result.model}\nAdvisory only. Read the surrounding context.`;
     }
 
     function jevLineSelectionContext(line, marker) {
@@ -18954,7 +19053,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.className = 'ack-jev-line-priority';
         marker.textContent = decision.emoji;
         const explanation = jevReadingGuideTitle(decision, result, evidence, 'line');
-        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice} · pause for AI explanation`;
+        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.classification.probability * 100)}% ${decision.classification.choice} · pause for AI explanation`;
         marker.title = explanation;
         marker.setAttribute('role', 'button');
         marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
@@ -18964,39 +19063,56 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return decision.level;
     }
 
-    function queueJevLineReading(pr, path, head, group, signature) {
-        const stats = { eligible: 0, alreadyAnnotated: 0, cacheHits: 0, queued: 0 };
+    function queueJevLineReading(pr, head, records, signature) {
+        const stats = { eligible: 0, alreadyAnnotated: 0, cacheHits: 0, queued: 0, batches: 0 };
         if (!jevLineReadingEnabled()) return stats;
-        const lines = group.flatMap((line) => line.parts?.length ? line.parts : [line]);
+        const lines = records.flatMap(({ path, line }) =>
+            (line.parts?.length ? line.parts : [line]).map((part) => ({ path, line: part })));
+        const entries = lines.map(({ path, line }) => ({ path, line, review: jevLineReviewTarget(path, line) }))
+            .filter((entry) => entry.review);
+        const statePaths = [...new Set(entries.map((entry) => entry.path))];
+        stats.eligible = entries.length;
         const tasks = [];
-        lines.forEach((line, index) => {
-            const review = jevLineReviewState(pr, path, head, lines, index, signature);
-            if (!review) return;
-            stats.eligible++;
-            const id = jevCacheId('line', review.state);
-            if (line.cell.dataset.ackJevLineId === id) {
-                stats.alreadyAnnotated++;
-                return;
-            }
-            if (jevReadCache(id)) stats.cacheHits++;
-            else stats.queued++;
-            line.cell.dataset.ackJevLineId = id;
-            tasks.push(jevEvaluate(pr, 'line', review.state).then((result) => {
-                if (!line.cell.isConnected || line.cell.dataset.ackJevLineId !== id) return;
-                return jevApplyLineReading(line, result, review.location);
+        for (let start = 0; start < entries.length; start += JEV_READING_BATCH_SIZE) {
+            const batch = entries.slice(start, start + JEV_READING_BATCH_SIZE);
+            const questions = jevReadingQuestions('line', batch.length);
+            const state = jevLineBatchState(
+                pr,
+                head,
+                signature,
+                entries.map((entry) => entry.review),
+                batch.map((entry) => entry.review),
+            );
+            const id = jevCacheId('line', state, questions);
+            const current = batch.filter(({ line }, index) =>
+                line.cell.dataset.ackJevLineId === `${id}:${index}`).length;
+            stats.alreadyAnnotated += current;
+            if (current === batch.length) continue;
+            stats.batches++;
+            if (jevReadCache(id)) stats.cacheHits += batch.length;
+            else stats.queued += batch.length;
+            batch.forEach(({ line }, index) => {
+                line.cell.dataset.ackJevLineId = `${id}:${index}`;
+            });
+            tasks.push(jevEvaluate(pr, 'line', state, questions).then((result) => {
+                return batch.map(({ line, review }, index) => {
+                    if (!line.cell.isConnected || line.cell.dataset.ackJevLineId !== `${id}:${index}`) return '';
+                    return jevApplyLineReading(line, jevReadingTargetResult(result, index), review.location);
+                });
             }));
-        });
+        }
         if (tasks.length) {
-            Promise.all(tasks).then((levels) => {
-                const rendered = levels.filter(Boolean);
-                jevDiagnostic('visible hunk lines completed', {
-                    path,
-                    evaluated: tasks.length,
+            Promise.all(tasks).then((groups) => {
+                const rendered = groups.flat().filter(Boolean);
+                jevDiagnostic('rendered patch lines completed', {
+                    paths: statePaths,
+                    batches: tasks.length,
+                    evaluated: stats.queued + stats.cacheHits,
                     rendered: rendered.length,
                     background: rendered.filter((level) => level === 'background').length,
                     foreground: rendered.filter((level) => level === 'foreground').length,
                     essence: rendered.filter((level) => level === 'essence').length,
-                }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
+                }, { key: signature, intervalMs: 0, repeatMs: 60000 });
             });
         }
         return stats;
@@ -19042,7 +19158,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function bindJevReadingHover(marker, contextFactory) {
         const showExplanation = () => {
             if (!marker.isConnected) return;
-            dismissJevReadingHover();
+            if (jevReadingExplainTimer !== null) {
+                ackClearTimeout(jevReadingExplainTimer);
+                jevReadingExplainTimer = null;
+            }
             const context = contextFactory();
             if (context) updateDiffSelectionToolbar(context);
         };
@@ -19060,6 +19179,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.addEventListener('click', (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (!jevReadingQuickTooltip) showJevReadingQuickTooltip(marker);
             showExplanation();
         });
     }
@@ -19192,23 +19312,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return sentences;
     }
 
-    function jevDescriptionReviewState(pr, head, bodyHash, sentences, index) {
-        const start = Math.max(0, index - 2);
-        const end = Math.min(sentences.length, index + 3);
+    function jevDescriptionBatchState(pr, head, bodyHash, sentences, indexes, fullText, context = {}) {
         return {
-            kind: 'description',
+            kind: 'description_batch',
+            artifact: context.artifact || 'pull_request_description',
             repository: `${pr.owner}/${pr.repo}`,
             pr: pr.pr,
             head,
             description_hash: bodyHash,
-            sentence_index: index + 1,
-            target_sentence: sentences[index].text,
-            nearby_sentences: sentences.slice(start, end).map((sentence, offset) =>
-                `${start + offset === index ? 'TARGET ' : '       '}${sentence.text}`).join('\n'),
+            source_identity: context.sourceIdentity || '',
+            full_text: fullText,
+            targets: indexes.map((index) => ({
+                sentence_index: index + 1,
+                sentence: sentences[index].text,
+            })),
         };
     }
 
-    function jevDescriptionSelectionContext(sentence, marker, pr, parentText) {
+    function jevDescriptionSelectionContext(sentence, marker, pr, parentText, context = {}) {
         return {
             kind: 'text',
             text: sentence.text,
@@ -19221,15 +19342,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             pr,
             rect: marker.getBoundingClientRect(),
             contextLines: '',
-            source: `${location.origin}${location.pathname}#issue-body`,
+            source: context.source || `${location.origin}${location.pathname}#issue-body`,
             parentText,
-            isPRDescription: true,
-            threadText: '',
+            isPRDescription: context.isPRDescription !== false,
+            threadText: context.threadText || '',
             syntheticSelection: true,
         };
     }
 
-    function jevApplyDescriptionReading(sentence, result, evidence, pr, parentText) {
+    function jevApplyDescriptionReading(sentence, result, evidence, pr, parentText, context = {}) {
         if (!sentence?.spans?.length || !result || !jevDescriptionReadingEnabled()) return '';
         sentence.marker?.remove();
         sentence.marker = null;
@@ -19245,16 +19366,124 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         marker.className = 'ack-jev-description-priority';
         marker.dataset.emoji = decision.emoji;
         const explanation = jevReadingGuideTitle(decision, result, evidence, 'sentence');
-        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.priority.probability * 100)}% ${decision.priority.choice} · pause for AI explanation`;
+        marker.dataset.quickExplanation = `${decision.meaning}\n${Math.round(decision.classification.probability * 100)}% ${decision.classification.choice} · pause for AI explanation`;
         marker.title = explanation;
         marker.setAttribute('role', 'button');
         marker.setAttribute('aria-label', `${explanation}\nHover to open the AI explanation popup.`);
         marker.tabIndex = 0;
         bindJevReadingHover(marker, () =>
-            jevDescriptionSelectionContext(sentence, marker, pr, parentText));
+            jevDescriptionSelectionContext(sentence, marker, pr, parentText, context));
         sentence.spans[0].before(marker);
         sentence.marker = marker;
         return decision.level;
+    }
+
+    function jevQueueDescriptionBatches(pr, head, bodyHash, sentences, parentText, context, evidencePrefix) {
+        const tasks = [];
+        let cacheHits = 0;
+        let queued = 0;
+        for (let start = 0; start < sentences.length; start += JEV_READING_BATCH_SIZE) {
+            const indexes = Array.from(
+                { length: Math.min(JEV_READING_BATCH_SIZE, sentences.length - start) },
+                (_, offset) => start + offset,
+            );
+            const questions = jevReadingQuestions('description', indexes.length);
+            const state = jevDescriptionBatchState(
+                pr,
+                head,
+                bodyHash,
+                sentences,
+                indexes,
+                parentText,
+                context,
+            );
+            const id = jevCacheId('description', state, questions);
+            const current = indexes.filter((sentenceIndex, batchIndex) =>
+                sentences[sentenceIndex].spans.every((span) =>
+                    span.dataset.ackJevDescriptionId === `${id}:${batchIndex}`)).length;
+            if (current === indexes.length) continue;
+            if (jevReadCache(id)) cacheHits += indexes.length;
+            else queued += indexes.length;
+            indexes.forEach((sentenceIndex, batchIndex) => {
+                for (const span of sentences[sentenceIndex].spans) {
+                    span.dataset.ackJevDescriptionId = `${id}:${batchIndex}`;
+                }
+            });
+            tasks.push(jevEvaluate(pr, 'description', state, questions).then((result) => {
+                return indexes.map((sentenceIndex, batchIndex) => {
+                    const sentence = sentences[sentenceIndex];
+                    if (!sentence.spans.every((span) => span.isConnected &&
+                        span.dataset.ackJevDescriptionId === `${id}:${batchIndex}`)) return '';
+                    return jevApplyDescriptionReading(
+                        sentence,
+                        jevReadingTargetResult(result, batchIndex),
+                        `${evidencePrefix} ${sentenceIndex + 1}`,
+                        pr,
+                        parentText,
+                        context,
+                    );
+                });
+            }));
+        }
+        return { tasks, batches: tasks.length, cacheHits, queued };
+    }
+
+    function queueJevCommentSentenceReading(pr, body, commentState) {
+        if (!jevDescriptionReadingEnabled() || !commentState?.selected_complete || !body?.isConnected) return;
+        const parentText = jevDescriptionText(body);
+        const sourceIdentity = commentState.selected_permalink || `comment-${commentState.comment_id || 'unknown'}`;
+        const sourceKey = hashPrompt([
+            'review_comment',
+            commentState.head || '',
+            sourceIdentity,
+            commentState.full_text_hash || hashPrompt(parentText),
+            parentText,
+        ].join('\0'));
+        const previous = jevDescriptionRecords.get(body);
+        if (previous?.sourceKey === sourceKey && previous.sentences.every((sentence) =>
+            sentence.spans.every((span) => span.isConnected))) return;
+
+        clearJevDescriptionAnnotations(body);
+        const sentences = jevWrapDescriptionSentences(body);
+        if (!sentences.length) return;
+        jevDescriptionRecords.set(body, { sourceKey, sentences });
+        const context = {
+            artifact: 'review_comment',
+            sourceIdentity,
+            source: commentState.selected_permalink || location.href,
+            isPRDescription: false,
+            threadText: commentState.thread_request
+                ? `Prior review request:\n${commentState.thread_request}`
+                : '',
+        };
+        const queued = jevQueueDescriptionBatches(
+            pr,
+            commentState.head || getImmediatePRHeadSHA() || '',
+            commentState.full_text_hash || hashPrompt(parentText),
+            sentences,
+            parentText,
+            context,
+            'Review comment sentence',
+        );
+        jevDiagnostic('comment reading guide queued', {
+            comment: sourceIdentity,
+            sentences: sentences.length,
+            batches: queued.batches,
+            cacheHits: queued.cacheHits,
+            queued: queued.queued,
+        }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
+        Promise.all(queued.tasks).then((levels) => {
+            const rendered = levels.flat().filter(Boolean);
+            jevDiagnostic('comment reading guide completed', {
+                comment: sourceIdentity,
+                sentences: sentences.length,
+                batches: queued.batches,
+                rendered: rendered.length,
+                background: rendered.filter((level) => level === 'background').length,
+                foreground: rendered.filter((level) => level === 'foreground').length,
+                essence: rendered.filter((level) => level === 'essence').length,
+            }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
+        });
     }
 
     function queueJevDescriptionReading() {
@@ -19308,28 +19537,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         const bodyHash = hashPrompt(parentText);
         jevDescriptionRecords.set(body, { sourceKey, sentences });
-        let cacheHits = 0;
-        const tasks = [];
-        sentences.forEach((sentence, index) => {
-            const state = jevDescriptionReviewState(pr, head, bodyHash, sentences, index);
-            const id = jevCacheId('description', state);
-            if (jevReadCache(id)) cacheHits++;
-            for (const span of sentence.spans) span.dataset.ackJevDescriptionId = id;
-            tasks.push(jevEvaluate(pr, 'description', state).then((result) => {
-                if (!sentence.spans.every((span) => span.isConnected && span.dataset.ackJevDescriptionId === id)) return;
-                return jevApplyDescriptionReading(sentence, result, `PR description sentence ${index + 1}`, pr, parentText);
-            }));
-        });
+        const queued = jevQueueDescriptionBatches(
+            pr,
+            head,
+            bodyHash,
+            sentences,
+            parentText,
+            {},
+            'PR description sentence',
+        );
         jevDiagnostic('description queued', {
             sentences: sentences.length,
-            cacheHits,
-            newRequests: sentences.length - cacheHits,
+            batches: queued.batches,
+            cacheHits: queued.cacheHits,
+            queued: queued.queued,
             sourceKey,
         }, { key: sourceKey, intervalMs: 0, repeatMs: 60000 });
-        Promise.all(tasks).then((levels) => {
-            const rendered = levels.filter(Boolean);
+        Promise.all(queued.tasks).then((levels) => {
+            const rendered = levels.flat().filter(Boolean);
             jevDiagnostic('description completed', {
                 sentences: sentences.length,
+                batches: queued.batches,
                 rendered: rendered.length,
                 background: rendered.filter((level) => level === 'background').length,
                 foreground: rendered.filter((level) => level === 'foreground').length,
@@ -19420,14 +19648,38 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             }
         }
-        const lineStats = queueJevLineReading(pr, path, head, group, signature);
         jevDiagnostic('visible hunk queued', {
             path,
             changedRows: group.length,
             hunkBadge: !!meta?.lineNum,
-            lineGuide: jevLineReadingEnabled(),
-            ...lineStats,
         }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
+    }
+
+    function queueJevRenderedPatchLines(pr, head) {
+        const records = [];
+        const paths = new Set();
+        const seenCells = new Set();
+        for (const file of qsa(document, DIFF_FILE_SELECTOR)) {
+            if (!file.isConnected) continue;
+            const path = readDiffFilePath(file);
+            if (!path) continue;
+            for (const row of file.querySelectorAll('tr')) {
+                const line = jevChangedRow(row);
+                if (!line) continue;
+                const cells = (line.parts?.length ? line.parts : [line]).map((part) => part.cell);
+                if (cells.every((cell) => seenCells.has(cell))) continue;
+                cells.forEach((cell) => seenCells.add(cell));
+                records.push({ path, line });
+                paths.add(path);
+            }
+        }
+        const signature = hashPrompt(head + records.map(({ path, line }) =>
+            `${path}\0${line.fullText}`).join('\n'));
+        return {
+            paths: [...paths],
+            signature,
+            ...queueJevLineReading(pr, head, records, signature),
+        };
     }
 
     function queueJevDiffHunks(file) {
@@ -19446,6 +19698,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const rows = [...file.querySelectorAll('tr')];
         const changed = rows.map(jevChangedRow).filter(Boolean);
         const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
+        const lineStats = queueJevRenderedPatchLines(pr, head);
         const signaledCells = new Set(qsa(file,
             'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
             .map((node) => node.closest?.('td.blob-code, td.diff-text, td.diff-text-cell') || node));
@@ -19489,6 +19742,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             hunks: groups.length,
             newlyObservedHunks: observed,
             immediatelyQueuedHunks: immediate,
+            lineGuide: jevLineReadingEnabled(),
+            ...lineStats,
             state: immediate
                 ? 'visible hunks queued immediately'
                 : observed ? 'waiting for hunks to enter the viewport'
@@ -26603,7 +26858,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommitPatchForSelection(ctx) {
-        if (!ctx?.pr || !ctx.commitSha) return '';
+        if (!ctx?.pr || !/^[0-9a-f]{7,40}$/i.test(String(ctx.commitSha || ''))) return '';
         try {
             return await fetchCommitPatch(ctx.pr, ctx.commitSha);
         } catch (e) {
@@ -26795,7 +27050,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const sha = ctx.commitSha || (await fetchSHA()) || '';
         const pr = ctx.pr;
         const loc = [
-            pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : '',
+            pr?.compare
+                ? `${pr.owner}/${pr.repo} compare ${pr.compareBase}...${pr.compareHead}`
+                : pr ? `${pr.owner}/${pr.repo}#${pr.pr}` : '',
             sha ? `Commit ${sha.slice(0, 8)}` : '',
             ctx.file ? ctx.file : '',
             ctx.startLabel
@@ -30519,6 +30776,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pr = { owner: 'acktopus-comment-fixture', repo: 'demo', pr: '5' };
         const prUrl = 'https://api.github.com/repos/acktopus-comment-fixture/demo/pulls/5';
         const head = 'c'.repeat(40);
+        const base = 'b'.repeat(40);
         const mount = document.createElement('div');
         mount.innerHTML = '<div class="js-line-comments">' +
             '<div class="review-comment"><a id="discussion_r1-permalink" href="https://github.com/acktopus-comment-fixture/demo/pull/5#discussion_r1"></a><div class="markdown-body">Please guard the bound.</div></div>' +
@@ -30537,6 +30795,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let staleBody = false;
         let multipleReplies = false;
         let listTruncated = false;
+        let changeBaseOnGet = 0;
         try {
             jevAnonymousCommentLists.clear();
             jevPublicRepository = () => Promise.resolve(publicAllowed);
@@ -30567,7 +30826,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             gmFetch = async (url) => {
                 githubGets++;
-                return { head: { sha: head }, changed_files: 1, additions: 1, deletions: 1 };
+                return {
+                    head: { sha: head },
+                    base: { sha: githubGets === changeBaseOnGet ? 'e'.repeat(40) : base },
+                    changed_files: 1,
+                    additions: 1,
+                    deletions: 1,
+                };
             };
             fetchPatch = async () => patch;
             fetchRawFile = async () => 'int guarded = 1;\n';
@@ -30636,15 +30901,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(largeThread.thread_request, 'Please guard the bound.');
             listTruncated = false;
             jevAnonymousCommentLists.clear();
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             jevCommentEvidenceSnapshots.clear();
-            fetchPatch = async () => `From ${'d'.repeat(40)} Thu Jan 1 00:00:00 1970\n` +
-                'diff --git a/src/a.cpp b/src/a.cpp\n@@ -1 +1 @@\n-old\n+wrong\n';
-            const stalePatch = await jevCommentReviewState(pr, reply, body);
-            ackAssert(!stalePatch.evidence_complete && stalePatch.evidence_note.includes('does not match'),
-                'a patch whose final commit differs from the API head cannot yield a fact verdict');
+            jevCommentRevisionHints.delete(jevCommentPRKey(pr));
+            changeBaseOnGet = githubGets + 2;
+            const changedBase = await jevCommentReviewState(pr, reply, body);
+            ackAssert(!changedBase?.evidence_complete,
+                'a base change while evidence loads cannot yield a fact verdict');
+            changeBaseOnGet = 0;
             jevCommentEvidenceSnapshots.clear();
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            jevCommentRevisionHints.delete(jevCommentPRKey(pr));
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             fetchPatch = async () => `From ${head} Thu Jan 1 00:00:00 1970\n` +
                 'diff --git a/src/deleted.cpp b/src/deleted.cpp\n' +
                 'deleted file mode 100644\n@@ deleted file contents omitted @@\n';
@@ -30667,7 +30934,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fetchPatch = oldPatch;
             fetchRawFile = oldRaw;
             readHeadShaFromSSR = oldSSR;
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${head}`);
+            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             jevCommentEvidenceSnapshots.clear();
             jevAnonymousCommentLists.clear();
         }
@@ -31562,33 +31829,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '<td class="blob-code blob-code-addition">total += entry.weight;</td></tr></table>';
         const line = jevChangedRow(host.querySelector('tr'));
         const codeBefore = line.cell.textContent;
-        const result = (priority, probability, category, concern = 0.05) => ({
+        const result = (classification, probability) => ({
             model: 'jev-test',
             answers: {
-                priority: { type: 'choice', choice: priority, probability },
-                category: { type: 'choice', choice: category, probability: 0.95 },
-                concern: { type: 'noul', noul: concern },
+                classification: { type: 'choice', choice: classification, probability },
             },
         });
         try {
             jevLineReadingEnabled = () => true;
-            jevApplyLineReading(line, result('background', 0.96, 'other'), 'src/example.cpp:R7');
+            jevApplyLineReading(line, result('background', 0.96), 'src/example.cpp:R7');
             ackAssert(line.cell.classList.contains('ack-jev-reading-background'), 'background line is muted');
             ackAssert(!host.querySelector('.ack-jev-line-priority'), 'background line has no emoji');
 
-            jevApplyLineReading(line, result('foreground', 0.91, 'behavior'), 'src/example.cpp:R7');
+            jevApplyLineReading(line, result('foreground', 0.91), 'src/example.cpp:R7');
             ackAssert(!line.cell.classList.contains('ack-jev-reading-background'), 'foreground line uses normal color');
             ackAssert(!line.cell.classList.contains('ack-jev-reading-essence'), 'foreground line is not bold');
             ackAssert(!host.querySelector('.ack-jev-line-priority'), 'foreground line has no emoji');
 
-            jevApplyLineReading(line, result('essence', 0.94, 'calculation'), 'src/example.cpp:R7');
+            jevApplyLineReading(line, result('essence_calculation', 0.94), 'src/example.cpp:R7');
             ackAssert(line.cell.classList.contains('ack-jev-reading-essence'), 'essence line is bold');
             ackEq(host.querySelector('.ack-jev-line-priority')?.textContent, '🧮', 'essence line gets its category emoji');
             ackAssert(host.querySelector('.ack-jev-line-priority')?.dataset.quickExplanation.includes('Calculation'),
                 'line emoji has the same immediate hover explanation as a description emoji');
             ackEq(line.cell.textContent, codeBefore, 'gutter emoji does not pollute copied code');
 
-            jevApplyLineReading(line, result('foreground', 0.88, 'behavior', 0.92), 'src/example.cpp:R7');
+            jevApplyLineReading(line, result('essence_bug', 0.92), 'src/example.cpp:R7');
             ackAssert(line.cell.classList.contains('ack-jev-reading-essence'), 'possible bug is promoted to essence');
             ackEq(host.querySelector('.ack-jev-line-priority')?.textContent, '🐛', 'possible bug gets immediate attention');
             ackAssert(host.querySelector('.ack-jev-line-priority')?.title.includes('Advisory only'), 'emoji explains its limits');
@@ -31608,21 +31873,72 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '<td class="blob-code blob-code-addition">return total;</td></tr></table>';
         const line = jevChangedRow(host.querySelector('tr'));
         const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
-        const first = jevLineReviewState(pr, 'src/example.cpp', 'a'.repeat(40), [line], 0, 'hunk-a');
-        const edited = jevLineReviewState(pr, 'src/example.cpp', 'b'.repeat(40), [line], 0, 'hunk-b');
-        ackAssert(first.state.nearby_changes.includes('TARGET + return total;'), 'marks the exact target inside nearby context');
+        const review = jevLineReviewTarget('src/example.cpp', line);
+        const first = jevLineBatchState(pr, 'a'.repeat(40), 'hunk-a', [review], [review]);
+        const edited = jevLineBatchState(pr, 'b'.repeat(40), 'hunk-b', [review], [review]);
+        const questions = jevReadingQuestions('line', 1);
+        ackAssert(first.full_patch.includes('src/example.cpp:R9\n+ return total;'),
+            'supplies the complete shared change block and exact target location once');
         ackAssert(jevValidatedResult('line', {
             model: 'jev-test',
             answers: {
-                priority: { type: 'choice', choice: 'essence', probabilities: { essence: 0.9 } },
-                category: { type: 'choice', choice: 'behavior', probabilities: { behavior: 0.8 } },
-                concern: { type: 'noul', noul: 0.1 },
+                target_1: { type: 'choice', choice: 'essence_behavior', probabilities: { essence_behavior: 0.9 } },
             },
-        }), 'accepts a complete typed line response');
-        ackAssert(jevCacheId('line', first.state) !== jevCacheId('line', edited.state),
+        }, questions), 'accepts one combined typed classification per target line');
+        ackAssert(jevCacheId('line', first, questions) !== jevCacheId('line', edited, questions),
             'head and hunk edits produce a new line cache key');
         host.querySelector('.blob-code').textContent = '';
         ackEq(jevChangedRow(host.querySelector('tr'))?.text, '[blank line]', 'blank changed lines are still classified');
+    });
+
+    ackTest('Jev line guide batches one classification per line against one shared rendered patch', async () => {
+        const oldLineEnabled = jevLineReadingEnabled;
+        const oldEvaluate = jevEvaluate;
+        const host = document.createElement('div');
+        host.setAttribute('data-path', 'src/example.cpp');
+        host.innerHTML = '<table>' +
+            '<tr class="blob-code-addition"><td data-line-number="7" id="diff-abcR7"></td>' +
+            '<td class="blob-code blob-code-addition">#include &lt;vector&gt;</td></tr>' +
+            '<tr class="blob-code-addition"><td data-line-number="8" id="diff-abcR8"></td>' +
+            '<td class="blob-code blob-code-addition">total += entry.weight;</td></tr>' +
+            '</table>';
+        document.body.appendChild(host);
+        const lines = [...host.querySelectorAll('tr')].map(jevChangedRow);
+        const calls = [];
+        try {
+            jevLineReadingEnabled = () => true;
+            jevEvaluate = async (_pr, kind, state, questions) => {
+                calls.push({ kind, state, questions });
+                return { model: 'jev-test', answers: {
+                    target_1: { type: 'choice', choice: 'background', probability: 0.98 },
+                    target_2: { type: 'choice', choice: 'essence_calculation', probability: 0.97 },
+                } };
+            };
+            queueJevLineReading(
+                { owner: 'bitcoin', repo: 'bitcoin', pr: '1' },
+                'a'.repeat(40),
+                lines.map((line) => ({ path: 'src/example.cpp', line })),
+                'file-signature',
+            );
+            await Promise.resolve();
+            await Promise.resolve();
+            ackEq(calls.length, 1, 'uses one Jev request for both changed lines');
+            ackEq(Object.keys(calls[0].questions).length, 2, 'asks one combined question per changed line');
+            ackAssert(calls[0].state.full_patch.includes('#include <vector>') &&
+                calls[0].state.full_patch.includes('total += entry.weight;'),
+            'supplies the complete shared rendered patch once');
+            ackAssert(lines[0].cell.classList.contains('ack-jev-reading-background'),
+                'the first combined answer drives background styling');
+            ackAssert(lines[1].cell.classList.contains('ack-jev-reading-essence'),
+                'the second combined answer drives essence styling');
+            ackEq(host.querySelector('.ack-jev-line-priority')?.textContent, '🧮',
+                'the same combined answer drives the essence emoji');
+        } finally {
+            clearJevLineAnnotations(host);
+            jevLineReadingEnabled = oldLineEnabled;
+            jevEvaluate = oldEvaluate;
+            host.remove();
+        }
     });
 
     ackTest('Jev finds the PR description in the current GitHub Conversation DOM', () => {
@@ -31664,12 +31980,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         document.body.appendChild(host);
         const textBefore = host.textContent;
         let hoverContext = null;
-        const result = (priority, probability, category, concern = 0.05) => ({
+        const result = (classification, probability) => ({
             model: 'jev-test',
             answers: {
-                priority: { type: 'choice', choice: priority, probability },
-                category: { type: 'choice', choice: category, probability: 0.95 },
-                concern: { type: 'noul', noul: concern },
+                classification: { type: 'choice', choice: classification, probability },
             },
         });
         try {
@@ -31678,11 +31992,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const sentences = jevWrapDescriptionSentences(host);
             ackEq(sentences.length, 3, 'splits prose and list text into sentences while excluding code blocks');
             ackAssert(!host.querySelector('pre .ack-jev-description-segment'), 'does not wrap preformatted code');
-            jevApplyDescriptionReading(sentences[0], result('background', 0.96, 'other'),
+            jevApplyDescriptionReading(sentences[0], result('background', 0.96),
                 'PR description sentence 1', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }, textBefore);
             ackAssert(sentences[0].spans.every((span) => span.classList.contains('ack-jev-reading-background')),
                 'background sentence uses the same muted style as a background line');
-            jevApplyDescriptionReading(sentences[1], result('essence', 0.94, 'behavior'),
+            jevApplyDescriptionReading(sentences[1], result('essence_behavior', 0.94),
                 'PR description sentence 2', { owner: 'bitcoin', repo: 'bitcoin', pr: '1' }, textBefore);
             const marker = sentences[1].marker;
             ackAssert(sentences[1].spans.every((span) => span.classList.contains('ack-jev-reading-essence')),
@@ -31699,6 +32013,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             marker.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
             marker.click();
             ackEq(hoverContext?.text, sentences[1].text, 'sustained hover or click opens the selection popup for the sentence');
+            ackAssert(document.querySelector('.ack-jev-reading-quick-tooltip'),
+                'the cached category tooltip remains visible beside the AI popup while hovered');
             ackEq(hoverContext?.parentText, textBefore, 'hover explanation includes the surrounding description');
             ackAssert(hoverContext?.syntheticSelection && hoverContext?.isPRDescription,
                 'hover uses the existing PR-description selection flow');
@@ -31713,27 +32029,83 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('Jev reading guide applies the same sentence algorithm to posted review comments', async () => {
+        const oldDescriptionEnabled = jevDescriptionReadingEnabled;
+        const oldEvaluate = jevEvaluate;
+        const host = document.createElement('div');
+        host.className = 'markdown-body';
+        host.innerHTML = '<p>The setup is routine. The bound check is the important review point.</p>';
+        document.body.appendChild(host);
+        const states = [];
+        try {
+            jevDescriptionReadingEnabled = () => true;
+            jevEvaluate = async (_pr, kind, state, questions) => {
+                states.push({ kind, state, questions });
+                return { model: 'jev-test', answers: {
+                    target_1: { type: 'choice', choice: 'background', probability: 0.97 },
+                    target_2: { type: 'choice', choice: 'essence_validation', probability: 0.97 },
+                } };
+            };
+            queueJevCommentSentenceReading(
+                { owner: 'bitcoin', repo: 'bitcoin', pr: '1' },
+                host,
+                {
+                    selected_complete: true,
+                    selected_permalink: 'https://github.com/bitcoin/bitcoin/pull/1#discussion_r9',
+                    comment_id: '9',
+                    full_text_hash: 'comment-body-hash',
+                    head: 'a'.repeat(40),
+                    thread_request: 'Please check the upper bound.',
+                },
+            );
+            await Promise.resolve();
+            await Promise.resolve();
+            const segments = host.querySelectorAll('.ack-jev-description-segment');
+            ackEq(segments.length, 2, 'splits the posted comment into sentences');
+            ackAssert(segments[0].classList.contains('ack-jev-reading-background'), 'mutes background comment prose');
+            ackAssert(segments[1].classList.contains('ack-jev-reading-essence'), 'emphasizes the important comment sentence');
+            ackEq(host.querySelector('.ack-jev-description-priority')?.dataset.emoji, '🚦',
+                'uses the same category emoji as descriptions and code lines');
+            ackEq(states.length, 1, 'batches both comment sentences into one Jev request');
+            ackAssert(states.every(({ kind, state }) => kind === 'description' &&
+                state.artifact === 'review_comment' && state.source_identity.endsWith('#discussion_r9')),
+            'cache state identifies the exact posted review comment');
+            ackEq(states[0].state.full_text, 'The setup is routine. The bound check is the important review point.',
+                'supplies the full posted comment once as shared context');
+            ackEq(Object.keys(states[0].questions).length, 2, 'asks one combined question per sentence');
+        } finally {
+            clearJevDescriptionAnnotations(host);
+            jevDescriptionReadingEnabled = oldDescriptionEnabled;
+            jevEvaluate = oldEvaluate;
+            host.remove();
+        }
+    });
+
     ackTest('Jev PR description sentence cache changes after edits and force pushes', () => {
         const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '1' };
         const sentences = [{ text: 'The new path caches the result.' }, { text: 'This avoids repeated work.' }];
-        const before = jevDescriptionReviewState(pr, 'a'.repeat(40), 'body-a', sentences, 0);
-        const edited = jevDescriptionReviewState(pr, 'a'.repeat(40), 'body-b',
-            [{ text: 'The new path stores the result.' }, sentences[1]], 0);
-        const pushed = jevDescriptionReviewState(pr, 'b'.repeat(40), 'body-a', sentences, 0);
-        ackAssert(before.nearby_sentences.includes('TARGET The new path caches the result.'),
-            'state identifies the exact target sentence');
-        ackNeq(jevCacheId('description', before), jevCacheId('description', edited),
+        const indexes = [0, 1];
+        const questions = jevReadingQuestions('description', indexes.length);
+        const before = jevDescriptionBatchState(pr, 'a'.repeat(40), 'body-a', sentences, indexes,
+            'The new path caches the result. This avoids repeated work.');
+        const editedSentences = [{ text: 'The new path stores the result.' }, sentences[1]];
+        const edited = jevDescriptionBatchState(pr, 'a'.repeat(40), 'body-b', editedSentences, indexes,
+            'The new path stores the result. This avoids repeated work.');
+        const pushed = jevDescriptionBatchState(pr, 'b'.repeat(40), 'body-a', sentences, indexes,
+            'The new path caches the result. This avoids repeated work.');
+        ackEq(before.targets[0].sentence, 'The new path caches the result.',
+            'state identifies each exact target sentence');
+        ackNeq(jevCacheId('description', before, questions), jevCacheId('description', edited, questions),
             'description edits cannot reuse a stale sentence result');
-        ackNeq(jevCacheId('description', before), jevCacheId('description', pushed),
+        ackNeq(jevCacheId('description', before, questions), jevCacheId('description', pushed, questions),
             'force pushes cannot reuse a stale sentence result');
         ackAssert(jevValidatedResult('description', {
             model: 'jev-test',
             answers: {
-                priority: { type: 'choice', choice: 'essence', probabilities: { essence: 0.9 } },
-                category: { type: 'choice', choice: 'behavior', probabilities: { behavior: 0.8 } },
-                concern: { type: 'noul', noul: 0.1 },
+                target_1: { type: 'choice', choice: 'essence_behavior', probabilities: { essence_behavior: 0.9 } },
+                target_2: { type: 'choice', choice: 'foreground', probabilities: { foreground: 0.8 } },
             },
-        }), 'accepts the same typed reading-guide answer shape as a changed line');
+        }, questions), 'accepts one combined typed classification per target sentence');
     });
 
     ackTest('sourceSection fails closed when structural-test anchors drift', () => {
@@ -43890,6 +44262,68 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackDeepEq(paths.sort(), ['doc/remove.md', 'src/new.cpp']);
     });
 
+    ackTest('fetchPatch falls back to an immutable base-head diff when an mbox omits the head', async () => {
+        const originalFetchText = gmFetchText;
+        const base = 'a'.repeat(40);
+        const otherBase = 'b'.repeat(40);
+        const head = 'c'.repeat(40);
+        const prior = 'd'.repeat(40);
+        const calls = [];
+        try {
+            _prPatchCache.clear();
+            gmFetchText = async (url) => {
+                calls.push(url);
+                if (url.endsWith('.patch')) return `From ${prior} Mon Sep 17 00:00:00 2001\nold mbox`;
+                return `diff --git a/src/a.cpp b/src/a.cpp\n+exact ${url}`;
+            };
+            const pr = { owner: 'octo', repo: 'demo', pr: '17' };
+            const first = await fetchPatch(pr, { baseSha: base, expectedHead: head });
+            ackAssert(first.includes(`${base}...${head}.diff`), 'uses the exact aggregate diff');
+            ackEq(calls.length, 2, 'loads one mutable mbox and one immutable diff');
+            ackEq(await fetchPatch(pr, { baseSha: base, expectedHead: head }), first, 'reuses the exact revision');
+            ackEq(calls.length, 2, 'exact revision hits the derived cache');
+            await fetchPatch(pr, { baseSha: otherBase, expectedHead: head });
+            ackEq(calls.length, 4, 'a different base cannot reuse the old aggregate diff');
+        } finally {
+            gmFetchText = originalFetchText;
+            _prPatchCache.clear();
+        }
+    });
+
+    ackTest('fetchPRContext handles an unlinked compare without PR-only API requests', async () => {
+        const originalComparePatch = fetchComparePatch;
+        const originalFetch = gmFetch;
+        let apiCalls = 0;
+        try {
+            fetchComparePatch = async (path) => `compare patch for ${path}`;
+            gmFetch = async () => {
+                apiCalls++;
+                throw new Error('unexpected PR API request');
+            };
+            const compare = {
+                owner: 'octo', repo: 'demo', pr: 'compare:base...head', compare: true,
+                compareBase: 'base', compareHead: 'head',
+            };
+            const context = await fetchPRContext(compare);
+            ackAssert(context.diff.includes('/octo/demo/compare/base...head'), 'reads the compare patch');
+            ackEq(apiCalls, 0, 'does not treat the compare range as a PR number');
+        } finally {
+            fetchComparePatch = originalComparePatch;
+            gmFetch = originalFetch;
+        }
+    });
+
+    ackTest('Jev comment evidence identities include both base and head revisions', () => {
+        const fn = sourceSection(
+            _ackSource,
+            'async function jevCommentCurrentEvidence',
+            'async function jevCommentReviewState',
+        );
+        ackAssert(fn.includes('const revision = `${baseSha}...${head}`'), 'builds a base-head revision');
+        ackAssert(fn.includes('jevCommentEvidenceSnapshots.get(requestKey)'), 'reads the exact revision snapshot');
+        ackAssert(fn.includes('jevCommentPatchCache.get(patchKey)'), 'reads the exact revision patch');
+    });
+
     ackTest('gmFetchText helper exists and is used by fetchPatch, fetchComparePatch, fetchRawFile, fetchCommitPatch', () => {
         const source = _ackSource;
         ackAssert(source.includes('function gmFetchText(url,'), 'gmFetchText defined');
@@ -45965,12 +46399,15 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackNeq(short, buildPromptCacheKey('claude', 'model-a', 'system', 'user', 'low', 100),
                 'provider credential scope changes the key');
             const state = { kind: 'line', text: 'x' };
+            const oneTarget = jevReadingQuestions('line', 1);
+            const twoTargets = jevReadingQuestions('line', 2);
             GM_setValue('jev_api_key', 'jev-a');
-            const jevA = jevCacheId('line', state);
+            const jevA = jevCacheId('line', state, oneTarget);
+            ackNeq(jevA, jevCacheId('line', state, twoTargets), 'the exact dynamic target questions change the key');
             GM_setValue('jev_api_key', 'jev-b');
-            ackNeq(jevA, jevCacheId('line', state), 'TypeSafe credential scope changes the key');
+            ackNeq(jevA, jevCacheId('line', state, oneTarget), 'TypeSafe credential scope changes the key');
             const jevKeySource = sourceSection(_ackSource, 'function jevCacheId', 'function jevCacheEntries');
-            ackAssert(jevKeySource.includes('questions: JEV_QUESTIONS[kind]'), 'Jev question rubric participates');
+            ackAssert(jevKeySource.includes('questions,'), 'the exact Jev question map participates');
             ackAssert(jevKeySource.includes('responseSchema: JEV_SCHEMA[kind]'), 'Jev response schema participates');
             ackAssert(jevKeySource.includes('state,'), 'Jev input state participates');
         } finally {
