@@ -7057,12 +7057,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     // --- Cache ---
 
-    function cacheKey(provider, pr, id) {
-        const kind = pageKind() || 'pull';
-        const model = getLLMConfig()[provider]?.model || 'default';
-        return `llm_cache_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${model}_${id}`;
-    }
-
     function prInfographicCachePrefix(pr) {
         return `llm_infographic_${pr.owner}_${pr.repo}_${pr.pr}_`;
     }
@@ -7125,11 +7119,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (!key) return;
         GM_setValue(key, value);
         recordCacheTimestamp(key);
-    }
-
-    function getCache(provider, pr, id) {
-        if (!getLLMConfig().cacheEnabled) return null;
-        return GM_getValue(cacheKey(provider, pr, id), null);
     }
 
     function recordCacheTimestamp(key) {
@@ -33148,37 +33137,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(getAnalysisMode('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), 'commit');
     });
 
-    // --- cacheKey ---
-
-    ackTest('generates correct cache key', () => {
-        const origPageKind = pageKind;
-        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '123' };
-        try {
-            pageKind = () => 'pull';
-            ackEq(cacheKey('claude', pr, 'pr'), `llm_cache_pull_bitcoin_bitcoin_123_claude_${LLM_MODELS.claude}_pr`);
-        } finally {
-            pageKind = origPageKind;
-        }
-    });
-
-    ackTest('handles different providers', () => {
-        const origPageKind = pageKind;
-        const pr = { owner: 'alice', repo: 'bitcoin', pr: '106' };
-        try {
-            pageKind = () => 'pull';
-            ackEq(
-                cacheKey('openai', pr, 'commit_abc'),
-                `llm_cache_pull_alice_bitcoin_106_openai_${LLM_MODELS.openai}_commit_abc`,
-            );
-            ackEq(
-                cacheKey('gemini', pr, 'commit_abc'),
-                `llm_cache_pull_alice_bitcoin_106_gemini_${LLM_MODELS.gemini}_commit_abc`,
-            );
-        } finally {
-            pageKind = origPageKind;
-        }
-    });
-
     // --- fmtTokens ---
 
     ackTest('formats small numbers as-is', () => {
@@ -33664,19 +33622,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('getAnalysisMode defaults to pr for unknown sub-paths', () => {
         ackEq(getAnalysisMode('/bitcoin/bitcoin/pull/1/whatever'), 'pr');
-    });
-
-    ackTest('cacheKey escapes nothing -- relies on clean inputs', () => {
-        const origPageKind = pageKind;
-        const pr = { owner: 'a/b', repo: 'c', pr: '1' };
-        try {
-            pageKind = () => 'pull';
-            const key = cacheKey('x', pr, 'y');
-            // Should just concatenate -- unknown provider 'x' falls back to model 'default'
-            ackEq(key, 'llm_cache_pull_a/b_c_1_x_default_y');
-        } finally {
-            pageKind = origPageKind;
-        }
     });
 
     ackTest('renderMarkdown handles empty string', () => {
@@ -36614,21 +36559,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     // ============================================================================
-    // cacheKey -- extended
-    // ============================================================================
-
-    ackTest('cacheKey separates different PRs', () => {
-        const pr1 = { owner: 'o', repo: 'r', pr: '1' };
-        const pr2 = { owner: 'o', repo: 'r', pr: '2' };
-        ackNeq(cacheKey('claude', pr1, 'pr'), cacheKey('claude', pr2, 'pr'));
-    });
-
-    ackTest('cacheKey separates different analysis modes', () => {
-        const pr = { owner: 'o', repo: 'r', pr: '1' };
-        ackNeq(cacheKey('claude', pr, 'pr'), cacheKey('claude', pr, 'commit'));
-    });
-
-    // ============================================================================
     // fmtTokens -- extended
     // ============================================================================
 
@@ -37031,19 +36961,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert('pr' in cfgO.instructions);
         ackAssert('pr' in cfgG.instructions);
         setActiveProvider('claude'); // restore
-    });
-
-    ackTest('cacheKey includes provider for per-LLM caching', () => {
-        const pr = { owner: 'o', repo: 'r', pr: '1' };
-        const keyC = cacheKey('claude', pr, 'pr');
-        const keyO = cacheKey('openai', pr, 'pr');
-        const keyG = cacheKey('gemini', pr, 'pr');
-        ackAssert(keyC.includes('claude'), 'claude in cache key');
-        ackAssert(keyO.includes('openai'), 'openai in cache key');
-        ackAssert(keyG.includes('gemini'), 'gemini in cache key');
-        ackNeq(keyC, keyO, 'different providers = different keys');
-        ackNeq(keyC, keyG, 'different providers = different keys');
-        ackNeq(keyO, keyG, 'different providers = different keys');
     });
 
     // ============================================================================
@@ -48821,10 +48738,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
     ackTest('LLM cache keys include page kind to prevent PR/issue collision', () => {
         const source = _ackSource;
-        // cacheKey function
-        const cacheKeyFn = source.slice(source.indexOf('function cacheKey'), source.indexOf('function getCache'));
-        ackAssert(cacheKeyFn.includes('pageKind()'), 'cacheKey uses pageKind');
-        ackAssert(cacheKeyFn.includes('llm_cache_${kind}_'), 'cacheKey includes kind in prefix');
         // prompt cache key via buildPromptCacheKey (used by callLLM)
         const buildKey = source.slice(
             source.indexOf('function buildPromptCacheKey'),
@@ -48936,7 +48849,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('recordCacheTimestamp tracks exact prompt, aggregate, and infographic saves', () => {
         const source = _ackSource;
         ackAssert(source.includes('function recordCacheTimestamp'), 'helper exists');
-        const cacheHelpers = sourceSection(source, 'function setInfographicCache', 'function getCache');
+        const cacheHelpers = sourceSection(source, 'function setInfographicCache', 'function recordCacheTimestamp');
         ackAssert(cacheHelpers.includes('recordCacheTimestamp(key)'), 'setInfographicCache records timestamp');
         const callFn = sourceSection(source, 'function callLLM(', 'function parseProviderError');
         ackAssert(callFn.includes('recordCacheTimestamp(promptKey)'), 'prompt cache records timestamp');
@@ -50661,7 +50574,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes('function addPromptDetails'), 'has reusable collapsible prompt details');
         const cache = source.slice(
             source.indexOf('function prInfographicCacheKey'),
-            source.indexOf('function getCache'),
+            source.indexOf('function recordCacheTimestamp'),
         );
         ackAssert(cache.includes('headSha'), 'cache key includes PR head sha');
         ackAssert(cache.includes('scope = ' + "'pr'"), 'cache helpers default to PR scope');
@@ -52510,14 +52423,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             const val = parseInt(m.split('=')[1], 10);
             ackAssert(val <= 100, `${m} exceeds GitHub max of 100`);
         }
-    });
-
-    ackTest('cacheKey includes model to prevent stale cache across model changes', () => {
-        const source = _ackSource;
-        const fn = source.slice(source.indexOf('function cacheKey'), source.indexOf('function getCache'));
-        ackAssert(fn.includes('getLLMConfig()[provider]?.model'), 'reads model from config');
-        ackAssert(fn.includes("|| 'default'"), 'falls back to default for unknown providers');
-        ackAssert(fn.includes('${model}_'), 'includes model in key');
     });
 
     ackTest('all Ctrl shortcuts require arm delay (no browser shortcut hijacking)', () => {
@@ -54588,7 +54493,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         parseIssue,
         parsePageContext,
         pageKind,
-        cacheKey,
         renderMarkdown,
         fmtTokens,
         fmtCost,
