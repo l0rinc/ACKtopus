@@ -17899,7 +17899,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function jevEvaluate(pr, kind, state, questions = JEV_QUESTIONS[kind]) {
+    // Callers that already derived the cache id pass it to avoid rehashing the state.
+    function jevEvaluate(pr, kind, state, questions = JEV_QUESTIONS[kind], id = jevCacheId(kind, state, questions)) {
         const epoch = jevEpoch;
         const readingRequest = kind === 'line' || kind === 'description';
         const readingEnabled = () => kind === 'line' ? jevLineReadingEnabled()
@@ -17908,7 +17909,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevDiagnostic('work skipped', { kind, reason: jevReadingUnavailableReason(kind) }, { key: kind, intervalMs: 2000 });
             return Promise.resolve(null);
         }
-        const id = jevCacheId(kind, state, questions);
         const cached = jevReadCache(id);
         // A local result sends no repository content anywhere. Public proof is
         // required immediately before a new TypeSafe request, not to display a
@@ -18784,7 +18784,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 slot.classList.add('ack-jev-comment-badges');
                 const evidence = `${state.selected_permalink || `${pr.owner}/${pr.repo}#comment`}${state.head ? ` at ${state.head.slice(0, 12)}` : ''}`;
                 const exactSuggestion = jevExactSuggestionApplied(state);
-                const evaluation = exactSuggestion ? Promise.resolve(exactSuggestion) : jevEvaluate(pr, 'comment', state);
+                const evaluation = exactSuggestion ? Promise.resolve(exactSuggestion)
+                    : jevEvaluate(pr, 'comment', state, JEV_QUESTIONS.comment, id);
                 return evaluation.then((result) => {
                     const currentHead = getImmediatePRHeadSHA();
                     if (slot.isConnected && slot.dataset.ackJevId === id &&
@@ -19345,11 +19346,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const meta = getDiffSelectionLineMeta(line.cell);
         if (!meta?.lineNum) return null;
         const location = `${path}:${meta.side || (line.deleted ? 'L' : 'R')}${meta.lineNum}`;
-        return {
-            meta,
-            location,
-            target: { location, change: line.excerpt },
-        };
+        return { location, target: { location, change: line.excerpt } };
     }
 
     function jevLineBatchState(pr, head, signature, allReviews, batchReviews, context = {}) {
@@ -19555,20 +19552,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             line.parts.map((part) => ({ path, line: part })));
         const entries = lines.map(({ path, line }) => ({ path, line, review: jevLineReviewTarget(path, line) }))
             .filter((entry) => entry.review);
-        const statePaths = [...new Set(entries.map((entry) => entry.path))];
         stats.eligible = entries.length;
+        // Only the targets differ between batches, so the file-wide rendered
+        // changes are joined and hashed once. `targets` keeps its key position.
+        const shared = jevLineBatchState(pr, head, signature, entries.map((entry) => entry.review), [], context);
         const tasks = [];
         for (let start = 0; start < entries.length; start += JEV_READING_BATCH_SIZE) {
             const batch = entries.slice(start, start + JEV_READING_BATCH_SIZE);
             const questions = jevReadingQuestions('line', batch.length);
-            const state = jevLineBatchState(
-                pr,
-                head,
-                signature,
-                entries.map((entry) => entry.review),
-                batch.map((entry) => entry.review),
-                context,
-            );
+            const state = { ...shared, targets: batch.map((entry) => entry.review.target) };
             const id = jevCacheId('line', state, questions);
             const current = batch.filter(({ line }, index) =>
                 line.cell.dataset.ackJevLineId === `${id}:${index}`).length;
@@ -19580,7 +19572,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             batch.forEach(({ line }, index) => {
                 line.cell.dataset.ackJevLineId = `${id}:${index}`;
             });
-            tasks.push(jevEvaluate(pr, 'line', state, questions).then((result) => {
+            tasks.push(jevEvaluate(pr, 'line', state, questions, id).then((result) => {
                 return batch.map(({ line, review }, index) => {
                     if (!line.cell.isConnected || line.cell.dataset.ackJevLineId !== `${id}:${index}`) return '';
                     const targetResult = jevReadingTargetResult(result, index);
@@ -19596,7 +19588,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             Promise.all(tasks).then((groups) => {
                 const rendered = groups.flat().filter(Boolean);
                 jevDiagnostic('rendered patch lines completed', {
-                    paths: statePaths,
+                    paths: shared.paths,
                     batches: tasks.length,
                     evaluated: stats.queued + stats.cacheHits,
                     ...jevReadingLevelCounts(rendered),
@@ -19933,7 +19925,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     span.dataset.ackJevDescriptionId = `${id}:${batchIndex}`;
                 }
             });
-            tasks.push(jevEvaluate(pr, 'description', state, questions).then((result) => {
+            tasks.push(jevEvaluate(pr, 'description', state, questions, id).then((result) => {
                 return indexes.map((sentenceIndex, batchIndex) => {
                     const sentence = sentences[sentenceIndex];
                     if (!sentence.spans.every((span) => span.isConnected &&
@@ -20344,7 +20336,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const id = jevCacheId('hunk', state);
                 const slot = jevHunkBadgeSlot(lineNumberCell, id);
                 if (slot) {
-                    jevEvaluate(pr, 'hunk', state).then((result) => {
+                    jevEvaluate(pr, 'hunk', state, JEV_QUESTIONS.hunk, id).then((result) => {
                         if (slot.isConnected && slot.dataset.ackJevId === id) jevRender(slot, 'hunk', result, locationKey, group.length > 16);
                     });
                 }
