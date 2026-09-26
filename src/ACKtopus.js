@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.282
+// @version      1.283
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -10509,6 +10509,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             if (!node) return '';
             if (node.nodeType === Node.TEXT_NODE) return normalizeText(node.textContent);
             if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            if (node.matches?.('.ack-jev-description-segment')) return renderInlineChildren(node);
+            if (node.matches?.(ACK_MUTATION_OWNED_SELECTOR)) return '';
             const tag = node.tagName.toLowerCase();
             if (tag === 'br') return '\n';
             if (tag === 'code' && node.parentElement?.tagName !== 'PRE') return normalizeText(node.textContent);
@@ -10571,6 +10573,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 return text || '';
             }
             if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            if (node.matches?.('.ack-jev-description-segment')) return renderInlineChildren(node);
+            if (node.matches?.(ACK_MUTATION_OWNED_SELECTOR)) return '';
             const tag = node.tagName.toLowerCase();
             const snippet = node.getAttribute?.('data-snippet-clipboard-copy-content');
             if (snippet) {
@@ -46926,6 +46930,15 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             1,
             'does not duplicate clipboard snippet text',
         );
+    });
+
+    ackTest('renderBodyMarkdown excludes injected controls while preserving wrapped prose', () => {
+        const body = document.createElement('div');
+        body.className = 'markdown-body';
+        body.innerHTML = '<p><span class="ack-jev-description-priority" data-emoji="🚦"></span>' +
+            '<span class="ack-jev-description-segment">Review this sentence.</span></p>' +
+            '<div class="ack-explain-panel">generated explanation</div>';
+        ackEq(renderBodyMarkdown(body), 'Review this sentence.');
     });
 
     ackTest('gatherFullPRContext fetches PR URL, title, description, commits, patch, comments', () => {
