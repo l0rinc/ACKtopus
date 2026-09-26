@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.275
+// @version      1.276
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1532,15 +1532,17 @@
     }
 
     function parseCompareReviewContext(path = location.pathname, search = location.search) {
-        const m = String(path || '').match(
-            /^\/([^/]+)\/([^/]+)\/compare\/([^/?#]+?)\.{2,3}([^/?#]+)(?:\/|$)/i,
-        );
+        const m = String(path || '').match(/^\/([^/]+)\/([^/]+)\/compare\/(.+)$/i);
         if (!m) return null;
+        const range = m[3].replace(/[?#].*$/, '').replace(/\/$/, '');
+        const separator = range.match(/\.{2,3}/);
+        if (!separator || separator.index === undefined) return null;
         const decode = (value) => {
             try { return decodeURIComponent(value); } catch (_) { return value; }
         };
-        const base = decode(m[3]);
-        const head = decode(m[4]);
+        const base = decode(range.slice(0, separator.index));
+        const head = decode(range.slice(separator.index + separator[0].length));
+        if (!base || !head) return null;
         const linkedPR = parseComparePrParam(search);
         return {
             owner: decode(m[1]),
@@ -1570,13 +1572,13 @@
     function getImmediatePRHeadSHA(path = location.pathname) {
         const pr = parsePR(path);
         if (!pr) return '';
-        const ssr = readHeadShaFromSSR();
-        if (/^[0-9a-f]{40}$/i.test(ssr)) return ssr;
         const cached =
             _prContextCache && _prContextKey.startsWith(`${pr.owner}/${pr.repo}/${pr.pr}:`)
                 ? _prContextCache.headSha || ''
                 : '';
         if (/^[0-9a-f]{40}$/i.test(cached)) return cached;
+        const ssr = readHeadShaFromSSR();
+        if (/^[0-9a-f]{40}$/i.test(ssr)) return ssr;
         return '';
     }
 
@@ -2907,6 +2909,17 @@
         }, 'warn');
     }
 
+    function githubResponseProvesRepoAccessDenied(url, status) {
+        if (status !== 404) return false;
+        try {
+            const parsed = new URL(url);
+            const repoKey = githubApiRepoKey(url);
+            return !!repoKey && decodeURIComponent(parsed.pathname).toLowerCase() === `/repos/${repoKey}`.toLowerCase();
+        } catch (_) {
+            return false;
+        }
+    }
+
     function ensureGithubPatRepoAccess(repoKey, { force = false } = {}) {
         const pat = githubPatValue();
         const key = githubPatRepoAccessKey(repoKey, pat);
@@ -3455,7 +3468,9 @@
                                     }
                                 } else {
                                     rememberGithubRateLimit(r2, fallbackHeaders);
-                                    if (r2.status === 404) rememberGithubPatRepoAccess(url, baseHeaders, 'denied');
+                                    if (githubResponseProvesRepoAccessDenied(url, r2.status)) {
+                                        rememberGithubPatRepoAccess(url, baseHeaders, 'denied');
+                                    }
                                     const error = githubHttpError(r2, url);
                                     if (r2.status === 404 && githubPatRepoAccessState(repoKey) === 'denied') {
                                         error.githubRepoAccessDenied = true;
@@ -3467,7 +3482,9 @@
                         });
                     } else {
                         rememberGithubRateLimit(r, headers);
-                        if (r.status === 404) rememberGithubPatRepoAccess(url, headers, 'denied');
+                        if (githubResponseProvesRepoAccessDenied(url, r.status)) {
+                            rememberGithubPatRepoAccess(url, headers, 'denied');
+                        }
                         const error = githubHttpError(r, url);
                         if (r.status === 404 && githubPatRepoAccessState(repoKey) === 'denied') {
                             error.githubRepoAccessDenied = true;
@@ -8840,12 +8857,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function fetchPatch(pr, opts = {}) {
-        const contextHint = !opts.expectedHead && _prContextCache &&
-            _prContextKey.startsWith(`${pr.owner}/${pr.repo}/${pr.pr}:`)
-            ? _prContextCache : null;
-        const expectedHead = String(opts.expectedHead || contextHint?.headSha || '').toLowerCase();
+        const expectedHead = String(opts.expectedHead || '').toLowerCase();
         const exactHead = /^[0-9a-f]{40}$/i.test(expectedHead) ? expectedHead : '';
-        const expectedBase = String(opts.baseSha || contextHint?.baseSha || '').toLowerCase();
+        const expectedBase = String(opts.baseSha || '').toLowerCase();
         const exactBase = /^[0-9a-f]{40}$/i.test(expectedBase) ? expectedBase : '';
         const key = prPatchCacheKey(pr, exactBase, exactHead);
         if (key && _prPatchCache.has(key)) return _prPatchCache.get(key);
@@ -29928,12 +29942,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (batch.length < 100) break;
         }
 
-        if (
-            apiResult.length &&
-            !apiFailed &&
-            (!head || apiResult.some((commit) => String(commit?.sha || '').toLowerCase() === head.toLowerCase()))
-        ) {
-            if (cacheKey) commitListCache.set(cacheKey, apiResult);
+        if (apiResult.length && !apiFailed) {
+            const includesExpectedHead = !head ||
+                apiResult.some((commit) => String(commit?.sha || '').toLowerCase() === head.toLowerCase());
+            if (cacheKey && includesExpectedHead) commitListCache.set(cacheKey, apiResult);
             return apiResult;
         }
 
@@ -43907,6 +43919,21 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(!helpers.includes('auth:${headers.Authorization}'), 'does not store Authorization header in rate-limit bucket key');
     });
 
+    ackTest('only a repository root 404 proves PAT repository denial', () => {
+        const root = 'https://api.github.com/repos/bitcoin/bitcoin';
+        ackEq(githubResponseProvesRepoAccessDenied(root, 404), true, 'repository probe denial is remembered');
+        ackEq(
+            githubResponseProvesRepoAccessDenied(`${root}/pulls/20`, 404),
+            false,
+            'a missing pull request says nothing about repository access',
+        );
+        ackEq(
+            githubResponseProvesRepoAccessDenied(`${root}/issues/comments/99/reactions`, 404),
+            false,
+            'a deleted comment says nothing about repository access',
+        );
+    });
+
     ackTest('rate-limit backoff honours the reset header but stays bounded', () => {
         const makeResponse = (resetSeconds) => ({
             status: 403,
@@ -44392,12 +44419,12 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('/commits/${raw}'), 'falls back to commit API lookup');
     });
 
-    ackTest('getImmediatePRHeadSHA only uses cached or SSR PR head SHA', () => {
+    ackTest('getImmediatePRHeadSHA prefers refreshed context over initial SSR data', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function getImmediatePRHeadSHA'), source.indexOf('function createBtn'));
         ackAssert(fn.includes('_prContextCache'), 'uses cached PR context head SHA');
         ackAssert(fn.includes('readHeadShaFromSSR'), 'uses embedded SSR PR head SHA');
-        ackAssert(fn.indexOf('readHeadShaFromSSR') < fn.indexOf('_prContextCache'), 'prefers live SSR over a cached hint');
+        ackAssert(fn.indexOf('_prContextCache') < fn.indexOf('readHeadShaFromSSR'), 'prefers refreshed context over initial SSR');
         ackAssert(!fn.includes('parseCommitsFromPage'), 'does not infer from commit list ordering');
         ackAssert(!fn.includes('querySelectorAll(\'a[href*="/commit"]\')'), 'does not infer from visible commit links');
     });
@@ -45420,6 +45447,32 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
+    ackTest('fetchPatch does not bind a mutable PR patch to an old context head', async () => {
+        const originalFetchText = gmFetchText;
+        const originalContext = _prContextCache;
+        const originalKey = _prContextKey;
+        const oldHead = 'a'.repeat(40);
+        const newHead = 'b'.repeat(40);
+        const urls = [];
+        try {
+            _prPatchCache.clear();
+            _prContextCache = { ...emptyPRContext(), headSha: oldHead, baseSha: 'c'.repeat(40) };
+            _prContextKey = 'octo/demo/17:' + oldHead;
+            gmFetchText = async (url) => {
+                urls.push(url);
+                return `From ${newHead} Mon Sep 17 00:00:00 2001\nnew patch`;
+            };
+            const patch = await fetchPatch({ owner: 'octo', repo: 'demo', pr: '17' });
+            ackAssert(patch.includes(newHead), 'returns the current mutable patch');
+            ackDeepEq(urls, ['https://github.com/octo/demo/pull/17.patch'], 'does not request a stale exact diff');
+        } finally {
+            gmFetchText = originalFetchText;
+            _prContextCache = originalContext;
+            _prContextKey = originalKey;
+            _prPatchCache.clear();
+        }
+    });
+
     ackTest('fetchPRContext handles an unlinked compare without PR-only API requests', async () => {
         const originalComparePatch = fetchComparePatch;
         const originalFetch = gmFetch;
@@ -46217,6 +46270,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackEq(isToolbarPage('/ryanofsky/bitcoin/commit/a3f596f269324d110031f97c3bc4373516ca9e8c'), true);
         ackEq(isToolbarPage('/bitcoin/bitcoin'), false);
         ackEq(isToolbarPage('/bitcoin/bitcoin/pulls'), false);
+    });
+
+    ackTest('parseCompareReviewContext preserves slashes in compare refs', () => {
+        const parsed = parseCompareReviewContext(
+            '/octo/demo/compare/release/v1...owner:topic/with/slashes',
+            '?pr=42',
+        );
+        ackEq(parsed?.compareBase, 'release/v1');
+        ackEq(parsed?.compareHead, 'owner:topic/with/slashes');
+        ackEq(parsed?.pr, '42');
     });
 
     ackTest('toolbar routes cover upstream and fork secp256k1 pages', () => {
