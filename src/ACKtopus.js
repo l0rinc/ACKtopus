@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.272
+// @version      1.273
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17008,8 +17008,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const JEV_LINE_READING_KEY = 'jev_line_reading_mode';
     const JEV_PUBLIC_CHECK_TTL_MS = 60000;
-    const JEV_MAX_REQUESTS_PER_PAGE = 250;
-    const JEV_MAX_LINE_REQUESTS_PER_PAGE = 2000;
+    const JEV_MAX_TOTAL_REQUESTS_PER_PAGE = 40;
+    const JEV_MAX_REQUESTS_PER_PAGE = 40;
+    const JEV_MAX_LINE_REQUESTS_PER_PAGE = 40;
+    const JEV_DIFF_SETTLE_MS = 750;
     const JEV_STACK_MAX_COMMITS = 12;
     const JEV_STACK_PATCH_CHARS = 12000;
     const JEV_STACK_MAX_STATE_CHARS = 80000;
@@ -17217,6 +17219,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevPageKey = '';
     let jevPageRequests = 0;
     let jevPageLineRequests = 0;
+    let jevPageScheduledRequests = 0;
+    let jevPageScheduledLineRequests = 0;
+    let jevPagePostAttempts = 0;
     let jevEpoch = 0;
     let jevRejectedKey = '';
     let jevSchemaRejected = false;
@@ -17511,7 +17516,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return check;
     }
 
-    function jevPost(kind, state, questions = JEV_QUESTIONS[kind], attempt = 0) {
+    function jevPost(kind, state, questions = JEV_QUESTIONS[kind], attempt = 0, budgetPageKey = '') {
         if (typeof questions === 'number') {
             attempt = questions;
             questions = JEV_QUESTIONS[kind];
@@ -17524,6 +17529,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!key) return Promise.reject(new Error('Jev API key missing'));
         const body = JSON.stringify({ state, model: JEV_MODEL, questions });
         if (JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
+        if (budgetPageKey) {
+            if (budgetPageKey !== jevPageKey) return Promise.reject(new Error('Jev page changed before request'));
+            if (jevPagePostAttempts >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE) {
+                return Promise.reject(new Error('Jev page HTTP request cap reached'));
+            }
+            jevPagePostAttempts++;
+        }
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -17533,7 +17545,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 timeout: 15000,
                 onload: (r) => {
                     if ((r.status === 429 || r.status === 529) && attempt < 2) {
-                        setTimeout(() => jevPost(kind, state, questions, attempt + 1).then(resolve, reject), 500 * 2 ** attempt);
+                        setTimeout(() => jevPost(kind, state, questions, attempt + 1, budgetPageKey).then(resolve, reject), 500 * 2 ** attempt);
                         return;
                     }
                     if (r.status === 429 || r.status === 529) {
@@ -17606,15 +17618,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevPageKey = pageKey;
             jevPageRequests = 0;
             jevPageLineRequests = 0;
+            jevPageScheduledRequests = 0;
+            jevPageScheduledLineRequests = 0;
+            jevPagePostAttempts = 0;
         }
-        if (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
+        const scheduled = readingRequest ? jevPageScheduledLineRequests : jevPageScheduledRequests;
+        const scheduledTotal = jevPageScheduledRequests + jevPageScheduledLineRequests;
+        if (scheduledTotal >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
+            || scheduled >= (readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE)) {
             jevDiagnostic('page request cap reached', {
                 kind,
-                used: readingRequest ? jevPageLineRequests : jevPageRequests,
-                limit: readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE,
+                used: scheduledTotal,
+                limit: JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
+                kindUsed: scheduled,
+                kindLimit: readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE,
             }, { key: kind, intervalMs: 0, repeatMs: 60000, level: 'warn' });
             return Promise.resolve(null);
         }
+        if (readingRequest) jevPageScheduledLineRequests++;
+        else jevPageScheduledRequests++;
         const routePath = location.pathname;
         const pending = new Promise((resolve) => {
             const run = async () => {
@@ -17630,7 +17652,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (location.pathname !== routePath) return resolve(null);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
-                    if (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE) {
+                    if (jevPageRequests + jevPageLineRequests >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
+                        || (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE)) {
                         return resolve(null);
                     }
                     if (readingRequest) jevPageLineRequests++;
@@ -17642,7 +17665,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         active: jevActive,
                         waiting: jevJobs.length,
                     }, { key: kind, intervalMs: 2000 });
-                    const result = await jevPost(kind, state, questions);
+                    const result = await jevPost(kind, state, questions, 0, pageKey);
                     if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
@@ -18763,27 +18786,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     let jevDiffObserved = new WeakSet();
-    const jevDiffPending = new WeakSet();
+    let jevDiffPending = new WeakSet();
     const jevVisibleDiffQueue = [];
-    function queueJevDiffFile(file, immediate = false) {
-        if (jevDiffPending.has(file)) return;
-        jevDiffPending.add(file);
-        jevVisibleDiffQueue.push(file);
-        jevDiagnostic('diff file entered viewport', {
-            path: readDiffFilePath(file) || '(path not rendered yet)',
-            pendingFiles: jevVisibleDiffQueue.length,
-            state: immediate ? 'visible DOM scan scheduled now' : 'waiting for background DOM scan',
-        }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1000 });
-        if (immediate) {
-            setTimeout(() => {
-                const index = jevVisibleDiffQueue.indexOf(file);
-                if (index >= 0) jevVisibleDiffQueue.splice(index, 1);
-                jevDiffPending.delete(file);
-                if (file?.isConnected) queueJevDiffHunks(file);
-                if (jevVisibleDiffQueue.length) scheduleJevDiffProcessing();
-            }, 0);
+    const jevDiffSettleTimers = new Map();
+
+    function settleJevDiffFile(file) {
+        jevDiffSettleTimers.delete(file);
+        if (!file?.isConnected) {
+            jevDiffPending.delete(file);
             return;
         }
+        if (!jevVisibleDiffQueue.includes(file)) jevVisibleDiffQueue.push(file);
+        scheduleJevDiffProcessing();
+    }
+
+    function queueJevDiffFile(file, immediate = false) {
+        const alreadyPending = jevDiffPending.has(file);
+        if (immediate) {
+            const previousTimer = jevDiffSettleTimers.get(file);
+            if (previousTimer !== undefined) clearTimeout(previousTimer);
+            const queuedIndex = jevVisibleDiffQueue.indexOf(file);
+            if (queuedIndex >= 0) jevVisibleDiffQueue.splice(queuedIndex, 1);
+            if (!alreadyPending) {
+                jevDiffPending.add(file);
+            }
+            jevDiffSettleTimers.set(file, setTimeout(() => settleJevDiffFile(file), JEV_DIFF_SETTLE_MS));
+        } else {
+            if (alreadyPending) return;
+            jevDiffPending.add(file);
+            jevVisibleDiffQueue.push(file);
+        }
+        jevDiagnostic('diff file entered viewport', {
+            path: readDiffFilePath(file) || '(path not rendered yet)',
+            pendingFiles: jevVisibleDiffQueue.length + jevDiffSettleTimers.size,
+            state: immediate ? 'waiting for diff DOM to settle' : 'waiting for background DOM scan',
+            settleMs: immediate ? JEV_DIFF_SETTLE_MS : 0,
+        }, { key: readDiffFilePath(file) || 'unknown-file', intervalMs: 1000 });
+        if (immediate) return;
         scheduleJevDiffProcessing();
     }
     function scheduleJevDiffProcessing() {
@@ -18808,6 +18847,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Forget which files and hunks were annotated so re-enabling Jev on the
     // same page annotates them again. Commit rows re-check their badge slot.
     function resetJevTrackers() {
+        for (const timer of jevDiffSettleTimers.values()) clearTimeout(timer);
+        jevDiffSettleTimers.clear();
+        jevVisibleDiffQueue.length = 0;
+        jevDiffPending = new WeakSet();
         jevDiffObserved = new WeakSet();
         jevHunkObserved = new WeakMap();
     }
@@ -18946,7 +18989,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return {
             kind: 'line_batch',
             repository: `${pr.owner}/${pr.repo}`,
+            pr: String(pr.pr || ''),
             head,
+            compare_base: pr.compareBase || '',
+            compare_head: pr.compareHead || '',
             paths: [...new Set(allReviews.map((review) =>
                 review.location.slice(0, review.location.lastIndexOf(':'))))],
             full_hunk_hash: signature,
@@ -19638,7 +19684,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const lineNumberCell = meta.lineEl || meta.row?.firstElementChild;
             if (lineNumberCell && lineNumberCell !== first.cell) {
                 const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
-                const state = { kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, head, path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'), full_hunk_hash: signature };
+                const state = {
+                    kind: 'hunk', repository: `${pr.owner}/${pr.repo}`, pr: String(pr.pr || ''), head,
+                    compare_base: pr.compareBase || '', compare_head: pr.compareHead || '',
+                    path, line: locationKey, changes: group.slice(0, 16).map((line) => line.excerpt).join('\n'),
+                    full_hunk_hash: signature,
+                };
                 const id = jevCacheId('hunk', state);
                 const slot = jevHunkBadgeSlot(lineNumberCell, id);
                 if (slot) {
@@ -19653,33 +19704,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             changedRows: group.length,
             hunkBadge: !!meta?.lineNum,
         }, { key: `${path}:${signature}`, intervalMs: 0, repeatMs: 60000 });
-    }
-
-    function queueJevRenderedPatchLines(pr, head) {
-        const records = [];
-        const paths = new Set();
-        const seenCells = new Set();
-        for (const file of qsa(document, DIFF_FILE_SELECTOR)) {
-            if (!file.isConnected) continue;
-            const path = readDiffFilePath(file);
-            if (!path) continue;
-            for (const row of file.querySelectorAll('tr')) {
-                const line = jevChangedRow(row);
-                if (!line) continue;
-                const cells = (line.parts?.length ? line.parts : [line]).map((part) => part.cell);
-                if (cells.every((cell) => seenCells.has(cell))) continue;
-                cells.forEach((cell) => seenCells.add(cell));
-                records.push({ path, line });
-                paths.add(path);
-            }
-        }
-        const signature = hashPrompt(head + records.map(({ path, line }) =>
-            `${path}\0${line.fullText}`).join('\n'));
-        return {
-            paths: [...paths],
-            signature,
-            ...queueJevLineReading(pr, head, records, signature),
-        };
     }
 
     function queueJevDiffHunks(file) {
@@ -19698,7 +19722,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const rows = [...file.querySelectorAll('tr')];
         const changed = rows.map(jevChangedRow).filter(Boolean);
         const changedSides = changed.reduce((count, line) => count + (line.parts?.length || 1), 0);
-        const lineStats = queueJevRenderedPatchLines(pr, head);
+        const fileSignature = hashPrompt(head + changed.map((line) => line.fullText).join('\n'));
+        const lineStats = queueJevLineReading(
+            pr,
+            head,
+            changed.map((line) => ({ path, line })),
+            fileSignature,
+        );
         const signaledCells = new Set(qsa(file,
             'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
             .map((node) => node.closest?.('td.blob-code, td.diff-text, td.diff-text-cell') || node));
@@ -31232,9 +31262,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const after = { selected_comment: 'The revised overflow check looks wrong' };
             ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
             ackEq(gets, 1, 'a new TypeSafe request proves the repository is public');
+            jevCacheMemory = null;
             jevPublicChecks.delete(publicKey);
             ackEq((await jevEvaluate(pr, 'comment', before))?.answers.intent.choice, 'concern');
-            ackEq(gets, 1, 'displaying the local result performs no public GitHub request');
+            ackEq(gets, 1, 'reloading the persisted exact result performs no public GitHub request');
+            ackEq(posts, 1, 'reloading the persisted exact result performs no TypeSafe request');
             ackEq((await jevEvaluate(pr, 'comment', after))?.answers.intent.choice, 'concern');
             ackEq(gets, 2, 'edited evidence requires a new public check before upload');
             ackEq(posts, 2, 'the edit must miss the old evidence cache');
@@ -31562,16 +31594,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         file.innerHTML = '<table><tr><td data-line-number="1"></td><td class="blob-code blob-code-addition">+value</td></tr></table>';
         file.getBoundingClientRect = () => ({ top: 10, bottom: 80, left: 0, right: 100, width: 100, height: 70 });
         document.body.appendChild(file);
-        const queueLength = jevVisibleDiffQueue.length;
         try {
             resetJevTrackers();
             ackAssert(observeJevDiffFile(file), 'new rendered file starts observation');
-            ackAssert(jevDiffPending.has(file), 'visible file is queued synchronously');
-            ackEq(jevVisibleDiffQueue.at(-1), file, 'the immediate queue contains this exact file node');
+            ackAssert(jevDiffPending.has(file), 'visible file is marked pending synchronously');
+            ackAssert(jevDiffSettleTimers.has(file), 'visible file waits for a quiet DOM interval');
+            ackAssert(!jevVisibleDiffQueue.includes(file), 'the background queue cannot bypass the settle delay');
+            const firstTimer = jevDiffSettleTimers.get(file);
+            queueJevDiffFile(file, true);
+            ackEq(jevDiffSettleTimers.size, 1, 'repeated streamed updates retain one settle timer');
+            ackNeq(jevDiffSettleTimers.get(file), firstTimer, 'a later streamed update restarts the quiet interval');
         } finally {
-            const index = jevVisibleDiffQueue.indexOf(file);
-            if (index >= queueLength) jevVisibleDiffQueue.splice(index, 1);
-            jevDiffPending.delete(file);
             file.remove();
             resetJevTrackers();
         }
@@ -31593,6 +31626,67 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'the initial compare DOM is scanned for Jev work');
         ackAssert(docInjectors.includes("name: 'diffSelection', when: (ctx) => ctx.onPR || ctx.onCompare"),
             'compare pages retain the selection explanation UI');
+        ackAssert(JEV_MAX_TOTAL_REQUESTS_PER_PAGE <= 40
+            && JEV_MAX_REQUESTS_PER_PAGE <= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
+            && JEV_MAX_LINE_REQUESTS_PER_PAGE <= JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
+            'batched Jev work has one bounded per-page account budget');
+    });
+
+    ackTest('Jev applies the combined request cap before queueing new work', async () => {
+        const oldGet = GM_getValue;
+        const oldRequest = GM_xmlhttpRequest;
+        const oldConfigured = jevConfigured;
+        const oldCacheMemory = jevCacheMemory;
+        const oldPageKey = jevPageKey;
+        const oldPageRequests = jevPageRequests;
+        const oldPageLineRequests = jevPageLineRequests;
+        const oldScheduledRequests = jevPageScheduledRequests;
+        const oldScheduledLineRequests = jevPageScheduledLineRequests;
+        const oldPostAttempts = jevPagePostAttempts;
+        const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '123' };
+        let posts = 0;
+        try {
+            GM_getValue = (key, fallback) => key === 'jev_api_key' ? 'synthetic-key' : oldGet(key, fallback);
+            GM_xmlhttpRequest = () => { posts++; };
+            jevConfigured = true;
+            jevCacheMemory = [];
+            jevPageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
+            jevPageRequests = 12;
+            jevPageLineRequests = 28;
+            jevPageScheduledRequests = 12;
+            jevPageScheduledLineRequests = 28;
+            const result = await jevEvaluate(pr, 'comment', { selected_comment: 'over the combined cap' });
+            ackEq(result, null);
+            ackEq(jevJobs.length, 0, 'no extra request is queued after the combined cap');
+            ackEq(jevPageScheduledRequests + jevPageScheduledLineRequests, JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
+                'a rejected request does not consume another reservation');
+            jevPagePostAttempts = JEV_MAX_TOTAL_REQUESTS_PER_PAGE;
+            const error = await jevPost('comment', { selected_comment: 'retry over the cap' }, undefined, 1, jevPageKey)
+                .catch((reason) => reason);
+            ackAssert(error.message.includes('HTTP request cap reached'));
+            ackEq(posts, 0, 'a retry cannot bypass the actual POST ceiling');
+        } finally {
+            GM_getValue = oldGet;
+            GM_xmlhttpRequest = oldRequest;
+            jevConfigured = oldConfigured;
+            jevCacheMemory = oldCacheMemory;
+            jevPageKey = oldPageKey;
+            jevPageRequests = oldPageRequests;
+            jevPageLineRequests = oldPageLineRequests;
+            jevPageScheduledRequests = oldScheduledRequests;
+            jevPageScheduledLineRequests = oldScheduledLineRequests;
+            jevPagePostAttempts = oldPostAttempts;
+        }
+    });
+
+    ackTest('Jev yields between settled diff files', () => {
+        const settle = sourceSection(_ackSource, 'function settleJevDiffFile', 'function queueJevDiffFile');
+        ackAssert(settle.includes('jevVisibleDiffQueue.push(file)'), 'a settled file enters the shared background queue');
+        ackAssert(!settle.includes('queueJevDiffHunks(file)'), 'a settle timer does not scan a file synchronously');
+        const process = sourceSection(_ackSource, 'function scheduleJevDiffProcessing', 'const jevDiffObserver');
+        ackAssert(process.includes('const file = jevVisibleDiffQueue.shift()'), 'each background turn removes one file');
+        ackAssert(process.includes('if (jevVisibleDiffQueue.length) scheduleJevDiffProcessing()'),
+            'remaining files receive a later background turn');
     });
 
     ackTest('Jev diagnostics expose triggers, privacy gates, queues, caches, and rendered work', () => {
@@ -31887,6 +31981,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }, questions), 'accepts one combined typed classification per target line');
         ackAssert(jevCacheId('line', first, questions) !== jevCacheId('line', edited, questions),
             'head and hunk edits produce a new line cache key');
+        const compareA = jevLineBatchState({ ...pr, compareBase: 'c'.repeat(40), compareHead: 'a'.repeat(40) },
+            'a'.repeat(40), 'hunk-a', [review], [review]);
+        const compareB = jevLineBatchState({ ...pr, compareBase: 'd'.repeat(40), compareHead: 'a'.repeat(40) },
+            'a'.repeat(40), 'hunk-a', [review], [review]);
+        ackNeq(jevCacheId('line', compareA, questions), jevCacheId('line', compareB, questions),
+            'the exact comparison range participates even when its rendered lines happen to match');
         host.querySelector('.blob-code').textContent = '';
         ackEq(jevChangedRow(host.querySelector('tr'))?.text, '[blank line]', 'blank changed lines are still classified');
     });
