@@ -17284,9 +17284,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
     const JEV_LINE_READING_KEY = 'jev_line_reading_mode';
     const JEV_PUBLIC_CHECK_TTL_MS = 60000;
-    const JEV_MAX_TOTAL_REQUESTS_PER_PAGE = 40;
+    // Bounds both queued or running Jev work and actual TypeSafe POSTs per page.
     const JEV_MAX_REQUESTS_PER_PAGE = 40;
-    const JEV_MAX_LINE_REQUESTS_PER_PAGE = 40;
     const JEV_DIFF_SETTLE_MS = 750;
     const JEV_STACK_MAX_COMMITS = 12;
     const JEV_STACK_PATCH_CHARS = 12000;
@@ -17495,11 +17494,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let jevCacheMemory = null;
     let jevActive = 0;
     let jevPageKey = '';
-    let jevPageRequests = 0;
-    let jevPageLineRequests = 0;
-    let jevPageScheduledRequests = 0;
-    let jevPageScheduledLineRequests = 0;
-    let jevPagePostAttempts = 0;
+    let jevPageScheduled = 0; // queued or running jobs on this page
+    let jevPagePostAttempts = 0; // TypeSafe POSTs on this page, including retries
     let jevEpoch = 0;
     let jevRejectedKey = '';
     let jevSchemaRejected = false;
@@ -17869,10 +17865,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevPost(kind, state, questions = JEV_QUESTIONS[kind], attempt = 0, budgetPageKey = '') {
-        if (typeof questions === 'number') {
-            attempt = questions;
-            questions = JEV_QUESTIONS[kind];
-        }
         if (!jevEnabled()) return Promise.reject(new Error('Jev disabled or paused'));
         if (kind === 'stack' && jevStackRejected) return Promise.reject(new Error('Jev stack review paused after a rejected request'));
         if (kind === 'line' && jevLineRejected) return Promise.reject(new Error('Jev line guide paused after a rejected request'));
@@ -17883,7 +17875,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (JEV_SECRET_RE.test(body)) return Promise.reject(new Error('Jev input contains a credential-shaped string'));
         if (budgetPageKey) {
             if (budgetPageKey !== jevPageKey) return Promise.reject(new Error('Jev page changed before request'));
-            if (jevPagePostAttempts >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE) {
+            if (jevPagePostAttempts >= JEV_MAX_REQUESTS_PER_PAGE) {
                 return Promise.reject(new Error('Jev page HTTP request cap reached'));
             }
             jevPagePostAttempts++;
@@ -17968,27 +17960,18 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const pageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
         if (pageKey !== jevPageKey) {
             jevPageKey = pageKey;
-            jevPageRequests = 0;
-            jevPageLineRequests = 0;
-            jevPageScheduledRequests = 0;
-            jevPageScheduledLineRequests = 0;
+            jevPageScheduled = 0;
             jevPagePostAttempts = 0;
         }
-        const scheduled = readingRequest ? jevPageScheduledLineRequests : jevPageScheduledRequests;
-        const scheduledTotal = jevPageScheduledRequests + jevPageScheduledLineRequests;
-        if (scheduledTotal >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
-            || scheduled >= (readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE)) {
+        if (jevPageScheduled >= JEV_MAX_REQUESTS_PER_PAGE) {
             jevDiagnostic('page request cap reached', {
                 kind,
-                used: scheduledTotal,
-                limit: JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
-                kindUsed: scheduled,
-                kindLimit: readingRequest ? JEV_MAX_LINE_REQUESTS_PER_PAGE : JEV_MAX_REQUESTS_PER_PAGE,
+                used: jevPageScheduled,
+                limit: JEV_MAX_REQUESTS_PER_PAGE,
             }, { key: kind, intervalMs: 0, repeatMs: 60000, level: 'warn' });
             return Promise.resolve(null);
         }
-        if (readingRequest) jevPageScheduledLineRequests++;
-        else jevPageScheduledRequests++;
+        jevPageScheduled++;
         const routePath = location.pathname;
         const pending = new Promise((resolve) => {
             const run = async () => {
@@ -18004,12 +17987,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (location.pathname !== routePath) return resolve(null);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
-                    if (jevPageRequests + jevPageLineRequests >= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
-                        || (readingRequest ? jevPageLineRequests >= JEV_MAX_LINE_REQUESTS_PER_PAGE : jevPageRequests >= JEV_MAX_REQUESTS_PER_PAGE)) {
-                        return resolve(null);
-                    }
-                    if (readingRequest) jevPageLineRequests++;
-                    else jevPageRequests++;
+                    if (jevPagePostAttempts >= JEV_MAX_REQUESTS_PER_PAGE) return resolve(null);
                     const started = jevDiagnosticCount('started', kind);
                     jevDiagnostic('request started', {
                         kind,
@@ -18037,13 +18015,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }, { key: kind, intervalMs: 0, level: 'warn' });
                     resolve(null);
                 } finally {
-                    if (pageKey === jevPageKey) {
-                        if (readingRequest) {
-                            jevPageScheduledLineRequests = Math.max(0, jevPageScheduledLineRequests - 1);
-                        } else {
-                            jevPageScheduledRequests = Math.max(0, jevPageScheduledRequests - 1);
-                        }
-                    }
+                    if (pageKey === jevPageKey) jevPageScheduled = Math.max(0, jevPageScheduled - 1);
                     jevPending.delete(id);
                 }
             };
@@ -31841,7 +31813,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldGet = GM_getValue;
         const oldRequest = GM_xmlhttpRequest;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
+        const oldPostAttempts = jevPagePostAttempts;
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const pr = { owner: 'acktopus-private-fixture', repo: 'example', pr: '7' };
@@ -31862,7 +31834,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_xmlhttpRequest = oldRequest;
             jevPublicChecks.delete('acktopus-private-fixture/example');
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
+            jevPagePostAttempts = oldPostAttempts;
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
         }
@@ -31873,7 +31845,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldSet = GM_setValue;
         const oldRequest = GM_xmlhttpRequest;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
+        const oldPostAttempts = jevPagePostAttempts;
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const pr = { owner: 'acktopus-public-fixture', repo: 'example', pr: '8' };
@@ -31916,7 +31888,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_xmlhttpRequest = oldRequest;
             jevPublicChecks.delete(publicKey);
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
+            jevPagePostAttempts = oldPostAttempts;
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
         }
@@ -31927,7 +31899,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldSet = GM_setValue;
         const oldRequest = GM_xmlhttpRequest;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
+        const oldPostAttempts = jevPagePostAttempts;
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const oldRejectedKey = jevRejectedKey;
@@ -31945,7 +31917,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevRejectedKey = '';
             jevSchemaRejected = false;
             jevPageKey = '';
-            jevPageRequests = 0;
+            jevPagePostAttempts = 0;
             GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
             GM_setValue = () => {};
             GM_xmlhttpRequest = (opts) => {
@@ -31961,7 +31933,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
             };
             ackEq(await jevEvaluate(pr, 'comment', { selected_comment: 'first attempt' }), null);
-            ackEq(jevPageRequests, 0, 'a failed public check does not use the TypeSafe request budget');
+            ackEq(jevPagePostAttempts, 0, 'a failed public check does not use the TypeSafe request budget');
             ackEq(posts, 0, 'no repository content was posted');
             ackAssert(jevPublicRetryTimers.has(key), 'a transient failure schedules a retry');
             ackEq(await jevPublicRepository(pr), false);
@@ -31973,7 +31945,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(!jevPublicRetryTimers.has(key), 'a completed public check cancels the stale retry timer');
             ackEq(gets, 2);
             ackEq(posts, 1);
-            ackEq(jevPageRequests, 1, 'only the actual TypeSafe POST uses the budget');
+            ackEq(jevPagePostAttempts, 1, 'only the actual TypeSafe POST uses the budget');
             status = 404;
             ackEq(await jevPublicRepository(denied), false);
             ackAssert(!jevPublicRetryTimers.has('acktopus-denied-fixture/example'), 'a missing or private repository is not retried');
@@ -31994,7 +31966,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_setValue = oldSet;
             GM_xmlhttpRequest = oldRequest;
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
+            jevPagePostAttempts = oldPostAttempts;
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
             jevRejectedKey = oldRejectedKey;
@@ -32090,7 +32062,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 opts.onload({ status: 429, responseText: 'rate limited' });
             };
             jevRequeueEmptyAnnotations = () => { resumes++; };
-            const error = await jevPost('comment', { selected_comment: 'cooldown fixture' }, 2).catch((e) => e);
+            const error = await jevPost('comment', { selected_comment: 'cooldown fixture' }, undefined, 2).catch((e) => e);
             ackAssert(error.message.includes('Jev HTTP 429'));
             ackEq(posts, 1);
             ackAssert(jevPauseUntil > Date.now() && jevPauseRetryTimer !== null, 'final rate limit schedules one cooldown retry');
@@ -32124,7 +32096,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
+        const oldPostAttempts = jevPagePostAttempts;
         const oldEpoch = jevEpoch;
         const oldRejectedKey = jevRejectedKey;
         const oldSchemaRejected = jevSchemaRejected;
@@ -32164,7 +32136,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
+            jevPagePostAttempts = oldPostAttempts;
             jevEpoch = oldEpoch;
             jevRejectedKey = oldRejectedKey;
             jevSchemaRejected = oldSchemaRejected;
@@ -32177,7 +32149,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldCacheMemory = jevCacheMemory;
         const oldConfigured = jevConfigured;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
+        const oldPostAttempts = jevPagePostAttempts;
         const oldEpoch = jevEpoch;
         const oldRejectedKey = jevRejectedKey;
         const oldSchemaRejected = jevSchemaRejected;
@@ -32190,7 +32162,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevRejectedKey = '';
             jevSchemaRejected = false;
             jevPageKey = '';
-            jevPageRequests = 0;
+            jevPagePostAttempts = 0;
             GM_getValue = (storageKey, fallback) => storageKey === 'jev_api_key' ? 'synthetic-key' : oldGet(storageKey, fallback);
             GM_xmlhttpRequest = (opts) => {
                 if (opts.method === 'GET') publicCheck = opts;
@@ -32204,7 +32176,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             publicCheck.onload({ status: 200, responseText: '{"private":false}' });
             ackEq(await pending, null);
             ackEq(posts, 0, 'stale queued work cannot send to TypeSafe');
-            ackEq(jevPageRequests, 0, 'stale queued work does not use the page budget');
+            ackEq(jevPagePostAttempts, 0, 'stale queued work does not use the page budget');
         } finally {
             GM_getValue = oldGet;
             GM_xmlhttpRequest = oldRequest;
@@ -32212,7 +32184,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevCacheMemory = oldCacheMemory;
             jevConfigured = oldConfigured;
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
+            jevPagePostAttempts = oldPostAttempts;
             jevEpoch = oldEpoch;
             jevRejectedKey = oldRejectedKey;
             jevSchemaRejected = oldSchemaRejected;
@@ -32266,10 +32238,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             'the initial compare DOM is scanned for Jev work');
         ackAssert(docInjectors.includes("name: 'diffSelection', when: (ctx) => ctx.onPR || ctx.onCompare"),
             'compare pages retain the selection explanation UI');
-        ackAssert(JEV_MAX_TOTAL_REQUESTS_PER_PAGE <= 40
-            && JEV_MAX_REQUESTS_PER_PAGE <= JEV_MAX_TOTAL_REQUESTS_PER_PAGE
-            && JEV_MAX_LINE_REQUESTS_PER_PAGE <= JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
-            'batched Jev work has one bounded per-page account budget');
+        ackAssert(JEV_MAX_REQUESTS_PER_PAGE <= 40, 'batched Jev work has one bounded per-page account budget');
     });
 
     ackTest('Jev applies the combined request cap before queueing new work', async () => {
@@ -32278,10 +32247,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldConfigured = jevConfigured;
         const oldCacheMemory = jevCacheMemory;
         const oldPageKey = jevPageKey;
-        const oldPageRequests = jevPageRequests;
-        const oldPageLineRequests = jevPageLineRequests;
-        const oldScheduledRequests = jevPageScheduledRequests;
-        const oldScheduledLineRequests = jevPageScheduledLineRequests;
+        const oldScheduled = jevPageScheduled;
         const oldPostAttempts = jevPagePostAttempts;
         const pr = { owner: 'bitcoin', repo: 'bitcoin', pr: '123' };
         let posts = 0;
@@ -32291,16 +32257,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevConfigured = true;
             jevCacheMemory = [];
             jevPageKey = `${pr.owner}/${pr.repo}/${pr.pr}:${location.pathname}`;
-            jevPageRequests = 12;
-            jevPageLineRequests = 28;
-            jevPageScheduledRequests = 12;
-            jevPageScheduledLineRequests = 28;
+            jevPageScheduled = JEV_MAX_REQUESTS_PER_PAGE;
             const result = await jevEvaluate(pr, 'comment', { selected_comment: 'over the combined cap' });
             ackEq(result, null);
             ackEq(jevJobs.length, 0, 'no extra request is queued after the combined cap');
-            ackEq(jevPageScheduledRequests + jevPageScheduledLineRequests, JEV_MAX_TOTAL_REQUESTS_PER_PAGE,
-                'a rejected request does not consume another reservation');
-            jevPagePostAttempts = JEV_MAX_TOTAL_REQUESTS_PER_PAGE;
+            ackEq(jevPageScheduled, JEV_MAX_REQUESTS_PER_PAGE, 'a rejected request does not consume another reservation');
+            jevPagePostAttempts = JEV_MAX_REQUESTS_PER_PAGE;
             const error = await jevPost('comment', { selected_comment: 'retry over the cap' }, undefined, 1, jevPageKey)
                 .catch((reason) => reason);
             ackAssert(error.message.includes('HTTP request cap reached'));
@@ -32311,10 +32273,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevConfigured = oldConfigured;
             jevCacheMemory = oldCacheMemory;
             jevPageKey = oldPageKey;
-            jevPageRequests = oldPageRequests;
-            jevPageLineRequests = oldPageLineRequests;
-            jevPageScheduledRequests = oldScheduledRequests;
-            jevPageScheduledLineRequests = oldScheduledLineRequests;
+            jevPageScheduled = oldScheduled;
             jevPagePostAttempts = oldPostAttempts;
         }
     });
@@ -32325,8 +32284,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const oldConfigured = jevConfigured;
         const oldCacheMemory = jevCacheMemory;
         const oldPageKey = jevPageKey;
-        const oldScheduledRequests = jevPageScheduledRequests;
-        const oldScheduledLineRequests = jevPageScheduledLineRequests;
+        const oldScheduled = jevPageScheduled;
         const pr = { owner: 'acktopus-budget-fixture', repo: 'example', pr: '14' };
         try {
             GM_getValue = (key, fallback) => key === 'jev_api_key' ? 'synthetic-key' : oldGet(key, fallback);
@@ -32334,19 +32292,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevConfigured = true;
             jevCacheMemory = [];
             jevPageKey = '';
-            for (let index = 0; index < JEV_MAX_TOTAL_REQUESTS_PER_PAGE + 2; index++) {
+            for (let index = 0; index < JEV_MAX_REQUESTS_PER_PAGE + 2; index++) {
                 ackEq(await jevEvaluate(pr, 'comment', { selected_comment: `blocked ${index}` }), null);
-                ackEq(jevPageScheduledRequests, 0, 'a stopped job releases its queue reservation');
+                ackEq(jevPageScheduled, 0, 'a stopped job releases its queue reservation');
             }
-            ackEq(jevPageScheduledLineRequests, 0);
         } finally {
             GM_getValue = oldGet;
             jevPublicRepository = oldPublicRepository;
             jevConfigured = oldConfigured;
             jevCacheMemory = oldCacheMemory;
             jevPageKey = oldPageKey;
-            jevPageScheduledRequests = oldScheduledRequests;
-            jevPageScheduledLineRequests = oldScheduledLineRequests;
+            jevPageScheduled = oldScheduled;
         }
     });
 
