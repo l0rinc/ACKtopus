@@ -5681,10 +5681,9 @@
     let _compareWatchdogTimer = null;
     let _compareActive = false;
     let _comparePath = '';
-    let _compareJevFilterKey = '';
-    let _compareJevFilterStatus = 'idle';
-    let _compareJevVisiblePaths = null;
-    let _compareJevFinalLineCounts = null;
+    // { key, visiblePaths, finalLineCounts } once the current compare route's
+    // file filter is ready. Until then no compare file is sent to Jev.
+    let _compareJevFilter = null;
 
     function normalizeComparePath(value) {
         const raw = String(value || '').trim().replace(/^\/+/, '');
@@ -5694,6 +5693,14 @@
         } catch (_) {
             return raw;
         }
+    }
+
+    // Classic file headers carry the path in a title, link, or data-path.
+    function compareFileHeaderPath(file) {
+        return normalizeComparePath(
+            file?.querySelector?.('.file-header [title], .file-info a, [data-testid="file-name"]')?.textContent?.trim() ||
+            file?.querySelector?.('.file-header')?.getAttribute('data-path') || '',
+        );
     }
 
     function compareJevFilterRouteKey(path = location.pathname, search = location.search) {
@@ -5747,27 +5754,20 @@
 
     function finishCompareJevFilter(compareKey, visiblePaths = null, finalLineCounts = null) {
         if (compareKey !== `${location.pathname}${location.search}`) return;
-        _compareJevFilterKey = compareKey;
-        _compareJevFilterStatus = 'ready';
-        _compareJevVisiblePaths = visiblePaths;
-        _compareJevFinalLineCounts = finalLineCounts;
+        _compareJevFilter = { key: compareKey, visiblePaths, finalLineCounts };
         queueJevPageAnnotations();
     }
 
     function jevCompareFileEligibility(file, path = location.pathname, search = location.search) {
         const routeKey = compareJevFilterRouteKey(path, search);
         if (!routeKey) return { allowed: true, reason: 'not a filtered comparison' };
-        if (_compareJevFilterKey !== routeKey || _compareJevFilterStatus !== 'ready') {
+        if (_compareJevFilter?.key !== routeKey) {
             return { allowed: false, reason: 'comparison file filter still pending' };
         }
+        const { visiblePaths } = _compareJevFilter;
         const filePath = normalizeComparePath(readDiffFilePath(file));
-        if (_compareJevVisiblePaths && (!filePath || !_compareJevVisiblePaths.has(filePath))) {
-            const headerTitle = file
-                ?.querySelector?.('.file-header [title], .file-info a, [data-testid="file-name"]')
-                ?.textContent?.trim() || file?.querySelector?.('.file-header')?.getAttribute('data-path') || '';
-            if (!_compareJevVisiblePaths.has(normalizeComparePath(headerTitle))) {
-                return { allowed: false, reason: 'file is outside the current PR' };
-            }
+        if (visiblePaths && !visiblePaths.has(filePath) && !visiblePaths.has(compareFileHeaderPath(file))) {
+            return { allowed: false, reason: 'file is outside the current PR' };
         }
         if (file?.dataset?.ackCompareHidden === '1' || file?.style?.display === 'none') {
             return { allowed: false, reason: 'file is hidden by comparison filtering' };
@@ -5822,10 +5822,7 @@
         if (_comparePath && _comparePath !== compareLocationKey) {
             clearCompareWatcher();
             _compareActive = false;
-            _compareJevFilterKey = '';
-            _compareJevFilterStatus = 'idle';
-            _compareJevVisiblePaths = null;
-            _compareJevFinalLineCounts = null;
+            _compareJevFilter = null;
             const style = document.getElementById('ack-compare-collapse');
             if (style) style.remove();
         }
@@ -5835,10 +5832,7 @@
         const m = location.pathname.match(/\/([^/]+)\/([^/]+)\/compare\/([0-9a-f]+)\.{2,3}([0-9a-f]+)/);
         if (!m) return;
         _compareActive = true;
-        _compareJevFilterKey = compareLocationKey;
-        _compareJevFilterStatus = 'pending';
-        _compareJevVisiblePaths = null;
-        _compareJevFinalLineCounts = null;
+        _compareJevFilter = null;
         const [, owner, repo, baseSha, headSha] = m;
         const compareStartedAt = Date.now();
         const compareDiagnostics = {
@@ -6055,19 +6049,21 @@
         const normalizedPrFileSet = new Set([...prFileSet].map(normalizeComparePath).filter(Boolean));
         setCompareStatus(`Compare: filtering to ${normalizedPrFileSet.size} PR file paths...`);
 
-        let finalLineCounts = null;
-        try {
-            const finalDiff = await gmFetchText(
-                `https://github.com/${owner}/${repo}/pull/${prNum}.diff`,
-                { freshForMs: 0 },
-            );
-            finalLineCounts = compareFinalDiffLineCounts(finalDiff);
+        // Only the Jev line filter reads the final diff, so collapsing does not
+        // wait for it. The filter becomes ready when the download settles.
+        const finalLineCountsRequest = gmFetchText(
+            `https://github.com/${owner}/${repo}/pull/${prNum}.diff`,
+            { freshForMs: 0 },
+        ).then((finalDiff) => {
+            const finalLineCounts = compareFinalDiffLineCounts(finalDiff);
             compareDiagnostics.finalDiffFiles = finalLineCounts.size;
             compareDiagnostics.finalDiffLines = [...finalLineCounts.values()]
                 .reduce((total, counts) => total + [...counts.values()].reduce((sum, count) => sum + count, 0), 0);
-        } catch (error) {
+            return finalLineCounts;
+        }, (error) => {
             noteCompareError('current PR final diff', error);
-        }
+            return null;
+        });
 
         let compareRangeFileSet = new Set();
         try {
@@ -6142,15 +6138,7 @@
                 // Match only normalized exact PR paths. Basename fallback is too permissive on huge compares.
                 const normalizedPath = normalizeComparePath(path);
                 let isPRFile = normalizedPrFileSet.has(normalizedPath);
-                if (!isPRFile) {
-                    const headerTitle =
-                        file
-                            .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                            ?.textContent?.trim() ||
-                        file.querySelector('.file-header')?.getAttribute('data-path') ||
-                        '';
-                    isPRFile = normalizedPrFileSet.has(normalizeComparePath(headerTitle));
-                }
+                if (!isPRFile) isPRFile = normalizedPrFileSet.has(compareFileHeaderPath(file));
                 if (isPRFile) {
                     delete file.dataset.ackCompareHidden;
                     file.style.display = '';
@@ -6206,14 +6194,15 @@
         // Try immediately
         collapseNewFiles();
         scrollToFirstKeptFile();
-        if (finalLineCounts) {
-            finishCompareJevFilter(compareLocationKey, normalizedPrFileSet, finalLineCounts);
-        } else {
-            _compareJevFilterStatus = 'unavailable';
-            logCompareOutcome('Jev line filtering unavailable', {
-                action: 'no comparison lines sent to TypeSafe',
-            }, 'warn');
-        }
+        finalLineCountsRequest.then((finalLineCounts) => {
+            if (finalLineCounts) {
+                finishCompareJevFilter(compareLocationKey, normalizedPrFileSet, finalLineCounts);
+            } else {
+                logCompareOutcome('Jev line filtering unavailable', {
+                    action: 'no comparison lines sent to TypeSafe',
+                }, 'warn');
+            }
+        });
 
         // Keep watching for progressively loaded file diffs. Huge compares
         // can stream more file cards minutes later as the user scrolls; keep a
@@ -19139,17 +19128,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevVisibleDiffQueue = [];
     const jevDiffSettleTimers = new Map();
 
+    // Whether comparison filtering lets Jev classify this file, logging why not.
+    function jevCompareFileAllowed(file) {
+        const eligibility = jevCompareFileEligibility(file);
+        if (!eligibility.allowed) {
+            jevDiagnostic('diff file skipped', {
+                path: readDiffFilePath(file) || '(path not rendered yet)',
+                reason: eligibility.reason,
+            }, { key: `compare:${readDiffFilePath(file)}`, intervalMs: 3000 });
+        }
+        return eligibility.allowed;
+    }
+
     function settleJevDiffFile(file) {
         jevDiffSettleTimers.delete(file);
-        const eligibility = jevCompareFileEligibility(file);
-        if (!file?.isConnected || !eligibility.allowed) {
+        if (!file?.isConnected || !jevCompareFileAllowed(file)) {
             jevDiffPending.delete(file);
-            if (file?.isConnected) {
-                jevDiagnostic('diff file skipped', {
-                    path: readDiffFilePath(file) || '(path not rendered yet)',
-                    reason: eligibility.reason,
-                }, { key: `compare:${readDiffFilePath(file)}`, intervalMs: 3000 });
-            }
             return;
         }
         if (!jevVisibleDiffQueue.includes(file)) jevVisibleDiffQueue.push(file);
@@ -19157,20 +19151,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function queueJevDiffFile(file, immediate = false) {
-        const eligibility = jevCompareFileEligibility(file);
-        if (!eligibility.allowed) return;
-        const alreadyPending = jevDiffPending.has(file);
+        if (!jevCompareFileEligibility(file).allowed) return;
         if (immediate) {
             const previousTimer = jevDiffSettleTimers.get(file);
             if (previousTimer !== undefined) clearTimeout(previousTimer);
             const queuedIndex = jevVisibleDiffQueue.indexOf(file);
             if (queuedIndex >= 0) jevVisibleDiffQueue.splice(queuedIndex, 1);
-            if (!alreadyPending) {
-                jevDiffPending.add(file);
-            }
+            jevDiffPending.add(file);
             jevDiffSettleTimers.set(file, setTimeout(() => settleJevDiffFile(file), JEV_DIFF_SETTLE_MS));
         } else {
-            if (alreadyPending) return;
+            if (jevDiffPending.has(file)) return;
             jevDiffPending.add(file);
             jevVisibleDiffQueue.push(file);
         }
@@ -19237,8 +19227,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // queued synchronously so a missed or delayed IntersectionObserver callback
     // cannot leave the page looking idle.
     function observeJevDiffFile(file) {
-        const eligibility = jevCompareFileEligibility(file);
-        if (!eligibility.allowed || jevDiffObserved.has(file) || !file.querySelector('tr')) return false;
+        if (!jevCompareFileEligibility(file).allowed || jevDiffObserved.has(file) || !file.querySelector('tr')) return false;
         jevDiffObserved.add(file);
         if (jevElementNearViewport(file, 300)) queueJevDiffFile(file, true);
         else jevDiffObserver.observe(file);
@@ -19392,13 +19381,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevComparisonFinalCounts(file, path) {
-        if (!_compareJevFinalLineCounts) return null;
-        const direct = _compareJevFinalLineCounts.get(normalizeComparePath(path));
-        if (direct) return direct;
-        const headerTitle = file
-            ?.querySelector?.('.file-header [title], .file-info a, [data-testid="file-name"]')
-            ?.textContent?.trim() || file?.querySelector?.('.file-header')?.getAttribute('data-path') || '';
-        return _compareJevFinalLineCounts.get(normalizeComparePath(headerTitle)) || new Map();
+        const counts = _compareJevFilter?.finalLineCounts;
+        if (!counts) return null;
+        return counts.get(normalizeComparePath(path)) || counts.get(compareFileHeaderPath(file)) || new Map();
     }
 
     function jevComparisonRelevantChanged(
@@ -19408,7 +19393,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         routePath = location.pathname,
         routeSearch = location.search,
     ) {
-        if (!compareJevFilterRouteKey(routePath, routeSearch) || !_compareJevFinalLineCounts) {
+        if (!compareJevFilterRouteKey(routePath, routeSearch) || !_compareJevFilter?.finalLineCounts) {
             return { changed, unrelatedSides: 0 };
         }
         const remaining = new Map(jevComparisonFinalCounts(file, path));
@@ -20351,14 +20336,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function queueJevDiffHunks(file) {
         if (_ackTesting || !jevEnabled() || !file.isConnected) return;
-        const eligibility = jevCompareFileEligibility(file);
-        if (!eligibility.allowed) {
-            jevDiagnostic('diff file skipped', {
-                path: readDiffFilePath(file) || '(path not rendered yet)',
-                reason: eligibility.reason,
-            }, { key: `compare:${readDiffFilePath(file)}`, intervalMs: 3000 });
-            return;
-        }
+        if (!jevCompareFileAllowed(file)) return;
         const pr = jevReviewPageContext();
         const path = readDiffFilePath(file);
         if (!pr || !path) {
@@ -20507,7 +20485,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             queueJevCommitMessageReading();
         }
         for (const file of files) {
-            if (!jevCompareFileEligibility(file).allowed) continue;
             if (observeJevDiffFile(file)) {
                 newlyObservedFiles++;
                 if (jevDiffPending.has(file)) immediatelyQueuedFiles++;
@@ -30596,10 +30573,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             clearCompareWatcher();
             _compareActive = false;
             _comparePath = '';
-            _compareJevFilterKey = '';
-            _compareJevFilterStatus = 'idle';
-            _compareJevVisiblePaths = null;
-            _compareJevFinalLineCounts = null;
+            _compareJevFilter = null;
             const collapseStyle = document.getElementById('ack-compare-collapse');
             if (collapseStyle) collapseStyle.remove();
         }
@@ -42476,9 +42450,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('Jev classifies only files retained by comparison filtering', () => {
-        const oldKey = _compareJevFilterKey;
-        const oldStatus = _compareJevFilterStatus;
-        const oldPaths = _compareJevVisiblePaths;
+        const oldFilter = _compareJevFilter;
         const path = `/bitcoin/bitcoin/compare/${'a'.repeat(40)}..${'b'.repeat(40)}`;
         const search = '?pr=36000';
         const key = `${path}${search}`;
@@ -42487,13 +42459,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const removed = document.createElement('div');
         removed.dataset.path = 'src/removed.cpp';
         try {
-            _compareJevFilterKey = key;
-            _compareJevFilterStatus = 'pending';
-            _compareJevVisiblePaths = null;
+            _compareJevFilter = null;
             ackAssert(!jevCompareFileEligibility(kept, path, search).allowed,
                 'no file is eligible while authoritative filtering is pending');
-            _compareJevFilterStatus = 'ready';
-            _compareJevVisiblePaths = new Set(['src/kept.cpp']);
+            _compareJevFilter = { key, visiblePaths: new Set(['src/kept.cpp']), finalLineCounts: null };
             ackAssert(jevCompareFileEligibility(kept, path, search).allowed,
                 'a retained current-PR file is eligible');
             ackAssert(!jevCompareFileEligibility(removed, path, search).allowed,
@@ -42502,18 +42471,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(!jevCompareFileEligibility(kept, path, search).allowed,
                 'a DOM-hidden file remains ineligible even when its path is retained');
         } finally {
-            _compareJevFilterKey = oldKey;
-            _compareJevFilterStatus = oldStatus;
-            _compareJevVisiblePaths = oldPaths;
+            _compareJevFilter = oldFilter;
         }
         const observe = sourceSection(_ackSource, 'function observeJevDiffFile', 'function queueJevDiffUpdates');
         ackAssert(observe.includes('jevCompareFileEligibility(file)'), 'visibility is checked before file observation');
         const scan = sourceSection(_ackSource, 'function queueJevDiffHunks', 'function queueJevPageAnnotations');
-        ackAssert(scan.includes('jevCompareFileEligibility(file)'), 'visibility is rechecked immediately before classification');
+        ackAssert(scan.includes('jevCompareFileAllowed(file)'), 'visibility is rechecked immediately before classification');
     });
 
     ackTest('comparison reading guide mutes lines absent from the final PR diff', () => {
-        const oldCounts = _compareJevFinalLineCounts;
+        const oldFilter = _compareJevFilter;
         const oldLineEnabled = jevLineReadingEnabled;
         const path = `/bitcoin/bitcoin/compare/${'a'.repeat(40)}..${'b'.repeat(40)}`;
         const finalDiff = [
@@ -42539,8 +42506,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             `<td class="blob-code blob-code-addition">${text}</td></tr>`).join('') + '</table>';
         try {
             jevLineReadingEnabled = () => true;
-            _compareJevFinalLineCounts = compareFinalDiffLineCounts(finalDiff);
-            const counts = _compareJevFinalLineCounts.get('src/example.cpp');
+            _compareJevFilter = { key: `${path}?pr=1`, visiblePaths: null, finalLineCounts: compareFinalDiffLineCounts(finalDiff) };
+            const counts = _compareJevFilter.finalLineCounts.get('src/example.cpp');
             ackEq(counts.get('-\0old value'), 1, 'parses deleted final-diff lines with their sign');
             ackEq(counts.get('+\0duplicate value'), 1, 'preserves duplicate counts exactly');
             ackEq(counts.get('+\0++ counter'), 1, 'does not mistake added source text for a file marker');
@@ -42555,7 +42522,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackAssert(host.querySelector('#diff-xR4').nextElementSibling.classList.contains('ack-jev-reading-background'),
                 'an unmatched duplicate is muted instead of borrowing another line match');
         } finally {
-            _compareJevFinalLineCounts = oldCounts;
+            _compareJevFilter = oldFilter;
             jevLineReadingEnabled = oldLineEnabled;
         }
     });
@@ -42578,8 +42545,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('// Try immediately'),
         );
         ackAssert(fn.includes('normalizedPrFileSet.has(normalizedPath)'), 'matches normalized exact file paths first');
-        ackAssert(fn.includes('.file-header [title]'), 'falls back to file header title');
-        ackAssert(fn.includes('normalizeComparePath(headerTitle)'), 'normalizes header-title fallback too');
+        ackAssert(fn.includes('compareFileHeaderPath(file)'), 'falls back to the normalized file header path');
+        ackAssert(sourceSection(_ackSource, 'function compareFileHeaderPath', 'function compareJevFilterRouteKey')
+            .includes('.file-header [title]'), 'the header fallback reads the file header title');
         ackAssert(!fn.includes("split('/').pop()"), 'does not use basename matching on huge compares');
     });
 
