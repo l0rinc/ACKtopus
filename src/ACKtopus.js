@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.277
+// @version      1.278
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -13824,9 +13824,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 });
                 if (ignoreWhitespace && diffPartIsWhitespaceOnly(d)) {
                     span.dataset.ackDiffWhitespaceIgnored = '1';
-                    // Keep the accepted spacing visible once. Removed spacing is
-                    // omitted so the word view reads naturally without a diff mark.
-                    span.textContent = d.type === 'del' ? '' : d.text;
+                    // Render the spacing that Accept will return after any
+                    // earlier per-change reverts, without a diff mark.
+                    span.textContent = d.type === 'del'
+                        ? revertState[idx] ? d.text : ''
+                        : revertState[idx] ? '' : d.text;
                     span.style.cursor = 'default';
                     span.title = 'Whitespace-only difference hidden';
                     return;
@@ -21439,12 +21441,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     .trim();
 
             let system, user;
-            let prForBody = null;
 
             if (isPRBody) {
                 // PR description -- high-level overview for a reviewer
                 const pr = parsePR();
-                prForBody = pr;
                 const ctx = await fetchPRContext(pr);
                 const prTitle =
                     normalizeInlineWhitespace(ctx.title) || normalizeInlineWhitespace(getPRTitleText()) || '';
@@ -21624,11 +21624,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 bodyEl.parentElement.insertBefore(explainPanel, bodyEl.nextSibling);
             } else {
                 container.appendChild(explainPanel);
-            }
-            if (isPRBody && prForBody) {
-                void precomputeLightbulbCachesFromPRBody(prForBody, provider, commentText, author).catch((e) =>
-                    console.warn('ACKtopus: PR-body lightbulb precompute failed:', e?.message || e),
-                );
             }
         } catch (e) {
             stopSpin();
@@ -22854,13 +22849,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (header.dataset.ackQuickProcessed && staleActions.length === 0) {
                 delete header.dataset.ackQuickProcessed;
             }
-            // Also verify the action set has the right buttons for current state,
-            // is still connected to the live DOM, and is visible.
+            // Also verify the action set has the right buttons for current state
+            // and is still connected to the live DOM.
             if (header.dataset.ackQuickProcessed === editState && staleActions.length === 1) {
                 const actions = staleActions[0];
                 if (!actions.isConnected) {
-                    delete header.dataset.ackQuickProcessed;
-                } else if (!isVisible(actions)) {
                     delete header.dataset.ackQuickProcessed;
                 } else if (!header.contains(actions)) {
                     // Icons belong to a different header variant inside the same container.
@@ -26532,29 +26525,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return key ? map[key] : undefined;
     }
 
-    function lightbulbAutoOpenKey(pr, provider, mode) {
-        return `llm_lightbulb_autoopen_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_${mode}`;
-    }
-
-    function commitListLightbulbOpenKey(pr, provider) {
-        return `llm_lightbulb_open_${pr.owner}_${pr.repo}_${pr.pr}_${provider}_commits`;
-    }
-
-    function setLightbulbAutoOpen(pr, provider, mode, value) {
-        if (!pr || !provider || !mode) return;
-        const k = lightbulbAutoOpenKey(pr, provider, mode);
-        GM_setValue(k, !!value);
-        recordCacheTimestamp(k);
-    }
-
-    function consumeLightbulbAutoOpen(pr, provider, mode) {
-        if (!pr || !provider || !mode) return false;
-        const k = lightbulbAutoOpenKey(pr, provider, mode);
-        const v = !!GM_getValue(k, false);
-        if (v) GM_setValue(k, false);
-        return v;
-    }
-
     function clampLLMContext(text, maxChars = 320000) {
         const raw = String(text || '');
         if (raw.length <= maxChars) return raw;
@@ -26587,57 +26557,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return tryParse(candidate);
             }
             throw firstErr;
-        }
-    }
-
-    async function fetchAllPRDiscussionForPrecompute(pr) {
-        if (!pr) return '';
-        const safeDate = (v) => v || '';
-        const safeBody = (v) => (v || '').trim() || '(no text)';
-        try {
-            const urls = prDiscussionPageUrls(pr);
-            const [issueComments, reviews, inlineComments] = await Promise.all([
-                fetchPagedGithubRows(urls.conversationComments, 10),
-                fetchPagedGithubRows(urls.reviewSummaries, 10),
-                fetchPagedGithubRows(urls.inlineComments, 10),
-            ]);
-
-            issueComments.sort((a, b) => String(a?.created_at || '').localeCompare(String(b?.created_at || '')));
-            reviews.sort((a, b) =>
-                String(a?.submitted_at || a?.created_at || '').localeCompare(
-                    String(b?.submitted_at || b?.created_at || ''),
-                ),
-            );
-            inlineComments.sort((a, b) => String(a?.created_at || '').localeCompare(String(b?.created_at || '')));
-
-            const issueText = issueComments
-                .map((c) => `**${c.user?.login || '?'}** (${safeDate(c.created_at)}):\n${safeBody(c.body)}`)
-                .join('\n\n---\n\n');
-
-            const reviewText = reviews
-                .map(
-                    (r) =>
-                        `**${r.user?.login || '?'}** [${r.state || 'COMMENTED'}] (${safeDate(r.submitted_at || r.created_at)}):\n${safeBody(r.body)}`,
-                )
-                .join('\n\n---\n\n');
-
-            const inlineText = inlineComments
-                .map((c) => {
-                    const loc = formatCommentLocation(c.path, c.line, c.commit_id ? String(c.commit_id).slice(0, 8) : '');
-                    return `**${c.user?.login || '?'}** (${safeDate(c.created_at)})${loc ? ` [${loc}]` : ''}:\n${safeBody(c.body)}`;
-                })
-                .join('\n\n---\n\n');
-
-            return [
-                wrapPromptBlock(`ISSUE COMMENTS (API, ${issueComments.length})`, issueText),
-                wrapPromptBlock(`PR REVIEWS (API, ${reviews.length})`, reviewText),
-                wrapPromptBlock(`INLINE REVIEW COMMENTS (API, ${inlineComments.length})`, inlineText),
-            ]
-                .filter(Boolean)
-                .join('\n\n');
-        } catch (e) {
-            console.warn('ACKtopus: precompute discussion context failed:', e?.message || e);
-            return '';
         }
     }
 
@@ -26797,83 +26716,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } catch (e) {
             console.error('ACKtopus: batch commit review aid failed:', e);
             return null;
-        }
-    }
-
-    const _prBodyLightbulbPrecomputeInFlight = new Map();
-
-    async function precomputeLightbulbCachesFromPRBody(pr, provider, prBodyText, prAuthor) {
-        if (!pr || !provider) return;
-        const llmConfig = getLLMConfig();
-        const inFlightKey = `${pr.owner}/${pr.repo}/${pr.pr}:${provider}:${hashPrompt(
-            JSON.stringify({
-                headSha: getImmediatePRHeadSHA() || '',
-                prBodyText: prBodyText || '',
-                prAuthor: prAuthor || '',
-                model: llmConfig[provider]?.model || '',
-                instructions: llmConfig.instructions || {},
-                highContextModel: getHighContextModelOverride(provider),
-                highContextReasoning: getHighContextReasoningEffort(provider),
-                highContextMaxTokens: getHighContextMaxTokens(provider),
-            }),
-        )}`;
-        if (_prBodyLightbulbPrecomputeInFlight.has(inFlightKey)) {
-            return _prBodyLightbulbPrecomputeInFlight.get(inFlightKey);
-        }
-
-        const job = (async () => {
-            console.log('ACKtopus: PR-body lightbulb precompute started', {
-                provider,
-                pr: `${pr.owner}/${pr.repo}#${pr.pr}`,
-            });
-            const allCommits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
-            const commits = (allCommits || []).map((c) => ({
-                sha: c.sha,
-                msg: c.commit?.message?.split('\n')[0] || '',
-            }));
-            if (commits.length === 0) return;
-
-            const [ctx, pageContext, apiDiscussion] = await Promise.all([
-                fetchPRContext(pr),
-                gatherFullPRContext(() => {}, { includePatch: true, includeComments: true }),
-                fetchAllPRDiscussionForPrecompute(pr),
-            ]);
-            const contextParts = [];
-            if (prBodyText)
-                contextParts.push(
-                    wrapPromptBlock('PR DESCRIPTION COMMENT (MAIN THREAD)', `by ${prAuthor || '?'}\n${prBodyText}`),
-                );
-            if (ctx.title) contextParts.push(`PR: "${ctx.title}"`);
-            if (ctx.description) contextParts.push(wrapPromptBlock('PR DESCRIPTION (API)', ctx.description));
-            if (ctx.commitMessages) contextParts.push(wrapPromptBlock('COMMIT MESSAGES (API)', ctx.commitMessages));
-            if (apiDiscussion) contextParts.push(apiDiscussion);
-            if (pageContext) contextParts.push(wrapPromptBlock('FULL PR CONTEXT SNAPSHOT', pageContext));
-            const fullContext = contextParts.filter(Boolean).join('\n\n');
-
-            const [commitExplanations, reviewAids] = await Promise.all([
-                fetchBatchCommitExplanations(pr, commits, {
-                    providerOverride: provider,
-                    extraContext: fullContext,
-                }),
-                fetchBatchCommitReviewAids(pr, commits, {
-                    providerOverride: provider,
-                    extraContext: fullContext,
-                }),
-            ]);
-
-            if (commitExplanations) setLightbulbAutoOpen(pr, provider, 'commits', true);
-            if (reviewAids) setLightbulbAutoOpen(pr, provider, 'commit', true);
-            console.log('ACKtopus: PR-body lightbulb precompute finished', {
-                commitListCached: !!commitExplanations,
-                singleCommitCached: !!reviewAids,
-            });
-        })();
-
-        _prBodyLightbulbPrecomputeInFlight.set(inFlightKey, job);
-        try {
-            return await job;
-        } finally {
-            _prBodyLightbulbPrecomputeInFlight.delete(inFlightKey);
         }
     }
 
@@ -28001,6 +27843,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             btn.addEventListener('click', async (e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                if (btn.dataset.ackLlmBusy === '1') return;
                 const provider = getActiveProvider();
                 const pr = parsePR();
 
@@ -28013,7 +27856,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const anyOpen = commits.some((cc) => cc.el.querySelector('.ack-commit-explain-panel'));
                 if (anyOpen) {
                     removeAllPanels();
-                    if (pr) GM_setValue(commitListLightbulbOpenKey(pr, provider), false);
                     return;
                 }
 
@@ -28025,6 +27867,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
                 // Spinner
                 const origText = btn.textContent;
+                btn.dataset.ackLlmBusy = '1';
                 const stopSpin = startBrailleAnimation((frame) => {
                     btn.textContent = frame;
                 });
@@ -28069,13 +27912,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         if (titleContainer) titleContainer.appendChild(panel);
                         else cc.el.appendChild(panel);
                     }
-                    GM_setValue(commitListLightbulbOpenKey(pr, provider), true);
                 } catch (err) {
                     stopSpin();
                     btn.textContent = '❌';
                     setTimeout(() => {
                         btn.textContent = origText;
                     }, 2000);
+                } finally {
+                    delete btn.dataset.ackLlmBusy;
                 }
             });
 
@@ -28090,19 +27934,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         }
 
-        // Auto-open commit-list lightbulb panels when precomputed cache is ready.
-        // This is set by the main PR-description lightbulb precompute.
-        const pr = parsePR();
-        if (pr) {
-            const provider = getActiveProvider();
-            const shouldReopen = !!GM_getValue(commitListLightbulbOpenKey(pr, provider), false);
-            const shouldAutoOpen = consumeLightbulbAutoOpen(pr, provider, 'commits');
-            const anyOpen = commits.some((c) => c.el.querySelector('.ack-commit-explain-panel'));
-            if ((shouldReopen || shouldAutoOpen) && !anyOpen) {
-                const firstBtn = commits.map((c) => c.el.querySelector('.ack-commit-explain')).find(Boolean);
-                if (firstBtn) setTimeout(() => firstBtn.click(), 0);
-            }
-        }
     }
 
     function addSingleCommitExplainButton(root = document) {
@@ -28160,6 +27991,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         btn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (btn.dataset.ackLlmBusy === '1') return;
 
             // The direct parent wrapper (.flex-1 in React, .commit-desc in Classic)
             const wrapper = commitHeader.parentElement;
@@ -28172,7 +28004,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 for (const child of wrapper.children) {
                     child.classList.remove('ack-grid-left');
                 }
-                GM_setValue('lightbulb_open', false);
                 return;
             }
 
@@ -28187,6 +28018,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             const origText = btn.textContent;
+            btn.dataset.ackLlmBusy = '1';
             const stopSpin = startBrailleAnimation((frame) => {
                 btn.textContent = frame;
             });
@@ -28296,7 +28128,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // 4. Span the panel exactly the number of rows that exist
                 panel.style.gridRow = `1 / span ${Math.max(1, leftItemCount)}`;
 
-                GM_setValue('lightbulb_open', true);
             } catch (err) {
                 stopSpin();
                 btn.textContent = '❌';
@@ -28304,20 +28135,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     btn.textContent = origText;
                 }, 2000);
                 console.error('ACKtopus: commit lightbulb failed:', err);
+            } finally {
+                delete btn.dataset.ackLlmBusy;
             }
         });
 
         actionTarget.prepend(proofreadBtn);
         actionTarget.prepend(btn);
 
-        // Auto-show if lightbulb was open on previous commit (cached data = instant)
-        const pr = parsePR();
-        if (pr) {
-            const provider = getActiveProvider();
-            const shouldReopen = !!GM_getValue('lightbulb_open', false);
-            const shouldAutoOpen = consumeLightbulbAutoOpen(pr, provider, 'commit');
-            if (shouldReopen || shouldAutoOpen) btn.click();
-        }
     }
 
     // --- Co-authored-by avatars ---
@@ -29528,10 +29353,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 invalidatePRContext();
                 commitListCache.clear();
                 if (pr) {
-                    for (const prov of Object.keys(PROVIDER_META)) {
-                        GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commits'));
-                        GM_deleteValue(lightbulbAutoOpenKey(pr, prov, 'commit'));
-                    }
                     const infographicPrefix = prInfographicCachePrefix(pr);
                     const aggregatePrefixes = [
                         `llm_explain_${pr.owner}_${pr.repo}_${pr.pr}_`,
@@ -35985,6 +35806,43 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('ignored whitespace view matches earlier per-change reverts', async () => {
+        const storageKey = 'diff_dialog_ignore_whitespace';
+        const previous = GM_getValue(storageKey, false);
+        GM_setValue(storageKey, false);
+        const original = 'alpha   beta old';
+        const corrected = 'alpha beta new';
+        const parts = wordDiff(original, corrected);
+        const whitespaceIndex = parts.findIndex(diffPartIsWhitespaceOnly);
+        ackAssert(whitespaceIndex >= 0, 'fixture has a whitespace-only diff part');
+        const promise = showDiffDialog(original, corrected, { showDuringSelfTests: true });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const overlay = document.querySelector('.ack-diff-dialog-overlay');
+        try {
+            const whitespaceSpan = overlay.querySelector(`[data-ack-diff-index="${whitespaceIndex}"]`);
+            whitespaceSpan.click();
+            const toggle = overlay.querySelector('.ack-diff-ignore-whitespace input');
+            toggle.checked = true;
+            toggle.dispatchEvent(new Event('change', { bubbles: true }));
+            const rerendered = overlay.querySelector(`[data-ack-diff-index="${whitespaceIndex}"]`);
+            ackEq(
+                rerendered.textContent,
+                parts[whitespaceIndex].type === 'del' ? parts[whitespaceIndex].text : '',
+                'hidden styling still shows the spacing that Accept will return',
+            );
+            const expected = parts.map((part, index) => {
+                if (part.type === 'same') return part.text;
+                if (part.type === 'del') return index === whitespaceIndex ? part.text : '';
+                return index === whitespaceIndex ? '' : part.text;
+            }).join('');
+            [...overlay.querySelectorAll('button')].find((btn) => btn.textContent === 'Accept').click();
+            ackDeepEq(await promise, { action: 'edit', text: expected });
+        } finally {
+            document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+            GM_setValue(storageKey, previous);
+        }
+    });
+
     ackTest('showDiffDialog source has accept/reject buttons and readability modes', () => {
         const source = _ackSource;
         ackAssert(source.includes("'Reject'"), 'has Reject button');
@@ -39656,6 +39514,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Must check === 1 (not > 0) so duplicates (length 2+) trigger re-processing
         ackAssert(source.includes('staleActions.length === 1'), 'checks for exactly 1 action set');
         ackAssert(source.includes('isConnected'), 'checks isConnected on action container');
+        const guard = sourceSection(source, 'if (header.dataset.ackQuickProcessed === editState', '// Never tear down an icon row mid-press');
+        ackAssert(!guard.includes('isVisible(actions)'), 'transient layout does not detach an in-flight action row');
         ackAssert(
             sourceIncludesLoose(source, 'staleActions.forEach(el => el.remove())'),
             'removes all stale action containers before adding new ones',
@@ -42844,7 +42704,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(injectSection.includes('llm_explain_${pr.owner}'), 'all exact commit explain caches cleared on force push');
         ackAssert(injectSection.includes('llm_lightbulb_${pr.owner}'), 'all exact lightbulb caches cleared on force push');
         ackAssert(injectSection.includes('llm_pr_overview_${pr.owner}'), 'all exact PR overview caches cleared on force push');
-        ackAssert(injectSection.includes('lightbulbAutoOpenKey'), 'auto-open lightbulb flags cleared on force push');
+        ackAssert(!injectSection.includes('lightbulbAutoOpenKey'), 'force-push handling has no implicit lightbulb trigger');
         // PR navigation teardown
         const teardown = source.slice(
             source.indexOf('const prChanged = prKey !== lastInjectedPR'),
@@ -48940,7 +48800,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(explainSave.includes('recordCacheTimestamp(ck)'), 'explain save records timestamp');
         const lightbulbSave = source.slice(
             source.indexOf('async function fetchBatchCommitReviewAids'),
-            source.indexOf('const _prBodyLightbulbPrecomputeInFlight'),
+            source.indexOf('// --- Diff Selection Helper'),
         );
         ackAssert(lightbulbSave.includes('recordCacheTimestamp(ck)'), 'lightbulb save records timestamp');
     });
@@ -51449,7 +51309,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('leftItemCount++'), 'counts left-column items');
         ackAssert(fn.includes('panel.style.gridRow'), 'sets dynamic gridRow span');
         ackAssert(fn.includes('Math.max(1, leftItemCount)'), 'spans at least 1 row');
-        ackAssert(fn.includes("GM_setValue('lightbulb_open', true)"), 'tracks open state');
+        ackAssert(fn.includes("btn.dataset.ackLlmBusy = '1'"), 'guards the paid request while it is running');
         // Toggle-off removes grid classes
         ackAssert(fn.includes("wrapper.classList.remove('ack-grid-wrapper')"), 'removes grid wrapper on toggle-off');
         ackAssert(
@@ -51497,7 +51357,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes("GM_setValue('maintainer_logins'"), 'saves maintainer list');
     });
 
-    ackTest('lightbulb toggle uses wrapper scope and tracks open state', () => {
+    ackTest('lightbulb toggle uses wrapper scope without automatic paid reopen', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function addSingleCommitExplainButton'),
@@ -51507,94 +51367,40 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             fn.includes("wrapper.querySelector('.ack-commit-explain-panel')"),
             'toggle scoped to wrapper (commitHeader.parentElement)',
         );
-        ackAssert(fn.includes("GM_setValue('lightbulb_open', false)"), 'close sets state false');
-        ackAssert(fn.includes("GM_setValue('lightbulb_open', true)"), 'open sets state true');
+        ackAssert(!fn.includes("GM_getValue('lightbulb_open'"), 'does not read a persisted auto-open state');
+        ackAssert(!fn.includes('btn.click()'), 'does not synthesize a paid lightbulb click');
     });
 
-    ackTest('lightbulb auto-shows on commit navigation when previously open', () => {
+    ackTest('single commit lightbulb runs only from an explicit guarded click', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function addSingleCommitExplainButton'),
             source.indexOf('// --- Co-authored-by'),
         );
-        ackAssert(fn.includes("GM_getValue('lightbulb_open'"), 'checks lightbulb_open state');
-        ackAssert(fn.includes('btn.click()'), 'auto-clicks the button when reopening was requested');
         ackAssert(fn.includes('fetchBatchCommitReviewAids'), 'button resolves the exact aggregate cache through the batch helper');
-        ackAssert(
-            fn.includes("consumeLightbulbAutoOpen(pr, provider, 'commit')"),
-            'also auto-opens from precompute flag',
-        );
+        ackAssert(fn.includes("if (btn.dataset.ackLlmBusy === '1') return"), 'a second click cannot duplicate the request');
+        ackAssert(fn.includes('delete btn.dataset.ackLlmBusy'), 'the click guard is released after completion');
     });
 
-    ackTest('main PR lightbulb starts exact-input commit-lightbulb precompute', () => {
+    ackTest('explaining a PR body does not precompute paid commit lightbulbs', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('async function explainComment'),
             source.indexOf('function schedulePostEditRefresh'),
         );
         ackAssert(!fn.includes('prOverviewCacheKey('), 'does not write an extra under-specified overview cache');
-        ackAssert(
-            fn.includes('precomputeLightbulbCachesFromPRBody'),
-            'kicks off background precompute from PR body explain',
-        );
+        ackAssert(!fn.includes('precomputeLightbulbCachesFromPRBody'), 'does not launch hidden commit batches');
     });
 
-    ackTest('PR-body lightbulb precompute builds its in-flight key before fetching commits', async () => {
-        const originalFetchCommitList = fetchCommitList;
-        let listed = 0;
-        fetchCommitList = async () => {
-            listed++;
-            return [];
-        };
-        try {
-            await precomputeLightbulbCachesFromPRBody({ owner: 'o', repo: 'r', pr: '1' }, 'claude', 'body', 'me');
-            ackEq(listed, 1, 'reaches the commit list instead of failing on the head lookup');
-        } finally {
-            fetchCommitList = originalFetchCommitList;
-        }
-    });
-
-    ackTest('PR-body lightbulb precompute gathers full context and seeds both commit caches', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('async function precomputeLightbulbCachesFromPRBody'),
-            source.indexOf('// --- Diff Selection Helper'),
-        );
-        ackAssert(fn.includes('fetchPRContext'), 'includes PR context');
-        ackAssert(fn.includes('gatherFullPRContext'), 'includes full page context');
-        ackAssert(fn.includes('fetchAllPRDiscussionForPrecompute'), 'includes API discussion/replies');
-        ackAssert(fn.includes('fetchBatchCommitExplanations'), 'seeds commits-view lightbulb cache');
-        ackAssert(fn.includes('fetchBatchCommitReviewAids'), 'seeds single-commit lightbulb cache');
-        ackAssert(fn.includes("setLightbulbAutoOpen(pr, provider, 'commits', true)"), 'arms commits-view auto-open');
-        ackAssert(fn.includes("setLightbulbAutoOpen(pr, provider, 'commit', true)"), 'arms single-commit auto-open');
-    });
-
-    ackTest('commit-list lightbulb auto-opens when precompute cache is ready', () => {
+    ackTest('commit-list lightbulb requires one explicit guarded click', () => {
         const source = _ackSource;
         const fn = source.slice(
             source.indexOf('function addCommitListExplainButtons'),
             source.indexOf('function addSingleCommitExplainButton'),
         );
-        ackAssert(source.includes('function commitListLightbulbOpenKey'), 'has persistent commit-list open-state key');
-        ackAssert(
-            fn.includes('GM_setValue(commitListLightbulbOpenKey(pr, provider), true)'),
-            'persistently tracks commit-list open state',
-        );
-        ackAssert(
-            fn.includes('GM_setValue(commitListLightbulbOpenKey(pr, provider), false)'),
-            'clears commit-list open state when toggled closed',
-        );
-        ackAssert(
-            fn.includes('GM_getValue(commitListLightbulbOpenKey(pr, provider), false)'),
-            'reopens commit-list lightbulb after DOM refresh while still marked open',
-        );
-        ackAssert(
-            fn.includes("consumeLightbulbAutoOpen(pr, provider, 'commits')"),
-            'consumes commits-view auto-open flag',
-        );
         ackAssert(fn.includes('fetchBatchCommitExplanations'), 'button resolves the exact aggregate cache through the batch helper');
-        ackAssert(fn.includes('!anyOpen'), 'does not auto-click if panels are already open');
-        ackAssert(fn.includes('firstBtn.click()'), 'opens commit-list lightbulb from cache');
+        ackAssert(fn.includes("if (btn.dataset.ackLlmBusy === '1') return"), 'a second click cannot duplicate the request');
+        ackAssert(!fn.includes('firstBtn.click()'), 'page refreshes do not synthesize clicks');
     });
 
     // --- Comment navigator & commit badges ---
@@ -52279,7 +52085,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(reviewChunk.includes('parseLLMJsonObject(raw)'), 'review aid chunk uses tolerant JSON parser');
         const reviewBatch = source.slice(
             source.indexOf('async function fetchBatchCommitReviewAids'),
-            source.indexOf('const _prBodyLightbulbPrecomputeInFlight'),
+            source.indexOf('// --- Diff Selection Helper'),
         );
         ackAssert(reviewBatch.includes('MAX_REVIEW_AID_BATCH_COMMITS'), 'review aid batch size constant used');
         ackAssert(reviewBatch.includes('fetchChunkRecursive'), 'review aids split recursively on parse failure');
@@ -52287,7 +52093,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
     ackTest('partial one-commit lightbulb batches are never stored as complete', () => {
         for (const [start, end] of [
-            ['async function fetchBatchCommitReviewAids', 'const _prBodyLightbulbPrecomputeInFlight'],
+            ['async function fetchBatchCommitReviewAids', '// --- Diff Selection Helper'],
             ['async function fetchBatchCommitExplanations', 'function addCommitExplainButtons'],
         ]) {
             const fn = sourceSection(_ackSource, start, end);
