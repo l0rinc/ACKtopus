@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.281
+// @version      1.282
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -23813,6 +23813,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Search header first, then the full container.
         const kebab = findCommentMenuTrigger(header, container);
         if (!kebab) return;
+        if (kebab.dataset.ackMenuActionBusy === '1') return;
+        kebab.dataset.ackMenuActionBusy = '1';
         const details = kebab.closest('details');
         const restoreNativeMenu = concealNativeCommentMenu(kebab, details);
         const pageScrollX = window.scrollX ?? window.pageXOffset ?? 0;
@@ -23838,6 +23840,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return;
             }
             cleanedUp = true;
+            delete kebab.dataset.ackMenuActionBusy;
             // A failed lookup must not leave GitHub's fullscreen overlay open.
             if (!clickedAction && !wasOpen) details?.removeAttribute('open');
             if (!clickedAction && !details && !wasReactOpen && kebab.isConnected &&
@@ -37467,6 +37470,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('concealNativeCommentMenu(kebab, details)'), 'native menu is concealed during automation');
         ackAssert(fn.includes('cleanup(true)'), 'menu remains concealed through native item activation');
         ackAssert(!fn.includes('focusVisibleDeleteCommentConfirmButton'), 'does not visually select the destructive action');
+    });
+
+    ackTest('triggerMenuAction coalesces repeated presses on one comment menu', async () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
+            '<details><summary class="timeline-comment-action">Actions</summary>' +
+            '<details-menu><button type="button" role="menuitem">Delete</button></details-menu>' +
+            '</details></div></div>';
+        document.body.appendChild(host);
+        const comment = host.querySelector('.timeline-comment');
+        const header = host.querySelector('.timeline-comment-header');
+        const item = host.querySelector('[role="menuitem"]');
+        item.getBoundingClientRect = () => ({ left: 0, top: 0, right: 60, bottom: 20, width: 60, height: 20 });
+        const pending = [];
+        const previousTimer = ackSetTimeout;
+        let deletes = 0;
+        item.addEventListener('click', () => deletes++);
+        try {
+            ackSetTimeout = (fn) => { pending.push(fn); return pending.length; };
+            triggerMenuAction(comment, header, 'delete');
+            triggerMenuAction(comment, header, 'delete');
+            ackEq(pending.length, 1, 'queues one lookup for two immediate presses');
+            pending.shift()();
+            ackEq(deletes, 1, 'activates the native action once');
+            ackAssert(!host.querySelector('summary').dataset.ackMenuActionBusy, 'releases the trigger after activation');
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        } finally {
+            ackSetTimeout = previousTimer;
+            host.remove();
+        }
     });
 
     ackTest('delete actions stay bound to the chosen comment when nearby comments share text', async () => {
