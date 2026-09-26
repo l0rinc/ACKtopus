@@ -9035,7 +9035,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         _prContextKey = '';
         _prReplyRowsKey = '';
         _prReplyRowsPromise = null;
-        clearJevCommitReviewContexts();
     }
 
     function wrapPromptBlock(label, content) {
@@ -9247,11 +9246,30 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         }
     }
 
-    // In-memory LRU cache for commit `.patch` fetches.
-    // This keeps selection helpers snappy (Explain/Simplify) when the user clicks
-    // around the same commit repeatedly. Key includes owner/repo to avoid
-    // accidental cross-repo collisions.
-    const _commitPatchCache = new Map(); // key -> Promise<string>
+    // Keeps the newest `max` promises by key. A rejected promise, or a value
+    // `keep` refuses, is dropped so the next call retries.
+    function cachedPromise(cache, key, max, create, keep = () => true) {
+        const cached = cache.get(key);
+        if (cached) {
+            cache.delete(key);
+            cache.set(key, cached);
+            return cached;
+        }
+        const tracked = create().then((value) => {
+            if (!keep(value) && cache.get(key) === tracked) cache.delete(key);
+            return value;
+        }, (error) => {
+            if (cache.get(key) === tracked) cache.delete(key);
+            throw error;
+        });
+        cache.set(key, tracked);
+        while (cache.size > max) cache.delete(cache.keys().next().value);
+        return tracked;
+    }
+
+    // In-memory LRU cache for commit `.patch` fetches, so selection helpers stay
+    // quick when the user clicks around the same commit. Only full SHAs are
+    // immutable, so shorter ones are always revalidated.
     const _fullCommitPatchCache = new Map(); // key -> Promise<string>
     const COMMIT_PATCH_CACHE_MAX = 12;
 
@@ -9260,57 +9278,19 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function clearCommitPatchCache() {
-        _commitPatchCache.clear();
         _fullCommitPatchCache.clear();
         clearJevCommitReviewContexts();
     }
 
     function fetchFullCommitPatch(pr, sha) {
         if (!pr?.owner || !pr?.repo || !sha) return Promise.resolve('');
-        const cacheable = /^[0-9a-f]{40}$/i.test(String(sha));
-        const key = commitPatchCacheKey(pr, sha);
-        const cached = cacheable ? _fullCommitPatchCache.get(key) : null;
-        if (cached) {
-            _fullCommitPatchCache.delete(key);
-            _fullCommitPatchCache.set(key, cached);
-            return cached;
-        }
-        const request = gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
-        const tracked = request.catch((error) => {
-            _fullCommitPatchCache.delete(key);
-            throw error;
-        });
-        if (!cacheable) return tracked;
-        _fullCommitPatchCache.set(key, tracked);
-        while (_fullCommitPatchCache.size > COMMIT_PATCH_CACHE_MAX) {
-            _fullCommitPatchCache.delete(_fullCommitPatchCache.keys().next().value);
-        }
-        return tracked;
+        const request = () => gmFetchText(`https://github.com/${pr.owner}/${pr.repo}/commit/${sha}.patch`);
+        if (!/^[0-9a-f]{40}$/i.test(String(sha))) return request();
+        return cachedPromise(_fullCommitPatchCache, commitPatchCacheKey(pr, sha), COMMIT_PATCH_CACHE_MAX, request);
     }
 
     function fetchCommitPatch(pr, sha) {
-        if (!pr?.owner || !pr?.repo || !sha) return Promise.resolve('');
-        const cacheable = /^[0-9a-f]{40}$/i.test(String(sha));
-        const key = commitPatchCacheKey(pr, sha);
-        const cached = cacheable ? _commitPatchCache.get(key) : null;
-        if (cached) {
-            // Refresh LRU position
-            _commitPatchCache.delete(key);
-            _commitPatchCache.set(key, cached);
-            return cached;
-        }
-        const p = fetchFullCommitPatch(pr, sha).then(stripDeletedFileBodiesFromPatch);
-        const wrapped = p.catch((e) => {
-            _commitPatchCache.delete(key);
-            throw e;
-        });
-        if (!cacheable) return wrapped;
-        _commitPatchCache.set(key, wrapped);
-        while (_commitPatchCache.size > COMMIT_PATCH_CACHE_MAX) {
-            const oldestKey = _commitPatchCache.keys().next().value;
-            _commitPatchCache.delete(oldestKey);
-        }
-        return wrapped;
+        return fetchFullCommitPatch(pr, sha).then(stripDeletedFileBodiesFromPatch);
     }
 
     const jevCommitContextCache = new Map();
@@ -9358,13 +9338,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const description = String(prInfo?.body || '');
         const descriptionHash = hashPrompt(description);
         const key = `${pr.owner}/${pr.repo}#${pr.pr}:${fullSha.toLowerCase()}:${descriptionHash}`;
-        const cached = jevCommitContextCache.get(key);
-        if (cached) {
-            jevCommitContextCache.delete(key);
-            jevCommitContextCache.set(key, cached);
-            return cached;
-        }
-        const request = (async () => {
+        return cachedPromise(jevCommitContextCache, key, JEV_COMMIT_CONTEXT_CACHE_MAX, async () => {
             const patch = await fetchFullCommitPatch(pr, fullSha).catch(() => '');
             if (!patch) return null;
             let message = commitMessageFromPatch(patch);
@@ -9386,19 +9360,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 description,
                 descriptionHash,
             };
-        })();
-        const tracked = request.then((context) => {
-            if (!context) jevCommitContextCache.delete(key);
-            return context;
-        }, (error) => {
-            jevCommitContextCache.delete(key);
-            throw error;
-        });
-        jevCommitContextCache.set(key, tracked);
-        while (jevCommitContextCache.size > JEV_COMMIT_CONTEXT_CACHE_MAX) {
-            jevCommitContextCache.delete(jevCommitContextCache.keys().next().value);
-        }
-        return tracked;
+        }, Boolean);
     }
 
     // --- Rendering ---
@@ -17457,7 +17419,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const jevPublicRetryWarned = new Set();
     const jevCommentEvidenceRequests = new Map();
     const jevCommentEvidenceSnapshots = new Map();
-    const jevCommentPatchCache = new Map();
     const jevCommentRevisionHints = new Map();
     const jevAnonymousCommentLists = new Map();
     const jevCommentListFreshReads = new Set();
@@ -17482,7 +17443,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         jevCommentResetGeneration++;
         jevCommentEvidenceRequests.clear();
         jevCommentEvidenceSnapshots.clear();
-        jevCommentPatchCache.clear();
         jevCommentRevisionHints.clear();
         jevAnonymousCommentLists.clear();
         jevCommentListFreshReads.clear();
@@ -18279,7 +18239,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         if (includeCodeEvidence) {
             for (const key of jevCommentEvidenceSnapshots.keys()) if (key.startsWith(prefix)) jevCommentEvidenceSnapshots.delete(key);
-            for (const key of jevCommentPatchCache.keys()) if (key.startsWith(prefix)) jevCommentPatchCache.delete(key);
             jevCommentRevisionHints.delete(prefix);
             const current = parsePR();
             if (current && jevCommentPRKey(current) === prefix) {
@@ -18413,13 +18372,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return { head, baseSha, patch: '', complete: false,
                     reason: 'PR patch exceeds the bounded review limit', prDescription: initialDescription };
             }
-            const patchKey = `${pr.owner}/${pr.repo}#${pr.pr}:${revision}`;
-            const cachedPatch = jevCommentPatchCache.get(patchKey);
-            const patch = cachedPatch && Date.now() - cachedPatch.ts < 60000
-                ? cachedPatch.patch : await fetchPatch(pr, {
-                    expectedHead: head,
-                    baseSha,
-                });
+            // fetchPatch caches the exact base...head patch itself.
+            const patch = await fetchPatch(pr, { expectedHead: head, baseSha });
             const after = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
                 { freshForMs: 0 });
             const afterDescription = jevPRDescriptionEvidence(after);
@@ -18427,8 +18381,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 afterDescription.hash !== initialDescription.hash ||
                 (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
             jevCommentRevisionHints.set(prPrefix, { info: after, ts: Date.now() });
-            jevCommentPatchCache.set(patchKey, { patch, ts: Date.now() });
-            while (jevCommentPatchCache.size > 4) jevCommentPatchCache.delete(jevCommentPatchCache.keys().next().value);
             return { head, baseSha, patch, complete: !!patch && patch.length <= 60000,
                 reason: patch.length > 60000 ? 'PR patch exceeds the bounded review limit' : '',
                 prDescription: afterDescription };
@@ -31532,7 +31484,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(largeThread.thread_request, 'Please guard the bound.');
             listTruncated = false;
             jevAnonymousCommentLists.clear();
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             jevCommentEvidenceSnapshots.clear();
             jevCommentRevisionHints.delete(jevCommentPRKey(pr));
             changeBaseOnGet = githubGets + 2;
@@ -31542,7 +31493,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             changeBaseOnGet = 0;
             jevCommentEvidenceSnapshots.clear();
             jevCommentRevisionHints.delete(jevCommentPRKey(pr));
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             fetchPatch = async () => `From ${head} Thu Jan 1 00:00:00 1970\n` +
                 'diff --git a/src/deleted.cpp b/src/deleted.cpp\n' +
                 'deleted file mode 100644\n@@ deleted file contents omitted @@\n';
@@ -31565,7 +31515,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fetchPatch = oldPatch;
             fetchRawFile = oldRaw;
             readHeadShaFromSSR = oldSSR;
-            jevCommentPatchCache.delete(`${pr.owner}/${pr.repo}#${pr.pr}:${base}...${head}`);
             jevCommentEvidenceSnapshots.clear();
             jevAnonymousCommentLists.clear();
         }
@@ -45644,7 +45593,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('afterDescription.hash !== initialDescription.hash'),
             'rejects a PR description edit while code evidence is loading');
         ackAssert(fn.includes('jevCommentEvidenceSnapshots.get(requestKey)'), 'reads the exact revision snapshot');
-        ackAssert(fn.includes('jevCommentPatchCache.get(patchKey)'), 'reads the exact revision patch');
+        ackAssert(fn.includes('fetchPatch(pr, { expectedHead: head, baseSha })'),
+            'reads the exact revision patch through the shared exact patch cache');
     });
 
     ackTest('gmFetchText helper serves every patch, compare, raw-file, and commit read', () => {
