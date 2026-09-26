@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.278
+// @version      1.279
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -5126,6 +5126,8 @@
     const pullRequestSizeQueue = [];
     const pendingPullRequestSizes = new Map();
     const pendingPullRequestSizeBatches = new Map();
+    const latestPullRequestSizeRevisions = new Map();
+    const PULL_REQUEST_SIZE_CACHE_INDEX_KEY = 'ack_pr_size:index:v2';
     let activePullRequestSizeRequests = 0;
     let pullRequestSizeDrainTimer = null;
     let pullRequestSizeFailureWarned = false;
@@ -5181,8 +5183,26 @@
         const key = pullRequestSizeCacheKey(pr, expectedRevision);
         const stats = normalizePullRequestSize(value);
         if (!key || !stats || actualRevision !== expectedRevision) return null;
+        const identity = pullRequestSizeIdentity(pr);
+        const index = GM_getValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, {});
+        const previousKey = index && typeof index === 'object' ? index[identity] : '';
+        if (previousKey && previousKey !== key) GM_deleteValue(previousKey);
         GM_setValue(key, { ...stats, ts: now });
+        GM_setValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, { ...(index || {}), [identity]: key });
         return stats;
+    }
+
+    function pullRequestSizeResponse(pr, value) {
+        const stats = normalizePullRequestSize(value);
+        if (!stats) return null;
+        const actualRevision = pullRequestSizeRevision(value);
+        if (!actualRevision || !pullRequestSizeRevision(pr)) return { stats, revision: '' };
+        const actual = {
+            headSha: String(value?.headSha || value?.head?.sha || value?.headRefOid || '').toLowerCase(),
+            updatedAt: String(value?.updatedAt || value?.updated_at || ''),
+        };
+        latestPullRequestSizeRevisions.set(pullRequestSizeIdentity(pr), actual);
+        return { stats: rememberPullRequestSize({ ...pr, ...actual }, value) || stats, revision: actualRevision };
     }
 
     function pullRequestListMetadata(root, repo) {
@@ -5238,7 +5258,10 @@
             );
             if (!row) continue;
             seen.add(identity);
-            entries.push({ identity, link, row, pr: { ...pr, ...(metadata.get(identity) || {}) } });
+            const embedded = metadata.get(identity) || {};
+            const latest = latestPullRequestSizeRevisions.get(identity);
+            const revision = latest && embedded.updatedAt && latest.updatedAt >= embedded.updatedAt ? latest : embedded;
+            entries.push({ identity, link, row, pr: { ...pr, ...revision } });
         }
         return entries;
     }
@@ -5318,14 +5341,13 @@
             activePullRequestSizeRequests++;
             const url = `https://api.github.com/repos/${item.pr.owner}/${item.pr.repo}/pulls/${item.pr.pr}`;
             gmFetch(url, { freshForMs: 0 })
-                .then((data) =>
-                    pullRequestSizeRevision(item.pr)
-                        ? rememberPullRequestSize(item.pr, data)
-                        : normalizePullRequestSize(data),
-                )
-                .then((stats) => {
-                    if (!stats) return;
-                    for (const marker of item.markers) renderPullRequestSize(marker, stats);
+                .then((data) => pullRequestSizeResponse(item.pr, data))
+                .then((response) => {
+                    if (!response) return;
+                    for (const marker of item.markers) {
+                        if (response.revision) marker.dataset.ackPrSizeRevision = response.revision;
+                        renderPullRequestSize(marker, response.stats);
+                    }
                 })
                 .catch((e) => {
                     if (!pullRequestSizeFailureWarned && shouldWarnOptionalGitHubApiError(e)) {
@@ -5382,11 +5404,14 @@
             let rendered = 0;
             for (const entry of exact) {
                 const data = repository[`pr_${entry.pr.pr}`];
-                const stats = rememberPullRequestSize(entry.pr, data);
-                if (!stats) continue;
+                const response = pullRequestSizeResponse(entry.pr, data);
+                if (!response) continue;
                 const pendingKey = pullRequestSizePendingKey(entry.pr);
                 const pending = pendingPullRequestSizes.get(pendingKey);
-                for (const marker of pending?.markers || []) renderPullRequestSize(marker, stats);
+                for (const marker of pending?.markers || []) {
+                    if (response.revision) marker.dataset.ackPrSizeRevision = response.revision;
+                    renderPullRequestSize(marker, response.stats);
+                }
                 pendingPullRequestSizes.delete(pendingKey);
                 rendered++;
             }
@@ -7177,6 +7202,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 count++;
             }
         });
+        const prSizeIndex = GM_getValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, {});
+        const prSizeIdentity = pullRequestSizeIdentity(pr);
+        if (prSizeIndex?.[prSizeIdentity]) {
+            delete prSizeIndex[prSizeIdentity];
+            GM_setValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, prSizeIndex);
+        }
         count += invalidateGithubHttpCacheForPR(`${pr.owner}/${pr.repo}#${pr.pr}`);
         jevInvalidateCommentCachesForPR(pr);
         const jevEntries = jevCacheEntries();
@@ -42035,6 +42066,75 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             if (old === null || old === undefined) GM_deleteValue(key);
             else GM_setValue(key, old);
+        }
+    });
+
+    ackTest('pull request size accepts a live response newer than the rendered row', () => {
+        const identity = 'octo/demo#91';
+        const oldIndex = GM_getValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, null);
+        const oldPr = {
+            owner: 'octo', repo: 'demo', pr: '91',
+            headSha: 'a'.repeat(40), updatedAt: '2026-09-25T20:30:28Z',
+        };
+        const fresh = {
+            additions: 11, deletions: 4,
+            head: { sha: 'b'.repeat(40) }, updated_at: '2026-09-25T20:31:28Z',
+        };
+        const freshKey = pullRequestSizeCacheKey({
+            ...oldPr,
+            headSha: fresh.head.sha,
+            updatedAt: fresh.updated_at,
+        });
+        const host = document.createElement('div');
+        host.innerHTML = [
+            '<script type="application/json" data-target="react-app.embeddedData">',
+            `{"payload":{"repoPullsDashboardContentRoute":{"results":[{"number":91,"repoNameWithOwner":"octo/demo","headSha":"${oldPr.headSha}","updatedAt":"${oldPr.updatedAt}"}]}}}`,
+            '</script>',
+            '<li><a data-testid="listitem-title-link" href="/octo/demo/pull/91">Updated PR</a></li>',
+        ].join('');
+        document.body.appendChild(host);
+        try {
+            const response = pullRequestSizeResponse(oldPr, fresh);
+            ackDeepEq(response?.stats, { additions: 11, deletions: 4 });
+            ackEq(response?.revision, `${fresh.head.sha}:${fresh.updated_at}`);
+            const [entry] = findPullRequestListEntries(host, { owner: 'octo', repo: 'demo', repoKey: 'octo/demo' });
+            ackEq(entry.pr.headSha, fresh.head.sha, 'later injector passes use the response revision');
+            ackEq(entry.pr.updatedAt, fresh.updated_at);
+            ackDeepEq(readPullRequestSize(entry.pr), { additions: 11, deletions: 4 });
+        } finally {
+            latestPullRequestSizeRevisions.delete(identity);
+            GM_deleteValue(freshKey);
+            if (oldIndex === null || oldIndex === undefined) GM_deleteValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY);
+            else GM_setValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, oldIndex);
+            host.remove();
+        }
+    });
+
+    ackTest('pull request size cache keeps only the latest exact revision per PR', () => {
+        const identity = 'octo/demo#92';
+        const oldIndex = GM_getValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, null);
+        const first = {
+            owner: 'octo', repo: 'demo', pr: '92',
+            headSha: 'c'.repeat(40), updatedAt: '2026-09-25T20:30:28Z',
+        };
+        const second = { ...first, headSha: 'd'.repeat(40), updatedAt: '2026-09-25T20:31:28Z' };
+        const firstKey = pullRequestSizeCacheKey(first);
+        const secondKey = pullRequestSizeCacheKey(second);
+        try {
+            rememberPullRequestSize(first, {
+                additions: 1, deletions: 2, head: { sha: first.headSha }, updated_at: first.updatedAt,
+            });
+            rememberPullRequestSize(second, {
+                additions: 3, deletions: 4, head: { sha: second.headSha }, updated_at: second.updatedAt,
+            });
+            ackEq(GM_getValue(firstKey, null), null, 'superseded exact revision is removed');
+            ackDeepEq(readPullRequestSize(second), { additions: 3, deletions: 4 });
+        } finally {
+            GM_deleteValue(firstKey);
+            GM_deleteValue(secondKey);
+            latestPullRequestSizeRevisions.delete(identity);
+            if (oldIndex === null || oldIndex === undefined) GM_deleteValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY);
+            else GM_setValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, oldIndex);
         }
     });
 
