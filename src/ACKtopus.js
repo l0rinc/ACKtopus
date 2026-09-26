@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.276
+// @version      1.277
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17573,7 +17573,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         clearJevDescriptionAnnotations();
         resetJevTrackers();
         updateGithubReviewOptions();
-        if (enabled && (jevLineReadingEnabled() || jevDescriptionReadingEnabled())) queueJevPageAnnotations();
+        if (enabled && (jevLineReadingEnabled() || jevDescriptionReadingEnabled())) {
+            queueJevPageAnnotations();
+            queueVisibleJevComments();
+        }
     }
 
     function jevCacheId(kind, state, questions = JEV_QUESTIONS[kind]) {
@@ -17925,6 +17928,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }, { key: kind, intervalMs: 0, level: 'warn' });
                     resolve(null);
                 } finally {
+                    if (pageKey === jevPageKey) {
+                        if (readingRequest) {
+                            jevPageScheduledLineRequests = Math.max(0, jevPageScheduledLineRequests - 1);
+                        } else {
+                            jevPageScheduledRequests = Math.max(0, jevPageScheduledRequests - 1);
+                        }
+                    }
                     jevPending.delete(id);
                 }
             };
@@ -19541,7 +19551,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             tasks.push(jevEvaluate(pr, 'line', state, questions).then((result) => {
                 return batch.map(({ line, review }, index) => {
                     if (!line.cell.isConnected || line.cell.dataset.ackJevLineId !== `${id}:${index}`) return '';
-                    return jevApplyLineReading(line, jevReadingTargetResult(result, index), review.location);
+                    const targetResult = jevReadingTargetResult(result, index);
+                    if (!targetResult) {
+                        delete line.cell.dataset.ackJevLineId;
+                        return '';
+                    }
+                    return jevApplyLineReading(line, targetResult, review.location);
                 });
             }));
         }
@@ -19884,9 +19899,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const sentence = sentences[sentenceIndex];
                     if (!sentence.spans.every((span) => span.isConnected &&
                         span.dataset.ackJevDescriptionId === `${id}:${batchIndex}`)) return '';
+                    const targetResult = jevReadingTargetResult(result, batchIndex);
+                    if (!targetResult) {
+                        for (const span of sentence.spans) delete span.dataset.ackJevDescriptionId;
+                        return '';
+                    }
                     return jevApplyDescriptionReading(
                         sentence,
-                        jevReadingTargetResult(result, batchIndex),
+                        targetResult,
                         `${evidencePrefix} ${sentenceIndex + 1}`,
                         pr,
                         parentText,
@@ -26753,11 +26773,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }),
                 );
             } catch (e) {
+                usedFallback = true;
                 if (chunk.length === 1) {
                     console.error('ACKtopus: commit review aid chunk failed:', chunk[0]?.sha?.slice(0, 8), e);
                     return;
                 }
-                usedFallback = true;
                 const mid = Math.ceil(chunk.length / 2);
                 await fetchChunkRecursive(chunk.slice(0, mid));
                 await fetchChunkRecursive(chunk.slice(mid));
@@ -27027,7 +27047,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     _diffSelectionOneLinerStopAnim = null;
                 }
                 if (isCurrent()) ackRaf(() => {
-                    if (isCurrent()) updateDiffSelectionToolbar();
+                    if (isCurrent()) updateDiffSelectionToolbar(ctx.syntheticSelection ? ctx : null);
                 });
             }
         }, 250);
@@ -27912,11 +27932,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }),
                 );
             } catch (e) {
+                usedFallback = true;
                 if (chunk.length === 1) {
                     console.error('ACKtopus: commit explain chunk failed:', chunk[0]?.sha?.slice(0, 8), e);
                     return;
                 }
-                usedFallback = true;
                 const mid = Math.ceil(chunk.length / 2);
                 await fetchChunkRecursive(chunk.slice(0, mid));
                 await fetchChunkRecursive(chunk.slice(mid));
@@ -32345,6 +32365,37 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('Jev releases queued budget when the privacy gate stops work', async () => {
+        const oldGet = GM_getValue;
+        const oldPublicRepository = jevPublicRepository;
+        const oldConfigured = jevConfigured;
+        const oldCacheMemory = jevCacheMemory;
+        const oldPageKey = jevPageKey;
+        const oldScheduledRequests = jevPageScheduledRequests;
+        const oldScheduledLineRequests = jevPageScheduledLineRequests;
+        const pr = { owner: 'acktopus-budget-fixture', repo: 'example', pr: '14' };
+        try {
+            GM_getValue = (key, fallback) => key === 'jev_api_key' ? 'synthetic-key' : oldGet(key, fallback);
+            jevPublicRepository = async () => false;
+            jevConfigured = true;
+            jevCacheMemory = [];
+            jevPageKey = '';
+            for (let index = 0; index < JEV_MAX_TOTAL_REQUESTS_PER_PAGE + 2; index++) {
+                ackEq(await jevEvaluate(pr, 'comment', { selected_comment: `blocked ${index}` }), null);
+                ackEq(jevPageScheduledRequests, 0, 'a stopped job releases its queue reservation');
+            }
+            ackEq(jevPageScheduledLineRequests, 0);
+        } finally {
+            GM_getValue = oldGet;
+            jevPublicRepository = oldPublicRepository;
+            jevConfigured = oldConfigured;
+            jevCacheMemory = oldCacheMemory;
+            jevPageKey = oldPageKey;
+            jevPageScheduledRequests = oldScheduledRequests;
+            jevPageScheduledLineRequests = oldScheduledLineRequests;
+        }
+    });
+
     ackTest('Jev yields between settled diff files', () => {
         const settle = sourceSection(_ackSource, 'function settleJevDiffFile', 'function queueJevDiffFile');
         ackAssert(settle.includes('jevVisibleDiffQueue.push(file)'), 'a settled file enters the shared background queue');
@@ -32653,9 +32704,45 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const bind = sourceSection(_ackSource, 'function bindJevReadingHover', 'function jevPRDescriptionBody');
         ackAssert(bind.includes("event.key !== 'Enter' && event.key !== ' '"),
             'keyboard activation opens the same explanation');
+        const summary = sourceSection(_ackSource, 'function queueDiffSelectionOneLiner', 'function installDiffSelectionActions');
+        ackAssert(summary.includes('updateDiffSelectionToolbar(ctx.syntheticSelection ? ctx : null)'),
+            'synthetic emoji context survives popup repositioning');
         const hunkSlot = sourceSection(_ackSource, 'function jevHunkBadgeSlot', 'const jevCommentPendingBodies');
         ackAssert(!/gray background|background color/i.test(hunkSlot),
             'hunk tooltips describe their scope without discussing presentation');
+    });
+
+    ackTest('failed Jev line batches clear their DOM reservation for retry', async () => {
+        const oldLineEnabled = jevLineReadingEnabled;
+        const oldEvaluate = jevEvaluate;
+        const host = document.createElement('div');
+        host.className = 'js-file';
+        host.setAttribute('data-path', 'src/retry.cpp');
+        host.innerHTML = '<table><tr class="blob-code-addition"><td data-line-number="7" id="diff-abcR7"></td>' +
+            '<td class="blob-code blob-code-addition">return corrected;</td></tr></table>';
+        document.body.appendChild(host);
+        const line = jevChangedRow(host.querySelector('tr'));
+        try {
+            jevLineReadingEnabled = () => true;
+            jevEvaluate = async () => null;
+            queueJevLineReading(
+                { owner: 'octo', repo: 'demo', pr: '1' },
+                'a'.repeat(40),
+                [{ path: 'src/retry.cpp', line }],
+                'retry-signature',
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(line.cell.dataset.ackJevLineId, undefined, 'a transient failure can be queued again');
+        } finally {
+            jevLineReadingEnabled = oldLineEnabled;
+            jevEvaluate = oldEvaluate;
+            host.remove();
+        }
+    });
+
+    ackTest('re-enabling the Jev guide revisits visible review comments', () => {
+        const fn = sourceSection(_ackSource, 'function setJevLineReadingPreferred', 'function jevCacheId');
+        ackAssert(fn.includes('queueVisibleJevComments()'), 'comment sentence guides are restored after quick re-enable');
     });
 
     ackTest('Jev line rubric separates test setup from behavioral assertions', () => {
@@ -52196,6 +52283,19 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(reviewBatch.includes('MAX_REVIEW_AID_BATCH_COMMITS'), 'review aid batch size constant used');
         ackAssert(reviewBatch.includes('fetchChunkRecursive'), 'review aids split recursively on parse failure');
+    });
+
+    ackTest('partial one-commit lightbulb batches are never stored as complete', () => {
+        for (const [start, end] of [
+            ['async function fetchBatchCommitReviewAids', 'const _prBodyLightbulbPrecomputeInFlight'],
+            ['async function fetchBatchCommitExplanations', 'function addCommitExplainButtons'],
+        ]) {
+            const fn = sourceSection(_ackSource, start, end);
+            const failure = fn.indexOf('if (chunk.length === 1)');
+            ackAssert(failure > 0, `${start} handles a failed one-commit chunk`);
+            ackAssert(fn.lastIndexOf('usedFallback = true', failure) >= 0,
+                `${start} marks a failed one-commit chunk partial before returning`);
+        }
     });
 
     ackTest('single commit explain title mentions review aid sections', () => {
