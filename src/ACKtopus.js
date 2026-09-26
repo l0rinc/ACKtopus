@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.280
+// @version      1.281
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -17283,7 +17283,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_STACK_MAX_COMMITS = 12;
     const JEV_STACK_PATCH_CHARS = 12000;
     const JEV_STACK_MAX_STATE_CHARS = 80000;
-    const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp|sk)[_-][A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
+    const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp)[_-][A-Za-z0-9_-]{20,}|(?:^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
         commit: {
             role: { type: 'choice', instructions: 'What is the primary role of this complete parent-relative commit patch within the pull request described by state.pr_description? Judge the patch together with the exact full commit message.', criteria: {
@@ -19792,7 +19792,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             for (const part of new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(text)) {
                 add(part.segment, part.index);
             }
-            return ranges;
+            const merged = [];
+            for (const range of ranges) {
+                const previous = merged.at(-1);
+                if (previous && !/[.!?…]["'”’\])]*$/.test(previous.text)) {
+                    previous.end = range.end;
+                    previous.text = text.slice(previous.start, range.end).trimEnd();
+                } else {
+                    merged.push({ ...range });
+                }
+            }
+            return merged;
         }
         const re = /[^.!?]+(?:[.!?]+(?=\s|$)|$)\s*/g;
         let match;
@@ -31666,6 +31676,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(JEV_SECRET_RE.test('token ghp_abcdefghijklmnopqrstuvwxyz0123'), 'catches GitHub tokens');
         ackAssert(JEV_SECRET_RE.test('-----BEGIN RSA PRIVATE KEY-----'), 'catches private key blocks');
         ackAssert(!JEV_SECRET_RE.test('const sk = value + 1; // ghp_short'), 'leaves ordinary code alone');
+        ackAssert(
+            !JEV_SECRET_RE.test('m_disk_space_remaining_capacity_counter'),
+            'leaves long identifiers containing sk_ alone',
+        );
+    });
+
+    ackTest('Jev sentence splitting keeps hard-wrapped prose together', () => {
+        const ranges = jevSentenceRanges('This sentence is hard\nwrapped across source lines.\nThis is the next sentence.');
+        ackEq(ranges.length, 2, 'newlines without sentence punctuation do not create extra sentences');
+        ackEq(ranges[0].text, 'This sentence is hard\nwrapped across source lines.');
+        ackEq(ranges[1].text, 'This is the next sentence.');
     });
 
     ackTest('Jev distinguishes rejected request shape from an invalid key', async () => {
