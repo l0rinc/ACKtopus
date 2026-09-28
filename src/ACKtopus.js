@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.287
+// @version      1.288
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1188,10 +1188,12 @@
         const prevQuietUntil = _ackInteractionQuietUntil;
         const nextQuietUntil = Math.max(_ackInteractionQuietUntil, now + quietMs);
         _ackInteractionQuietUntil = nextQuietUntil;
-        const extensionMs = nextQuietUntil - prevQuietUntil;
-        const sameReason = reason === _ackLastActivityReason;
+        const interactionWasAlreadyActive = prevQuietUntil > now;
         _ackLastActivityReason = reason;
-        if (sameReason && extensionMs < 120) return;
+        // One physical gesture can alternate between input event names, such as
+        // wheel and scroll. Coalesce by time instead of event name so it does
+        // not repeatedly rebuild every pending background timer.
+        if (interactionWasAlreadyActive) return;
         _ackInteractionGeneration++;
         ackBackgroundLog(
             'user activity paused background work',
@@ -1227,8 +1229,8 @@
         document.addEventListener('keydown', keyboard, passiveCapture);
         document.addEventListener('beforeinput', keyboard, passiveCapture);
         document.addEventListener('input', keyboard, passiveCapture);
-        document.addEventListener('wheel', scroll, passiveCapture);
-        document.addEventListener('touchmove', scroll, passiveCapture);
+        // Actual scroll events cover wheel, touch, keyboard, and scrollbar
+        // movement without running extra work before the browser can scroll.
         document.addEventListener('scroll', scroll, passiveCapture);
         window.addEventListener('scroll', scroll, { passive: true });
         document.addEventListener('pointerdown', pointer, passiveCapture);
@@ -4444,17 +4446,6 @@
                 flex: '1',
                 minWidth: '0',
             });
-            chipsWrap.addEventListener(
-                'wheel',
-                (e) => {
-                    if (e.deltaY !== 0) {
-                        chipsWrap.scrollLeft += e.deltaY;
-                        e.preventDefault();
-                    }
-                },
-                { passive: false },
-            );
-
             for (const u of users) {
                 const chip = document.createElement('a');
                 chip.href = u.url;
@@ -24018,19 +24009,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const openTarget = type === 'details' ? trigger.querySelector('summary') || trigger : trigger;
 
-            // Hover: open popup (200ms delay)
+            // Hover: open after scrolling has settled. Content moving beneath a
+            // stationary pointer emits mouseenter, and opening GitHub's popup in
+            // the middle of that gesture can make it reveal its anchor.
             let hoverTimer = null;
-            openTarget.addEventListener('mouseenter', () => {
+            let pointerInside = false;
+            const scheduleHoverOpen = () => {
+                if (hoverTimer) clearTimeout(hoverTimer);
                 hoverTimer = setTimeout(() => {
+                    hoverTimer = null;
+                    if (!pointerInside) return;
+                    if (isAckUserInteracting()) {
+                        scheduleHoverOpen();
+                        return;
+                    }
                     if (!isAddReactionTrigger(trigger, type)) return;
                     if (type === 'details') {
                         trigger.setAttribute('open', '');
                     } else {
                         withReactionPassthrough(() => trigger.click());
                     }
-                }, 200);
+                }, ackInteractionDelay(200));
+            };
+            openTarget.addEventListener('mouseenter', () => {
+                pointerInside = true;
+                scheduleHoverOpen();
             });
             openTarget.addEventListener('mouseleave', () => {
+                pointerInside = false;
                 if (hoverTimer) {
                     clearTimeout(hoverTimer);
                     hoverTimer = null;
@@ -38112,6 +38118,30 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('reaction hover waits for page scrolling to settle', async () => {
+        const host = document.createElement('div');
+        host.style.position = 'absolute';
+        host.style.left = '-99999px';
+        host.innerHTML = '<button aria-label="Add your reaction"><svg class="octicon-smiley"></svg></button>';
+        document.body.appendChild(host);
+        const previousQuietUntil = _ackInteractionQuietUntil;
+        try {
+            const trigger = host.querySelector('button');
+            let opens = 0;
+            trigger.addEventListener('click', () => opens++);
+            autoOpenReactionPopup(host);
+            _ackInteractionQuietUntil = ackNow() + 280;
+            trigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+            await new Promise((resolve) => setTimeout(resolve, 230));
+            ackEq(opens, 0, 'does not open a popup while a touchpad gesture is active');
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            ackEq(opens, 1, 'opens once after the pointer and page are quiet');
+        } finally {
+            _ackInteractionQuietUntil = previousQuietUntil;
+            host.remove();
+        }
+    });
+
     ackTest('autoOpenReactionPopup does not attach handlers to current-user posts', () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -39264,7 +39294,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(guards.includes("'pointerdown'"), 'keeps intentional pointer interaction tracking');
         ackAssert(guards.includes("'scroll'"), 'keeps scroll interaction tracking');
+        ackAssert(!guards.includes("'wheel'"), 'does not run work before a wheel gesture can scroll');
+        ackAssert(!guards.includes("'touchmove'"), 'does not run work before touch scrolling');
         ackAssert(!guards.includes("'pointermove'"), 'mouse movement does not continually defer background work');
+
+        const activity = sourceSection(_ackSource, 'function markAckUserActivity', 'function installAckInteractionGuards');
+        ackAssert(activity.includes('interactionWasAlreadyActive'), 'coalesces one continuous interaction period');
+        ackAssert(!activity.includes('sameReason'), 'does not treat alternating browser event names as new gestures');
     });
 
     ackTest('editor affordance buttons refresh quickly without full document rescans', () => {
@@ -41608,6 +41644,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes("'#3fb950'"), 'green border for maintainers');
         ackAssert(fn.includes('(maintainer)'), 'maintainer indicator in tooltip');
         ackAssert(fn.includes('(member)'), 'member indicator in tooltip');
+    });
+
+    ackTest('ACK panel leaves vertical wheel gestures to the page', () => {
+        const panel = buildAckPanel([
+            { type: 'ACK', user: 'reviewer', url: 'https://github.com/example#issuecomment-1' },
+        ]);
+        const chips = panel.querySelector('.ack-chips');
+        const event = new WheelEvent('wheel', { deltaY: 80, bubbles: true, cancelable: true });
+        const dispatched = chips.dispatchEvent(event);
+        ackEq(dispatched, true, 'wheel event remains available to its native scroll chain');
+        ackEq(event.defaultPrevented, false, 'ACK chips do not capture vertical page scrolling');
     });
 
     ackTest('buildAckPanel call site fetches members and logs diagnostics before building panel', () => {
