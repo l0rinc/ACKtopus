@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.294
+// @version      1.295
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -23934,6 +23934,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Passthrough flag: when true, our click handler yields to native GitHub behavior.
     // Used when we programmatically click to open the reaction popup.
     let _reactionPassthrough = false;
+    const reactionHoverBindings = new WeakMap();
 
     function withReactionPassthrough(fn) {
         _reactionPassthrough = true;
@@ -23957,9 +23958,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     // auto-open the native reaction popup on mouseenter. One less click to
-    // react. Clicking the trigger itself applies 👍 directly.
+    // react. Single-clicking the trigger applies 👍 and double-clicking applies ❤️.
     // Pure DOM — no API calls, no PAT needed, uses GitHub's own session.
     function autoOpenReactionPopup(root = document) {
+        root = getReactionContainer(root) || root;
         // Skip buttons that represent an already-applied reaction, not the
         // "add reaction" smiley trigger. The classic-UI markers
         // (data-reaction-content / js-reaction-group-button) miss modern
@@ -23980,6 +23982,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return true;
             }
             const aria = (el.getAttribute?.('aria-label') || '').toLowerCase();
+            if (/\badd(?: or remove)? (?:your )?reactions?\b/.test(aria)) return false;
             if (/\breacted with\b|\byou reacted\b|\busers? reacted\b|\bpeople reacted\b/.test(aria)) return true;
             if (el.tagName === 'BUTTON') {
                 // Current React reaction chips may render a plain emoji inside
@@ -23988,7 +23991,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // classic data-reaction-content and g-emoji markers are gone.
                 if (el.hasAttribute('aria-pressed') || /checkbox/i.test(el.getAttribute('role') || '')) return true;
                 if (/^react with\b/.test(aria)) return true;
-                if (/reaction/i.test(el.className || '') && !/\badd(?: or remove)? (?:your )?reactions?\b/.test(aria)) return true;
+                if (/reaction/i.test(el.className || '') && !el.querySelector('.octicon-smiley')) return true;
                 if (!el.querySelector('.octicon-smiley') && /\p{Extended_Pictographic}/u.test(el.textContent || '')) return true;
             }
             return false;
@@ -24014,8 +24017,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (dd && !triggers.some((t) => t.el === dd)) triggers.push({ el: dd, type: 'details' });
         });
         // React UI: standalone button with reaction aria-label or smiley icon.
-        // Filter out existing reaction emoji buttons up front so we don't
-        // attach hover/click handlers to them.
+        // Discover add selectors separately. Existing emoji chips open their
+        // selector on hover below and keep GitHub's native click behavior.
         qsa(root, 'button[aria-label*="reaction" i], button[aria-label*="react" i]').forEach((btn) => {
             if (btn.closest('details')) return;
             if (isExistingReactionButton(btn)) return;
@@ -24032,25 +24035,34 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
 
         for (const { el: trigger, type } of triggers) {
-            // Re-check in case a details/summary entry somehow resolved to an
-            // existing reaction button.
             if (!isAddReactionTrigger(trigger, type)) continue;
             if (isOwnReactionTrigger(trigger)) continue;
-            if (trigger.dataset.ackReactionHover) continue;
-            trigger.dataset.ackReactionHover = 'true';
-
             const openTarget = type === 'details' ? trigger.querySelector('summary') || trigger : trigger;
-
-            // Hover: open after scrolling has settled. Content moving beneath a
-            // stationary pointer emits mouseenter, and opening GitHub's popup in
-            // the middle of that gesture can make it reveal its anchor.
+            const container = getReactionContainer(trigger) || trigger.parentElement;
+            const hoverTargets = [openTarget, ...qsa(container, 'button').filter((button) =>
+                !trigger.contains(button) && isExistingReactionButton(button) &&
+                (getReactionContainer(button) || button.parentElement) === container)];
+            const existing = reactionHoverBindings.get(trigger);
+            if (existing && !existing.lifetime.signal.aborted) {
+                hoverTargets.forEach(existing.bindHover);
+                continue;
+            }
+            trigger.dataset.ackReactionHover = 'true';
+            const lifetime = ensureAckLifetime('reaction-hover');
             let hoverTimer = null;
-            let pointerInside = false;
+            let clickTimer = null;
+            const hovered = new Set();
+            const bound = new WeakSet();
+            const cancelHover = () => {
+                if (hoverTimer) ackClearTimeout(hoverTimer);
+                hoverTimer = null;
+            };
             const scheduleHoverOpen = () => {
-                if (hoverTimer) clearTimeout(hoverTimer);
-                hoverTimer = setTimeout(() => {
+                cancelHover();
+                hoverTimer = ackSetTimeout(() => {
                     hoverTimer = null;
-                    if (!pointerInside) return;
+                    if (lifetime.signal.aborted || !trigger.isConnected ||
+                        ![...hovered].some((target) => target.isConnected)) return;
                     if (isAckUserInteracting()) {
                         scheduleHoverOpen();
                         return;
@@ -24058,41 +24070,59 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     if (!isAddReactionTrigger(trigger, type)) return;
                     if (type === 'details') {
                         trigger.setAttribute('open', '');
-                    } else {
+                    } else if (trigger.getAttribute('aria-expanded') !== 'true') {
                         withReactionPassthrough(() => trigger.click());
                     }
                 }, ackInteractionDelay(200));
             };
-            openTarget.addEventListener('mouseenter', () => {
-                pointerInside = true;
-                scheduleHoverOpen();
-            });
-            openTarget.addEventListener('mouseleave', () => {
-                pointerInside = false;
-                if (hoverTimer) {
-                    clearTimeout(hoverTimer);
-                    hoverTimer = null;
-                }
-            });
+            const bindHover = (target) => {
+                if (bound.has(target)) return;
+                bound.add(target);
+                target.addEventListener('mouseenter', () => {
+                    if (lifetime.signal.aborted) return;
+                    hovered.add(target);
+                    scheduleHoverOpen();
+                });
+                target.addEventListener('mouseleave', () => {
+                    hovered.delete(target);
+                    if (!hovered.size) cancelHover();
+                });
+            };
+            reactionHoverBindings.set(trigger, { lifetime, bindHover });
+            hoverTargets.forEach(bindHover);
 
-            // Click: apply 👍 directly (pure DOM, no API)
-            openTarget.addEventListener(
-                'click',
-                (e) => {
-                    if (_reactionPassthrough) return; // allow native popup open
-                    if (e.isTrusted === false) return; // never turn synthetic hover/open clicks into 👍
-                    if (hoverTimer) {
-                        clearTimeout(hoverTimer);
-                        hoverTimer = null;
-                    }
-                    e.preventDefault();
-                    e.stopPropagation();
-                    applyReactionChoice(trigger, '+1').catch((err) =>
-                        console.error('ACKtopus: applyReactionChoice failed:', err),
-                    );
-                },
-                true,
-            ); // capture phase to beat GitHub's handler
+            const applyChoice = (content) => {
+                if (lifetime.signal.aborted || !trigger.isConnected) return;
+                applyReactionChoice(trigger, content).catch((err) =>
+                    console.error('ACKtopus: applyReactionChoice failed:', err));
+            };
+            const cancelClick = () => {
+                if (clickTimer) ackClearTimeout(clickTimer);
+                clickTimer = null;
+            };
+            // Delay a pointer single-click so a double-click chooses only ❤️.
+            // Keyboard activation applies 👍 immediately. Hover never applies a reaction.
+            openTarget.addEventListener('click', (e) => {
+                if (_reactionPassthrough || e.isTrusted === false || lifetime.signal.aborted) return;
+                cancelHover();
+                cancelClick();
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.detail > 1) return;
+                if (e.detail === 0) applyChoice('+1');
+                else clickTimer = ackSetTimeout(() => {
+                    clickTimer = null;
+                    applyChoice('+1');
+                }, 350);
+            }, true); // capture phase to beat GitHub's handler
+            openTarget.addEventListener('dblclick', (e) => {
+                if (e.isTrusted === false || lifetime.signal.aborted) return;
+                cancelHover();
+                cancelClick();
+                e.preventDefault();
+                e.stopPropagation();
+                applyChoice('heart');
+            }, true);
         }
     }
 
@@ -38922,7 +38952,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(source.includes('.ack-overflow-fix{overflow:visible'), 'overflow fix CSS');
     });
 
-    ackTest('autoOpenReactionPopup opens native popup on hover with delay, excludes existing emoji buttons', () => {
+    ackTest('autoOpenReactionPopup opens the picker on hover and binds shortcuts only to add selectors', () => {
         const source = _ackSource;
         ackAssert(source.includes('function autoOpenReactionPopup'), 'function exists');
         const fn = source.slice(
@@ -38934,11 +38964,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!source.includes('ack-inline-reactions'), 'no custom inline reactions row');
         // Opens popup on mouseenter with delay
         ackAssert(fn.includes('mouseenter'), 'adds mouseenter listener');
-        ackAssert(fn.includes('setTimeout'), 'delays opening with setTimeout');
+        ackAssert(fn.includes('ackSetTimeout'), 'hover timers stop when the page lifetime ends');
         ackAssert(fn.includes('mouseleave'), 'adds mouseleave to cancel timer');
-        ackAssert(fn.includes('clearTimeout'), 'cancels timer on mouseleave');
+        ackAssert(fn.includes('ackClearTimeout'), 'cancels timer on mouseleave');
         ackAssert(fn.includes('ackReactionHover'), 'guards against double-processing');
-        const hoverBlock = fn.slice(fn.indexOf("openTarget.addEventListener('mouseenter'"), fn.indexOf('// Click:'));
+        const hoverBlock = fn.slice(fn.indexOf('const scheduleHoverOpen'), fn.indexOf('const applyChoice'));
         ackAssert(!hoverBlock.includes('applyReactionChoice'), 'hover path does not apply thumbs up');
         // Excludes existing reaction emoji buttons (classic + React UI)
         ackAssert(fn.includes('data-reaction-content'), 'skips buttons with data-reaction-content');
@@ -38947,7 +38977,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('reacted with'), 'skips buttons whose aria-label describes an existing reaction');
     });
 
-    ackTest('autoOpenReactionPopup hover opens only the add selector and never toggles an existing reaction', async () => {
+    ackTest('autoOpenReactionPopup hovering an existing emoji opens the picker without toggling it', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
         host.style.left = '-99999px';
@@ -38966,10 +38996,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             existing.addEventListener('click', () => existingClicks++);
             trigger.addEventListener('click', () => triggerClicks++);
             autoOpenReactionPopup(host);
-            ackAssert(!existing.dataset.ackReactionHover, 'existing reaction button is not marked as a hover target');
+            ackAssert(!existing.dataset.ackReactionHover, 'existing reaction keeps its native click behavior');
             ackAssert(trigger.dataset.ackReactionHover === 'true', 'add-reaction trigger is marked as a hover target');
             existing.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
-            trigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
             await new Promise((resolve) => setTimeout(resolve, 240));
             ackEq(existingClicks, 0, 'hovering an existing reaction never synthesizes a reaction click');
             ackEq(triggerClicks, 1, 'hovering the add selector opens its native popup once');
@@ -38980,6 +39009,77 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'hovering/clicking the existing reaction follows native behavior, no extra click is synthesized',
             );
         } finally {
+            host.remove();
+        }
+    });
+
+    ackTest('reaction hover binds newly rendered emoji chips and keeps an open picker open', async () => {
+        const host = document.createElement('div');
+        host.className = 'comment-reactions';
+        host.innerHTML = '<button aria-label="Add your reaction" aria-pressed="false" aria-expanded="false"><svg class="octicon-smiley"></svg></button>';
+        document.body.appendChild(host);
+        try {
+            const trigger = host.querySelector('button');
+            let opens = 0;
+            trigger.addEventListener('click', () => { opens++; trigger.setAttribute('aria-expanded', 'true'); });
+            autoOpenReactionPopup(host);
+            const chip = document.createElement('button');
+            chip.setAttribute('aria-label', 'React with thumbs up');
+            chip.textContent = '👍 1';
+            host.appendChild(chip);
+            let reactions = 0;
+            chip.addEventListener('click', () => reactions++);
+            autoOpenReactionPopup(chip);
+            chip.dispatchEvent(new MouseEvent('mouseenter'));
+            await new Promise((resolve) => setTimeout(resolve, 240));
+            ackEq(opens, 1, 'new chips open the existing add selector');
+            ackEq(reactions, 0, 'hover never adds or removes a reaction');
+            chip.dispatchEvent(new MouseEvent('mouseleave'));
+            trigger.dispatchEvent(new MouseEvent('mouseenter'));
+            await new Promise((resolve) => setTimeout(resolve, 240));
+            ackEq(opens, 1, 'moving onto the smiley does not toggle the picker closed');
+        } finally { host.remove(); }
+    });
+
+    ackTest('reaction single-click chooses thumbs up and double-click chooses only a heart', async () => {
+        const originalApply = applyReactionChoice;
+        const host = document.createElement('div');
+        host.className = 'comment-reactions';
+        host.innerHTML = '<button aria-label="Add your reaction"><svg class="octicon-smiley"></svg></button>';
+        document.body.appendChild(host);
+        const trigger = host.querySelector('button');
+        const originalAdd = trigger.addEventListener;
+        const handlers = {};
+        const choices = [];
+        trigger.addEventListener = function (type, handler, options) {
+            handlers[type] = handler;
+            originalAdd.call(this, type, handler, options);
+        };
+        const click = (detail, isTrusted = true) => ({ detail, isTrusted, preventDefault() {}, stopPropagation() {} });
+        try {
+            applyReactionChoice = async (_trigger, content) => { choices.push(content); };
+            autoOpenReactionPopup(host);
+            ackAssert(handlers.dblclick, 'the smiley has a double-click handler');
+            handlers.click(click(1));
+            ackDeepEq(choices, [], 'the first click waits for a possible double-click');
+            handlers.click(click(2));
+            handlers.dblclick(click(2));
+            await new Promise((resolve) => setTimeout(resolve, 390));
+            ackDeepEq(choices, ['heart'], 'double-click never applies thumbs up first');
+            handlers.click(click(1));
+            await new Promise((resolve) => setTimeout(resolve, 390));
+            ackDeepEq(choices, ['heart', '+1'], 'a pointer single-click still applies thumbs up');
+            handlers.click(click(0));
+            ackDeepEq(choices, ['heart', '+1', '+1'], 'keyboard activation remains immediate');
+            handlers.click(click(1, false));
+            handlers.dblclick(click(2, false));
+            handlers.click(click(1));
+            host.remove();
+            await new Promise((resolve) => setTimeout(resolve, 390));
+            ackDeepEq(choices, ['heart', '+1', '+1'], 'synthetic clicks and a detached trigger cannot write reactions');
+        } finally {
+            applyReactionChoice = originalApply;
+            trigger.addEventListener = originalAdd;
             host.remove();
         }
     });
@@ -51222,7 +51322,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function autoOpenReactionPopup'),
             source.indexOf('function getReactionContainer'),
         );
-        ackAssert(fn.includes("applyReactionChoice(trigger, '+1')"), 'click applies thumbs up');
+        ackAssert(fn.includes("applyChoice('+1')"), 'single-click applies thumbs up');
+        ackAssert(fn.includes("applyChoice('heart')"), 'double-click applies a heart');
         ackAssert(fn.includes('e.preventDefault()'), 'prevents default popup open');
         ackAssert(fn.includes('e.stopPropagation()'), 'stops propagation');
         ackAssert(fn.includes('capture'), 'uses capture phase');

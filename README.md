@@ -290,7 +290,7 @@ Keeps the comment formatting toolbar accessible while editing longer comments.
 
 ### Faster reactions
 
-Makes reacting faster by reducing clicks: hovering a comment's smiley button opens the reaction picker, and clicking applies a 👍 directly (guarded so it never fires on your own comments or on accidental targets).
+Hovering a comment's smiley button or an existing emoji opens the reaction picker without adding or removing reactions. Single-click the smiley for 👍 or double-click it for ❤️. Pointer single-clicks wait briefly to distinguish a double-click, while keyboard activation applies 👍 immediately. These shortcuts skip your own comments. Existing emoji clicks keep GitHub's native behavior.
 
 ### PGP signature badges
 
