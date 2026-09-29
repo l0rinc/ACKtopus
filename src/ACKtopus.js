@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.292
+// @version      1.293
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -6358,6 +6358,7 @@
                 const message = data.choices?.[0]?.message;
                 return (message?.content || '') + (message?.refusal || '');
             },
+            parseRefusal: (data) => !!data.choices?.[0]?.message?.refusal,
             parseUsage: (data) => [data.usage?.prompt_tokens, data.usage?.completion_tokens],
             parseFinishReason: (data) => data.choices?.map((choice) => choice.finish_reason).find(Boolean) || '',
         },
@@ -6466,6 +6467,7 @@
             inputPrice: 2, // $/M input tokens
             outputPrice: 10, // $/M output tokens
             modelPrices: {
+                // Retain older model prices for historical usage records.
                 'claude-sonnet-5': { input: 2, output: 10 },
                 'claude-sonnet-5-5': { input: 2, output: 10 },
                 'claude-opus-5-5': { input: 4, output: 20 },
@@ -6479,6 +6481,7 @@
             outputPrice: 0.5, // $/M output tokens
             modelPrices: {
                 'gpt-6-luna': { input: 0.1, output: 0.5 },
+                // Retain older model prices for historical usage records.
                 'gpt-6-sol': { input: 2, output: 10 },
                 'gpt-6.1-sol': { input: 2, output: 10 },
                 'gpt-image-2': { input: 2.5, output: 15 },
@@ -7901,13 +7904,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             )
                 return;
             const n = factoryReset();
-            resetAllBtn.textContent = `✓ Reset ${n} entries`;
-            panel.querySelectorAll('textarea[data-instr-key]').forEach((el) => {
-                el.value = el.dataset.instrDefault || '';
-            });
-            setTimeout(() => {
-                resetAllBtn.textContent = '☢ Factory reset';
-            }, 2000);
+            closePanel();
+            document.body.appendChild(buildConfigPanel());
+            ackLogEvent('settings reset', { removed: n });
         });
         clearRow.appendChild(resetAllBtn);
         panel.appendChild(clearRow);
@@ -7992,7 +7991,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const testCounter = document.createElement('span');
         testCounter.textContent = '0/' + _ackTests.length;
         const testStatus = document.createElement('span');
-        testStatus.textContent = '▸ running…';
+        testStatus.textContent = 'Ready';
         testStatus.style.color = '#8b949e';
         const testProgress = document.createElement('div');
         Object.assign(testProgress.style, {
@@ -8084,7 +8083,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 });
         };
         runTestsBtn.addEventListener('click', runSelfTests);
-        setTimeout(runSelfTests, 50);
 
         // --- Save / Cancel ---
         sep();
@@ -8417,6 +8415,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             inputTokens: undefined,
             outputTokens: undefined,
             finishReason: '',
+            refused: false,
             done: false,
         };
     }
@@ -8480,6 +8479,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     );
                 }
                 appendLLMStreamText(state, delta.refusal);
+                if (delta.refusal) state.refused = true;
             }
         }
     }
@@ -8607,7 +8607,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 }
                 reject(makeLLMRequestError(label, kind, details, meta));
             };
-            const resolveWithText = (text, inputTokens, outputTokens, finishReason = '') => {
+            const resolveWithText = (text, inputTokens, outputTokens, finishReason = '', refused = false) => {
                 if (settled) return;
                 const responseText = String(text || '');
                 const meta = {
@@ -8616,6 +8616,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     finishReason: String(finishReason || ''),
                 };
                 if (inputTokens || outputTokens) addUsage(provider, inputTokens, outputTokens, model);
+                if (refused || /^(refusal|safety|blocked)$/i.test(finishReason)) {
+                    rejectWithLoggedError('response refused', responseText || finishReason);
+                    return;
+                }
                 if (isLLMTruncatedFinishReason(finishReason)) {
                     settled = true;
                     if (!_ackTesting) {
@@ -8675,6 +8679,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                                 streamState.inputTokens,
                                 streamState.outputTokens,
                                 streamState.finishReason,
+                                streamState.refused,
                             );
                             return;
                         }
@@ -8688,7 +8693,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                         const [inp, out] = api.parseUsage(data);
                         const text = api.parseText(data);
                         const finishReason = api.parseFinishReason?.(data) || '';
-                        resolveWithText(text, inp, out, finishReason);
+                        resolveWithText(text, inp, out, finishReason, api.parseRefusal?.(data) || false);
                     } else {
                         rejectWithLoggedError(`${r.status}`, parseProviderError(r), r);
                     }
@@ -9165,33 +9170,23 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function readDiffFilePath(file) {
-        const normalize = (value) =>
-            String(value || '')
-                .trim()
-                .replace(/^Diff for:\s*/i, '');
-        const direct =
-            file?.getAttribute?.('data-path') ||
-            file?.getAttribute?.('data-file-name') ||
-            file?.getAttribute?.('data-tagsearch-path') ||
-            '';
+        if (!file) return '';
+        const normalize = (value) => String(value || '').trim().replace(/^Diff for:\s*/i, '');
+        const direct = file.getAttribute('data-path') || file.getAttribute('data-file-name') ||
+            file.getAttribute('data-tagsearch-path');
         if (direct) return normalize(direct);
-        const tableLabel = file
-            ?.querySelector?.('table[aria-label^="Diff for:"]')
-            ?.getAttribute?.('aria-label');
-        if (tableLabel) return normalize(tableLabel);
-        const header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR);
-        const named =
-            header?.querySelector?.(
-                '[data-testid="file-name"], [class*="DiffFileHeader-module__file-name"], .file-info a',
-            ) || header?.querySelector?.('a[title], [data-path]');
-        return normalize(
-            header?.getAttribute?.('data-path') ||
-            named?.getAttribute?.('data-path') ||
-            named?.getAttribute?.('title') ||
-            named?.getAttribute?.('aria-label') ||
-            named?.textContent?.trim() ||
-            '',
-        );
+        const table = file.matches('table[aria-label^="Diff for:"]') ? file :
+            file.querySelector('table[aria-label^="Diff for:"]');
+        if (table) return normalize(table.getAttribute('aria-label'));
+        const outerFile = file.closest(DIFF_FILE_SELECTOR);
+        const header = file.matches(DIFF_FILE_HEADER_SELECTOR) ? file :
+            file.querySelector(DIFF_FILE_HEADER_SELECTOR) || outerFile?.querySelector(DIFF_FILE_HEADER_SELECTOR);
+        if (!header) return normalize(outerFile?.getAttribute('data-path'));
+        const named = header.querySelector(
+            '[data-testid="file-name"], [class*="DiffFileHeader-module__file-name"], .file-info a',
+        ) || qsa(header, 'a[title], span[title], [data-path]').find((node) => !node.closest('button'));
+        return normalize(header.getAttribute('data-path') || named?.getAttribute('data-path') ||
+            named?.getAttribute('title') || named?.getAttribute('aria-label') || named?.textContent || '');
     }
 
     function visibleDiffFilePaths(root = document) {
@@ -9630,15 +9625,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         document.querySelectorAll(diffFileSelector).forEach((file) => {
             // A nested match (e.g. the .diff-table inside a .js-file) is already covered by its outer container.
             if (file.parentElement?.closest(diffFileSelector)) return;
-            const fileName =
-                file
-                    .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                    ?.textContent?.trim() || '';
-            file.querySelectorAll('td.blob-code, td.diff-text').forEach((cell) => {
+            const fileName = readDiffFilePath(file);
+            file.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell').forEach((cell) => {
                 const text = cell.textContent?.trim();
                 if (!text || text.length < 3) return;
                 const row = cell.closest('tr');
-                const lineNum = row?.querySelector('[data-line-number]')?.getAttribute('data-line-number') || '';
+                const lineNum = getDiffSelectionLineMeta(cell)?.lineNum || '';
                 items.push({ type: 'code', file: fileName, line: lineNum, text: text.slice(0, 200), el: row || cell });
             });
         });
@@ -10109,9 +10101,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const diffFile = container.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
         if (diffFile) {
             file =
-                diffFile
-                    .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                    ?.textContent?.trim() || '';
+                readDiffFilePath(diffFile);
         }
 
         let threadEl = threadRoot || getCommentThreadRoot(container) || container;
@@ -14297,9 +14287,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const diffFile = container?.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
                 if (diffFile) {
                     const fileName =
-                        diffFile
-                            .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                            ?.textContent?.trim() || '';
+                        readDiffFilePath(diffFile);
                     const commentRow = container?.closest('tr.inline-comments, tr.js-inline-comments-container');
                     const tbody = commentRow?.closest('tbody') || diffFile.querySelector('tbody');
                     if (tbody) {
@@ -15322,7 +15310,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             [...dialog.querySelectorAll('textarea')].find(isVisible) ||
             null;
         if (reviewBody) {
-            setTextareaValue(reviewBody, String(body || ''));
+            if (String(body || '').trim()) setTextareaValue(reviewBody, String(body));
             await ackSleep(50);
             reviewBody.focus();
         }
@@ -15495,9 +15483,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Files changed threads: use diff file header if available.
         const diffFile = form?.closest?.('.js-file, .diff-table, [data-testid="diff-file"], .file');
         const headerText =
-            diffFile
-                ?.querySelector?.('.file-header [title], .file-info a, [data-testid="file-name"]')
-                ?.textContent?.trim?.() || '';
+            readDiffFilePath(diffFile);
         if (headerText) return headerText;
 
         // Conversation tab: the reply form is often far away from the file header link,
@@ -16962,7 +16948,35 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     for (const [k, v] of Object.entries(_pgpStored)) pgpKeyCache.set(k, Promise.resolve(v));
 
     const pgpResultCache = new Map(); // cleartextArmored -> { status, reason?, keyId?, fingerprint? }
-    const pgpUserResults = new Map(); // username -> { status, reason?, fingerprint? }
+    const pgpCommentResults = new Map(); // comment permalink -> { details, text, result }
+
+    function pgpCommentKey(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            const pr = parsePR(parsed.pathname);
+            return parsed.hostname === 'github.com' && pr && parsed.hash
+                ? `${pr.owner}/${pr.repo}#${pr.pr}:${parsed.hash}` : '';
+        } catch (_) { return ''; }
+    }
+
+    function pgpSignatureText(details) {
+        const code = details.querySelector('pre, code');
+        if (code) return code.textContent;
+        const clone = details.cloneNode(true);
+        clone.querySelectorAll('.ack-pgp-badge').forEach((badge) => badge.remove());
+        return clone.textContent;
+    }
+
+    function rememberPGPComment(details, result, text) {
+        if (!details.isConnected || pgpSignatureText(details) !== text) return;
+        const root = details.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
+        const key = pgpCommentKey(getCommentPermalink(root));
+        if (!key) return;
+        pgpCommentResults.delete(key);
+        pgpCommentResults.set(key, { details, text, result });
+        while (pgpCommentResults.size > 1000) pgpCommentResults.delete(pgpCommentResults.keys().next().value);
+        updateAckPanelPGPOverlays();
+    }
 
     function getCommentAuthor(el) {
         const container = el.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
@@ -17071,10 +17085,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
 
             const sig = result.signatures[0];
-            await sig.verified; // throws on invalid signature
+            if (!sig) return { status: 'error', reason: 'No verification result returned' };
+            try {
+                await sig.verified;
+            } catch (err) {
+                return { status: 'invalid', reason: err.message || String(err) };
+            }
             return { status: 'valid', keyId: keyIdHex, fingerprint: publicKey.getFingerprint().toUpperCase() };
         } catch (err) {
-            return { status: 'invalid', reason: err.message || String(err) };
+            return { status: 'error', reason: err.message || String(err) };
         }
     }
 
@@ -17088,6 +17107,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!summary) continue;
             if (summary.dataset.ackPgpChecked) continue;
             const textContent = details.textContent;
+            const signatureText = pgpSignatureText(details);
 
             // --- Minisign signature detection ---
             if (textContent.includes('untrusted comment: signature from minisign')) {
@@ -17097,12 +17117,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const result = { status: 'minisign', reason: trustedMatch ? trustedMatch[1].trim() : '' };
                 applyPGPBadge(summary, result);
 
-                // Register as recognized for ACK panel overlay
-                const author = getCommentAuthor(details);
-                if (author) {
-                    pgpUserResults.set(author, result);
-                    updateAckPanelPGPOverlays();
-                }
+                rememberPGPComment(details, result, signatureText);
                 continue;
             }
 
@@ -17120,6 +17135,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (pgpResultCache.has(cleartext)) {
                 const cached = pgpResultCache.get(cleartext);
                 applyPGPBadge(summary, cached);
+                rememberPGPComment(details, cached, signatureText);
                 continue;
             }
 
@@ -17129,15 +17145,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             badge.title = 'Verifying PGP signature...';
 
             // Verify async
-            const author = getCommentAuthor(details);
             verifyPGPSignature(cleartext).then((result) => {
+                if (!details.isConnected || pgpSignatureText(details) !== signatureText) {
+                    delete summary.dataset.ackPgpChecked;
+                    return;
+                }
                 // Don't cache transient errors so a failed key fetch can recover on the next scan.
                 if (result.status !== 'error') pgpResultCache.set(cleartext, result);
+                else delete summary.dataset.ackPgpChecked;
                 applyPGPBadge(summary, result);
-                if (author) {
-                    pgpUserResults.set(author, result);
-                    updateAckPanelPGPOverlays();
-                }
+                rememberPGPComment(details, result, signatureText);
             });
         }
     }
@@ -17165,7 +17182,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             badge.textContent = '✅';
             const fp = result.fingerprint || '';
             const fpFmt = fp.replace(/(.{4})/g, '$1 ').trim();
-            badge.title = `Valid PGP signature\nKey: ${fpFmt}`;
+            badge.title = `Valid PGP signature\nKey: ${fpFmt}\nSigning key ownership by the GitHub author has not been checked`;
         } else if (result.status === 'minisign') {
             badge.textContent = '🔑';
             badge.title = `Minisign signature detected${result.reason ? '\n' + result.reason : ''}\n(Verification requires the signer's public key)`;
@@ -17187,13 +17204,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const nameSpan = chip.querySelector('span:not(.ack-pgp-avatar-wrap):not(.ack-pgp-overlay)');
             if (!nameSpan) continue;
             const username = nameSpan.textContent.trim();
-            const result = pgpUserResults.get(username);
-            if (!result) continue;
+            const key = pgpCommentKey(chip.href);
+            const record = pgpCommentResults.get(key);
+            if (!record || !record.details.isConnected || pgpSignatureText(record.details) !== record.text) {
+                if (record) pgpCommentResults.delete(key);
+                chip.querySelector('.ack-pgp-overlay')?.remove();
+                if (chip._ackPgpOriginalTitle !== undefined) chip.title = chip._ackPgpOriginalTitle;
+                continue;
+            }
+            const { result } = record;
+            if (chip._ackPgpOriginalTitle === undefined) chip._ackPgpOriginalTitle = chip.title;
 
             const avatar = chip.querySelector('img');
             if (!avatar) continue;
-            // Wrap avatar in a positioned container once; the overlay/title updates below
-            // always re-run so a later result for the same user refreshes the badge.
+            // Wrap the avatar in a positioned container once. The overlay/title updates below
+            // refresh the badge when verification of this comment finishes.
             let wrap = avatar.closest('.ack-pgp-avatar-wrap');
             if (!wrap) {
                 wrap = document.createElement('span');
@@ -17226,15 +17251,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             overlay.style.fontSize = '8px'; // reset the invalid-branch bump on status upgrades
             if (result.status === 'valid') {
-                overlay.textContent = '✅';
+                overlay.textContent = '🔑';
                 const fp = result.fingerprint || '';
                 const fpFmt = fp.replace(/(.{4})/g, '$1 ').trim();
-                chip.title = `${username}: PGP verified\n${fpFmt}`;
+                chip.title = `Valid PGP signature in this comment\nKey: ${fpFmt}\nSigning key ownership by ${username} has not been checked`;
             } else if (result.status === 'minisign') {
                 overlay.textContent = '🔑';
                 chip.title = `${username}: minisign signature${result.reason ? '\n' + result.reason : ''}`;
             } else {
-                overlay.textContent = '❌';
+                overlay.textContent = result.status === 'invalid' ? '❌' : '⚠️';
                 Object.assign(overlay.style, { fontSize: '10px' });
                 chip.title = `${username}: PGP ${result.status === 'invalid' ? 'INVALID' : 'failed'}: ${result.reason || 'unknown'}`;
             }
@@ -21480,9 +21505,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
                 if (diffFile) {
                     fileName =
-                        diffFile
-                            .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                            ?.textContent?.trim() || '';
+                        readDiffFilePath(diffFile);
 
                     // The comment container is inside a <tr class="inline-comments">.
                     // The code line being discussed is the <tr> immediately BEFORE it.
@@ -21916,6 +21939,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             return true;
         }
+        const locator = postEditRefreshLocator(form);
+        const lifetime = ensureAckLifetime('edit-save-confirmation');
         form._ackEditDiffConfirming = true;
         try {
             const { action, text } = await showDiffDialog(original, current, {
@@ -21924,18 +21949,27 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 acceptLabel: 'Accept and update',
                 acceptTitle: 'Submit this edited post',
             });
-            if (action === false) {
-                ta.focus();
+            if (lifetime.signal.aborted) return false;
+            const liveForm = form.isConnected ? form :
+                qsa(resolvePostEditRefreshRoot(locator), EDIT_FORM_SELECTOR).find((candidate) =>
+                    isExistingPostEditForm(candidate));
+            const liveTextarea = findEditTextarea(liveForm);
+            if (!liveForm || !liveTextarea ||
+                (liveTextarea.value !== current && liveTextarea.value !== original)) {
+                alert('The comment editor changed while the comparison was open. Review the current edit before saving again.');
                 return false;
             }
-            if (action !== 'unchanged' && typeof text === 'string' && text !== current) {
-                setTextareaValue(ta, text);
+            if (action === false) {
+                liveTextarea.focus();
+                return false;
             }
-            markEditDiffAccepted(form, ta.value || '');
-            const saveBtn = submitter?.isConnected ? submitter : findEditSaveButton(form);
+            const accepted = action !== 'unchanged' && typeof text === 'string' ? text : current;
+            if (liveTextarea.value !== accepted) setTextareaValue(liveTextarea, accepted);
+            markEditDiffAccepted(liveForm, accepted);
+            const saveBtn = submitter?.isConnected && liveForm.contains(submitter) ? submitter : findEditSaveButton(liveForm);
             if (saveBtn?.isConnected) saveBtn.click();
-            else if (typeof form.requestSubmit === 'function') form.requestSubmit();
-            else form.submit?.();
+            else if (typeof liveForm.requestSubmit === 'function') liveForm.requestSubmit();
+            else liveForm.submit?.();
             return false;
         } finally {
             form._ackEditDiffConfirming = false;
@@ -21955,7 +21989,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _ackPressedQuickActions = btn.closest('.ack-quick-actions');
         const clearPress = () => {
             _ackPressedQuickActions = null;
-            // Only one of the pair fires; drop the other so presses do not accumulate listeners.
+            // Only one of the pair fires. Drop the other so presses do not accumulate listeners.
             document.removeEventListener('pointerup', clearPress, true);
             document.removeEventListener('pointercancel', clearPress, true);
         };
@@ -27144,18 +27178,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ({ left: 'L', right: 'R' })[(lineEl || codeCell).getAttribute?.('data-diff-side')] ||
             '';
 
-        // File path: classic containers first, then the React diff table's own aria-label.
-        const diffFile = codeCell.closest('[data-path], .js-file, .diff-table, [data-testid="diff-file"], .file');
-        const fileName =
-            diffFile
-                ?.querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                ?.textContent?.trim() ||
-            diffFile?.getAttribute?.('data-path') ||
-            codeCell
-                .closest('table[data-diff-anchor]')
-                ?.getAttribute('aria-label')
-                ?.match(/^Diff for: (.+)$/)?.[1] ||
-            '';
+        const diffFile = codeCell.closest('[data-path], .diff-table, table[data-diff-anchor], ' + DIFF_FILE_SELECTOR);
+        const fileName = readDiffFilePath(diffFile);
 
         return { codeCell, row, fileName, lineNum, side, anchorId, lineEl };
     }
@@ -31283,6 +31307,212 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             fetchComparePatch = originalCompare;
             invalidatePRContext();
         }
+    });
+
+    ackTest('factory reset refreshes the open settings form before Save', async () => {
+        const originalConfirm = window.confirm;
+        const oldConfigured = jevConfigured;
+        const existingOverlay = document.querySelector('.ack-config-overlay');
+        existingOverlay?.classList.remove('ack-config-overlay');
+        let overlay;
+        try {
+            window.confirm = () => true;
+            GM_setValue('jev_api_key', 'preserved-test-key');
+            GM_setValue('jev_enabled', true);
+            GM_setValue('maintainer_logins', 'stale-user');
+            GM_setValue('llm_cache_enabled', false);
+            overlay = buildConfigPanel();
+            document.body.appendChild(overlay);
+            const reset = [...overlay.querySelectorAll('button')].find((button) => button.textContent === '☢ Factory reset');
+            reset.click();
+            const fresh = document.querySelector('.ack-config-overlay');
+            ackAssert(fresh && fresh !== overlay, 'the stale form is replaced');
+            overlay = fresh;
+            ackEq(fresh.querySelector('#ack-jev-enabled').checked, false);
+            ackEq(fresh.querySelector('#ack-jev-api-key').value, 'preserved-test-key');
+            ackAssert(fresh.querySelector('#ack-maintainer-logins').value !== 'stale-user');
+            [...fresh.querySelectorAll('button')].find((button) => button.textContent === 'Save').click();
+            ackEq(GM_getValue('jev_enabled'), false, 'Save cannot re-enable the reset feature');
+            ackAssert(GM_getValue('maintainer_logins') !== 'stale-user', 'Save cannot restore old preferences');
+            ackEq(GM_getValue('llm_cache_enabled'), true, 'Save uses the displayed default');
+            await Promise.resolve();
+        } finally {
+            window.confirm = originalConfirm;
+            jevConfigured = oldConfigured;
+            overlay?.querySelectorAll('button').forEach((button) => {
+                if (button.textContent === 'Cancel') button.click();
+            });
+            overlay?.remove();
+            existingOverlay?.classList.add('ack-config-overlay');
+        }
+    });
+
+    ackTest('opening a native review preserves a draft when the main comment is empty', async () => {
+        const open = openReviewDialog;
+        const find = findNativeReviewDialog;
+        const host = document.createElement('div');
+        host.innerHTML = '<textarea id="pull_request_review_body">Existing review draft</textarea>';
+        document.body.appendChild(host);
+        try {
+            openReviewDialog = async () => true;
+            findNativeReviewDialog = () => host;
+            await prepareNativeReviewDialog({ body: '' });
+            ackEq(host.querySelector('textarea').value, 'Existing review draft');
+            await prepareNativeReviewDialog({ body: 'New review text' });
+            ackEq(host.querySelector('textarea').value, 'New review text', 'an explicit body can still be transferred');
+        } finally {
+            openReviewDialog = open;
+            findNativeReviewDialog = find;
+            host.remove();
+        }
+    });
+
+    ackTest('accepted edits submit the replacement native form after a rerender', async () => {
+        const show = showDiffDialog;
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment" id="issuecomment-900011"><form class="js-comment-update"><textarea>Before</textarea><button type="submit" class="js-comment-update">Update comment</button></form></div>';
+        document.body.appendChild(host);
+        let finish;
+        let oldSubmits = 0;
+        let newSubmits = 0;
+        try {
+            showDiffDialog = () => new Promise((resolve) => { finish = resolve; });
+            trackEditForms(host);
+            const oldForm = host.querySelector('form');
+            oldForm.addEventListener('submit', (event) => { event.preventDefault(); oldSubmits++; });
+            oldForm.querySelector('textarea').value = 'Draft';
+            const request = confirmEditSave(oldForm, oldForm.querySelector('button'));
+            host.innerHTML = host.innerHTML;
+            trackEditForms(host);
+            const newForm = host.querySelector('form');
+            newForm.addEventListener('submit', (event) => { event.preventDefault(); newSubmits++; });
+            finish({ action: true, text: 'Accepted draft' });
+            await request;
+            ackEq(oldSubmits, 0);
+            ackEq(newSubmits, 1, 'only the connected replacement form submits');
+            ackEq(newForm.querySelector('textarea').value, 'Accepted draft');
+        } finally { showDiffDialog = show; host.remove(); }
+    });
+
+    ackTest('accepted edits cannot overwrite a draft changed during the comparison', async () => {
+        const show = showDiffDialog;
+        const oldAlert = window.alert;
+        const host = document.createElement('div');
+        host.innerHTML = '<form class="js-comment-update"><textarea>Before</textarea><button type="submit" class="js-comment-update">Update comment</button></form>';
+        document.body.appendChild(host);
+        let finish;
+        let submits = 0;
+        let warning = '';
+        try {
+            showDiffDialog = () => new Promise((resolve) => { finish = resolve; });
+            window.alert = (message) => { warning = message; };
+            trackEditForms(host);
+            const form = host.querySelector('form');
+            form.addEventListener('submit', (event) => { event.preventDefault(); submits++; });
+            const textarea = form.querySelector('textarea');
+            textarea.value = 'Draft';
+            const request = confirmEditSave(form, form.querySelector('button'));
+            textarea.value = 'Newer draft';
+            finish({ action: true, text: 'Accepted old draft' });
+            await request;
+            ackEq(submits, 0);
+            ackEq(textarea.value, 'Newer draft');
+            ackAssert(warning.includes('editor changed'), 'the skipped save is explained');
+        } finally { showDiffDialog = show; window.alert = oldAlert; host.remove(); }
+    });
+
+    ackTest('classic inline review and split-side selection share the full file path', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-file"><div class="file-header"><span title="src/full/path.cpp">path.cpp</span></div><table class="diff-table"><tbody><tr><td data-line-number="5"></td><td class="blob-code blob-code-deletion">old_value</td><td data-line-number="15"></td><td class="blob-code blob-code-addition">new_value</td></tr><tr class="inline-comments"><td><div class="review-comment">Review</div></td></tr></tbody></table></div>';
+        document.body.appendChild(host);
+        try {
+            const table = host.querySelector('table');
+            ackEq(readDiffFilePath(table), 'src/full/path.cpp', 'a nested table reads the outer classic header');
+            ackEq(getCommentLocationInfo(host.querySelector('.review-comment')).file, 'src/full/path.cpp');
+            const cell = host.querySelector('.blob-code-addition');
+            const meta = getDiffSelectionLineMeta(cell);
+            ackEq(meta.fileName, 'src/full/path.cpp');
+            ackEq(meta.lineNum, '15');
+            const line = gatherPageIndex().find((item) => item.el === cell.closest('tr') && item.text === 'new_value');
+            ackEq(line?.file, 'src/full/path.cpp');
+            ackEq(line?.line, '15');
+            host.innerHTML = '<table data-diff-anchor="fixture" aria-label="Diff for: src/modern.cpp"><tbody><tr><td data-line-number="7"></td><td class="diff-text-cell"><code class="diff-text">value</code></td></tr></tbody></table>';
+            ackEq(getDiffSelectionLineMeta(host.querySelector('code')).fileName, 'src/modern.cpp');
+        } finally { host.remove(); }
+    });
+
+    ackTest('PGP badges belong to signed comments and cannot verify the GitHub author', () => {
+        const host = document.createElement('div');
+        const originalById = document.getElementById;
+        const first = '#issuecomment-900021', second = '#issuecomment-900022';
+        host.innerHTML = `<div class="timeline-comment"><a class="author">same-user</a><a class="timestamp" href="${first}">time</a><details><summary>Signature</summary><pre>signed message</pre></details></div><div class="timeline-comment"><a class="author">same-user</a><a class="timestamp" href="${second}">time</a><details><summary>Unsigned</summary><pre>other message</pre></details></div><div id="${ACK_PANEL_ID}"><a href="${first}"><img><span>same-user</span></a><a href="${second}"><img><span>same-user</span></a></div>`;
+        document.body.appendChild(host);
+        document.getElementById = (id) => id === ACK_PANEL_ID ?
+            host.querySelector(`#${ACK_PANEL_ID}`) : originalById.call(document, id);
+        const details = host.querySelector('details');
+        try {
+            const result = { status: 'valid', fingerprint: '12345678' };
+            rememberPGPComment(details, result, pgpSignatureText(details));
+            const chips = host.querySelectorAll(`#${ACK_PANEL_ID} a`);
+            ackEq(chips[0].querySelector('.ack-pgp-overlay')?.textContent, '🔑');
+            ackAssert(chips[0].title.includes('has not been checked'), 'valid signatures do not establish key ownership');
+            ackEq(chips[1].querySelector('.ack-pgp-overlay'), null, 'another comment by the same author inherits nothing');
+            details.querySelector('pre').textContent = 'Edited signature';
+            updateAckPanelPGPOverlays();
+            ackEq(chips[0].querySelector('.ack-pgp-overlay'), null, 'an edit invalidates the displayed signature result');
+            rememberPGPComment(details, { status: 'error', reason: 'Key unavailable' }, pgpSignatureText(details));
+            ackEq(chips[0].querySelector('.ack-pgp-overlay')?.textContent, '⚠️', 'an unavailable key is not an invalid signature');
+        } finally {
+            document.getElementById = originalById;
+            pgpCommentResults.delete(pgpCommentKey(first));
+            pgpCommentResults.delete(pgpCommentKey(second));
+            host.remove();
+        }
+    });
+
+    ackTest('PGP key parsing failures differ from a rejected signature', async () => {
+        const originalPGP = openpgp;
+        const originalFetch = fetchPGPKey;
+        try {
+            fetchPGPKey = async () => 'fixture key';
+            openpgp = {
+                readCleartextMessage: async () => ({ getSigningKeyIDs: () => [{ toHex: () => 'abcd' }] }),
+                readKey: async () => { throw new Error('Key parse failed'); },
+            };
+            ackEq((await verifyPGPSignature('fixture')).status, 'error');
+            openpgp.readKey = async () => ({ getFingerprint: () => 'abcd' });
+            openpgp.verify = async () => ({ signatures: [{ verified: Promise.reject(new Error('Rejected signature')) }] });
+            ackEq((await verifyPGPSignature('fixture')).status, 'invalid');
+        } finally { openpgp = originalPGP; fetchPGPKey = originalFetch; }
+    });
+
+    ackTest('OpenAI refusals report errors and usage without being cached', async () => {
+        const request = GM_xmlhttpRequest;
+        let calls = 0;
+        try {
+            GM_setValue('llm_openai_key', 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            GM_xmlhttpRequest = (options) => {
+                calls++;
+                if (JSON.parse(options.data).stream) {
+                    options.onload({ status: 200, responseText: 'data: {"choices":[{"delta":{"refusal":"Refused"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}\n\ndata: [DONE]\n\n' });
+                } else {
+                    options.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { refusal: 'Refused' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2 } }) });
+                }
+            };
+            for (const maxTokens of [100, 5000]) {
+                const options = { maxTokens };
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    let error;
+                    try { await callLLM('openai', 'refusal fixture', 'prompt', options); }
+                    catch (e) { error = e; }
+                    ackAssert(error?.message.includes('response refused: Refused'),
+                        'refusals surface as errors so feature caches cannot store them as successful answers');
+                }
+            }
+            ackEq(calls, 4, 'both response paths retry instead of replaying the refusal');
+            ackEq(getUsage('openai').calls, 4, 'paid refusal responses remain counted');
+        } finally { GM_xmlhttpRequest = request; }
     });
 
     // --- parsePR ---
@@ -41856,17 +42086,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(cacheBlock.includes('ack-pgp-badge'), 'removes pgp badges');
     });
 
-    ackTest('verifyPGPSignatures extracts comment author and stores in pgpUserResults', () => {
+    ackTest('verifyPGPSignatures associates results with the signed comment', () => {
         const source = _ackSource;
-        ackAssert(source.includes('pgpUserResults'), 'pgpUserResults map exists');
+        ackAssert(source.includes('pgpCommentResults'), 'per-comment results map exists');
         ackAssert(source.includes('function getCommentAuthor'), 'getCommentAuthor function exists');
         const fn = source.slice(
             source.indexOf('function verifyPGPSignatures'),
             source.indexOf('function applyPGPBadge'),
         );
-        ackAssert(fn.includes('getCommentAuthor(details)'), 'extracts author from comment container');
-        ackAssert(fn.includes('pgpUserResults.set(author'), 'stores result keyed by username');
-        ackAssert(fn.includes('updateAckPanelPGPOverlays'), 'triggers ACK panel overlay update');
+        ackAssert(fn.includes('rememberPGPComment(details'), 'records the specific signed comment');
+        ackAssert(String(rememberPGPComment).includes('pgpCommentKey(getCommentPermalink(root))'), 'stores results by comment identity');
+        ackAssert(String(rememberPGPComment).includes('updateAckPanelPGPOverlays'), 'triggers ACK panel overlay update');
     });
 
     ackTest('getCommentAuthor handles avatar-only links and ignores @mentions', () => {
@@ -41884,29 +42114,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('updateAckPanelPGPOverlays adds valid/invalid overlays on ACK chip avatars', () => {
-        const source = _ackSource;
-        ackAssert(source.includes('function updateAckPanelPGPOverlays'), 'function exists');
-        const fn = source.slice(
-            source.indexOf('function updateAckPanelPGPOverlays'),
-            source.indexOf('// --- Lazy Visibility'),
-        );
+        const fn = String(updateAckPanelPGPOverlays);
         // Scans ACK panel chips
         ackAssert(fn.includes('ACK_PANEL_ID'), 'targets ACK panel');
-        ackAssert(fn.includes('pgpUserResults.get(username)'), 'looks up PGP result by username');
+        ackAssert(fn.includes('pgpCommentResults.get(key)'), 'looks up the signature on this comment');
         // Wraps avatar for positioning
         ackAssert(fn.includes('ack-pgp-avatar-wrap'), 'wraps avatar in positioned container');
         ackAssert(fn.includes('ack-pgp-overlay'), 'adds overlay element');
         ackAssert(fn.includes("position: 'absolute'"), 'overlay is absolutely positioned');
-        // Valid: green tick, invalid: red cross
-        ackAssert(
-            fn.includes("overlay.textContent = '\\u2705'") || fn.includes("overlay.textContent = '\u2705'"),
-            'valid shows checkmark',
-        );
-        ackAssert(
-            fn.includes("overlay.textContent = '\\u274C'") || fn.includes("overlay.textContent = '\u274C'"),
-            'invalid shows cross',
-        );
-        ackAssert(fn.includes('PGP verified'), 'valid tooltip says verified');
+        ackAssert(fn.includes("overlay.textContent = '🔑'"), 'valid signatures use a key badge');
+        ackAssert(fn.includes("result.status === 'invalid' ? '❌' : '⚠️'"), 'unavailable keys differ from invalid signatures');
+        ackAssert(fn.includes('Signing key ownership'), 'tooltip explains the unverified author association');
         ackAssert(fn.includes('INVALID'), 'invalid tooltip says INVALID');
     });
 
@@ -42116,13 +42334,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('return existingOverlay'), 'returns existing overlay instead of recreating it');
     });
 
-    ackTest('buildConfigPanel auto-runs self-tests on open', () => {
+    ackTest('buildConfigPanel runs self-tests only on request', () => {
         const source = _ackSource;
         const cfg = source.slice(
             source.indexOf('function buildConfigPanel'),
             source.indexOf('// --- LLM API Callers ---'),
         );
-        ackAssert(cfg.includes('setTimeout(runSelfTests, 50)'), 'auto-runs tests shortly after panel opens');
+        ackAssert(!cfg.includes('setTimeout(runSelfTests'), 'opening settings cannot reset live review state');
+        ackAssert(cfg.includes("runTestsBtn.addEventListener('click', runSelfTests)"), 'the test button remains available');
     });
 
     ackTest('ghco format uses review base branch via upstream/origin remote fallback', () => {
@@ -45603,7 +45822,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('td.diff-text-cell'), 'supports React diff table cells');
         ackAssert(fn.includes('code.diff-text'), 'supports nested code.diff-text nodes');
         ackAssert(fn.includes('data-line-anchor'), 'derives R/L side from React line anchors');
-        ackAssert(fn.includes('Diff for:'), 'derives file name from React diff table aria-label');
+        ackAssert(fn.includes('readDiffFilePath(diffFile)'), 'uses the shared classic and React file path resolver');
     });
 
     ackTest('diff selection context works outside diff (commit messages/comments/etc)', () => {
@@ -47832,7 +48051,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function getCommentLocationInfo'),
             source.indexOf('function formatCommentLocation'),
         );
-        ackAssert(helper.includes('.file-header [title]'), 'reads file from files-changed header');
+        ackAssert(helper.includes('readDiffFilePath(diffFile)'), 'shares the file-path reader for files-changed headers');
         ackAssert(helper.includes('a.text-mono.Link--primary'), 'reads file from conversation thread link');
         ackAssert(helper.includes('a[href*="/files/"][href*="#diff-"]'), 'reads file/commit from file link');
         ackAssert(helper.includes('tr.inline-comments'), 'reads line from adjacent inline comment row');
@@ -48763,11 +48982,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     });
 
     ackTest('ACK panel overlay handles minisign', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function updateAckPanelPGPOverlays'),
-            source.indexOf('function updateAckPanelPGPOverlays') + 3000,
-        );
+        const fn = String(updateAckPanelPGPOverlays);
         ackAssert(fn.includes("status === 'minisign'"), 'checks minisign status');
         ackAssert(fn.includes("'🔑'"), 'shows key overlay');
     });
@@ -55631,13 +55846,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         return { passed, failed, total: _ackTests.length, failures, skipped };
     }
 
-    ackTest('runACKtopusTests re-syncs live page after auto-tests', () => {
+    ackTest('runACKtopusTests re-syncs live page after self-tests', () => {
         const fn = String(runACKtopusTests);
         ackAssert(fn.includes('resyncAfterSelfTests'), 'triggers a post-test re-sync');
         ackAssert(fn.includes('setTimeout('), 're-sync is deferred until testing flag clears');
     });
 
-    ackTest('runACKtopusTests restores GitHub authentication state after auto-tests', () => {
+    ackTest('runACKtopusTests restores GitHub authentication state after self-tests', () => {
         const fn = String(runACKtopusTests);
         ackAssert(fn.includes('githubBadPat: _githubBadPat'), 'snapshots the rejected PAT marker');
         ackAssert(fn.includes("_githubBadPat = ''"), 'clears rejected PAT state between tests');
