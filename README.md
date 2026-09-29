@@ -152,7 +152,7 @@ If the PR changes C/C++ files, additional per-PR helpers appear:
 
 - `clang-format-diff`: apply formatting only to changed lines
 - `clang-tidy-diff`: run clang-tidy only on changed lines
-- `IWYU (changed)`: run include-what-you-use only on changed `src/*.h` / `src/*.cpp` files
+- `IWYU report (changed)`: report include-what-you-use findings for changed `src/*.h` / `src/*.cpp` files without editing them
 
 These three commands are generated with the PR’s exact changed C/C++ file paths already filled in, so they are ready to run as-is.
 

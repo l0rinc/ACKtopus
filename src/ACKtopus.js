@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.291
+// @version      1.292
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -239,11 +239,16 @@
         );
     }
 
+    // Unwrap a reply the model fenced as a whole. A lone trailing fence closes a
+    // code block that belongs to the text (e.g. benchmark output) and is kept.
+    function stripWholeReplyFence(text) {
+        const s = String(text || '').trim();
+        const m = s.match(/^```[a-z]*\n?([\s\S]*?)\n?```$/);
+        return (m ? m[1] : s).trim();
+    }
+
     function cleanPlainProofreadResult(raw) {
-        let s = String(raw || '')
-            .trim()
-            .replace(/^```[a-z]*\n?|\n?```$/g, '')
-            .trim();
+        let s = stripWholeReplyFence(raw);
         const outputMatch = s.match(/<output>\s*([\s\S]*?)\s*<\/output>/i);
         if (outputMatch) s = outputMatch[1].trim();
         return postProcessProofreadMarkdown(s);
@@ -327,7 +332,7 @@
             document.querySelector('.PullRequestHeaderSummary-module__summaryContainer__dA7dP') ||
             document.querySelector('#partial-discussion-header') ||
             document;
-        const branchLink = [...(summary.querySelectorAll?.('a[href*="/tree/"]') || [])][0];
+        const branchLink = summary.querySelector?.('a[href*="/tree/"]');
         const href = branchLink?.getAttribute?.('href') || '';
         const m = href.match(/\/tree\/([^?#]+)/);
         return m?.[1] ? decodeURIComponent(m[1]) : '';
@@ -932,7 +937,6 @@
     function createAckLifetime(gen, key) {
         const ac = new AbortController();
         const timers = new Set();
-        const intervals = new Set();
         const rafs = new Set();
         const cleanups = [];
 
@@ -942,7 +946,6 @@
             ac,
             signal: ac.signal,
             timers,
-            intervals,
             rafs,
             onAbort(fn) {
                 cleanups.push(fn);
@@ -953,7 +956,6 @@
             'abort',
             () => {
                 for (const id of timers) clearTimeout(id);
-                for (const id of intervals) clearInterval(id);
                 for (const id of rafs) cancelAnimationFrame(id);
                 for (const fn of cleanups) {
                     try {
@@ -961,7 +963,6 @@
                     } catch (_) {}
                 }
                 timers.clear();
-                intervals.clear();
                 rafs.clear();
             },
             { once: true },
@@ -1164,7 +1165,6 @@
                 queuedAt: ackNow(),
                 delayMs: ACK_BACKGROUND_MIN_DELAY_MS,
                 timeoutMs: ACK_BACKGROUND_IDLE_TIMEOUT_MS,
-                fn,
             };
         if (!job.onAbort) {
             job.signal = lifetime.signal;
@@ -1175,9 +1175,8 @@
             job.signal.addEventListener('abort', job.onAbort, { once: true });
         }
         job.fn = fn;
-        job.delayMs = opts.delayMs ?? job.delayMs ?? ACK_BACKGROUND_MIN_DELAY_MS;
-        job.timeoutMs = opts.timeoutMs ?? job.timeoutMs ?? ACK_BACKGROUND_IDLE_TIMEOUT_MS;
-        job.queuedAt = job.queuedAt || ackNow();
+        job.delayMs = opts.delayMs ?? job.delayMs;
+        job.timeoutMs = opts.timeoutMs ?? job.timeoutMs;
         _ackBackgroundJobs.set(label, job);
         scheduleAckBackgroundTimer(job, opts.reason || 'schedule');
     }
@@ -1318,20 +1317,14 @@
 
     function findPostEditTargetInRoot(root) {
         if (!root || root.nodeType !== 1) return null;
-        const containers = [];
+        // Insertion order is preserved and duplicates are removed. closest() also covers root itself.
+        const containers = new Set();
         const push = (el) => {
-            if (el && el.nodeType === 1 && !containers.includes(el)) containers.push(el);
+            if (el && el.nodeType === 1) containers.add(el);
         };
         push(root.closest?.('[data-testid="issue-body"]'));
         push(root.closest?.(COMMENT_CONTAINER_SELECTOR));
         push(root.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR));
-        if (
-            root.matches?.('[data-testid="issue-body"]') ||
-            root.matches?.(COMMENT_CONTAINER_SELECTOR) ||
-            root.matches?.(WIDE_COMMENT_CONTAINER_SELECTOR)
-        ) {
-            push(root);
-        }
         qsa(root, '[data-testid="issue-body"]').forEach(push);
         qsa(root, COMMENT_CONTAINER_SELECTOR).forEach(push);
         qsa(root, WIDE_COMMENT_CONTAINER_SELECTOR).forEach(push);
@@ -1359,10 +1352,12 @@
             if (target) return target;
         }
         const visibleRoots = [
-            ...qsa(document, '[data-testid="issue-body"]'),
-            ...qsa(document, COMMENT_CONTAINER_SELECTOR),
-            ...qsa(document, WIDE_COMMENT_CONTAINER_SELECTOR),
-        ].filter((el, idx, arr) => arr.indexOf(el) === idx && isInViewport(el));
+            ...new Set([
+                ...qsa(document, '[data-testid="issue-body"]'),
+                ...qsa(document, COMMENT_CONTAINER_SELECTOR),
+                ...qsa(document, WIDE_COMMENT_CONTAINER_SELECTOR),
+            ]),
+        ].filter(isInViewport);
         for (const root of visibleRoots) {
             const target = findPostEditTargetInRoot(root);
             if (target) return target;
@@ -1433,9 +1428,7 @@
             if (url.startsWith('/')) continue;
             // Some GitHub states include a leading numeric segment; always rewrite
             // to the current PR number to avoid resolving to the wrong PR (404 spam).
-            const normalized = url
-                .replace(/^\d+\/partials\/unread_timeline\b/, 'partials/unread_timeline')
-                .replace(/^\/+/, '');
+            const normalized = url.replace(/^\d+\/partials\/unread_timeline\b/, 'partials/unread_timeline');
             if (normalized.startsWith('partials/unread_timeline')) {
                 el.setAttribute('data-url', pullPrefix + normalized);
             }
@@ -1586,9 +1579,7 @@
                 ? _prContextCache.headSha || ''
                 : '';
         if (/^[0-9a-f]{40}$/i.test(cached)) return cached;
-        const ssr = readHeadShaFromSSR();
-        if (/^[0-9a-f]{40}$/i.test(ssr)) return ssr;
-        return '';
+        return readHeadShaFromSSR();
     }
 
     function createBtn(text, onClick, tooltip) {
@@ -1644,22 +1635,18 @@
         const raw = String(sha || '').trim();
         if (!raw) return '';
         if (/^[0-9a-f]{40}$/i.test(raw)) return raw;
+        const findFullMatch = (commits) =>
+            commits
+                .map(commitHashFromEntry)
+                .find((full) => /^[0-9a-f]{40}$/i.test(full) && (full.startsWith(raw) || raw.startsWith(full)));
 
-        const pageMatch = parseCommitsFromPage().find((c) => {
-            const full = String(c?.sha || '').trim();
-            return /^[0-9a-f]{40}$/i.test(full) && (full.startsWith(raw) || raw.startsWith(full));
-        });
-        if (pageMatch?.sha) return pageMatch.sha;
+        const pageMatch = findFullMatch(parseCommitsFromPage());
+        if (pageMatch) return pageMatch;
 
         if (pr) {
             try {
-                const commits = await fetchCommitList(pr.owner, pr.repo, pr.pr);
-                const apiMatch = commits.find((c) => {
-                    const full = String(c?.sha || c?.oid || '').trim();
-                    return /^[0-9a-f]{40}$/i.test(full) && (full.startsWith(raw) || raw.startsWith(full));
-                });
-                if (apiMatch?.sha) return apiMatch.sha;
-                if (apiMatch?.oid) return apiMatch.oid;
+                const apiMatch = findFullMatch(await fetchCommitList(pr.owner, pr.repo, pr.pr));
+                if (apiMatch) return apiMatch;
             } catch (_) {}
             try {
                 const commit = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/commits/${raw}`);
@@ -1812,17 +1799,17 @@
     // Retries up to 3 times with re-query.
     async function setTextareaValueRobust(container, taFallback, value, taSelector) {
         const lt = ensureAckLifetime('setTextareaValueRobust');
+        const selector = taSelector || `${COMMENT_TA_SELECTOR}, textarea`;
+        // Every wait below returns on abort, so the lifetime is live at each attempt.
         for (let attempt = 1; attempt <= 3; attempt++) {
-            if (lt.signal.aborted)
-                return container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
-            const ta = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
+            const ta = container.querySelector(selector) || taFallback;
             const valueBefore = ta?.value?.length;
             ta.focus();
             setTextareaValue(ta, value);
             const aborted1 = await ackSleep(150, lt);
             if (aborted1) return ta;
             // Re-query to check if it stuck (React may have replaced the element)
-            const check = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || ta;
+            const check = container.querySelector(selector) || ta;
             if (check.value === value) {
                 ackLogEvent(`textarea update applied on attempt ${attempt}`, {
                     textarea: `${check?.tagName || 'unknown'}.${check?.className || ''}`,
@@ -1835,7 +1822,7 @@
             if (aborted2) return check;
         }
         // Final attempt: return whatever we have
-        const ta = container.querySelector(taSelector || `${COMMENT_TA_SELECTOR}, textarea`) || taFallback;
+        const ta = container.querySelector(selector) || taFallback;
         ackLogEvent('textarea update failed after retries', {
             expectedLength: value.length,
             currentLength: ta.value.length,
@@ -1921,21 +1908,30 @@
         return mount ? { mount } : {};
     }
 
+    // Like ackSleep(), settle on page-lifetime abort too: the aborted frame
+    // never fires, and callers must still reach their cleanup.
     function waitForNextPaint() {
-        return new Promise((resolve) => ackRaf(() => resolve()));
+        const lt = ensureAckLifetime('paint');
+        return new Promise((resolve) => {
+            const done = () => {
+                lt.signal.removeEventListener('abort', done);
+                resolve();
+            };
+            lt.signal.addEventListener('abort', done, { once: true });
+            ackRaf(done);
+        });
     }
 
-    function copyTextWithFeedback(btn, text, { successContent = '✓', restoreMs = 1000 } = {}) {
+    function copyTextWithFeedback(btn, text) {
         if (!btn || btn.dataset.ackCopyBusy === '1' || !text) return false;
         btn.dataset.ackCopyBusy = '1';
         const origHTML = btn.innerHTML;
         GM_setClipboard(text);
-        if (/<[^>]+>/.test(String(successContent || ''))) btn.innerHTML = String(successContent);
-        else btn.textContent = String(successContent || '✓');
+        btn.textContent = '✓';
         ackSetTimeout(() => {
             btn.innerHTML = origHTML;
             delete btn.dataset.ackCopyBusy;
-        }, restoreMs);
+        }, 1000);
         return true;
     }
 
@@ -2328,6 +2324,7 @@
     // in some views (buttons now appear directly under `.discussion-item-header`).
     const AJAX_PAGINATION_BTN_SELECTOR = '.ajax-pagination-btn';
     const HIDDEN_CONVERSATION_SELECTOR = '.ajax-pagination-form';
+    const HIDDEN_TIMELINE_COUNT_RE = /(\d+)\s+hidden\s+(?:items?|conversations?)/i;
     const ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR =
         'button[data-testid^="issue-timeline-load-more-"], ' +
         '[data-testid^="issue-timeline-load-more-container-"] button';
@@ -2341,12 +2338,9 @@
     }
 
     function getIssueTimelineLoadMoreButtons() {
-        const seen = new Set();
-        return [...document.querySelectorAll(ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR)].filter((btn) => {
-            if (seen.has(btn) || !isIssueTimelineLoadMoreButton(btn)) return false;
-            seen.add(btn);
-            return true;
-        });
+        return [...document.querySelectorAll(ISSUE_TIMELINE_LOAD_MORE_BTN_SELECTOR)].filter(
+            isIssueTimelineLoadMoreButton,
+        );
     }
 
     function getIssueTimelineLoadMoreCount() {
@@ -2361,12 +2355,12 @@
     function getHiddenCount() {
         let total = getIssueTimelineLoadMoreCount();
         document.querySelectorAll(HIDDEN_CONVERSATION_SELECTOR).forEach((el) => {
-            const m = (el.textContent || '').match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
+            const m = (el.textContent || '').match(HIDDEN_TIMELINE_COUNT_RE);
             if (m) total += parseInt(m[1], 10);
         });
         document.querySelectorAll(AJAX_PAGINATION_BTN_SELECTOR).forEach((b) => {
             if (b.closest(HIDDEN_CONVERSATION_SELECTOR)) return; // form pass above already counted wrapped buttons
-            const m = b.textContent.match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
+            const m = b.textContent.match(HIDDEN_TIMELINE_COUNT_RE);
             if (m) total += parseInt(m[1], 10);
         });
         return total;
@@ -2420,11 +2414,16 @@
             ),
         ];
         const outdated = [...document.querySelectorAll('.outdated-comment details:not([open]):not([data-resolved])')];
-        // /changes page: "Load Diff" buttons for large diffs
-        const loadDiffs = [...document.querySelectorAll('button span, [class*="Button-Label"]')]
-            .filter((el) => /^load\s*diff$/i.test(el.textContent.trim()))
-            .map((el) => el.closest('button'))
-            .filter(Boolean);
+        // /changes page: "Load Diff" buttons for large diffs. Primer nests the
+        // label span inside a content span, so both match. Count each button once.
+        const loadDiffs = [
+            ...new Set(
+                [...document.querySelectorAll('button span, [class*="Button-Label"]')]
+                    .filter((el) => /^load\s*diff$/i.test(el.textContent.trim()))
+                    .map((el) => el.closest('button'))
+                    .filter(Boolean),
+            ),
+        ];
         return { paginationBtns, timelineLoadMore, minimized, outdated, loadDiffs };
     }
 
@@ -2529,12 +2528,9 @@
             seenControls.add(item.control);
             items.push(item);
         };
-        const select = (selector) => [
-            ...(root.matches?.(selector) ? [root] : []),
-            ...(root.querySelectorAll?.(selector) || []),
-        ];
 
-        for (const details of select(
+        for (const details of qsa(
+            root,
             'details[data-resolved], details.js-resolvable-timeline-thread-container, .outdated-comment details',
         )) {
             if (!isSafeReviewThreadDetails(details)) continue;
@@ -2551,9 +2547,9 @@
             });
         }
 
-        for (const button of select(REVIEW_THREAD_TOGGLE_SELECTOR)) {
+        for (const button of qsa(root, REVIEW_THREAD_TOGGLE_SELECTOR)) {
             const scope = button.closest?.(REVIEW_THREAD_SCOPE_SELECTOR);
-            if (!scope || (root !== document && !root.contains(scope) && scope !== root)) continue;
+            if (!scope || (root !== document && !root.contains(scope))) continue;
             const body = scope.querySelector?.('[data-target="review-thread-collapsible.body"]');
             const isOpen = () => {
                 const expanded = button.getAttribute('aria-expanded');
@@ -2649,7 +2645,7 @@
         ];
         for (const scope of scopes) {
             if (!hiddenCommentScopeMayContainMine(scope, commentAuthors, mineCommentIds)) continue;
-            const match = String(scope.textContent || '').match(/(\d+)\s+hidden\s+(?:items|conversations)/i);
+            const match = String(scope.textContent || '').match(HIDDEN_TIMELINE_COUNT_RE);
             total += match ? parseInt(match[1], 10) : 1;
         }
         return total;
@@ -2808,7 +2804,7 @@
             if (!body.textContent.includes('Reviews')) continue;
             const table = body.querySelector('table');
             if (!table) continue;
-            const rows = table.querySelectorAll('tbody tr, tr');
+            const rows = table.querySelectorAll('tr');
             for (const row of rows) {
                 const cells = row.querySelectorAll('td');
                 if (cells.length < 2) continue;
@@ -3145,7 +3141,7 @@
             const match = parsed.hostname === 'api.github.com'
                 ? parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/(?:pulls|issues)\/(\d+)(?:\/|$)/)
                 : parsed.hostname === 'github.com'
-                    ? parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\.patch|\/|$)/)
+                    ? parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\.(?:patch|diff)|\/|$)/)
                     : null;
             return match ? `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}#${match[3]}` : '';
         } catch (_) {
@@ -3665,7 +3661,7 @@
                 );
                 if (page === 1 && apiSnapshots) apiSnapshots.issueComments = comments;
                 for (const c of comments) {
-                    if (c.user.login !== 'DrahtBot') continue;
+                    if (c.user?.login !== 'DrahtBot') continue;
                     if (!c.body.includes('### Reviews')) continue;
                     const acks = [];
                     const lines = c.body.split('\n');
@@ -3693,8 +3689,7 @@
     function navigateToFragment(url) {
         const hash = new URL(url, location.href).hash;
         if (!hash) return null;
-        const id = hash.slice(1);
-        let el = document.getElementById(id) || document.querySelector(`[id="${cssEscape(id)}"]`);
+        const el = document.getElementById(hash.slice(1));
         if (!el) return null;
         // Expand any collapsed parent details
         let parent = el.closest('details:not([open])');
@@ -4200,7 +4195,7 @@
                 );
                 for (const r of reviews) {
                     const assoc = r.author_association;
-                    if (assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') {
+                    if ((assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') && r.user?.login) {
                         members.add(r.user.login);
                     }
                 }
@@ -4225,7 +4220,7 @@
                 apiSnapshots.issueComments = comments;
                 for (const c of comments) {
                     const assoc = c.author_association;
-                    if (assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') {
+                    if ((assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') && c.user?.login) {
                         members.add(c.user.login);
                     }
                 }
@@ -4250,7 +4245,7 @@
                 apiSnapshots.inlineComments = inline;
                 for (const c of inline) {
                     const assoc = c.author_association;
-                    if (assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') {
+                    if ((assoc === 'MEMBER' || assoc === 'COLLABORATOR' || assoc === 'OWNER') && c.user?.login) {
                         members.add(c.user.login);
                     }
                 }
@@ -4578,8 +4573,12 @@
         const pr = parsePR();
         if (!pr) return [];
         try {
-            const events = await gmFetch(
-                `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/timeline?per_page=100`,
+            // The timeline is oldest-first, so the latest pushes of a long PR
+            // live on its last pages.
+            const events = await fetchPagedGithubRows(
+                (page) =>
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/issues/${pr.pr}/timeline?per_page=100&page=${page}`,
+                10,
             );
             const pushes = [];
             for (const e of events) {
@@ -4645,7 +4644,7 @@
 
     function forcePushSignature(pushes) {
         return (pushes || [])
-            .map((push) => `${push.fromFull || push.from || ''}->${push.toFull || push.to || ''}`)
+            .map((push) => `${forcePushRangeEndpoint(push, 'from')}->${forcePushRangeEndpoint(push, 'to')}`)
             .join('|');
     }
 
@@ -4696,7 +4695,7 @@
         if (userAck.url) {
             const hash = userAck.url.includes('#') ? userAck.url.split('#')[1] : null;
             if (hash) {
-                const el = document.getElementById(hash) || document.querySelector(`[id="${cssEscape(hash)}"]`);
+                const el = document.getElementById(hash);
                 if (el) {
                     const container = el.closest(COMMENT_CONTAINER_SELECTOR) || el.parentElement;
                     const sha = ackShaFromBody(container?.querySelector(MARKDOWN_BODY_SELECTOR));
@@ -5095,7 +5094,8 @@
                 return '';
             })
             .finally(() => {
-                repoDefaultBranchRequests.delete(repoKey);
+                // A cache clear may have started a newer request for this repo.
+                if (repoDefaultBranchRequests.get(repoKey) === request) repoDefaultBranchRequests.delete(repoKey);
             });
         repoDefaultBranchRequests.set(repoKey, request);
         return request;
@@ -5231,7 +5231,8 @@
         if (!repo) return [];
         const entries = [];
         const seen = new Set();
-        const metadata = pullRequestListMetadata(root, repo);
+        // Parsed only once a row is found: most injector roots hold no PR links.
+        let metadata = null;
         for (const link of qsa(
             root,
             'a[data-testid="listitem-title-link"][href*="/pull/"], a[data-hovercard-type="pull_request"][href], ' +
@@ -5254,6 +5255,7 @@
             );
             if (!row) continue;
             seen.add(identity);
+            metadata ||= pullRequestListMetadata(root, repo);
             const embedded = metadata.get(identity) || {};
             const latest = latestPullRequestSizeRevisions.get(identity);
             const revision = latest && embedded.updatedAt && latest.updatedAt >= embedded.updatedAt ? latest : embedded;
@@ -5316,9 +5318,12 @@
         marker.setAttribute('aria-label', marker.title);
     }
 
+    // A plain timer: a page-lifetime timer cancelled by navigation would leave
+    // pullRequestSizeDrainTimer set and stall the queue for the whole session.
+    // The drain itself skips rows whose markers left the page.
     function schedulePullRequestSizeQueue() {
         if (!pullRequestSizeQueue.length || pullRequestSizeDrainTimer) return;
-        pullRequestSizeDrainTimer = ackSetTimeout(() => {
+        pullRequestSizeDrainTimer = setTimeout(() => {
             pullRequestSizeDrainTimer = null;
             drainPullRequestSizeQueue();
         }, 0);
@@ -5453,12 +5458,16 @@
     }
 
     function findPullsAuthorFilterControl(root = document) {
-        const controls = qsa(root, 'summary, button, a, [role="button"]').filter(isVisible);
         const labelOf = (el) =>
             String(el?.textContent || el?.getAttribute?.('aria-label') || el?.title || '')
                 .replace(/\s+/g, ' ')
                 .trim();
-        return controls.find((el) => /^Author$/i.test(labelOf(el))) || null;
+        // Match the label before the layout-reading visibility check.
+        return (
+            qsa(root, 'summary, button, a, [role="button"]').find(
+                (el) => /^Author$/i.test(labelOf(el)) && isVisible(el),
+            ) || null
+        );
     }
 
     function enhancePullRequestListPage(root = document, opts = {}) {
@@ -5773,13 +5782,16 @@
     }
 
     function compareFileElements(root = document) {
-        const candidates = qsa(root, COMPARE_FILE_SELECTOR).filter((file) => readDiffFilePath(file));
-        const candidateSet = new Set(candidates);
-        return candidates.filter((file) => {
+        const candidatePaths = new Map();
+        for (const file of qsa(root, COMPARE_FILE_SELECTOR)) {
             const path = readDiffFilePath(file);
+            if (path) candidatePaths.set(file, path);
+        }
+        return [...candidatePaths.keys()].filter((file) => {
+            const path = candidatePaths.get(file);
             let ancestor = file.parentElement;
             while (ancestor) {
-                if (candidateSet.has(ancestor) && readDiffFilePath(ancestor) === path) return false;
+                if (candidatePaths.get(ancestor) === path) return false;
                 ancestor = ancestor.parentElement;
             }
             return true;
@@ -6279,9 +6291,7 @@
     }
 
     function getHighContextMaxTokens(provider) {
-        if (provider === 'claude') return 32768;
-        if (provider === 'openai') return 32768;
-        if (provider === 'gemini') return 32768;
+        if (provider === 'claude' || provider === 'openai' || provider === 'gemini') return 32768;
         return 0;
     }
 
@@ -6343,7 +6353,11 @@
                 reasoning_effort: getDefaultOpenAIReasoningEffort(model),
                 messages: [{ role: 'user', content: 'hi' }],
             }),
-            parseText: (data) => data.choices?.[0]?.message?.content || '',
+            // Surface refusals like the streaming parser does instead of an empty reply.
+            parseText: (data) => {
+                const message = data.choices?.[0]?.message;
+                return (message?.content || '') + (message?.refusal || '');
+            },
             parseUsage: (data) => [data.usage?.prompt_tokens, data.usage?.completion_tokens],
             parseFinishReason: (data) => data.choices?.map((choice) => choice.finish_reason).find(Boolean) || '',
         },
@@ -6371,8 +6385,9 @@
             parseUsage: (data) => {
                 const usage = data.usageMetadata || {};
                 const input = usage.promptTokenCount;
+                // Thinking tokens are billed as output but reported apart from candidates.
                 const output =
-                    usage.candidatesTokenCount ||
+                    (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0) ||
                     (typeof usage.totalTokenCount === 'number' && typeof input === 'number'
                         ? Math.max(0, usage.totalTokenCount - input)
                         : undefined);
@@ -6432,15 +6447,15 @@
         }
         return {
             method: 'POST',
-            url: providerRequestUrl(api, target.model, key),
+            url: providerRequestUrl(api, target.model),
             headers: api.headers(key),
             data: JSON.stringify(api.validateBody(target.model)),
             timeout: LLM_REQUEST_TIMEOUT_MS,
         };
     }
 
-    function providerRequestUrl(api, model, key = '') {
-        return typeof api.url === 'function' ? api.url(model, key) : api.url;
+    function providerRequestUrl(api, model) {
+        return typeof api.url === 'function' ? api.url(model) : api.url;
     }
 
     // Provider branding -- small trusted inline SVG icons for the settings and recipe UI.
@@ -7131,7 +7146,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const now = Date.now();
         const ts = GM_getValue('llm_cache_timestamps', {});
         const keys = GM_listValues();
-        let evicted = 0;
+        let changed = false;
         for (const k of keys) {
             const isLLM =
                 k.startsWith('llm_cache_') ||
@@ -7140,15 +7155,24 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 k.startsWith('llm_explain_') ||
                 k.startsWith('llm_pr_overview_') ||
                 k.startsWith('llm_infographic_');
-            if (!isLLM || k === 'llm_cache_timestamps') continue;
+            // llm_cache_enabled is the user's cache toggle, not a cache entry.
+            if (!isLLM || k === 'llm_cache_timestamps' || k === 'llm_cache_enabled') continue;
             const age = ts[k] ? now - ts[k] : Infinity;
             if (age > THIRTY_DAYS) {
                 GM_deleteValue(k);
                 delete ts[k];
-                evicted++;
+                changed = true;
             }
         }
-        if (evicted > 0) GM_setValue('llm_cache_timestamps', ts);
+        // PR cache clears and force-push invalidation delete entries without
+        // their timestamps, so drop timestamps whose entry no longer exists.
+        const live = new Set(keys);
+        for (const k of Object.keys(ts)) {
+            if (live.has(k)) continue;
+            delete ts[k];
+            changed = true;
+        }
+        if (changed) GM_setValue('llm_cache_timestamps', ts);
     }
 
     evictStaleCache();
@@ -7170,7 +7194,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const overviewPrefix = `llm_pr_overview_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const autoOpenPrefix = `llm_lightbulb_autoopen_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const infographicPrefix = prInfographicCachePrefix(pr);
-        const prSizePrefix = `ack_pr_size:v2:${pullRequestSizeIdentity(pr)}:`;
+        const prSizeIdentity = pullRequestSizeIdentity(pr);
+        const prSizePrefix = `ack_pr_size:v2:${prSizeIdentity}:`;
         const keys = typeof GM_listValues === 'function' ? GM_listValues() : [];
         let count = 0;
         keys.forEach((k) => {
@@ -7192,7 +7217,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             }
         });
         const prSizeIndex = GM_getValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, {});
-        const prSizeIdentity = pullRequestSizeIdentity(pr);
         if (prSizeIndex?.[prSizeIdentity]) {
             delete prSizeIndex[prSizeIdentity];
             GM_setValue(PULL_REQUEST_SIZE_CACHE_INDEX_KEY, prSizeIndex);
@@ -7213,7 +7237,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('llm_lightbulb_') ||
             k.startsWith('llm_pr_overview_') ||
             k.startsWith('llm_infographic_') ||
-            k.startsWith('llm_cache_') ||
+            (k.startsWith('llm_cache_') && k !== 'llm_cache_enabled') ||
             k.startsWith('llm_prompt_') ||
             k.startsWith('ack_pr_size:') ||
             k.startsWith('pr_comment_count_') ||
@@ -7268,7 +7292,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         pullRequestSizeQueue.length = 0;
         pendingPullRequestSizes.clear();
         if (pullRequestSizeDrainTimer) {
-            ackClearTimeout(pullRequestSizeDrainTimer);
+            clearTimeout(pullRequestSizeDrainTimer);
             pullRequestSizeDrainTimer = null;
         }
         reactorCache.clear();
@@ -7713,7 +7737,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 help.textContent = `Get key → ${links.domain}`;
             }
         };
-        keyInput.addEventListener('blur', () => validateKey(active, keyInput.value, status, updateHelp));
+        keyInput.addEventListener('blur', () => validateKey(active, keyInput.value.trim(), status, updateHelp));
         if (cfg.key) validateKey(active, cfg.key, status, updateHelp);
 
         // --- Custom Instructions (per-provider) ---
@@ -8080,7 +8104,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         });
         saveBtn.addEventListener('click', () => {
             panel.querySelectorAll('input[data-provider]').forEach((el) => {
-                GM_setValue(providerKeyStorageKey(el.dataset.provider), el.value);
+                GM_setValue(providerKeyStorageKey(el.dataset.provider), el.value.trim());
             });
             panel.querySelectorAll('textarea[data-instr-key]').forEach((el) => {
                 const val = el.value.trim() === (el.dataset.instrDefault || '').trim() ? '' : el.value;
@@ -8474,13 +8498,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const chunk = full.slice(state.offset);
         state.offset = full.length;
         state.buffer += chunk;
-        let sep = state.buffer.search(/\r?\n\r?\n/);
-        while (sep >= 0) {
-            const block = state.buffer.slice(0, sep);
-            const separator = state.buffer.match(/\r?\n\r?\n/)[0];
-            state.buffer = state.buffer.slice(sep + separator.length);
+        let separator;
+        while ((separator = /\r?\n\r?\n/.exec(state.buffer))) {
+            const block = state.buffer.slice(0, separator.index);
+            state.buffer = state.buffer.slice(separator.index + separator[0].length);
             parseLLMStreamBlock(provider, block, state);
-            sep = state.buffer.search(/\r?\n\r?\n/);
         }
         if (final && state.buffer.trim()) {
             const block = state.buffer;
@@ -8531,7 +8553,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         }
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
-        const requestUrl = providerRequestUrl(api, model, cfg.key);
+        const requestUrl = providerRequestUrl(api, model);
         const streaming = !!api.streamBody && shouldStreamLLMRequest(provider, { timeoutMs, maxTokens: effectiveMaxTokens });
         const rawBody = api.body(model, system, userContent, { reasoningEffort, maxTokens: effectiveMaxTokens });
         const requestBody = JSON.stringify(streaming ? api.streamBody(rawBody) : rawBody);
@@ -8612,7 +8634,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     console.log(responseText);
                     console.groupEnd();
                 }
-                if (promptKey && cacheEpoch === _llmCacheEpoch && getLLMConfig().cacheEnabled) {
+                // An empty reply would otherwise be replayed from cache on every retry.
+                if (promptKey && responseText.trim() && cacheEpoch === _llmCacheEpoch && getLLMConfig().cacheEnabled) {
                     GM_setValue(promptKey, responseText);
                     recordCacheTimestamp(promptKey);
                 }
@@ -8683,11 +8706,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function parseProviderError(response) {
+        const text = String(response?.responseText || '');
         try {
-            const data = JSON.parse(response.responseText || '{}');
-            return data?.error?.message || response.responseText.slice(0, 200);
+            return JSON.parse(text || '{}')?.error?.message || text.slice(0, 200);
         } catch (_) {
-            return response.responseText.slice(0, 200);
+            return text.slice(0, 200);
         }
     }
 
@@ -8695,7 +8718,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (status !== 403) return false;
         const text = String(message || '').toLowerCase();
         return (
-            text.includes('organization must be verified') ||
             text.includes('verify organization') ||
             text.includes('organization verification') ||
             text.includes('must be verified')
@@ -8941,7 +8963,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 paths.add(diff[2]);
             }
         }
-        return [...paths].filter(Boolean);
+        return [...paths];
     }
 
     async function fetchPRPatchFilePaths(pr) {
@@ -9036,10 +9058,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 jevCommentPatchHead(ctx.diff).toLowerCase() !== ctx.headSha.toLowerCase()
             ) {
                 try {
-                    ctx.diff = await fetchPatch(pr, {
-                        expectedHead: ctx.headSha,
-                        baseSha: prResp.status === 'fulfilled' ? prResp.value.base?.sha : '',
-                    });
+                    ctx.diff = await fetchPatch(pr, { expectedHead: ctx.headSha, baseSha: ctx.baseSha });
                 } catch (_) {
                     ctx.diff = '';
                 }
@@ -9080,7 +9099,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (ctx.description) parts.push(wrapPromptBlock('PR DESCRIPTION', ctx.description.slice(0, maxDesc)));
         if (ctx.commitMessages) parts.push(wrapPromptBlock('COMMIT MESSAGES', ctx.commitMessages.slice(0, maxCommits)));
         if (ctx.diff && ctx.diff.length <= maxDiff) {
-            parts.push(wrapPromptBlock('FULL PR DIFF', ctx.diff.slice(0, maxDiff)));
+            parts.push(wrapPromptBlock('FULL PR DIFF', ctx.diff));
         } else if (ctx.diff) {
             parts.push(`(PR diff too large: ${ctx.diff.length} chars, omitted; commit messages provided above)`);
         }
@@ -9253,17 +9272,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     async function fetchPRFileCategories(pr) {
         const visibleCats = visibleDiffFileCategories(document, pr);
         try {
-            const files = [];
-            let page = 1;
-            let batch;
-            do {
-                batch = await gmFetch(
+            const files = await fetchPagedGithubRows(
+                (page) =>
                     `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=100&page=${page}`,
-                );
-                if (!Array.isArray(batch)) throw new Error('GitHub files response was not an array');
-                files.push(...batch);
-                page++;
-            } while (batch.length === 100 && page <= 30); // up to 3000 files (GitHub API listing cap)
+                30, // up to 3000 files (GitHub API listing cap)
+            );
             const cats = mergeFileCategories(categorizePRFiles(files.map((f) => f.filename), pr), visibleCats);
 
             await resolveBenchmarkNames(cats, files, pr);
@@ -9613,7 +9626,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             });
         });
         // Code diff hunks
-        document.querySelectorAll('.js-file, .diff-table, [data-testid="diff-file"], .file').forEach((file) => {
+        const diffFileSelector = '.js-file, .diff-table, [data-testid="diff-file"], .file';
+        document.querySelectorAll(diffFileSelector).forEach((file) => {
+            // A nested match (e.g. the .diff-table inside a .js-file) is already covered by its outer container.
+            if (file.parentElement?.closest(diffFileSelector)) return;
             const fileName =
                 file
                     .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
@@ -9649,9 +9665,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return parts.filter(Boolean).join(' · ');
     }
 
+    const FIND_SEARCH_ITEM_TEXT_MAX_CHARS = 3500;
+
     function findSearchItemForLLM(item, ref, viewerLogin = getCurrentGitHubLogin()) {
         const isMine = !!viewerLogin && item?.author?.toLowerCase?.() === viewerLogin.toLowerCase();
-        const text = String(item?.fullText || item?.text || '').replace(/\r\n/g, '\n').slice(0, 3500);
+        const text = String(item?.fullText || item?.text || '')
+            .replace(/\r\n/g, '\n')
+            .slice(0, FIND_SEARCH_ITEM_TEXT_MAX_CHARS);
         const fields = [
             `REF: ${ref}`,
             `Type: ${item?.type === 'code' ? 'visible code line' : item?.kind || item?.source || 'comment'}`,
@@ -9673,7 +9693,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         let cur = [];
         let curLen = 0;
         for (const item of items || []) {
-            const len = String(item.fullText || item.text || '').length + 500;
+            // Budget what findSearchItemForLLM actually sends: capped text plus ~500 chars of metadata.
+            const textLen = String(item.fullText || item.text || '').length;
+            const len = Math.min(textLen, FIND_SEARCH_ITEM_TEXT_MAX_CHARS) + 500;
             if (cur.length && curLen + len > maxChars) {
                 chunks.push(cur);
                 cur = [];
@@ -9750,7 +9772,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             source,
             api: true,
             id: `${source}:${raw.id || raw.node_id || htmlUrl}`,
-            author: raw.user?.login || raw.author_association || '?',
+            author: raw.user?.login || '?',
             text: body,
             fullText: body,
             htmlUrl,
@@ -9928,88 +9950,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     const NAV_QUERY_RE =
         /^\/find\b|^\s*find\b.*\b(?:comment|reply|review|code|where|file|line)\b|where (?:did|do|is|are|was|were)\b|which comment|take me to|show me where|navigate to/i;
-
-    function parseNavigationMatches(raw, itemCount = Infinity) {
-        const text = String(raw || '').trim();
-        if (!text) throw new Error('empty navigation response');
-
-        const stripFences = (value) =>
-            String(value || '')
-                .trim()
-                .replace(/^```(?:json)?\s*/i, '')
-                .replace(/\s*```$/i, '')
-                .trim();
-        const isValidIndex = (index) => Number.isInteger(index) && index >= 0 && index < itemCount;
-        const normalize = (value, fallbackReason = '') => {
-            const index =
-                typeof value === 'number'
-                    ? value
-                    : typeof value === 'string'
-                      ? Number.parseInt(value, 10)
-                      : Number.parseInt(
-                            value?.index ?? value?.ref ?? value?.id ?? value?.item ?? value?.match ?? value?.result,
-                            10,
-                        );
-            if (!isValidIndex(index)) return null;
-            const reason =
-                typeof value === 'object' && value
-                    ? String(value.reason || value.match || value.text || fallbackReason || '').trim()
-                    : String(fallbackReason || '').trim();
-            return { index, reason };
-        };
-        const normalizeCollection = (parsed) => {
-            const source = Array.isArray(parsed)
-                ? parsed
-                : parsed && typeof parsed === 'object'
-                  ? parsed.matches || parsed.results || parsed.items || parsed.indices || parsed.refs
-                  : null;
-            if (!Array.isArray(source)) throw new Error('navigation response was not an array');
-            const out = [];
-            const seen = new Set();
-            for (const entry of source) {
-                const match = normalize(entry);
-                if (!match || seen.has(match.index)) continue;
-                seen.add(match.index);
-                out.push(match);
-            }
-            return out;
-        };
-        const tryParseJson = (candidate) => normalizeCollection(JSON.parse(stripFences(candidate)));
-
-        try {
-            return tryParseJson(text);
-        } catch (_) {}
-
-        const cleaned = stripFences(text);
-        for (const [startChar, endChar] of [
-            ['[', ']'],
-            ['{', '}'],
-        ]) {
-            const start = cleaned.indexOf(startChar);
-            const end = cleaned.lastIndexOf(endChar);
-            if (start >= 0 && end > start) {
-                try {
-                    return tryParseJson(cleaned.slice(start, end + 1));
-                } catch (_) {}
-            }
-        }
-
-        const out = [];
-        const seen = new Set();
-        const addIndex = (index, reason) => {
-            if (!isValidIndex(index) || seen.has(index)) return;
-            seen.add(index);
-            out.push({ index, reason: String(reason || '').trim() });
-        };
-        const refRe = /\[(?:ref:)?(\d+)\]/gi;
-        let m;
-        while ((m = refRe.exec(text))) addIndex(Number.parseInt(m[1], 10), 'referenced by navigation answer');
-        const indexRe = /\b(?:index|item|result)\s*[:#]?\s*(\d+)\b/gi;
-        while ((m = indexRe.exec(text))) addIndex(Number.parseInt(m[1], 10), 'referenced by navigation answer');
-        if (out.length) return out;
-
-        throw new Error('could not parse navigation matches');
-    }
 
     function parseFindSearchMatches(raw, itemCount = Infinity) {
         const text = String(raw || '').trim();
@@ -10234,7 +10174,14 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return { file, line, commitSha, threadRoot: threadEl };
     }
 
+    // Keyed by the parsed SSR payload (readPRSSRData returns one object per script content), so each
+    // payload is walked once instead of once per copied comment.
+    const embeddedDiffContentsCache = new WeakMap();
+
     function collectEmbeddedDiffContents(root = readPRSSRData()) {
+        if (!root || typeof root !== 'object') return [];
+        const cached = embeddedDiffContentsCache.get(root);
+        if (cached) return cached;
         const out = [];
         const seen = new Set();
         const visit = (node) => {
@@ -10248,6 +10195,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             for (const value of Object.values(node)) visit(value);
         };
         visit(root);
+        embeddedDiffContentsCache.set(root, out);
         return out;
     }
 
@@ -10298,6 +10246,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function getEmbeddedDiffLineContext(file, line, commitSha = '') {
+        if (!file || !line) return '';
         return formatEmbeddedDiffLineContext(collectEmbeddedDiffContents(), file, line, commitSha);
     }
 
@@ -10309,11 +10258,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         );
     }
 
-    function getCommentCodeContext(container, threadRoot = null) {
+    // `loc` lets callers that already ran getCommentLocationInfo(container, threadRoot) skip a second DOM scan.
+    function getCommentCodeContext(container, threadRoot = null, loc = null) {
         const commentRow = container.closest('tr.inline-comments, tr.js-inline-comments-container');
         const threadEl = threadRoot || getCommentThreadRoot(container) || container;
         const diffTable = threadEl.querySelector?.('table.diff-table, .js-diff-table');
-        const loc = getCommentLocationInfo(container, threadEl);
+        loc = loc || getCommentLocationInfo(container, threadEl);
         let codeRows = [];
         let targetRow = null;
 
@@ -10516,7 +10466,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 const text = renderInlineChildren(node).trim() || normalizeText(node.textContent).trim();
                 const href = node.getAttribute('href') || '';
                 if (!href || !text) return text;
-                return `[${text}](${new URL(href, location.href).href})`;
+                let url = href;
+                try {
+                    // Rendered markdown can keep unparseable targets such as `[x](https://)`.
+                    url = new URL(href, location.href).href;
+                } catch (_) {}
+                return `[${text}](${url})`;
             }
             if (tag === 'img') {
                 const alt = node.getAttribute('alt') || '';
@@ -10777,19 +10732,22 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const seenBodies = new Set();
         const knownContainers = qsa(root, COMMENT_CONTAINER_SELECTOR);
         const markers = qsa(root, PENDING_REVIEW_MARKER_SELECTOR).filter(isPendingReviewMarker);
-        const markerContainers = markers.map((marker) => findPendingReviewCommentContainer(marker, root)).filter(Boolean);
+        // Exactly the containers commentHasOwnPendingReviewMarker(container, root) accepts, computed in one pass.
+        const markerContainers = new Set(
+            markers.map((marker) => findPendingReviewCommentContainer(marker, root)).filter(Boolean),
+        );
         const containers = [...new Set([...knownContainers, ...markerContainers])];
         if (diagnostics) {
             diagnostics.knownContainers = knownContainers.length;
             diagnostics.markers = markers.length;
-            diagnostics.markerContainers = new Set(markerContainers).size;
+            diagnostics.markerContainers = markerContainers.size;
         }
         for (const container of containers) {
             const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!body || seenBodies.has(body)) continue;
+            if (!markerContainers.has(container)) continue;
             const threadRoot = getCommentThreadRoot(container);
             const flags = getCommentThreadFlags(container, threadRoot);
-            if (!commentHasOwnPendingReviewMarker(container, root)) continue;
             seenBodies.add(body);
             const markdown = renderBodyMarkdown(body);
             if (!markdown) continue;
@@ -10798,7 +10756,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 continue;
             }
             const timeEl = container.querySelector('relative-time, time, a.timestamp relative-time');
-            const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
+            const loc = getCommentLocationInfo(container, threadRoot);
+            const { file, line, commitSha } = loc;
             const threadContext = gatherCommentContext(container);
             const comment = {
                 source: 'visible DOM',
@@ -10810,7 +10769,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 file,
                 line,
                 commitSha,
-                codeContext: getCommentCodeContext(container, threadRoot) || getEmbeddedDiffLineContext(file, line, commitSha),
+                codeContext:
+                    getCommentCodeContext(container, threadRoot, loc) ||
+                    getEmbeddedDiffLineContext(file, line, commitSha),
                 threadContext: threadContext.includes('## Prior thread context') ? threadContext : '',
                 ...flags,
                 isPending: true,
@@ -11040,8 +11001,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const threadRoot = getCommentThreadRoot(container);
             const threadId = getCommentThreadId(container, threadRoot);
             const { isResolved, isOutdated, isPending } = getCommentThreadFlags(container, threadRoot);
-            const { file, line, commitSha } = getCommentLocationInfo(container, threadRoot);
-            const codeContext = getCommentCodeContext(container, threadRoot);
+            const loc = getCommentLocationInfo(container, threadRoot);
+            const { file, line, commitSha } = loc;
+            const codeContext = getCommentCodeContext(container, threadRoot, loc);
             const reactions = getCommentReactionSummary(container);
             const comment = {
                 author,
@@ -11457,7 +11419,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const s = String(text || '');
         if (s.length <= maxChars) return s;
         const keep = Math.max(0, maxChars - 44);
-        return `${s.slice(0, keep).trimEnd()}\n...[TRUNCATED ${s.length - maxChars} chars]...`;
+        return `${s.slice(0, keep).trimEnd()}\n...[TRUNCATED ${s.length - keep} chars]...`;
     }
 
     function splitRecipeSections(text) {
@@ -11796,20 +11758,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return `${getReviewSystemBase()}\n\n${extraInstr}${citationInstructions}`;
     }
 
-    function scrollToAndHighlight(el) {
+    function scrollToAndHighlight(el, durationMs = 3000) {
         if (!el) return;
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        const origBg = el.style.background;
-        const origOutline = el.style.outline;
-        const origRadius = el.style.borderRadius;
+        // Re-highlighting before the previous timer fired must keep the pre-highlight styles,
+        // otherwise the highlight itself is captured as "original" and never cleared.
+        const pending = el._ackHighlightRestore;
+        if (pending) clearTimeout(pending.timer);
+        const orig = pending?.orig || {
+            background: el.style.background,
+            outline: el.style.outline,
+            borderRadius: el.style.borderRadius,
+        };
         el.style.background = 'rgba(88, 166, 255, 0.15)';
         el.style.outline = '2px solid #58a6ff';
         el.style.borderRadius = '4px';
-        setTimeout(() => {
-            el.style.background = origBg;
-            el.style.outline = origOutline;
-            el.style.borderRadius = origRadius;
-        }, 3000);
+        const timer = setTimeout(() => {
+            el._ackHighlightRestore = null;
+            el.style.background = orig.background;
+            el.style.outline = orig.outline;
+            el.style.borderRadius = orig.borderRadius;
+        }, durationMs);
+        el._ackHighlightRestore = { orig, timer };
     }
 
     // Replace [ref:N] markers in rendered HTML with clickable navigation links.
@@ -12988,7 +12958,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
         }
 
-        sendBtn.addEventListener('click', send);
+        sendBtn.addEventListener('click', () => send());
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -13000,9 +12970,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             selectRobotThread(thread.id);
         });
         onRobotHistoryCleared = (e) => {
+            // Panels replaced via .remove() (re-open, SPA navigation) never reach the close handler.
+            if (!panel.isConnected) {
+                window.removeEventListener(ROBOT_CHAT_HISTORY_CLEARED_EVENT, onRobotHistoryCleared);
+                return;
+            }
             if (e?.detail?.key !== chatThreadStorageKey) return;
-            robotThreads = [createRobotThread()];
-            activeThreadId = robotThreads[0].id;
+            // Drop the in-memory threads first: createRobotThread() persists the whole list,
+            // which would otherwise write the just-cleared discussions back to storage.
+            robotThreads = [];
+            activeThreadId = createRobotThread().id;
             renderRobotThreadList();
             renderRobotThreadMessages();
         };
@@ -13944,10 +13921,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             function refreshWordDiffNavTargets() {
                 const markedLines = new Set();
+                const spans = [];
+                for (const span of contentEl.querySelectorAll('[data-ack-diff-index]')) {
+                    spans[Number(span.dataset.ackDiffIndex)] ??= span;
+                }
                 let line = 0;
                 for (let i = 0; i < diff.length; i++) {
                     const d = diff[i];
-                    const span = contentEl.querySelector(`[data-ack-diff-index="${i}"]`);
+                    const span = spans[i];
                     if (span) {
                         delete span.dataset.ackDiffNavTarget;
                         delete span.dataset.ackDiffNavActive;
@@ -14494,7 +14475,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         user: '',
                         parsed,
                         noOp: true,
-                        stripped: text !== cleaned ? text : null,
                     };
                 const headingNormalizationRule =
                     '- Preserve meaningful Markdown headings and the existing document structure. In a short GitHub comment or PR description, compact a generic heading or standalone label to an inline bold prefix only when that clearly improves readability without flattening a meaningful section. Do not invent, remove, reorder, or rename sections merely to impose a template. When compacting a heading followed by normal prose, put the first prose block on the same line after the colon and keep later paragraphs or block content below. If a table, image, list, code fence, HTML block, or similar block follows first, keep that block below the prefix.';
@@ -14509,14 +14489,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     system: `${getReviewSystemBase()}\n\nYou are proofreading a GitHub PR ${isPRBody ? 'description' : 'comment'}. ${extra}\n\nThe input contains ${parsed.mutableCount} numbered XML section${parsed.mutableCount > 1 ? 's' : ''} (<s1>...</s1>, <s2>...</s2>, etc). Read-only context (quotes, references, images) appears in <ctx> tags - use it to understand meaning but do NOT include <ctx> tags in your output.\n\nRULES:\n- If a section needs no changes, return it EXACTLY unchanged - character for character.\n- Keep edits minimal. Small length growth is acceptable for wrapping technical identifiers in inline backticks, softening adversarial wording, fixing typos, correcting factual errors, removing duplicated wording, or fixing accidental wrapping. Do not grow substantive prose, add new sentences, or pad existing sentences with filler.\n- Prefer simple, plain language. Do not add jargon or more formal wording unless the technical meaning requires it.\n- Use surrounding context to resolve references and remove accidental duplication, but never copy context-only text into the output.\n- Preserve existing blank lines and structural separators, except for collapsible details spacing. Blank lines after blockquotes are semantic in GitHub Markdown; preserve the blank line between a Markdown blockquote (\`> ...\`) and a following reply so GitHub does not render the reply as part of the quote. For <details> blocks, use exactly one blank line after the <summary> line and no blank line before </details>.\n- For generic collapsible summaries like <summary>Details</summary>, preserve the tags and replace only the summary text with a short, specific label when the section content supports one.\n- Accuracy examples to catch: wrong function name, incorrect file path, exaggerated performance number not backed by data, claim about code that the diff contradicts.\n${fenceLanguageRule}\n${fenceFormattingRule}\n${lineWrappingRule}\n${headingNormalizationRule}\n${prDescriptionRule ? `${prDescriptionRule}\n` : ''}\nReturn ONLY the corrected sections wrapped in <output>...</output> tags. Keep each section in its original <sN> tag inside the <output> block. Preserve markdown formatting except for the heading-to-prefix normalization above. Nothing outside <output> tags.`,
                     user: `Proofread the following sections:\n\n${xmlInput}${localContext}${proofreadContext}`,
                     parsed,
-                    stripped: text !== cleaned ? text : null,
                 };
             };
             const cleanResult = (r) => {
-                let s = r
-                    .trim()
-                    .replace(/^```[a-z]*\n?|\n?```$/g, '')
-                    .trim();
+                let s = stripWholeReplyFence(r);
                 // Extract content from <output>...</output> wrapper if present
                 const outputMatch = s.match(/<output>\s*([\s\S]*?)\s*<\/output>/);
                 if (outputMatch) s = outputMatch[1].trim();
@@ -14674,7 +14650,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const textForProofread = initialUrlRewrite.text;
                     let linkRewriteCount = initialUrlRewrite.count;
                     let strippedOriginal = stripGitHubMeta(textForProofread);
-                    let result = stripGitHubMeta(textForProofread);
+                    let result = strippedOriginal;
                     const localProofreadContext = hasSelection
                         ? buildSurroundingProofreadContext(textareaValueAtStart, selStart, selEnd)
                         : '';
@@ -15120,9 +15096,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const cacheKey = cacheable ? hashPrompt(`${auth}\0${query}\0${JSON.stringify(variables || {})}`) : '';
         const cached = cacheKey && _githubGraphQLResults.get(cacheKey);
         if (cached && Date.now() - cached.ts < GITHUB_GRAPHQL_FRESH_MS) return cached.data;
-        if (cacheKey && _githubGraphQLRequests.has(`${cacheKey}:${resetGeneration}:${generation}`)) {
-            return _githubGraphQLRequests.get(`${cacheKey}:${resetGeneration}:${generation}`);
-        }
+        const pendingKey = cacheKey ? `${cacheKey}:${resetGeneration}:${generation}` : '';
+        if (pendingKey && _githubGraphQLRequests.has(pendingKey)) return _githubGraphQLRequests.get(pendingKey);
         const preflight = githubRateLimitPreflightError(url, headers);
         if (preflight) throw preflight;
         const request = new Promise((resolve, reject) => {
@@ -15155,7 +15130,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         });
         if (!cacheKey) return request;
-        const pendingKey = `${cacheKey}:${resetGeneration}:${generation}`;
         const tracked = request.then((data) => {
             if (resetGeneration === _githubGraphQLResetGeneration &&
                 generation === (_githubHttpPrGenerations.get(prKey) || 0)) {
@@ -15228,8 +15202,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     'textarea#pull_request_review_body, textarea[name="pull_request_review[body]"], [data-testid="review-body"] textarea, input[name="reviewEvent"], input[name="pull_request_review[event]"]',
                 ) || /^(submit\s*review|comment\s*review|approve|request changes)$/i.test(text);
             if (!isReviewSpecificControl) continue;
+            // The control is not ACK-owned, so none of its ancestors are either.
             for (let el = control; el && el !== document.body; el = el.parentElement) {
-                if (!isVisible(el) || isAckOwnedReviewControl(el)) continue;
+                if (!isVisible(el)) continue;
                 if (hasNativeReviewDialogControls(el)) {
                     push(el);
                     break;
@@ -15241,14 +15216,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function findNativeReviewDialog() {
-        const dialogRoots = getNativeDialogRoots();
-        for (const root of dialogRoots) {
-            if (isAckOwnedReviewControl(root)) continue;
-            if (hasNativeReviewDialogControls(root, { loose: true })) {
-                return root;
-            }
-        }
-        return null;
+        // getNativeDialogRoots already excludes ACKtopus-owned roots.
+        return getNativeDialogRoots().find((root) => hasNativeReviewDialogControls(root, { loose: true })) || null;
     }
 
     function findNativeReviewTrigger() {
@@ -15814,11 +15783,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // HTML, extracts the updated thread, and swaps it into the DOM. The existing
     // MutationObserver then runs addQuickCommentActions, queueLazyComments, etc.
     async function refreshThreadAfterPendingComment(form) {
+        const threadSelector =
+            '.js-resolvable-timeline-thread-container, .js-line-comments, ' +
+            '.review-thread-component, .inline-comments, details[data-resolved]';
         try {
-            const threadContainer = form.closest(
-                '.js-resolvable-timeline-thread-container, .js-line-comments, ' +
-                    '.review-thread-component, .inline-comments, details[data-resolved]',
-            );
+            const threadContainer = form.closest(threadSelector);
             const threadId = threadContainer?.id || threadContainer?.querySelector('[id^="discussion_r"]')?.id || '';
             if (!threadId || !threadContainer) {
                 // Can't identify thread — don't force navigation. The comment
@@ -15830,18 +15799,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const html = await gmFetchPageText(location.href, { force: true, pageSessionFallback: true });
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const freshThread =
-                doc
-                    .getElementById(threadId)
-                    ?.closest(
-                        '.js-resolvable-timeline-thread-container, .js-line-comments, ' +
-                            '.review-thread-component, .inline-comments, details[data-resolved]',
-                    ) || doc.getElementById(threadId)?.parentElement;
-            if (freshThread) {
-                threadContainer.replaceWith(freshThread);
+                doc.getElementById(threadId)?.closest(threadSelector) || doc.getElementById(threadId)?.parentElement;
+            // React may have replaced the thread during the fetch. Swap the live one.
+            const liveThread = threadContainer.isConnected
+                ? threadContainer
+                : document.getElementById(threadId)?.closest(threadSelector);
+            if (freshThread && liveThread) {
+                liveThread.replaceWith(freshThread);
                 // MutationObserver picks up the new DOM automatically.
                 return true;
             } else {
-                console.warn('ACKtopus: partial thread refresh skipped (fresh thread not found)');
+                console.warn(`ACKtopus: partial thread refresh skipped (${freshThread ? 'live' : 'fresh'} thread not found)`);
                 return false;
             }
         } catch (e) {
@@ -15934,7 +15902,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         return;
                     }
                 } catch (e) {
-                    stopSpin('❌');
+                    stopSpin();
                     startBtn.textContent = 'Start a review';
                     startBtn.disabled = false;
                     delete startBtn.dataset.ackRunning;
@@ -16047,16 +16015,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const rawBody = mainTa?.value || '';
                 const body = rawBody.trim() ? rawBody : '';
                 await prepareNativeReviewDialog({ event: 'COMMENT', body });
-                stopSpin('✅');
-                submitBtn.textContent = origText;
-                submitBtn.disabled = false;
-                delete submitBtn.dataset.ackRunning;
             } catch (err) {
-                stopSpin('❌');
+                console.warn('ACKtopus: open review dialog failed:', err?.message || err);
+            } finally {
+                stopSpin();
                 submitBtn.textContent = origText;
                 submitBtn.disabled = false;
                 delete submitBtn.dataset.ackRunning;
-                console.warn('ACKtopus: open review dialog failed:', err?.message || err);
             }
         });
 
@@ -16088,6 +16053,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         GM_setValue('prQueue', JSON.stringify(q));
     }
 
+    // parsePR() yields string PR numbers, GitHub search results numeric ones.
+    function isSameQueuedPR(a, b) {
+        return !!a && !!b && a.owner === b.owner && a.repo === b.repo && String(a.pr) === String(b.pr);
+    }
+
     function getPRTitle() {
         return (
             getPRTitleText() ||
@@ -16096,6 +16066,22 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ?.textContent?.trim() ||
             ''
         );
+    }
+
+    // Page title format: "PR title by author ... Pull Request #N ... owner/repo".
+    function parsePRTitleFromPageHtml(html) {
+        const m = String(html || '').match(/<title>([^<]*)<\/title>/);
+        if (!m) return '';
+        // Decode &amp; last so an escaped entity in the title (e.g. "&amp;lt;") stays literal.
+        const raw = m[1]
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&#39;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/&amp;/g, '&');
+        // Greedy + anchored to the author separator so PR titles containing ' by ' survive.
+        const titleMatch = raw.match(/^(.+)\s+by\s+\S+\s+\u00b7\s+Pull Request/);
+        return titleMatch ? titleMatch[1].trim() : raw.split(' \u00b7 ')[0].trim();
     }
 
     let _backfillRefreshTimer = null;
@@ -16109,7 +16095,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const title = getPRTitle();
             if (title) {
                 for (const item of q) {
-                    if (!item.title && item.owner === pr.owner && item.repo === pr.repo && item.pr === pr.pr) {
+                    if (!item.title && isSameQueuedPR(item, pr)) {
                         item.title = title;
                         changed = true;
                     }
@@ -16122,7 +16108,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const updateTitle = (title) => {
                 if (!title) return;
                 const q2 = getQueue();
-                const match = q2.find((x) => x.owner === item.owner && x.repo === item.repo && x.pr === item.pr);
+                const match = q2.find((x) => isSameQueuedPR(x, item));
                 if (match && !match.title) {
                     match.title = title;
                     setQueue(q2);
@@ -16132,22 +16118,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             };
             // Same-origin HTML fetch avoids API rate limits and reuses the shared cache.
             gmFetchPageText(`https://github.com/${item.owner}/${item.repo}/pull/${item.pr}`)
-                .then((html) => {
-                    if (!html) return;
-                    const m = html.match(/<title>([^<]*)<\/title>/);
-                    if (m) {
-                        // Title format: "PR title by author ... Pull Request #N ... owner/repo"
-                        const raw = m[1]
-                            .replace(/&amp;/g, '&')
-                            .replace(/&lt;/g, '<')
-                            .replace(/&gt;/g, '>')
-                            .replace(/&#39;/g, "'")
-                            .replace(/&quot;/g, '"');
-                        // Greedy + anchored to the author separator so PR titles containing ' by ' survive.
-                        const titleMatch = raw.match(/^(.+)\s+by\s+\S+\s+\u00b7\s+Pull Request/);
-                        updateTitle(titleMatch ? titleMatch[1].trim() : raw.split(' \u00b7 ')[0].trim());
-                    }
-                })
+                .then((html) => updateTitle(parsePRTitleFromPageHtml(html)))
                 .catch(() => {});
         }
         if (changed) setQueue(q);
@@ -16207,7 +16178,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         header.appendChild(search);
 
         const addBtn = document.createElement('button');
-        const currentInQueue = pr && queue.some((q) => q.owner === pr.owner && q.repo === pr.repo && q.pr === pr.pr);
+        const currentInQueue = pr && queue.some((q) => isSameQueuedPR(q, pr));
         addBtn.textContent = currentInQueue ? '✓' : '+';
         addBtn.title = currentInQueue ? 'Already in queue' : 'Add current PR to queue';
         addBtn.disabled = !pr || currentInQueue;
@@ -16225,7 +16196,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         function updateAddBtn() {
             const q = getQueue();
-            const inQ = pr && q.some((x) => x.owner === pr.owner && x.repo === pr.repo && x.pr === pr.pr);
+            const inQ = pr && q.some((x) => isSameQueuedPR(x, pr));
             addBtn.textContent = inQ ? '✓' : '+';
             addBtn.title = inQ ? 'Already in queue' : 'Add current PR to queue';
             addBtn.disabled = !pr || inQ;
@@ -16238,7 +16209,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!pr) return;
             // Re-check queue at click time (not stale closure)
             const q = getQueue();
-            if (q.some((x) => x.owner === pr.owner && x.repo === pr.repo && x.pr === pr.pr)) return;
+            if (q.some((x) => isSameQueuedPR(x, pr))) return;
             q.push({ owner: pr.owner, repo: pr.repo, pr: pr.pr, title: getPRTitle() });
             setQueue(q);
             refreshQueuePanel();
@@ -16280,7 +16251,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             for (const item of filtered) {
                 const row = document.createElement('div');
-                const isCurrent = pr && item.owner === pr.owner && item.repo === pr.repo && item.pr === pr.pr;
+                const isCurrent = isSameQueuedPR(item, pr);
                 Object.assign(row.style, {
                     display: 'flex',
                     alignItems: 'center',
@@ -16342,7 +16313,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const link = document.createElement('a');
                 link.href = `https://github.com/${item.owner}/${item.repo}/pull/${item.pr}`;
                 link.target = '_blank';
-                link.title = `${item.owner}/${item.repo}#${item.pr}: ${item.title}`;
+                link.title = `${item.owner}/${item.repo}#${item.pr}: ${item.title || ''}`;
                 link.innerHTML = `<span style="color:#58a6ff;font-weight:500">#${item.pr}</span> <span style="color:${item.title ? '#c9d1d9' : '#484f58'}">${escapeHTML(truncate(item.title || '(loading title...)', 40))}</span>`;
                 Object.assign(link.style, {
                     flex: '1',
@@ -16403,7 +16374,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             searchResults.appendChild(sep);
 
             for (const item of items) {
-                const alreadyQueued = q.some((x) => x.owner === item.owner && x.repo === item.repo && x.pr === item.pr);
+                const alreadyQueued = q.some((x) => isSameQueuedPR(x, item));
                 const row = document.createElement('div');
                 Object.assign(row.style, {
                     display: 'flex',
@@ -16456,7 +16427,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     addResultBtn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         const q = getQueue();
-                        if (q.some((x) => x.owner === item.owner && x.repo === item.repo && x.pr === item.pr)) return;
+                        if (q.some((x) => isSameQueuedPR(x, item))) return;
                         q.push({ owner: item.owner, repo: item.repo, pr: item.pr, title: item.title });
                         setQueue(q);
                         addResultBtn.textContent = '✓';
@@ -16623,14 +16594,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return { hasComment, resolved };
     }
 
-    function timelineFilterPinnedItem(item) {
+    // Resolve elements targeted by the URL hash once per filter pass.
+    function timelineFilterPinnedTargets() {
         const hash = location.hash || '';
-        if (!hash || hash === '#') return false;
-        const id = decodeURIComponent(hash.slice(1));
-        const byId = document.getElementById(id);
-        if (byId && item.contains(byId)) return true;
-        const target = document.querySelector(`[name="${cssEscape(id)}"]`);
-        return !!target && item.contains(target);
+        if (!hash || hash === '#') return [];
+        let id = hash.slice(1);
+        try {
+            id = decodeURIComponent(id);
+        } catch (_) {}
+        return [document.getElementById(id), document.querySelector(`[name="${cssEscape(id)}"]`)].filter(Boolean);
+    }
+
+    function timelineFilterPinnedItem(item, targets = timelineFilterPinnedTargets()) {
+        return targets.some((target) => item.contains(target));
     }
 
     function timelineFilterShouldShowItem(item, mode, pinned = timelineFilterPinnedItem(item)) {
@@ -16676,8 +16652,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         restoreTimelineFilterItems(scope);
         let hidden = 0;
         if (mode !== 'all') {
+            const pinnedTargets = timelineFilterPinnedTargets();
             for (const item of gatherTimelineFilterItems(scope)) {
-                if (timelineFilterShouldShowItem(item, mode)) continue;
+                if (timelineFilterShouldShowItem(item, mode, timelineFilterPinnedItem(item, pinnedTargets))) continue;
                 item.dataset.ackTimelineFilterHidden = '1';
                 item.dataset.ackTimelineFilterDisplay = item.style.display || '';
                 item.style.display = 'none';
@@ -16901,10 +16878,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             : location.href;
 
         const threadComments = [];
-        const seenBodies = new Set();
         for (const bodyEl of threadRoot.querySelectorAll(MARKDOWN_BODY_SELECTOR)) {
-            if (!bodyEl || seenBodies.has(bodyEl)) continue;
-            seenBodies.add(bodyEl);
             const text = renderBodyMarkdown(bodyEl);
             if (!text || /^nothing to preview$/i.test(text)) continue;
             const commentContainer =
@@ -17073,8 +17047,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Extract the full PGP cleartext signed message block from raw text.
         // Handle both \r\n and \n line endings, and HTML-decoded content.
         const start = text.indexOf('-----BEGIN PGP SIGNED MESSAGE-----');
-        const end = text.indexOf('-----END PGP SIGNATURE-----');
-        if (start === -1 || end === -1) return null;
+        if (start === -1) return null;
+        const end = text.indexOf('-----END PGP SIGNATURE-----', start);
+        if (end === -1) return null;
         return text.slice(start, end + '-----END PGP SIGNATURE-----'.length);
     }
 
@@ -17746,16 +17721,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return { model: response.model.slice(0, 80), answers };
     }
 
-    function jevIsPublicRepoResponse(response) {
-        if (response?.status !== 200) return false;
-        try { return JSON.parse(response.responseText)?.private === false; }
-        catch (_) { return false; }
-    }
-
     function queueVisibleJevComments() {
         for (const container of leafLazyCommentContainers()) {
-            const bounds = container.getBoundingClientRect();
-            if (bounds.bottom >= 0 && bounds.top <= window.innerHeight) queueJevComment(container);
+            if (jevElementNearViewport(container)) queueJevComment(container);
         }
     }
 
@@ -17846,8 +17814,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return allowed;
         }).catch((error) => {
             const status = Number(error?.status || 0);
+            const retryable = !status || status === 403 || status === 429 || (status >= 500 && status < 600);
             record.status = 'blocked';
-            if (!status || status === 403 || status === 429 || (status >= 500 && status < 600)) {
+            if (retryable) {
                 jevSchedulePublicRetry(key, status ? `HTTP ${status}` : 'network error');
             } else {
                 clearRetry();
@@ -17856,8 +17825,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 repository: key,
                 state: status === 404 ? 'private or unavailable to anonymous GitHub users' : status ? `GitHub HTTP ${status}` : 'GitHub network error',
                 action: 'no repository content sent to TypeSafe',
-                retry: !status || status === 403 || status === 429 || (status >= 500 && status < 600)
-                    ? 'scheduled in one minute' : 'not scheduled',
+                retry: retryable ? 'scheduled in one minute' : 'not scheduled',
             }, { key, intervalMs: 0, repeatMs: JEV_PUBLIC_CHECK_TTL_MS, level: 'warn' });
             return false;
         });
@@ -17953,7 +17921,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (cached) {
             const count = jevDiagnosticCount('cache', kind);
             jevDiagnostic('cached result reused', { kind, reused: count }, { key: kind, intervalMs: 2000 });
-            return Promise.resolve(epoch === jevEpoch && jevEnabled() ? cached : null);
+            return Promise.resolve(jevEnabled() ? cached : null);
         }
         if (jevPending.has(id)) {
             jevDiagnostic('pending result reused', { kind, active: jevActive, waiting: jevJobs.length }, { key: kind, intervalMs: 2000 });
@@ -18389,7 +18357,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     async function jevCommentCurrentEvidence(pr) {
         const resetGeneration = jevCommentResetGeneration;
         const immediateHead = readHeadShaFromSSR();
-        const prPrefix = `${pr.owner}/${pr.repo}#${pr.pr}:`;
+        const prPrefix = jevCommentPRKey(pr);
         const hinted = jevCommentRevisionHints.get(prPrefix);
         const info = hinted && Date.now() - hinted.ts < JEV_COMMENT_REVISION_HINT_MS &&
             (!immediateHead || hinted.info?.head?.sha === immediateHead)
@@ -18419,9 +18387,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const after = await gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
                 { freshForMs: 0 });
             const afterDescription = jevPRDescriptionEvidence(after);
+            const pageHead = readHeadShaFromSSR();
             if (after?.head?.sha !== head || after?.base?.sha !== baseSha ||
                 afterDescription.hash !== initialDescription.hash ||
-                (readHeadShaFromSSR() && readHeadShaFromSSR() !== head)) return null;
+                (pageHead && pageHead !== head)) return null;
             jevCommentRevisionHints.set(prPrefix, { info: after, ts: Date.now() });
             return { head, baseSha, patch, complete: !!patch && patch.length <= 60000,
                 reason: patch.length > 60000 ? 'PR patch exceeds the bounded review limit' : '',
@@ -18671,6 +18640,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return [...(node.matches?.(MARKDOWN_BODY_SELECTOR) ? [node] : []),
                 ...(node.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
         };
+        // The DOM does not change during this pass. Hash each body once even
+        // when one batch holds many records for it, such as sentence wrapping.
+        const textHashes = new Map();
+        const textHash = (body) => {
+            if (!textHashes.has(body)) textHashes.set(body, jevCommentTextHash(body));
+            return textHashes.get(body);
+        };
         for (const mutation of mutations) {
             const target = mutation.target?.nodeType === 3 ? mutation.target.parentElement : mutation.target;
             if (!target?.closest) continue;
@@ -18682,7 +18658,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const previous = jevCommentSeenBodies.get(body);
                 const expected = previous?.hash ?? jevCommentPendingHashes.get(body) ??
                     jevCommentObservedHashes.get(body);
-                if (expected !== undefined && expected !== jevCommentTextHash(body) ||
+                if (expected !== undefined && expected !== textHash(body) ||
                     expected === undefined && mutation.type === 'characterData' &&
                     !!root?.querySelector?.('.ack-jev-comment-badges')) {
                     add(root, body);
@@ -18697,13 +18673,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const replacement = permalink && [...(root?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])]
                         .find((candidate) => candidate !== removed &&
                             jevCommentOwnPermalink(candidate) === permalink &&
-                            jevCommentTextHash(candidate) === jevCommentTextHash(removed));
+                            textHash(candidate) === textHash(removed));
                     if (replacement) {
                         stableBodies.add(replacement);
                         const record = jevCommentSeenBodies.get(removed);
                         if (record) jevCommentSeenBodies.set(replacement, record);
                         jevCommentSeenBodies.delete(removed);
-                        jevCommentObservedHashes.set(replacement, jevCommentTextHash(replacement));
+                        jevCommentObservedHashes.set(replacement, textHash(replacement));
                         continue;
                     }
                     if (jevCommentSeenBodies.has(removed) || jevCommentPendingBodies.has(removed) ||
@@ -18716,7 +18692,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         if (stableBodies.has(added)) continue;
                         const permalink = jevCommentOwnPermalink(added);
                         const known = permalink && jevCommentKnownPermalinks.get(permalink);
-                        if (known?.hash === jevCommentTextHash(added)) continue;
+                        if (known?.hash === textHash(added)) continue;
                         add(root, added);
                     }
                 }
@@ -18757,8 +18733,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const bodies = [...(container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
         const stats = { bodiesFound: bodies.length, eligible: 0, queued: 0, pending: 0, reused: 0 };
         for (const body of bodies) {
-            const text = jevCommentText(body);
             if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            const text = jevCommentText(body);
             stats.eligible++;
             const originalHash = hashPrompt(text);
             let previous = jevCommentSeenBodies.get(body);
@@ -18868,9 +18844,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackTesting || !jevEnabled() || root === document) return;
         if (!root.matches?.(MARKDOWN_BODY_SELECTOR) && !root.closest?.(MARKDOWN_BODY_SELECTOR) && !root.querySelector?.(MARKDOWN_BODY_SELECTOR)) return;
         const container = root.closest?.(WIDE_COMMENT_CONTAINER_SELECTOR) || root.querySelector?.(WIDE_COMMENT_CONTAINER_SELECTOR);
-        if (!container) return;
-        const bounds = container.getBoundingClientRect();
-        if (bounds.bottom >= -200 && bounds.top <= window.innerHeight + 200) queueJevComment(container);
+        if (jevElementNearViewport(container, 200)) queueJevComment(container);
     }
 
     const jevCommitRecords = new WeakMap();
@@ -19139,6 +19113,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function queueJevCommitRow(commit) {
+        // Rows observed before Jev was disabled or paused can still intersect.
+        // Re-enabling observes rows without a badge slot again.
+        if (!jevEnabled()) return;
         const pr = parsePR();
         if (!pr) return;
         const sha = commit.sha;
@@ -19359,8 +19336,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return {
                 row,
                 cell: candidate,
-                text: text.slice(0, 500),
-                excerpt: `${deleted ? '-' : '+'} ${text.slice(0, 500)}`,
+                text,
+                excerpt: `${deleted ? '-' : '+'} ${text}`,
                 fullText: rawText,
                 deleted,
             };
@@ -19746,6 +19723,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return ranges;
     }
 
+    // ACKtopus-created elements carry an ack- class. Stop at `root`: GitHub
+    // elements around the prose can carry ACKtopus marker classes, such as the
+    // commit heading, or <html> while Ctrl shortcuts are armed.
+    function jevInsideAckDecoration(element, root) {
+        for (let node = element; node && node !== root; node = node.parentElement) {
+            if (node.matches('[class^="ack-"], [class*=" ack-"]')) return true;
+        }
+        return false;
+    }
+
     function jevDescriptionTextNodes(block, blockSet, allowPre = false) {
         const nodes = [];
         const walker = document.createTreeWalker(block, window.NodeFilter?.SHOW_TEXT || 4);
@@ -19754,8 +19741,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const parent = node.parentElement;
             if (!parent || parent.closest('script, style, textarea, button, select, [contenteditable="true"]')) continue;
             if (!allowPre && parent.closest('pre')) continue;
-            if (parent.closest('[class^="ack-"], [class*=" ack-"]')) continue;
-            if (parent.closest('.ack-jev-description-priority')) continue;
+            if (jevInsideAckDecoration(parent, block)) continue;
             let nested = parent;
             let ownedByNestedBlock = false;
             while (nested && nested !== block) {
@@ -19773,7 +19759,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function jevWrapDescriptionSentences(body, explicitBlocks = null) {
         const blocks = (explicitBlocks || qsa(body, JEV_DESCRIPTION_BLOCK_SELECTOR)).filter((block) =>
             block?.isConnected && !block.closest('script, style, textarea, [contenteditable="true"]') &&
-                (explicitBlocks || !block.closest('pre')),
+                (explicitBlocks || (!block.closest('pre') && !jevInsideAckDecoration(block, body))),
         );
         const blockSet = new Set(blocks);
         const sentences = [];
@@ -20333,7 +20319,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // the row's first numbered cell is the old-side line.
             const lineNumberCell = meta.lineEl || meta.row?.firstElementChild;
             if (lineNumberCell && lineNumberCell !== first.cell) {
-                const locationKey = `${path}:${meta.side || 'R'}${meta.lineNum}`;
+                const locationKey = `${path}:${meta.side || (first.deleted ? 'L' : 'R')}${meta.lineNum}`;
                 const state = {
                     kind: 'hunk', artifact: context.artifact || 'rendered_diff',
                     repository: `${pr.owner}/${pr.repo}`, pr: String(pr.pr || ''), head,
@@ -20525,10 +20511,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             diffFilesInDOM: files.length,
             newlyObservedFiles,
             immediatelyQueuedFiles,
-            visibleComments: leafLazyCommentContainers().filter((container) => {
-                const bounds = container.getBoundingClientRect();
-                return bounds.bottom >= 0 && bounds.top <= window.innerHeight;
-            }).length,
+            visibleComments: leafLazyCommentContainers().filter((container) => jevElementNearViewport(container)).length,
             active: jevActive,
             waiting: jevJobs.length,
         }, { key: 'page-scan', intervalMs: 1000 });
@@ -21156,7 +21139,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!ta) return false;
         if (form?.querySelector?.(REVIEW_REPLY_TO_INPUT_SELECTOR)) return true;
         const action = form?.getAttribute?.('action') || '';
-        if (/\/review_comment\/\d+\/(?:repl(?:y|ies))(?=\?|\/|$)|\/repl(?:y|ies)(?=\?|\/|$)/.test(action)) return true;
+        if (/\/repl(?:y|ies)(?=[?/]|$)/.test(action)) return true;
         if (ta.closest('.review-thread-reply, [data-testid="review-thread-reply"]')) return true;
 
         const thread = ta.closest(
@@ -21393,13 +21376,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // We do not prepend into non-empty textareas (avoids duplicates).
 
     // --- Quick Comment Actions (Edit/Delete icons) ---
-    // Adds 📝✏️🗑️ icons directly in each comment header.
+    // Adds 📎✏️🗑️ (plus reply/explain) icons directly in each comment header.
     // Tracked at HEADER level using data-ack-quick-processed.
     // Classic UI: headers have [data-morpheus-enabled] attribute.
     // React UI: headers have CSS module class containing "__activityHeader".
     // PR body detected via permalink href starting with "#issue-".
 
-    async function explainComment(container, btn) {
+    // isPRBody comes from the caller's header detection, which also resolves
+    // absolute and React issue-body permalinks.
+    async function explainComment(container, btn, isPRBody = false) {
         // Toggle: if explanation already shown, remove it (no key needed)
         const existing = container.querySelector('.ack-explain-panel');
         if (existing) {
@@ -21421,10 +21406,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
 
         try {
-            // Detect PR body
-            const permalink = container.querySelector('a[id$="-permalink"]');
-            const isPRBody = permalink?.getAttribute('href')?.startsWith('#issue-') || false;
-
             // Extract comment text -- widen search if not found in container
             let bodyEl = container.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!bodyEl) {
@@ -21849,8 +21830,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (root.querySelectorAll) {
             qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR).forEach(pushScope);
         }
+        // pushScope only collects scopes that already passed isExistingPostEditForm.
         for (const form of forms) {
-            if (!isExistingPostEditForm(form)) continue;
             form._ackEditTracked = true;
             markEditSaveButtons(form);
             const ta = findEditTextarea(form);
@@ -21974,6 +21955,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _ackPressedQuickActions = btn.closest('.ack-quick-actions');
         const clearPress = () => {
             _ackPressedQuickActions = null;
+            // Only one of the pair fires; drop the other so presses do not accumulate listeners.
+            document.removeEventListener('pointerup', clearPress, true);
+            document.removeEventListener('pointercancel', clearPress, true);
         };
         document.addEventListener('pointerup', clearPress, { capture: true, once: true });
         document.addEventListener('pointercancel', clearPress, { capture: true, once: true });
@@ -22222,29 +22206,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     );
 
     function findVisibleDeleteCommentConfirmButton() {
+        // Avoid affecting unrelated destructive dialogs (delete branch/repo/etc).
+        // Comment deletion dialogs contain the phrase "Delete … comment" in the body.
+        // Match text before measuring visibility: this runs on every plain Enter,
+        // and pages carry many hidden [popover] tooltips.
         const dialogRoots = [
             ...document.querySelectorAll(
                 'details-dialog[open], dialog[open], [role="dialog"][aria-modal="true"], ' +
                     '[role="alertdialog"], [popover], [aria-modal="true"]',
             ),
-        ].filter(isVisible);
+        ].filter((root) => /delete\b[\s\S]{0,32}comment/i.test(root.textContent || '') && isVisible(root));
         const isDisabledBtn = (b) => {
             if (!b) return true;
             if (b.getAttribute?.('aria-disabled') === 'true') return true;
             return b instanceof HTMLButtonElement ? !!b.disabled : false;
         };
         for (const root of dialogRoots) {
-            // Avoid affecting unrelated destructive dialogs (delete branch/repo/etc).
-            // Comment deletion dialogs contain the phrase "Delete … comment" in the body.
-            if (!/delete\b[\s\S]{0,32}comment/i.test(root.textContent || '')) continue;
             const buttons = [...root.querySelectorAll('button')].filter((b) => isVisible(b) && !isDisabledBtn(b));
-            const danger = buttons.filter(
-                (b) =>
-                    b.classList.contains('btn-danger') ||
-                    b.classList.contains('Button--danger') ||
-                    /\bbtn-danger\b/.test(b.className) ||
-                    /\bButton--danger\b/.test(b.className),
-            );
+            const danger = buttons.filter((b) => /\b(?:btn-danger|Button--danger)\b/.test(b.className));
             for (const b of danger.length ? danger : buttons) {
                 const label = (b.textContent || b.getAttribute('aria-label') || '').trim();
                 if (/^delete\b/i.test(label)) return b;
@@ -22277,6 +22256,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         'input[name="pull_request[title]"], input#pull_request_title, input[id*="pull_request_title"], ' +
         '.js-issue-title, [data-testid="issue-title"], [data-testid*="issue-title" i], ' +
         '[data-testid*="pull-request-title" i], .markdown-title';
+    const PR_TITLE_EDIT_INPUT_SELECTOR =
+        'input[name="issue[title]"], input[name="pull_request[title]"], ' +
+        'input#issue_title, input[id*="issue_title"], input[aria-label*="title" i], ' +
+        'input[data-testid*="title" i]';
 
     function rootMayAffectPRTitle(root) {
         if (!root || root === document) return true;
@@ -22376,6 +22359,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return text.replace(/\s*#\d+\s*$/, '').trim();
     }
 
+    // Idle content is fixed, so status icons restore to it instead of to a
+    // snapshot that could hold the SVG-less text or another run's spinner.
+    function resetPRTitleProofreadButton(btn) {
+        btn.innerHTML = `${PROOFREAD_ICON}<span>Proofread</span>`;
+        btn.title = 'Proofread PR title (context: description + commit messages)';
+    }
+
     function addPRTitleProofreadButton(root = document) {
         if (!isPRPage()) return;
         if (!rootMayAffectPRTitle(root)) return;
@@ -22405,8 +22395,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'ack-pr-title-proofread';
-        btn.innerHTML = `${PROOFREAD_ICON}<span>Proofread</span>`;
-        btn.title = 'Proofread PR title (context: description + commit messages)';
+        resetPRTitleProofreadButton(btn);
         Object.assign(btn.style, {
             display: 'inline-flex',
             alignItems: 'center',
@@ -22465,12 +22454,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const scope = headerRoot || document;
         const host = titleHost || scope;
 
-        const inputFinder = (c) =>
-            c?.querySelector?.(
-                'input[name="issue[title]"], input[name="pull_request[title]"], ' +
-                    'input#issue_title, input[id*="issue_title"], input[aria-label*="title" i], ' +
-                    'input[data-testid*="title" i]',
-            );
+        const inputFinder = (c) => c?.querySelector?.(PR_TITLE_EDIT_INPUT_SELECTOR);
         let input = inputFinder(host) || inputFinder(scope);
         if (!input || !isVisible(input)) {
             const editBtnSel =
@@ -22521,6 +22505,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         if (!isPRPage()) return;
+        // A second press would start another request and diff dialog.
+        if (btn.dataset.ackProofreadBusy === '1') return;
 
         const provider = active;
         const pr = parsePageContext();
@@ -22528,17 +22514,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Re-query title right before we start (React may have re-rendered)
         const { titleHost, headerRoot, titleInputEl } = findPRTitleDom();
         const titleInput =
-            (titleHost || headerRoot || document).querySelector?.(
-                'input[name="issue[title]"], input[name="pull_request[title]"], ' +
-                    'input#issue_title, input[id*="issue_title"], input[aria-label*="title" i], ' +
-                    'input[data-testid*="title" i]',
-            ) ||
+            (titleHost || headerRoot || document).querySelector?.(PR_TITLE_EDIT_INPUT_SELECTOR) ||
             titleInputEl ||
             null;
         const original = (titleInput && isVisible(titleInput) ? titleInput.value : getPRTitleText()).trim();
         const generateTitle = !original;
 
-        const origText = btn.textContent;
+        btn.dataset.ackProofreadBusy = '1';
         const stopSpin = startSpin(btn);
 
         try {
@@ -22618,14 +22600,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (action === 'unchanged') {
                 btn.textContent = '✅';
                 btn.title = NO_CHANGES_MSG;
-                setTimeout(() => {
-                    btn.textContent = origText;
-                    btn.title = '';
-                }, 2000);
+                setTimeout(() => resetPRTitleProofreadButton(btn), 2000);
                 return;
             }
             if (action === false) {
-                btn.textContent = origText;
+                resetPRTitleProofreadButton(btn);
                 return;
             }
 
@@ -22638,17 +22617,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!ok) throw new Error('could not apply PR title');
 
             btn.textContent = '✅';
-            setTimeout(() => {
-                btn.textContent = origText;
-            }, 2000);
+            setTimeout(() => resetPRTitleProofreadButton(btn), 2000);
             // React may re-render the header after submit; ensure our button comes back.
             setTimeout(() => addPRTitleProofreadButton(document), 1500);
         } catch (e) {
             stopSpin('❌');
-            setTimeout(() => {
-                btn.textContent = origText;
-            }, 2000);
+            setTimeout(() => resetPRTitleProofreadButton(btn), 2000);
             console.error('ACKtopus PR title proofread failed:', e);
+        } finally {
+            delete btn.dataset.ackProofreadBusy;
         }
     }
 
@@ -22933,20 +22910,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     // While editing: keep only cancel here. Proofread lives in the edit toolbar.
                     actionContainer.appendChild(
                         makeIconBtn('❌', 'Cancel edit', () => {
-                            clickWithRetry(
-                                container,
-                                (c) => {
-                                    return (
-                                        c.querySelector(
-                                            'button.js-comment-cancel-button, button[data-testid="cancel-edit-button"]',
-                                        ) ||
-                                        [...c.querySelectorAll('button')].find((b) =>
-                                            /^cancel$/i.test(b.textContent.trim()),
-                                        )
-                                    );
-                                },
-                                'cancel edit button',
-                            );
+                            clickWithRetry(container, findEditCancelButton, 'cancel edit button');
                         }),
                     );
                 } else {
@@ -22958,24 +22922,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             }),
                         );
                     }
-                    const editBtn = makeIconBtn(
-                        '✏️',
-                        withKeyboardShortcutHint(
-                            isPRBody ? 'Edit PR description' : 'Edit comment',
-                            EDIT_POST_SHORTCUT_KEY,
-                        ),
-                        () => {
-                            // Prefer GitHub's native edit_form fragment when present;
-                            // fall back to the lazily-rendered kebab menu for React UI.
-                            triggerMenuEdit(container, header, { isPRBody });
-                        },
-                    );
+                    const editTitle = isPRBody ? 'Edit PR description' : 'Edit comment';
+                    const editBtn = makeIconBtn('✏️', editTitle, () => {
+                        // Prefer GitHub's native edit_form fragment when present.
+                        // Fall back to the lazily-rendered kebab menu for React UI.
+                        triggerMenuEdit(container, header, { isPRBody });
+                    });
                     editBtn.classList.add('ack-edit-post-btn');
-                    applyKeyboardShortcutHint(
-                        editBtn,
-                        isPRBody ? 'Edit PR description' : 'Edit comment',
-                        EDIT_POST_SHORTCUT_KEY,
-                    );
+                    // Sets the title with the shortcut hint plus aria-keyshortcuts.
+                    applyKeyboardShortcutHint(editBtn, editTitle, EDIT_POST_SHORTCUT_KEY);
                     actionContainer.appendChild(editBtn);
 
                     if (!isPRBody) {
@@ -23011,7 +22966,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         '💡',
                         isPRBody ? 'Explain this PR at a high level' : 'Explain this comment in context',
                         (btn) => {
-                            explainComment(container, btn);
+                            explainComment(container, btn, isPRBody);
                         },
                     ),
                 );
@@ -23942,14 +23897,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     }
 
-    function isReactionVisible(el) {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect?.();
-        if (!rect || rect.width === 0 || rect.height === 0) return false;
-        const s = getComputedStyle(el);
-        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-    }
-
     function isOwnReactionTrigger(trigger) {
         const login = getCurrentGitHubLogin();
         if (!login || !trigger) return false;
@@ -24141,10 +24088,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Classic <details> contains the menu inline
         if (trigger?.tagName === 'DETAILS') {
             const inside = trigger.querySelector(sel);
-            if (inside && isReactionVisible(inside)) return inside;
+            if (inside && isVisible(inside)) return inside;
         }
         // Global search for visible popup buttons
-        const candidates = [...document.querySelectorAll(sel)].filter(isReactionVisible);
+        const candidates = [...document.querySelectorAll(sel)].filter(isVisible);
         return (
             candidates.find((b) => b.closest('details-menu,[role="menu"],.Overlay,.Popover,.ActionListWrap')) ||
             candidates[0] ||
@@ -24497,6 +24444,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return btn;
     }
 
+    const COMPOSE_EDITOR_ROOT_SELECTOR =
+        'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
+        '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
+        '.js-review-body, [data-testid="review-body"], .review-changes-modal, ' +
+        '.CommentBox, [class*="CommentBox-module__commentBoxContainer__"]';
+
     function getToolbarEditorRoot(toolbar) {
         if (toolbar?.classList?.contains('ack-toolbar-actions')) {
             return (
@@ -24510,12 +24463,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             );
         }
         return (
-            toolbar?.closest(
-                'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
-                    '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
-                    '.js-review-body, [data-testid="review-body"], .review-changes-modal, ' +
-                    '.CommentBox, [class*="CommentBox-module__commentBoxContainer__"]',
-            ) || (toolbar?.tagName === 'MARKDOWN-TOOLBAR' ? toolbar.parentElement : null)
+            toolbar?.closest(COMPOSE_EDITOR_ROOT_SELECTOR) ||
+            (toolbar?.tagName === 'MARKDOWN-TOOLBAR' ? toolbar.parentElement : null)
         );
     }
 
@@ -24586,18 +24535,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const form = ta.closest?.('form') || null;
         const isPRCreation = form ? isPRCreationForm(form, path) : isPRCreationPage(path, document);
         if (!isPRPage(path) && !isIssuePage(path) && !isPRCreation) return false;
-
-        const editorRoot =
-            ta.closest?.(
-                'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
-                    '.js-previewable-comment-form, .js-write-bucket, .write-content, ' +
-                    '.js-review-body, [data-testid="review-body"], .review-changes-modal, ' +
-                    '.CommentBox, [class*="CommentBox-module__commentBoxContainer__"]',
-            ) ||
-            form ||
-            null;
-        if (!editorRoot) return false;
-        return true;
+        return !!(form || ta.closest?.(COMPOSE_EDITOR_ROOT_SELECTOR));
     }
 
     function isSuggestedReplyTextarea(ta, path = location.pathname) {
@@ -24615,7 +24553,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const value = String(ta.value || '');
         const start = Number.isFinite(ta.selectionStart) ? ta.selectionStart : value.length;
         const end = Number.isFinite(ta.selectionEnd) ? ta.selectionEnd : start;
-        const blockStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+        const blockStart = start > 0 ? value.lastIndexOf('\n', start - 1) + 1 : 0;
         const selectionEnd = end > start && value[end - 1] === '\n' ? end - 1 : end;
         const blockEnd = selectionEnd + value.slice(selectionEnd).search(/\n|$/);
         const originalBlock = value.slice(blockStart, blockEnd);
@@ -24753,6 +24691,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function runExpectedReplyForComment(container, commentEl) {
+        if (commentEl.dataset.ackLlmBusy === '1') return;
         const provider = getActiveProvider();
         if (!isProviderAvailable(provider)) {
             document.body.appendChild(buildConfigPanel());
@@ -24771,6 +24710,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
 
         const origText = commentEl.textContent;
+        commentEl.dataset.ackLlmBusy = '1';
         const stopSpin = startSpin(commentEl);
         try {
             const page = parsePageContext();
@@ -24782,9 +24722,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const threadContext = threadRoot
                 ? buildSelectionThreadContextFromRoot({ threadRoot, targetBodyEl: bodyEl })
                 : '';
-            const locationInfo = container
-                ? getCommentLocationInfo(container, threadRoot)
-                : { file: '', line: '', commitSha: '' };
+            const locationInfo = getCommentLocationInfo(container, threadRoot);
             const pageLabel = page ? `${page.owner}/${page.repo}#${page.pr}` : location.href;
             const loc = [
                 `Page: ${pageLabel}`,
@@ -24819,7 +24757,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const raw = await callLLM(provider, system, user);
             stopSpin();
-            commentEl.textContent = origText;
 
             const panel = buildExpectedReplyPanel(normalizeExpectedReplyResult(raw), provider);
             if (bodyEl?.parentElement) bodyEl.parentElement.insertBefore(panel, bodyEl.nextSibling);
@@ -24832,6 +24769,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 } catch (_) {}
             }, 1500);
             console.error('ACKtopus: expected reply failed:', e?.message || e);
+        } finally {
+            delete commentEl.dataset.ackLlmBusy;
         }
     }
 
@@ -25461,25 +25400,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
 
             const hasRenderedToolbarIcon = (btn) => !!btn?.querySelector?.('svg, img, g-emoji, .Button-visual');
-            const removeToolbarButtons = (scope, selector) => {
+            const removeToolbarButtons = (scope, selector, keep = () => false) => {
                 scope.querySelectorAll(selector).forEach((btn) => {
+                    if (keep(btn)) return;
                     const item = btn.closest('.ack-toolbar-item');
                     if (item && item.parentElement) item.remove();
                     else btn.remove();
                 });
             };
-            const removeBrokenToolbarButtons = (scope, selector) => {
-                scope.querySelectorAll(selector).forEach((btn) => {
-                    if (hasRenderedToolbarIcon(btn)) return;
-                    const item = btn.closest('.ack-toolbar-item');
-                    if (item && item.parentElement) item.remove();
-                    else btn.remove();
-                });
-            };
-            removeBrokenToolbarButtons(toolbar, '.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-suggest-reply');
-            const isEditToolbar = !!findEditForm(toolbar);
+            // Drop broken (iconless) buttons so they are re-created below.
+            removeToolbarButtons(
+                toolbar,
+                '.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-suggest-reply',
+                hasRenderedToolbarIcon,
+            );
+            // isExistingPostEditToolbar also covers findEditForm(toolbar).
             const allowProofread =
-                isEditToolbar || isExistingPostEditToolbar(toolbar) || isProofreadableComposeTextarea(toolbarTextarea, path);
+                isExistingPostEditToolbar(toolbar) || isProofreadableComposeTextarea(toolbarTextarea, path);
             const allowSuggestReply = isSuggestedReplyTextarea(toolbarTextarea, path);
             if (!allowProofread) removeToolbarButtons(toolbar, '.ack-toolbar-proofread');
             if (!allowSuggestReply) removeToolbarButtons(toolbar, '.ack-toolbar-suggest-reply');
@@ -25521,15 +25458,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // GitHub's newer `markdown-toolbar` uses an ActionBar internally. Injecting
             // buttons as direct children can end up hidden (overflow/height), so when
             // possible insert as an ActionBar item.
-            const insertionRoot = (() => {
-                if (toolbar.tagName === 'MARKDOWN-TOOLBAR') {
-                    return (
-                        toolbar.querySelector('[data-target="action-bar.itemContainer"], .ActionBar-item-container') ||
-                        toolbar
-                    );
-                }
-                return toolbar;
-            })();
+            const insertionRoot =
+                (isActionBarToolbar &&
+                    toolbar.querySelector('[data-target="action-bar.itemContainer"], .ActionBar-item-container')) ||
+                toolbar;
 
             if (
                 insertionRoot !== toolbar &&
@@ -25603,7 +25535,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         addFallbackScope(root);
         qsa(root, EDIT_TRACKING_CANDIDATE_SELECTOR).forEach(addFallbackScope);
         fallbackScopes.forEach((form) => {
-            const usableToolbar = [...qsa(form, toolbarSelector)].find(
+            const usableToolbar = qsa(form, toolbarSelector).find(
                 (tb) => tb !== form && (!form.isConnected || isVisible(tb)) && !!getToolbarTextarea(tb),
             );
             const existingRow = form.querySelector('.ack-toolbar-actions');
@@ -25765,7 +25697,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function gatherCommentElements() {
         const entries = [];
-        const seenBodies = new Set();
         const seenContainers = new Set();
         const isPR = !!parsePR();
         const postedContainerSelector =
@@ -25802,9 +25733,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const bodies = document.querySelectorAll(MARKDOWN_BODY_SELECTOR);
         let order = 0;
         for (const body of bodies) {
-            if (seenBodies.has(body)) continue;
-            seenBodies.add(body);
-            if (!body.innerText?.trim() || body.innerText.trim().length < 3) continue;
+            if ((body.innerText?.trim() || '').length < 3) continue;
 
             // Skip PR body
             if (
@@ -25973,9 +25902,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function findDiffFileToggle(file, header = file?.querySelector?.(DIFF_FILE_HEADER_SELECTOR)) {
         if (!file || !header) return null;
         const candidates = [
-            ...header.querySelectorAll('button, summary, [role="button"]'),
-            ...file.querySelectorAll('button.js-details-target, summary.js-details-target'),
-        ].filter((el, idx, arr) => arr.indexOf(el) === idx && isVisible(el));
+            ...new Set([
+                ...header.querySelectorAll('button, summary, [role="button"]'),
+                ...file.querySelectorAll('button.js-details-target, summary.js-details-target'),
+            ]),
+        ].filter(isVisible);
         const labelOf = (el) =>
             [
                 el.getAttribute?.('aria-label'),
@@ -26264,10 +26195,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 (jevChangedRow(row)?.parts || []).filter((part) => !part.deleted));
             for (const { cell, fullText } of additions) {
                 const text = fullText.trim();
-                const meta = getDiffSelectionLineMeta(cell);
-                const lineNum = meta?.lineNum || '';
-                const lineAnchor = meta?.anchorId || cell.closest('[data-line-anchor]')?.getAttribute('data-line-anchor') ||
-                    (anchor && lineNum ? `${anchor}R${lineNum}` : anchor);
 
                 // C/C++: function/method definition patterns
                 // e.g. "void FuncName(", "bool CClass::Method(", "static int64_t GetSize("
@@ -26283,6 +26210,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const names = [cppMatch?.[1], pyMatch?.[1], typeMatch?.[1], varMatch?.[1], defMatch?.[1]].filter(
                     Boolean,
                 );
+                if (!names.length) continue;
+
+                const meta = getDiffSelectionLineMeta(cell);
+                const lineNum = meta?.lineNum || '';
+                const lineAnchor = meta?.anchorId || cell.closest('[data-line-anchor]')?.getAttribute('data-line-anchor') ||
+                    (anchor && lineNum ? `${anchor}R${lineNum}` : anchor);
 
                 // Get surrounding context (the line itself + neighbors)
                 const tr = cell.closest('tr');
@@ -26331,7 +26264,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             parts[i] = parts[i].replace(pattern, (match) => {
                 const sym = symbolIndex[match];
                 if (!sym) return match;
-                const href = sym.anchor ? `#${sym.anchor}` : '#';
+                const href = escapeHTML(sym.anchor ? `#${sym.anchor}` : '#');
                 const loc = `${sym.file}${sym.line ? ':' + sym.line : ''}`;
                 const ctx = sym.context.slice(0, 200).replace(/\n/g, '\n  ');
                 const tip = escapeHTML(`${loc}\n\n  ${ctx}`);
@@ -26343,7 +26276,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // Walk DOM and add diff-anchor tooltips to <code> elements matching symbols.
     function linkifyCodeElements(el, symbolIndex) {
-        if (!symbolIndex || Object.keys(symbolIndex).length === 0) return;
+        const names = symbolIndex ? Object.keys(symbolIndex) : [];
+        if (names.length === 0) return;
         for (const code of el.querySelectorAll('code')) {
             const text = code.textContent.trim();
             // Try exact match, then prefix match for qualified names like Class::Method
@@ -26359,7 +26293,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             }
             if (!sym) {
                 // Try finding a symbol that contains this text
-                const key = Object.keys(symbolIndex).find((k) => k === text || text.includes(k) || k.includes(text));
+                const key = names.find((k) => k === text || text.includes(k) || k.includes(text));
                 if (key) sym = symbolIndex[key];
             }
             if (!sym) continue;
@@ -26385,15 +26319,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Convert LLM tooltip annotations {{term||explanation}} into hoverable <span> elements.
     // Works on rendered HTML: splits on HTML tags to avoid replacing inside tag attributes.
     const TOOLTIP_RE = /\{\{([^|{}]+)\|\|([^}]+)\}\}/g;
+    const TOOLTIP_TEXT_ENTITY_RE = /&(amp|lt|gt|quot|#39|nbsp);/g;
+    const TOOLTIP_TEXT_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", nbsp: '\u00a0' };
 
     function expandTooltipMarkers(html) {
         const parts = html.split(/(<[^>]+>)/);
         for (let i = 0; i < parts.length; i++) {
             if (parts[i].startsWith('<')) continue;
-            parts[i] = parts[i].replace(
-                TOOLTIP_RE,
-                (_, term, tip) => `<span class="ack-tip" title="${escapeHTML(tip.trim())}">${term.trim()}</span>`,
-            );
+            parts[i] = parts[i].replace(TOOLTIP_RE, (_, term, tip) => {
+                // Text segments are already HTML-escaped. Decode them once so the
+                // title attribute does not show literal entities like `&lt;`.
+                const plainTip = tip.trim().replace(TOOLTIP_TEXT_ENTITY_RE, (entity, name) => TOOLTIP_TEXT_ENTITIES[name]);
+                return `<span class="ack-tip" title="${escapeHTML(plainTip)}">${term.trim()}</span>`;
+            });
         }
         return parts.join('');
     }
@@ -26540,11 +26478,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function llmAggregateCacheKey(prefix, pr, provider, input) {
         if (!pr || !provider || !input) return '';
-        const model = getLLMConfig()[provider]?.model || 'default';
+        const providerConfig = getLLMConfig()[provider];
+        const model = providerConfig?.model || 'default';
         const request = JSON.stringify({
             schema: LLM_AGGREGATE_CACHE_SCHEMA,
             provider,
-            credentialScope: hashPrompt(String(getLLMConfig()[provider]?.key || '')),
+            credentialScope: hashPrompt(String(providerConfig?.key || '')),
             model,
             input,
         });
@@ -26845,6 +26784,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         _diffSelectionOneLinerReqId++;
     }
 
+    // Cancel any in-flight summary/action so stale results can't appear later,
+    // then clear and hide the output area.
+    function resetDiffSelectionOutput() {
+        _diffSelectionActionReqId++;
+        cancelDiffSelectionOneLiner();
+        if (_diffSelectionOneLinerEl) {
+            _diffSelectionOneLinerEl.innerHTML = '';
+            _diffSelectionOneLinerEl.style.display = 'none';
+        }
+    }
+
     function readDiffSelectionOutputTextForChat() {
         const el = _diffSelectionOneLinerEl;
         if (!el) return '';
@@ -27051,14 +27001,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_diffSelectionToolbar) _diffSelectionToolbar.style.display = 'none';
         _diffSelectionCtx = null;
         _diffSelectionCtxKey = '';
-        // Cancel any in-flight selection action so stale results can't appear later.
-        _diffSelectionActionReqId++;
-        cancelDiffSelectionOneLiner();
-        if (_diffSelectionOneLinerEl) {
-            _diffSelectionOneLinerEl.textContent = '';
-            _diffSelectionOneLinerEl.innerHTML = '';
-            _diffSelectionOneLinerEl.style.display = 'none';
-        }
+        resetDiffSelectionOutput();
     }
 
     function teardownDiffSelectionUI() {
@@ -27196,7 +27139,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // GitHub anchors context lines as R<n>, matching permalink semantics) or data-diff-side.
         const lineAnchor = codeCell.closest('[data-line-anchor]')?.getAttribute('data-line-anchor') || '';
         const side =
-            anchorId.match(/#?diff-\w+([RL])\d+$/)?.[1] ||
             anchorId.match(/([RL])\d+$/)?.[1] ||
             lineAnchor.match(/diff-\w+([RL])\d+$/)?.[1] ||
             ({ left: 'L', right: 'R' })[(lineEl || codeCell).getAttribute?.('data-diff-side')] ||
@@ -27486,23 +27428,29 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!outEl) return;
         setDiffSelectionOutputPresentation('action');
         outEl.style.display = 'block';
-        outEl.textContent = '';
         outEl.innerHTML = '';
         const stopSpin = startBrailleAnimation((frame) => {
             if (reqId !== _diffSelectionActionReqId) return;
             outEl.textContent = frame;
         });
+        // A synthetic (emoji) context has no live DOM selection to re-derive.
+        const repositionCtx = ctx.syntheticSelection ? ctx : null;
         // Re-position after the output area style change (height may change).
         ackRaf(() => {
             if (reqId !== _diffSelectionActionReqId) return;
             try {
-                updateDiffSelectionToolbar();
+                updateDiffSelectionToolbar(repositionCtx);
             } catch (_) {}
         });
 
         try {
             const prCtx = ctx.pr ? await fetchPRContext(ctx.pr) : null;
             const patch = mode === 'explain' || mode === 'simplify' ? await fetchCommitPatchForSelection(ctx) : '';
+            // Skip the paid request when the selection changed while context loaded.
+            if (reqId !== _diffSelectionActionReqId) {
+                stopSpin();
+                return;
+            }
 
             const loc = [
                 ctx.file ? `File: ${ctx.file}` : '',
@@ -27621,7 +27569,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (reqId !== _diffSelectionActionReqId) return;
                 if (!outEl.isConnected) return;
                 try {
-                    updateDiffSelectionToolbar();
+                    updateDiffSelectionToolbar(repositionCtx);
                 } catch (_) {}
             });
         } catch (e) {
@@ -27701,14 +27649,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const changed = !!nextKey && nextKey !== _diffSelectionCtxKey;
         if (changed) {
             _diffSelectionCtxKey = nextKey;
-            // Cancel any in-flight action from the previous selection.
-            _diffSelectionActionReqId++;
-            cancelDiffSelectionOneLiner();
-            if (_diffSelectionOneLinerEl) {
-                _diffSelectionOneLinerEl.textContent = '';
-                _diffSelectionOneLinerEl.innerHTML = '';
-                _diffSelectionOneLinerEl.style.display = 'none';
-            }
+            // Drop any in-flight work from the previous selection.
+            resetDiffSelectionOutput();
             setDiffSelectionOutputPresentation('one-liner');
         }
         _diffSelectionCtx = ctx;
@@ -28121,8 +28063,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const panel = buildLightbulbPanel(data, provMeta, symbolIndex);
 
                 // Add all-commits overview at the top of the panel
-                if (explanations && Object.keys(explanations).length > 1) {
-                    const pr2 = parsePR();
+                if (Object.keys(explanations).length > 1) {
                     const overviewDetails = document.createElement('details');
                     overviewDetails.style.marginBottom = '8px';
                     const overviewSummary = document.createElement('summary');
@@ -28147,7 +28088,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                             borderLeft: isCurrent ? '2px solid #58a6ff' : '2px solid transparent',
                         });
                         const summary = typeof cData === 'string' ? cData : cData.summary || '';
-                        const commitUrl = pr2 ? `/${pr2.owner}/${pr2.repo}/pull/${pr2.pr}/commits/${cSha}` : '#';
+                        const commitUrl = `/${pr.owner}/${pr.repo}/pull/${pr.pr}/commits/${cSha}`;
                         item.innerHTML = `<a href="${safeHref(commitUrl)}" style="color:#58a6ff;text-decoration:none;font-family:monospace">${escapeHTML(cSha)}</a> ${expandTooltipMarkers(renderMarkdown(summary))}`;
                         list.appendChild(item);
                     }
@@ -28477,6 +28418,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
+    // Reveal/close loops stop when the page lifetime ends instead of clicking
+    // controls on the page the user navigated to.
+    const REVEAL_PAGE_CHANGED_MESSAGE = 'Stopped because the page changed';
+
     // Wrap-up for the reveal/close toolbar actions: stop the spinner, show the
     // outcome on the button and popup, then restore both after restoreMs.
     function makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim = null, stopCompactSpin = null, onFinish = null } = {}) {
@@ -28511,6 +28456,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
               });
         const popup = makeStatusPopup('Revealing hidden timeline items, resolved threads, and collapsed sections...');
         const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim, stopCompactSpin });
+        const lt = ensureAckLifetime('reveal-all');
 
         try {
             let openedCount = 0;
@@ -28558,7 +28504,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
 
                 const waitMs = state.paginationBtns.length + state.timelineLoadMore.length > 0 ? 1800 : 700;
-                await ackSleep(waitMs);
+                if (await ackSleep(waitMs, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
             }
 
             const remaining = getRevealAllState().total;
@@ -28585,12 +28531,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             onFinish: (msg, ok) =>
                 ackLogEvent(`reveal mine: ${ok ? 'finished' : 'stopped'}`, { message: msg }, ok ? 'log' : 'warn'),
         });
+        const lt = ensureAckLifetime('reveal-mine');
 
         if (!login) return finish('Could not identify your GitHub account', '❌', false);
         try {
             if (pr) {
                 popup.textContent = 'Finding your review threads...';
                 await fetchReviewCommentCommits(pr.owner, pr.repo, pr.pr);
+                if (lt.signal.aborted) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
             }
             const commentAuthors = cachedReviewCommentAuthors(pr);
             const knownMineCommentIds = currentUserReviewCommentIds(login, commentAuthors);
@@ -28635,7 +28583,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                     if (pendingFallback.size > 0) {
                         popup.textContent = `Checking review threads... ${pendingFallback.size} loading`;
-                        await ackSleep(500);
+                        if (await ackSleep(500, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
                         continue;
                     }
                 }
@@ -28655,7 +28603,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     state.paginationBtns.forEach((button) => button.click());
                     state.timelineLoadMore.forEach((button) => button.click());
                     hiddenWaitRounds = 0;
-                    await ackSleep(1800);
+                    if (await ackSleep(1800, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
                     continue;
                 }
                 if (state.hiddenCount > 0) {
@@ -28663,7 +28611,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         return finish(`${state.hiddenCount} hidden comments could not be loaded`, '❌', false);
                     }
                     popup.textContent = `Waiting for hidden comments... ${state.hiddenCount} remaining`;
-                    await ackSleep(500);
+                    if (await ackSleep(500, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
                     continue;
                 }
                 if (state.targets.length > 0) {
@@ -28675,7 +28623,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const batch = state.targets.slice(0, REVEAL_MINE_BATCH_SIZE);
                     popup.textContent = `Opening your review threads... ${state.targets.length} remaining`;
                     batch.forEach((item) => item.setOpen(true));
-                    await ackSleep(700);
+                    if (await ackSleep(700, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
                     continue;
                 }
 
@@ -28688,7 +28636,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     pendingFallback.set(item.scope, { item, waitRounds: 0 });
                     item.setOpen(true);
                 }
-                await ackSleep(500);
+                if (await ackSleep(500, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
             }
             const remaining = getRevealMineState(document, login, {
                 commentAuthors,
@@ -28713,6 +28661,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         const popup = makeStatusPopup(`Closing ${label}...`);
         const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim });
+        const lt = ensureAckLifetime('close-review-threads');
 
         if (mineOnly && !login) return finish('Could not identify your GitHub account', '❌', false);
         try {
@@ -28728,7 +28677,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     })
                     .sort((a, b) => b.depth - a.depth)
                     .forEach(({ item }) => item.setOpen(false));
-                await ackSleep(250);
+                if (await ackSleep(250, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
             }
             const remaining = getReviewThreadToggleItems({ mineOnly, login }).filter((item) => item.isOpen()).length;
             if (remaining === 0) return finish(`Closed ${label}`, '✅', true);
@@ -28749,6 +28698,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
         const popup = makeStatusPopup('Opening pending review comments only...');
         const finish = makeRevealFinisher(btn, popup, origText, restoreMs, { stopAnim });
+        const lt = ensureAckLifetime('reveal-pending');
 
         try {
             for (let round = 0; round < 10; round++) {
@@ -28757,7 +28707,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 popup.textContent = `Opening pending review comments only... ${targets.length} remaining`;
                 targets[0]?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
                 targets.forEach((target) => target.click?.());
-                await ackSleep(500);
+                if (await ackSleep(500, lt)) return finish(REVEAL_PAGE_CHANGED_MESSAGE, '❌', false);
             }
             const remaining = getPendingReviewRevealTargets().length;
             if (remaining === 0) return finish('Pending comments are open or loaded', '✅', true);
@@ -28904,6 +28854,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         const runContextCopyAction = async (action, btn) => {
             if (!action.enabled()) return;
+            const pageKey = getAckLifetimeKey();
             if (action.revealBeforeCopy === 'all' && !usesAlternateToolbarMode() && getRevealAllState().total > 0) {
                 await revealAllContext(btn, { restoreMs: 0 });
             } else if (
@@ -28913,6 +28864,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ) {
                 await revealPendingReviewComments(btn, { restoreMs: 0 });
             }
+            // A reveal cut short by navigation must not copy the next page's context.
+            if (getAckLifetimeKey() !== pageKey) return;
             await action.run(btn);
         };
 
@@ -29295,18 +29248,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!wrapper.isConnected) return;
             prFileCategories = mergeFileCategories(prFileCategories, cats);
             delete prFileCategories.benchFiles;
-            if (prFileCategories) {
-                const nextSignature = JSON.stringify(prFileCategories);
-                if (nextSignature !== fileCategorySignature) {
-                    fileCategorySignature = nextSignature;
-                    ackLogEvent(`toolbar file actions updated (${source})`, prFileCategories);
-                }
-                for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
-                    if (prFileCategories[cat].length > 0) {
-                        document.querySelectorAll(`[data-ack-cond="${cat}"]`).forEach((el) => {
-                            el.style.display = '';
-                        });
-                    }
+            const nextSignature = JSON.stringify(prFileCategories);
+            if (nextSignature !== fileCategorySignature) {
+                fileCategorySignature = nextSignature;
+                ackLogEvent(`toolbar file actions updated (${source})`, prFileCategories);
+            }
+            for (const cat of ['bench', 'test', 'fuzz', 'functional', 'cpp']) {
+                if (prFileCategories[cat].length > 0) {
+                    document.querySelectorAll(`[data-ack-cond="${cat}"]`).forEach((el) => {
+                        el.style.display = '';
+                    });
                 }
             }
         };
@@ -29456,15 +29407,21 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // --- Inject ---
 
     function inject() {
-        if (document.getElementById(BUTTON_CONTAINER_ID)) {
+        const existingWrapper = document.getElementById(BUTTON_CONTAINER_ID);
+        if (existingWrapper) {
+            // A lifetime reset that keeps the toolbar (query-only URL change, self-test
+            // cleanup) aborts its dropdown closer. Re-arm it on the surviving toolbar.
+            const existingToolbar = existingWrapper.firstElementChild;
+            if (existingToolbar && installAckToolbarDropdownCloser._ac?.signal.aborted) {
+                installAckToolbarDropdownCloser(existingToolbar);
+            }
             // popstate can update the URL before Turbo restores the conversation DOM.
             // The later render/load events must still process that restored content.
             refreshExistingConversationEnhancements();
             return;
         }
-        const onPR = isPRPage();
-        const onCompare = isComparePage();
-        const ctx = { onPR, onCompare, onToolbar: isToolbarPage() };
+        const ctx = currentInjectContext();
+        const { onPR, onCompare } = ctx;
 
         const wrapper = document.createElement('div');
         wrapper.id = BUTTON_CONTAINER_ID;
@@ -29703,7 +29660,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Load ACK panel + force-push data async (PR only)
         if (onPR) {
             const pr = parsePR();
-            if (pr && repoMirrorUrlForPath()) updatePRCommentCountState(pr).catch(() => {});
+            if (pr && mirrorUrl) updatePRCommentCountState(pr).catch(() => {});
             // Always create the ACK panel container synchronously so DOM tests
             // can validate injection even before async ACK discovery finishes.
             const existingAckPanel = document.getElementById(ACK_PANEL_ID);
@@ -29735,28 +29692,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // reversible: when our floater is absent or still loading, GitHub's native
     // prev/next buttons should remain visible as a fallback.
     function hideNativeCommitNav(hidden = !!document.getElementById('ack-commit-nav')) {
-        const sels = [
-            'a[aria-label*="next commit" i]',
-            'a[data-testid="next-commit-link"]',
-            'a[aria-label*="previous commit" i]',
-            'a[data-testid="prev-commit-link"]',
-        ];
-        for (const sel of sels) {
-            document.querySelectorAll(sel).forEach((el) => {
+        document
+            .querySelectorAll(
+                'a[aria-label*="next commit" i], a[data-testid="next-commit-link"], ' +
+                    'a[aria-label*="previous commit" i], a[data-testid="prev-commit-link"]',
+            )
+            .forEach((el) => {
                 // Don't hide our own floating commit-nav buttons which intentionally
                 // use "Next/Previous commit" aria-labels for accessibility.
                 if (el.closest?.('#ack-commit-nav')) return;
                 el.style.display = hidden ? 'none' : '';
             });
-        }
     }
 
     // --- Floating commit navigation ---
 
     // Generation counter prevents stacking of multiple commit nav bars.
-    // addFloatingCommitNav is called from 4 places (turbo:load, turbo:render,
-    // mutation observer, inject), each triggering async API calls. Without the
-    // counter, all calls resolve and create bars. Each call bumps the generation;
+    // addFloatingCommitNav is called from several places (inject, every route
+    // refresh, live force-push updates), each triggering async API calls. Without
+    // the counter, all calls resolve and create bars. Each call bumps the generation.
     // the async callback checks gen !== commitNavGeneration to discard stale calls.
     let commitNavGeneration = 0;
     let commitNavTimer = null;
@@ -29849,7 +29803,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const shaM = href.match(/\/(?:commits|changes)\/([0-9a-f]{7,40})/);
                 if (!shaM) continue;
                 const sha = shaM[1];
-                if (commits.some((c) => c.sha.startsWith(sha) || sha.startsWith(c.sha))) continue;
+                if (commits.some((c) => commitShaMatches(c.sha, sha))) continue;
                 commits.push({
                     sha,
                     commit: { message: a.textContent.trim() },
@@ -30002,7 +29956,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             nextCommit = commits[0];
         } else {
             // Match bidirectionally: API returns full SHAs, HTML scrape may return short
-            currentIdx = commits.findIndex((c) => c.sha.startsWith(currentSha) || currentSha.startsWith(c.sha));
+            currentIdx = commits.findIndex((c) => commitShaMatches(c.sha, currentSha));
             if (currentIdx === -1) return;
             // Circular: prev of first wraps to last, next of last wraps to first
             prevCommit = commits[(currentIdx - 1 + commits.length) % commits.length];
@@ -30310,7 +30264,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             updateJumpDiffStatus(query);
             let loaded = loadedDiffCount();
             const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
-                while (pending.length && token === jumpDiffSearchToken) {
+                // Stop fetching patches once navigation replaced this bar.
+                while (pending.length && token === jumpDiffSearchToken && bar.isConnected) {
                     const commit = pending.shift();
                     try {
                         const patch = await fetchCommitPatch(pr, commit.sha);
@@ -30460,6 +30415,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         };
         const onJumpKeydown = (e) => {
             if (e.key !== 'Escape') return;
+            // A bar replaced while its chooser was open must not swallow later Escapes.
+            if (!jumpWrap.isConnected) {
+                removeJumpCloseListeners();
+                return;
+            }
             e.preventDefault();
             e.stopPropagation();
             closeJumpMenu();
@@ -30474,7 +30434,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         bar.appendChild(jumpWrap);
         if (nextCommit) bar.appendChild(makeNavBtn(nextCommit, true));
 
-        if (gen !== commitNavGeneration) return;
         const existing = document.getElementById('ack-commit-nav');
         if (existing) existing.remove();
         document.body.appendChild(bar);
@@ -30574,10 +30533,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         lastInjectedPR = null;
         lastInjectedPath = null;
         tryInject();
-        if (isPRPage()) {
-            addFloatingCommitNav({ immediate: true });
-            hideNativeCommitNav();
-        }
+        if (isPRPage()) addFloatingCommitNav({ immediate: true });
     }
 
     function maybeRefreshToolbarForForcePushLiveUpdate() {
@@ -30660,6 +30616,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 }
                 resetCommentNav();
                 resetCompareFileNav();
+                currentCommitIdx = -1;
                 resetReviewCommentHashNavigation();
             }
             inject();
@@ -30691,13 +30648,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // Shared route-change work: rebuild the toolbar, honor a #discussion_r
     // hash, and rebuild the floating commit nav. addFloatingCommitNav removes
-    // stale bars on non-PR pages, so it runs unconditionally.
+    // stale bars on non-PR pages (restoring GitHub's native prev/next links),
+    // so it runs unconditionally.
     function refreshAfterNavigation(reason) {
         if (_ackTesting) return;
         tryInject();
         scheduleReviewCommentHashNavigation(reason);
         addFloatingCommitNav({ immediate: true });
-        hideNativeCommitNav();
     }
 
     if (!_ackTesting) refreshAfterNavigation('initial load');
@@ -30723,25 +30680,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
                     '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, ' +
                     '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-actions, .ack-config-overlay, .ack-jev-badges, ' +
+                    '.ack-commit-explain-panel, .ack-explain-panel, .ack-pgp-badge, .ack-changes-link, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
             )
             .forEach((el) => el.remove());
-        document.querySelectorAll('[data-ack-prefilled]').forEach((el) => delete el.dataset.ackPrefilled);
-        document.querySelectorAll('[data-ack-quick-processed]').forEach((el) => delete el.dataset.ackQuickProcessed);
-        document.querySelectorAll('[data-ack-reaction-hover]').forEach((el) => delete el.dataset.ackReactionHover);
-        document.querySelectorAll('[data-ack-avatar-processed]').forEach((el) => delete el.dataset.ackAvatarProcessed);
-        document.querySelectorAll('[data-ack-pgp-checked]').forEach((el) => delete el.dataset.ackPgpChecked);
-        document.querySelectorAll('.ack-pgp-badge').forEach((el) => el.remove());
-        document.querySelectorAll('[data-ack-lazy-queued]').forEach((el) => delete el.dataset.ackLazyQueued);
-        document
-            .querySelectorAll('[data-ack-start-review-injected]')
-            .forEach((el) => delete el.dataset.ackStartReviewInjected);
+        // The snapshot is a clone without event listeners or observers, so drop
+        // every "already processed/bound" guard to let a restored page rebind.
+        for (const attr of [
+            'data-ack-prefilled',
+            'data-ack-quick-processed',
+            'data-ack-reaction-hover',
+            'data-ack-avatar-processed',
+            'data-ack-pgp-checked',
+            'data-ack-lazy-queued',
+            'data-ack-start-review-injected',
+            'data-ack-editor-ergonomics-bound',
+            'data-ack-toolbar-proofread-bound',
+            'data-ack-head-branch-bound',
+        ]) {
+            document.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
+        }
         document.querySelectorAll('[data-ack-orig-label]').forEach((el) => {
             el.textContent = el.dataset.ackOrigLabel;
             el.title = '';
             delete el.dataset.ackOrigLabel;
         });
-        document.querySelectorAll('.ack-changes-link').forEach((el) => el.remove());
         _ackPendingReviewActive = false;
         lastForcePush = null;
         lastForcePushRange = null;
@@ -31108,6 +31071,54 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('empty LLM replies are returned but not cached', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPage = parsePageContext;
+        const callbacks = [];
+        let key = '';
+        try {
+            parsePageContext = () => ({ owner: 'audit', repo: 'llm', pr: '3' });
+            GM_setValue('llm_claude_key', 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            GM_xmlhttpRequest = (options) => { callbacks.push(options); };
+            key = buildPromptCacheKey('claude', LLM_MODELS.claude, 'empty', 'prompt', '', 100);
+            const first = callLLM('claude', 'empty', 'prompt', { maxTokens: 100 });
+            callbacks[0].onload({ status: 200, responseText: JSON.stringify({ content: [] }) });
+            ackEq(await first, '', 'the caller still receives the empty reply');
+            ackEq(GM_getValue(key, null), null, 'the empty reply is not replayed from cache');
+            const retry = callLLM('claude', 'empty', 'prompt', { maxTokens: 100 });
+            ackEq(callbacks.length, 2, 'a retry sends a new request');
+            callbacks[1].onload({ status: 200, responseText: JSON.stringify({ content: [{ text: 'reply' }] }) });
+            ackEq(await retry, 'reply');
+            ackEq(GM_getValue(key, null), 'reply', 'a non-empty reply is cached');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            parsePageContext = originalPage;
+            if (key) GM_deleteValue(key);
+        }
+    });
+
+    ackTest('provider replies surface refusals, count Gemini thinking, and tolerate missing error bodies', () => {
+        const refusal = { choices: [{ message: { content: null, refusal: 'I cannot help with that.' } }] };
+        ackEq(PROVIDER_API.openai.parseText(refusal), 'I cannot help with that.', 'matches the streaming parser');
+        ackEq(PROVIDER_API.openai.parseText({ choices: [{ message: { content: 'Hi' } }] }), 'Hi');
+        ackEq(PROVIDER_API.openai.parseText({}), '');
+        const thinkingUsage = { promptTokenCount: 10, candidatesTokenCount: 5, thoughtsTokenCount: 20, totalTokenCount: 35 };
+        ackDeepEq(
+            PROVIDER_API.gemini.parseUsage({ usageMetadata: thinkingUsage }),
+            [10, 25],
+            'Gemini thinking tokens count as output',
+        );
+        ackDeepEq(
+            PROVIDER_API.gemini.parseUsage({ usageMetadata: { promptTokenCount: 10, totalTokenCount: 17 } }),
+            [10, 7],
+            'Gemini output falls back to total minus prompt',
+        );
+        ackEq(parseProviderError({ responseText: '{"error":{"message":"bad key"}}' }), 'bad key');
+        ackEq(parseProviderError({ responseText: 'plain failure' }), 'plain failure');
+        ackEq(parseProviderError({ status: 0 }), '', 'a missing response body does not throw');
+    });
+
     ackTest('Jev caches paid results completed after navigation and releases skipped jobs', async () => {
         const originalEnabled = jevEnabled;
         const originalPublic = jevPublicRepository;
@@ -31290,7 +31301,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(_ackSource.includes('function tryInject'), 'expected runtime code in _ackSource');
     });
 
-    ackTest('Jev accepts only complete typed answers and public repository proof', () => {
+    ackTest('Jev accepts only complete typed answers', () => {
         const response = { model: 'jev-test', answers: {
             role: { type: 'choice', choice: 'fix', probabilities: { fix: 0.91 } },
             risk: { type: 'score', score: 1.8 },
@@ -31302,9 +31313,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(jevValidatedResult('commit', response)?.answers.role.choice, 'fix');
         ackEq(jevValidatedResult('commit', { ...response, answers: { ...response.answers, role: { ...response.answers.role, choice: 'invented' } } }), null);
         ackEq(jevValidatedResult('commit', { ...response, answers: { ...response.answers, concern: { type: 'noul', noul: 1.2 } } }), null);
-        ackAssert(jevIsPublicRepoResponse({ status: 200, responseText: '{"private":false}' }));
-        ackAssert(!jevIsPublicRepoResponse({ status: 200, responseText: '{"private":true}' }));
-        ackAssert(!jevIsPublicRepoResponse({ status: 404, responseText: '{"private":false}' }));
     });
 
     const jevMockCommentAnswers = () => ({
@@ -32277,8 +32285,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let currentPr = { owner: 'different-repository', repo: 'example', pr: '1' };
         const root = document.createElement('div');
         root.innerHTML = '<span class="ack-jev-badges" id="retry-empty"></span><span class="ack-jev-badges" id="retry-filled">🧪</span>';
-        const visible = { getBoundingClientRect: () => ({ top: 0, bottom: 10 }) };
-        const hidden = { getBoundingClientRect: () => ({ top: -100, bottom: -10 }) };
+        const visible = { isConnected: true, getBoundingClientRect: () => ({ top: 0, bottom: 10 }) };
+        const hidden = { isConnected: true, getBoundingClientRect: () => ({ top: -100, bottom: -10 }) };
         let pages = 0;
         const comments = [];
         try {
@@ -32627,6 +32635,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('Jev commit badge stays with the React commit title', () => {
+        const oldEnabled = jevEnabled;
         const oldParsePR = parsePR;
         const oldPublicRepository = jevPublicRepository;
         const row = document.createElement('div');
@@ -32636,6 +32645,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '<span class="Title-module__trailingBadgesContainer__INeSa"></span>' +
             '</div><span data-testid="commit-row-metadata">authored yesterday</span></div>';
         try {
+            jevEnabled = () => true;
             parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
             jevPublicRepository = () => Promise.resolve(false);
             queueJevCommitRow({ sha: 'a'.repeat(40), msg: 'Fix bounds', el: row });
@@ -32648,6 +32658,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(row.querySelector('[data-testid="commit-row-metadata"]').textContent, 'authored yesterday',
                 'placement leaves the metadata cell intact');
         } finally {
+            jevEnabled = oldEnabled;
+            parsePR = oldParsePR;
+            jevPublicRepository = oldPublicRepository;
+        }
+    });
+
+    ackTest('Jev commit rows reached while Jev is disabled get no slot or GitHub reads', () => {
+        const oldEnabled = jevEnabled;
+        const oldParsePR = parsePR;
+        const oldPublicRepository = jevPublicRepository;
+        const row = document.createElement('div');
+        row.innerHTML = '<div data-listview-item-title-container><h4><a>Fix bounds</a></h4></div>';
+        const commit = { sha: 'a'.repeat(40), msg: 'Fix bounds', el: row };
+        let publicChecks = 0;
+        try {
+            jevEnabled = () => false;
+            parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
+            jevPublicRepository = () => {
+                publicChecks++;
+                return Promise.resolve(false);
+            };
+            queueJevCommitRow(commit);
+            ackEq(row.querySelector('.ack-jev-badges'), null, 'a disabled or paused Jev adds no empty badge slot');
+            ackEq(publicChecks, 0, 'a disabled or paused Jev starts no GitHub reads for the row');
+            jevEnabled = () => true;
+            queueJevCommitRow(commit);
+            ackAssert(row.querySelector('.ack-jev-badges'), 'the same row is annotated once Jev is enabled again');
+            ackEq(publicChecks, 1, 'the enabled row starts the public-repository check');
+        } finally {
+            jevEnabled = oldEnabled;
             parsePR = oldParsePR;
             jevPublicRepository = oldPublicRepository;
         }
@@ -32655,6 +32695,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('React commit detail keeps GitHub title and review controls on one line', () => {
         // Reduced from scratch_17.txt, captured on a real commit detail page.
+        const oldEnabled = jevEnabled;
         const oldParsePR = parsePR;
         const oldPublicRepository = jevPublicRepository;
         const mount = document.createElement('div');
@@ -32669,6 +32710,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const title = heading.querySelector('[data-component="Text"]');
         const description = mount.querySelector('.text-mono');
         try {
+            jevEnabled = () => true;
             parsePR = () => ({ owner: 'bitcoin', repo: 'bitcoin', pr: '36280' });
             jevPublicRepository = () => Promise.resolve(false);
             addSingleCommitExplainButton(mount);
@@ -32696,6 +32738,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(proofread.style.float, '', 'proofread button no longer floats over GitHub title');
             ackEq(getComputedStyle(heading).display, 'flex', 'heading uses one flex line for title and actions');
         } finally {
+            jevEnabled = oldEnabled;
             parsePR = oldParsePR;
             jevPublicRepository = oldPublicRepository;
             mount.remove();
@@ -32963,6 +33006,40 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(line.cell.dataset.ackJevLineId, undefined, 'a transient failure can be queued again');
         } finally {
             jevLineReadingEnabled = oldLineEnabled;
+            jevEvaluate = oldEvaluate;
+            host.remove();
+        }
+    });
+
+    ackTest('Jev hunk location keeps an unanchored deletion on the old side like line targets', () => {
+        const oldEnabled = jevEnabled;
+        const oldEvaluate = jevEvaluate;
+        const host = document.createElement('div');
+        host.className = 'js-file';
+        host.setAttribute('data-path', 'src/removed.cpp');
+        host.innerHTML = '<table><tr><td data-line-number="7"></td>' +
+            '<td class="blob-code blob-code-deletion">return stale;</td></tr></table>';
+        document.body.appendChild(host);
+        const line = jevChangedRow(host.querySelector('tr'));
+        let hunkState = null;
+        try {
+            jevEnabled = () => true;
+            jevEvaluate = (pr, kind, state) => {
+                hunkState = state;
+                return Promise.resolve(null);
+            };
+            queueJevVisibleHunk({
+                pr: { owner: 'octo', repo: 'demo', pr: '1' },
+                path: 'src/removed.cpp',
+                head: 'a'.repeat(40),
+                group: [line],
+                signature: 'deleted-hunk',
+            });
+            ackEq(jevLineReviewTarget('src/removed.cpp', line.parts[0])?.location, 'src/removed.cpp:L7',
+                'the line guide labels the deleted line on the old side');
+            ackEq(hunkState?.line, 'src/removed.cpp:L7', 'the hunk badge uses the same old-side label');
+        } finally {
+            jevEnabled = oldEnabled;
             jevEvaluate = oldEvaluate;
             host.remove();
         }
@@ -33257,6 +33334,36 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             clearJevDescriptionAnnotations(view.root);
             ackEq(jevCommitMessageRenderedText(view), rendered, 'annotation cleanup preserves exact GitHub prose');
         } finally {
+            getAnalysisMode = originalMode;
+            host.remove();
+        }
+    });
+
+    ackTest('Jev sentence guide ignores ACKtopus marker classes around the prose', () => {
+        const originalMode = getAnalysisMode;
+        const html = document.documentElement;
+        const wasArmed = html.classList.contains('ack-ctrl-armed');
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="bgColor-inset"><div class="flex-1">' +
+            '<h2 class="prc-Heading-Heading-MtWFE"><span data-component="Text"><div>fix: count exact-limit chunks</div></span></h2>' +
+            '<span class="text-mono ws-pre-wrap f6">Explain the boundary. Preserve the existing behavior elsewhere.</span>' +
+            '</div></div><div class="markdown-body"><p>The bound is exact. <span class="ack-pgp-badge">signed</span></p></div>';
+        document.body.appendChild(host);
+        try {
+            getAnalysisMode = () => ANALYSIS_MODES.commit;
+            const view = jevCommitMessageView(host);
+            commitHeadingActions(view.header);
+            ackAssert(view.header.classList.contains('ack-commit-heading'), 'the heading carries the shared marker class');
+            ackDeepEq(jevWrapDescriptionSentences(view.root, view.blocks).map((sentence) => sentence.text), [
+                'fix: count exact-limit chunks',
+                'Explain the boundary.',
+                'Preserve the existing behavior elsewhere.',
+            ], 'a marked commit heading keeps its subject in the reading guide');
+            html.classList.add('ack-ctrl-armed');
+            ackDeepEq(jevWrapDescriptionSentences(host.querySelector('.markdown-body')).map((sentence) => sentence.text),
+                ['The bound is exact.'], 'armed Ctrl shortcuts hide no prose; in-body decorations stay excluded');
+        } finally {
+            if (!wasArmed) html.classList.remove('ack-ctrl-armed');
             getAnalysisMode = originalMode;
             host.remove();
         }
@@ -36624,6 +36731,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(_ackSource.includes('```'), 'cleanResult handles markdown fences');
     });
 
+    ackTest('proofread replies unwrap a whole-reply fence but keep a trailing code block', () => {
+        ackEq(stripWholeReplyFence('```markdown\nFixed text.\n```'), 'Fixed text.', 'unwraps a fenced reply');
+        const bench = 'Speeds up IBD.\n\n```\nns/op 12.3\n```';
+        ackEq(stripWholeReplyFence(bench), bench, 'keeps the closing fence of trailing benchmark output');
+        ackEq(cleanPlainProofreadResult(bench), bench, 'plain proofread keeps the code block intact');
+    });
+
     ackTest('proofread EDIT mode uses textarea value and shows diff dialog', () => {
         const proofFn = _ackSource.slice(
             _ackSource.indexOf('EDIT MODE: proofread'),
@@ -36791,6 +36905,59 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(runFn.includes('${PROOFREAD_SANITY_RULE}'), 'title proofreading includes the sanity check');
         ackAssert(runFn.includes('${PROOFREAD_NATURAL_PROSE_RULE}'), 'title proofreading avoids stock prose');
+    });
+
+    ackTest('PR title proofread keeps its icon and tooltip and ignores overlapping presses', async () => {
+        const orig = {
+            isProviderAvailable,
+            isPRPage,
+            parsePageContext,
+            findPRTitleDom,
+            getPRTitleText,
+            fetchPRContext,
+            parseCommitsFromPage,
+            callLLM,
+            showDiffDialog,
+        };
+        const btn = document.createElement('button');
+        resetPRTitleProofreadButton(btn);
+        const idleHTML = btn.innerHTML;
+        const idleTitle = btn.title;
+        document.body.appendChild(btn);
+        const pendingRequests = [];
+        try {
+            isProviderAvailable = () => true;
+            isPRPage = () => true;
+            parsePageContext = () => ({ owner: 'owner', repo: 'repo', pr: '1' });
+            findPRTitleDom = () => ({ headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null });
+            getPRTitleText = () => 'net: fix typo';
+            fetchPRContext = async () => ({});
+            parseCommitsFromPage = () => [];
+            callLLM = () => new Promise((resolve) => pendingRequests.push(resolve));
+            showDiffDialog = async () => ({ action: false, text: '' });
+            const runs = [runProofreadOnPRTitle(btn), runProofreadOnPRTitle(btn)];
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const startedRequests = pendingRequests.length;
+            pendingRequests.forEach((resolve) => resolve('net: fix typo'));
+            await Promise.all(runs);
+            ackEq(startedRequests, 1, 'a press during a running proofread does not start another request');
+            ackEq(btn.innerHTML, idleHTML, 'rejecting the diff restores the icon markup');
+            ackEq(btn.title, idleTitle, 'rejecting the diff keeps the tooltip');
+            ackEq(btn.dataset.ackProofreadBusy, undefined, 'finished proofread accepts new presses');
+        } finally {
+            ({
+                isProviderAvailable,
+                isPRPage,
+                parsePageContext,
+                findPRTitleDom,
+                getPRTitleText,
+                fetchPRContext,
+                parseCommitsFromPage,
+                callLLM,
+                showDiffDialog,
+            } = orig);
+            btn.remove();
+        }
     });
 
     ackTest('parseCommitsFromPage falls back to SSR commits on compare pages', () => {
@@ -38887,6 +39054,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(ta.value, 'alpha\nbeta', 'removes four-space indentation');
     });
 
+    ackTest('editor ergonomics indents an empty first line in place', () => {
+        const ta = document.createElement('textarea');
+        ta.value = '\nbeta';
+        ta.selectionStart = ta.selectionEnd = 0;
+        ackEq(indentTextareaSelection(ta, false), true, 'indent changed the caret line');
+        ackEq(ta.value, '    \nbeta', 'indents the empty first line without duplicating its newline');
+    });
+
     ackTest('installEditorErgonomics binds GitHub comment textareas', () => {
         const root = document.createElement('div');
         root.innerHTML = `
@@ -40508,6 +40683,51 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('PR-body explain button sends the PR overview prompt for React absolute permalinks', async () => {
+        const root = document.createElement('div');
+        Object.assign(root.style, { position: 'absolute', left: '-10000px', top: '0', width: '400px' });
+        root.innerHTML = `
+            <div data-testid="issue-body">
+                <div><button type="button" aria-haspopup="true" aria-label="Issue body actions"></button></div>
+                <a data-testid="issue-body-header-author" href="https://github.com/pr_author">pr_author</a>
+                <a data-testid="issue-body-header-link" href="https://github.com/owner/repo/pull/123#issue-444">opened</a>
+                <div class="markdown-body">Original PR description.</div>
+            </div>
+        `;
+        document.body.appendChild(root);
+        const orig = { isProviderAvailable, parsePR, fetchPRContext, callLLM, getCurrentGitHubLogin };
+        let system = '';
+        let llmCalled;
+        const called = new Promise((resolve) => {
+            llmCalled = resolve;
+        });
+        try {
+            getCurrentGitHubLogin = () => 'acktest_user';
+            isProviderAvailable = () => true;
+            parsePR = () => ({ owner: 'owner', repo: 'repo', pr: '123' });
+            fetchPRContext = async () => ({ title: 'net: fix typo', description: '', commitMessages: '', diff: '' });
+            callLLM = async (_provider, sys) => {
+                system = sys;
+                llmCalled();
+                return 'Explanation.';
+            };
+            addQuickCommentActions(root, '/owner/repo/pull/123');
+            const explainBtn = root.querySelector('button[title="Explain this PR at a high level"]');
+            ackAssert(explainBtn, 'missing PR-body explain button');
+            explainBtn.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true }));
+            await Promise.race([called, new Promise((resolve) => setTimeout(resolve, 1000))]);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackAssert(
+                system.includes('understand a PR before starting their review'),
+                'PR-body explain uses the high-level PR prompt',
+            );
+        } finally {
+            ({ isProviderAvailable, parsePR, fetchPRContext, callLLM, getCurrentGitHubLogin } = orig);
+            document.dispatchEvent(new Event('pointerup'));
+            root.remove();
+        }
+    });
+
     ackTest('invariant check: marked header with 0 buttons forces rebuild', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -40695,6 +40915,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(cacheBlock.includes('data-ack-quick-processed'), 'resets quick processed flags');
         ackAssert(cacheBlock.includes('data-ack-prefilled'), 'resets prefilled flags');
         ackAssert(cacheBlock.includes('data-ack-start-review-injected'), 'resets start review injected flags');
+        ackAssert(cacheBlock.includes('data-ack-editor-ergonomics-bound'), 'resets editor keyboard listener flags');
+        ackAssert(cacheBlock.includes('data-ack-toolbar-proofread-bound'), 'resets toolbar proofread listener flags');
+        ackAssert(cacheBlock.includes('data-ack-head-branch-bound'), 'resets head-branch copy listener flags');
+        ackAssert(cacheBlock.includes('.ack-commit-explain-panel'), 'removes lightbulb panels like route teardown');
+        ackAssert(cacheBlock.includes('.ack-explain-panel'), 'removes explain panels like route teardown');
         ackAssert(cacheBlock.includes('lastInjectedPath = null'), 'resets injected path cache');
     });
 
@@ -40742,7 +40967,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(refreshFn.includes('runDocInjectors(ctx)'), 'reruns document injectors on restored DOM');
 
         const injectStart = source.indexOf('function inject()');
-        const injectSetup = source.slice(injectStart, source.indexOf('const onPR = isPRPage()', injectStart));
+        const injectSetup = source.slice(injectStart, source.indexOf('const ctx = currentInjectContext()', injectStart));
         ackAssert(
             injectSetup.includes('refreshExistingConversationEnhancements()'),
             'existing-toolbar path refreshes page enhancements before returning',
@@ -40911,10 +41136,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes('AJAX_PAGINATION_BTN_SELECTOR'), 'getHiddenCount uses shared selector constant');
         ackAssert(fn.includes('getIssueTimelineLoadMoreCount()'), 'getHiddenCount includes issue timeline load-more counts');
-        ackAssert(
-            fn.includes('hidden\\s+(?:items|conversations)'),
-            'counts both hidden items and hidden conversations',
-        );
+        ackAssert(fn.includes('HIDDEN_TIMELINE_COUNT_RE'), 'getHiddenCount uses the shared hidden-count pattern');
+        for (const [label, count] of [
+            ['134 hidden items', '134'],
+            ['9 hidden conversations', '9'],
+            ['1 hidden item', '1'],
+            ['1 hidden conversation', '1'],
+        ]) {
+            ackEq(label.match(HIDDEN_TIMELINE_COUNT_RE)?.[1], count, `counts "${label}"`);
+        }
+    });
+
+    ackTest('getHiddenCount counts singular hidden items and conversations', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <form class="ajax-pagination-form">
+                <span>1 hidden item</span>
+                <button class="ajax-pagination-btn">Load more...</button>
+            </form>
+            <button class="ajax-pagination-btn">1 hidden conversation</button>
+        `;
+        const before = getHiddenCount();
+        document.body.appendChild(host);
+        try {
+            ackEq(getHiddenCount(), before + 2, 'singular pagination labels still count their hidden item');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('conversation loaders submit each GitHub pagination form once', () => {
@@ -41230,7 +41478,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(revealMine.includes('state.paginationBtns.forEach'), 'loads classic hidden-comment pages');
         ackAssert(revealMine.includes('state.timelineLoadMore.forEach'), 'loads modern hidden timeline pages');
         ackAssert(
-            revealMine.indexOf('await ackSleep(1800);') < revealMine.indexOf('batch.forEach'),
+            revealMine.indexOf('await ackSleep(1800, lt)') < revealMine.indexOf('batch.forEach'),
             'finishes each hidden-comment loading pass before opening matching threads',
         );
         ackAssert(revealMine.includes('continue;'), 'does not open unrelated thread controls during the loader phase');
@@ -41247,6 +41495,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!closeThreads.includes('paginationBtns'), 'closing never loads hidden timeline pages');
         ackAssert(!closeThreads.includes('timelineLoadMore'), 'closing never fetches more comments');
         ackAssert(closeThreads.includes('mineOnly'), 'one close path supports all and current-user threads');
+    });
+
+    ackTest('reveal all stops clicking when the page lifetime ends', async () => {
+        const originalState = getRevealAllState;
+        const btn = document.createElement('button');
+        let clicks = 0;
+        const collapsed = { click: () => clicks++ };
+        try {
+            getRevealAllState = () => ({
+                hiddenCount: 0,
+                paginationBtns: [],
+                timelineLoadMore: [],
+                resolved: [],
+                minimized: [collapsed],
+                outdated: [],
+                loadDiffs: [],
+                total: 1,
+            });
+            const run = revealAllContext(btn, { restoreMs: 0 });
+            abortAckLifetime('test navigation');
+            const result = await Promise.race([run, new Promise((resolve) => setTimeout(() => resolve('timeout'), 300))]);
+            ackEq(result, false, 'reports the interrupted reveal instead of continuing');
+            ackEq(clicks, 1, 'does not click controls on the next page');
+            ackEq(btn._running, false, 'releases the button');
+        } finally {
+            getRevealAllState = originalState;
+        }
     });
 
     ackTest('childList observer does not rebuild the toolbar for comment loaders', () => {
@@ -41423,6 +41698,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('addBtn.disabled = !pr || currentInQueue'), 'disables add when duplicate');
     });
 
+    ackTest('queue matches page PR numbers against numeric search-result entries', () => {
+        const originalParsePR = parsePR;
+        const originalQueue = GM_getValue('prQueue', '[]');
+        try {
+            parsePR = () => ({ owner: 'octo', repo: 'demo', pr: '42' });
+            setQueue([{ owner: 'octo', repo: 'demo', pr: 42, title: 'Added from search' }]);
+            const panel = buildQueuePanel();
+            const addBtn = panel.querySelector('button');
+            ackEq(addBtn.disabled, true, 'current PR added from search counts as already queued');
+            ackEq(addBtn.textContent, '✓', 'shows the queued marker');
+            ackAssert(
+                !panel.querySelector('.ack-queue-list > div').style.borderLeft.includes('transparent'),
+                'highlights the current PR row',
+            );
+            ackEq(isSameQueuedPR({ owner: 'o', repo: 'r', pr: '7' }, { owner: 'o', repo: 'r', pr: 8 }), false);
+            ackEq(isSameQueuedPR({ owner: 'o', repo: 'r', pr: '7' }, null), false, 'handles a missing page PR');
+        } finally {
+            parsePR = originalParsePR;
+            GM_setValue('prQueue', originalQueue);
+        }
+    });
+
     ackTest('queue panel is cleaned up in turbo:before-cache', () => {
         const source = _ackSource;
         ackAssert(source.includes('QUEUE_PANEL_ID'), 'QUEUE_PANEL_ID constant exists');
@@ -41456,6 +41753,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             '-----END PGP SIGNATURE-----',
         ].join('\n');
         ackEq(extractCleartextMessage(`intro\n${block}\noutro`), block, 'extracts exact cleartext block');
+        ackEq(
+            extractCleartextMessage(`quoted -----END PGP SIGNATURE-----\n${block}`),
+            block,
+            'ignores an END marker that precedes the signed message',
+        );
         ackEq(extractCleartextMessage('ACK without signature markers'), null, 'returns null when markers missing');
     });
 
@@ -42071,7 +42373,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('.author'), 'filters by author');
         ackAssert(fn.includes('if (sha) foundSha = sha;'), 'takes the last matching ACK comment');
         ackAssert(fn.includes('return linkedFullSha || m[1];'), 'prefers linked full commit SHAs');
-        ackAssert(fn.includes('cssEscape('), 'safely handles fragment navigation');
+        ackAssert(
+            fn.includes('document.getElementById(hash)') && !fn.includes('[id="${hash}"]'),
+            'safely handles fragment navigation without building a selector from the hash',
+        );
         ackAssert(
             fn.includes('a[href*="/commit/"], a[href*="/commits/"]'),
             'prefers full linked commit SHAs when present in ACK comment body',
@@ -42153,6 +42458,42 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(parser.includes("item.querySelector('.author')"), 'captures force-push author');
         ackAssert(parser.includes(".commit-ref .css-truncate-target"), 'captures force-push branch');
         ackAssert(parser.includes('relative-time[datetime]'), 'captures force-push timestamp');
+    });
+
+    ackTest('API force-push fallback reads every timeline page to find the latest push', async () => {
+        const oldParsePR = parsePR;
+        const oldFetch = gmFetch;
+        const originalHints = GM_getValue(GITHUB_PAGED_HINTS_KEY, null);
+        const push = (before, after) => ({
+            event: 'head_ref_force_pushed',
+            before: { sha: before.repeat(40) },
+            after: { sha: after.repeat(40) },
+            created_at: '2026-09-25T20:30:28Z',
+        });
+        const pages = {
+            1: [push('a', 'b'), ...Array.from({ length: 99 }, () => ({ event: 'commented' }))],
+            2: [{ event: 'commented' }, push('b', 'c')],
+        };
+        const requested = [];
+        try {
+            GM_deleteValue(GITHUB_PAGED_HINTS_KEY);
+            parsePR = () => ({ owner: 'ack-timeline-test', repo: 'demo', pr: '7' });
+            gmFetch = async (url) => {
+                const page = Number(new URL(url).searchParams.get('page'));
+                requested.push(page);
+                return pages[page] || [];
+            };
+            const pushes = await parseForcePushesFromAPI();
+            ackDeepEq(requested, [1, 2], 'follows the full first page to the next one');
+            ackDeepEq(pushes.map((p) => p.to), ['bbbbbbb', 'ccccccc'], 'keeps pushes in chronological order');
+            ackEq(getForcePushRange(pushes).toFull, 'c'.repeat(40), 'the range ends at the latest push');
+        } finally {
+            parsePR = oldParsePR;
+            gmFetch = oldFetch;
+            invalidateGithubHttpCacheForPR('ack-timeline-test/demo#7');
+            if (originalHints === null) GM_deleteValue(GITHUB_PAGED_HINTS_KEY);
+            else GM_setValue(GITHUB_PAGED_HINTS_KEY, originalHints);
+        }
     });
 
     ackTest('enhanceForcePushLinks adds badge and stores PR in sessionStorage', () => {
@@ -42446,6 +42787,33 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('pull request size fallback still drains after navigation aborts the page lifetime', async () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-issue-row"><a data-hovercard-type="pull_request" href="/octo/demo/pull/16">Classic PR</a></div>';
+        document.body.appendChild(host);
+        const originalGmFetch = gmFetch;
+        const fetched = [];
+        gmFetch = async (url) => {
+            fetched.push(url);
+            return { additions: 2, deletions: 3 };
+        };
+        try {
+            addPullRequestListSizes(host, { path: '/octo/demo/pulls' });
+            // Classic rows have no exact revision, so the GraphQL batch settles at
+            // once and the REST drain timer is scheduled.
+            await Promise.resolve();
+            await Promise.resolve();
+            abortAckLifetime('test navigation');
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            ackDeepEq(fetched, ['https://api.github.com/repos/octo/demo/pulls/16'], 'queued row is still fetched');
+            ackEq(host.querySelector('.ack-pr-size')?.textContent, '+2-3', 'connected row renders its counts');
+            ackEq(pullRequestSizeDrainTimer, null, 'no drain timer is left pending');
+        } finally {
+            gmFetch = originalGmFetch;
+            host.remove();
+        }
+    });
+
     ackTest('pull request size cache expires and rejects invalid counts', () => {
         const pr = {
             owner: 'octo', repo: 'demo', pr: '12',
@@ -42552,7 +42920,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(queueSection.includes('PULL_REQUEST_SIZE_FETCH_CONCURRENCY = 4'), 'limits fallback requests');
         ackAssert(queueSection.includes('fetchPullRequestSizeBatch(missing)'), 'batches visible rows with GraphQL');
-        ackAssert(queueSection.includes('pullRequestSizeDrainTimer = ackSetTimeout'), 'starts fallback without an idle wait');
+        ackAssert(queueSection.includes('pullRequestSizeDrainTimer = setTimeout'), 'starts fallback without an idle wait');
         ackAssert(queueSection.includes('readPullRequestSize(entry.pr)'), 'uses persistent cache before fetching');
         const enhancer = sourceSection(_ackSource, 'function enhancePullRequestListPage', 'function isComparePullRequestButton');
         ackAssert(
@@ -43563,12 +43931,28 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('backfillQueueTitles uses same-origin HTML fetch instead of API', () => {
         const source = _ackSource;
         const fn = source.slice(
-            source.indexOf('function backfillQueueTitles'),
+            source.indexOf('function parsePRTitleFromPageHtml'),
             source.indexOf('function toggleQueuePanel'),
         );
+        ackAssert(fn.includes('function backfillQueueTitles'), 'covers the backfill helper');
         ackAssert(!fn.includes('api.github.com'), 'does NOT use rate-limited API');
         ackAssert(fn.includes('gmFetchPageText(`https://github.com/'), 'uses shared cached same-origin HTML fetch');
         ackAssert(fn.includes('<title>'), 'extracts title from HTML page title');
+    });
+
+    ackTest('parsePRTitleFromPageHtml decodes entities once and drops the page suffix', () => {
+        ackEq(
+            parsePRTitleFromPageHtml('<title>Fix &amp;lt;tag&amp;gt; by alice \u00b7 Pull Request #1 \u00b7 o/r \u00b7 GitHub</title>'),
+            'Fix &lt;tag&gt;',
+            'escaped entities in the title stay literal',
+        );
+        ackEq(
+            parsePRTitleFromPageHtml('<title>Tom &amp; Jerry&#39;s &quot;fix&quot; by bob \u00b7 Pull Request #2 \u00b7 o/r</title>'),
+            'Tom & Jerry\'s "fix"',
+            'decodes the entities GitHub emits',
+        );
+        ackEq(parsePRTitleFromPageHtml('<title>a by b by carol \u00b7 Pull Request #3 \u00b7 o/r</title>'), 'a by b');
+        ackEq(parsePRTitleFromPageHtml('<html></html>'), '', 'missing title yields empty string');
     });
 
     // --- Co-authored-by avatars ---
@@ -43926,6 +44310,11 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             githubHttpCachePRKey('https://github.com/octo/demo/pull/42.patch'),
             'octo/demo#42',
             'maps the web patch to its PR for invalidation',
+        );
+        ackEq(
+            githubHttpCachePRKey('https://github.com/octo/demo/pull/42.diff'),
+            'octo/demo#42',
+            'maps the web aggregate diff to its PR for invalidation',
         );
         ackEq(
             githubHttpCachePRKey('https://github.com/octo/demo/pull/42/changes'),
@@ -45269,6 +45658,43 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
+    ackTest('expected author reply ignores repeated presses while its request runs', async () => {
+        const previousContext = fetchPRContext;
+        const previousCall = callLLM;
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="comment-body">Is this loop bounded?</div>';
+        const btn = document.createElement('button');
+        btn.textContent = '👤';
+        document.body.append(host, btn);
+        let finishContext;
+        const contextReady = new Promise((resolve) => {
+            finishContext = resolve;
+        });
+        let calls = 0;
+        try {
+            setActiveProvider('claude');
+            GM_setValue(providerKeyStorageKey('claude'), 'test-key');
+            fetchPRContext = () => contextReady;
+            callLLM = async () => {
+                calls++;
+                return '{"verdict":"accurate","feedback":"Real catch.","reply":"Yes."}';
+            };
+            const first = runExpectedReplyForComment(host, btn);
+            const second = runExpectedReplyForComment(host, btn);
+            finishContext({});
+            await Promise.all([first, second]);
+            ackEq(calls, 1, 'a second press does not start another paid request');
+            ackEq(host.querySelectorAll('.ack-expected-reply-panel').length, 1, 'only one reply panel is rendered');
+            ackEq(btn.textContent, '👤', 'the button icon is restored without a stale spinner frame');
+            ackEq(btn.dataset.ackLlmBusy, undefined, 'the busy guard is released');
+        } finally {
+            fetchPRContext = previousContext;
+            callLLM = previousCall;
+            host.remove();
+            btn.remove();
+        }
+    });
+
     ackTest('expected author reply helper uses stable context first and comment text last', () => {
         const source = _ackSource;
         const panelFn = source.slice(
@@ -45360,6 +45786,36 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('_diffSelectionActionReqId'), 'uses action request id');
         ackAssert(fn.includes('reqId !== _diffSelectionActionReqId'), 'guards stale results');
         ackAssert(fn.includes('outEl.isConnected'), 'guards detached output area');
+    });
+
+    ackTest('diff selection actions keep a synthetic emoji context while repositioning', async () => {
+        const previousUpdate = updateDiffSelectionToolbar;
+        const previousCall = callLLM;
+        const previousRaf = ackRaf;
+        const previousCtx = _diffSelectionCtx;
+        const ctx = { kind: 'diff', text: 'selected line', syntheticSelection: true, pr: null };
+        const repositioned = [];
+        try {
+            setActiveProvider('claude');
+            GM_setValue(providerKeyStorageKey('claude'), 'test-key');
+            updateDiffSelectionToolbar = (provided) => repositioned.push(provided);
+            ackRaf = (fn) => fn(0);
+            callLLM = async () => 'Line explanation';
+            _diffSelectionCtx = ctx;
+            await runDiffSelectionLLM('explain');
+            ackEq(repositioned.length, 2, 'repositions after the style change and after the result');
+            ackAssert(
+                repositioned.every((provided) => provided === ctx),
+                'repositioning reuses the emoji context instead of the empty DOM selection',
+            );
+            ackAssert(_diffSelectionOneLinerEl?.textContent.includes('Line explanation'), 'action result is rendered');
+        } finally {
+            updateDiffSelectionToolbar = previousUpdate;
+            callLLM = previousCall;
+            ackRaf = previousRaf;
+            teardownDiffSelectionUI();
+            _diffSelectionCtx = previousCtx;
+        }
     });
 
     ackTest('diff selection proofread renders inline diff and result in the tooltip area', () => {
@@ -46423,6 +46879,27 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackEq(getPageIndexThreadInfo(null, cache), null, 'handles comments without a discussion root');
     });
 
+    ackTest('gatherPageIndex indexes code in nested diff containers once', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div class="file js-file">
+                <div class="file-header"><a title="src/foo.cpp" href="#diff-1">src/foo.cpp</a></div>
+                <table class="diff-table"><tbody>
+                    <tr><td data-line-number="7"></td><td class="blob-code">int answer = 42;</td></tr>
+                </tbody></table>
+            </div>
+        `;
+        document.body.appendChild(host);
+        try {
+            const code = gatherPageIndex().filter((item) => item.type === 'code' && host.contains(item.el));
+            ackEq(code.length, 1, 'indexes the line once');
+            ackEq(code[0].file, 'src/foo.cpp', 'keeps the outer file name');
+            ackEq(code[0].line, '7', 'keeps the line number');
+        } finally {
+            host.remove();
+        }
+    });
+
     ackTest('NAV_QUERY_RE detects navigation patterns', () => {
         const re = NAV_QUERY_RE;
         ackAssert(re.test('/find my concern about fuzzers'), '/find triggers');
@@ -46450,23 +46927,14 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(source.includes('review coach'), 'quiz system prompt mentions review coach');
     });
 
-    ackTest('chat navigation parser accepts JSON and citation-shaped results', () => {
-        ackEq(parseNavigationMatches('[{"index":2,"reason":"mentions HaveCoin"}]', 5)[0].index, 2, 'parses JSON array');
-        ackEq(
-            parseNavigationMatches('```json\n{"matches":[{"index":3,"reason":"Andrew comment"}]}\n```', 5)[0].index,
-            3,
-            'parses fenced object wrapper',
+    ackTest('find search chunks budget only the text sent to the LLM', () => {
+        const long = { type: 'comment', fullText: 'x'.repeat(50000) };
+        ackAssert(
+            findSearchItemForLLM(long, 0, '').length < FIND_SEARCH_ITEM_TEXT_MAX_CHARS + 500,
+            'LLM item text is capped',
         );
-        ackEq(
-            parseNavigationMatches('Andrew mentioned this in [ref:4] while discussing HaveCoin.', 7)[0].index,
-            4,
-            'falls back to ref citations in prose',
-        );
-        ackEq(
-            parseNavigationMatches('Results: item 1 and index 9', 3).map((m) => m.index).join(','),
-            '1',
-            'drops out-of-range indices',
-        );
+        ackEq(chunkFindSearchItems([long, long, long], 52000).length, 1, 'long comments share one capped batch');
+        ackEq(chunkFindSearchItems([{ text: 'a' }, { text: 'b' }], 1000).length, 2, 'splits past the budget');
     });
 
     ackTest('find search parser validates LLM JSON result shape', () => {
@@ -46556,6 +47024,32 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
+    ackTest('clearing robot history while the panel is open keeps it cleared', () => {
+        const previousIndex = gatherPageIndex;
+        const key = robotChatHistoryKeyForPage();
+        let panel;
+        try {
+            gatherPageIndex = () => [];
+            GM_setValue(key, [
+                { id: 'old-thread', title: 'Old', updatedAt: 1, messages: [{ role: 'user', content: 'Old question' }] },
+            ]);
+            panel = buildChatPanel();
+            document.body.appendChild(panel);
+            const messages = panel.querySelector('.ack-chat-messages');
+            ackAssert(messages.textContent.includes('Old question'), 'loads the stored discussion');
+            ackEq(clearRobotChatHistoryForPage(), 1, 'reports the cleared history');
+            ackAssert(
+                !GM_getValue(key, []).some((thread) => thread.messages?.length),
+                'open panel does not write cleared discussions back',
+            );
+            ackAssert(!messages.textContent.includes('Old question'), 'open panel shows a fresh discussion');
+        } finally {
+            gatherPageIndex = previousIndex;
+            panel?.querySelector('button[title="Close robot panel"]')?.click();
+            GM_deleteValue(key);
+        }
+    });
+
     ackTest('Robot find search is passive and robot discussions persist', () => {
         const fn = sourceSection(_ackSource, 'function buildChatPanel', 'function addPromptDetails');
         const findFn = sourceSection(fn, 'async function runFindSearch', 'async function send');
@@ -46614,6 +47108,22 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
 
     ackTest('scrollToAndHighlight helper exists and is exported', () => {
         ackEq(typeof scrollToAndHighlight, 'function', 'scrollToAndHighlight exported');
+    });
+
+    ackTest('scrollToAndHighlight restores original styles after overlapping highlights', async () => {
+        const el = document.createElement('div');
+        el.style.background = 'red';
+        document.body.appendChild(el);
+        try {
+            scrollToAndHighlight(el, 10);
+            scrollToAndHighlight(el, 10);
+            ackEq(el.style.outline, '2px solid #58a6ff', 'highlights while active');
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            ackEq(el.style.background, 'red', 'restores the pre-highlight background');
+            ackEq(el.style.outline, '', 'clears the highlight outline');
+        } finally {
+            el.remove();
+        }
     });
 
     ackTest('linkifyRefs replaces [ref:N] with clickable ack-ref-link anchors', () => {
@@ -46795,8 +47305,8 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     ackTest('inject gates PR-only features behind isPRPage', () => {
         const source = _ackSource;
         const injectFn = source.slice(source.indexOf('function inject()'), source.indexOf('// --- Hide GitHub'));
-        ackAssert(injectFn.includes('const onPR = isPRPage()'), 'inject checks isPRPage');
-        ackAssert(injectFn.includes('const onCompare = isComparePage()'), 'inject checks compare mode');
+        ackAssert(injectFn.includes('const ctx = currentInjectContext()'), 'inject uses the shared page context');
+        ackAssert(injectFn.includes('const { onPR, onCompare } = ctx'), 'inject checks PR and compare mode');
         ackAssert(injectFn.includes('if (onPR)'), 'gates features behind onPR');
         // ACK toggle and SHA group only on PR
         const ackSection = injectFn.slice(injectFn.indexOf('ACK toggle'), injectFn.indexOf('💬 Comment navigator'));
@@ -47088,6 +47598,16 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackEq(lifetime.timers.size, 0, 'no timers remain');
     });
 
+    ackTest('waitForNextPaint settles when navigation cancels the frame', async () => {
+        const pending = waitForNextPaint();
+        abortAckLifetime('test navigation');
+        const outcome = await Promise.race([
+            pending.then(() => 'settled'),
+            new Promise((resolve) => setTimeout(() => resolve('hung'), 50)),
+        ]);
+        ackEq(outcome, 'settled', 'copySHA can still stop its spinner and clear its busy flag');
+    });
+
     ackTest('async waits are lifetime-aware (no raw await setTimeout Promises)', () => {
         const source = _ackSource;
         const rawSleeps = (source.match(/await new Promise\(r => setTimeout/g) || []).length;
@@ -47145,7 +47665,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'captures outdated/pending/resolved thread flags',
         );
         ackAssert(
-            fn.includes('getCommentCodeContext(container, threadRoot)'),
+            fn.includes('getCommentCodeContext(container, threadRoot, loc)'),
             'captures inline code context for copied review comments',
         );
         ackAssert(
@@ -47219,6 +47739,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             '<span class="ack-jev-description-segment">Review this sentence.</span></p>' +
             '<div class="ack-explain-panel">generated explanation</div>';
         ackEq(renderBodyMarkdown(body), 'Review this sentence.');
+    });
+
+    ackTest('renderBodyMarkdown keeps links whose href cannot be parsed as a URL', () => {
+        const body = document.createElement('div');
+        body.className = 'markdown-body';
+        body.innerHTML = '<p>See <a href="https://">empty host</a> and <a href="/a/b">relative</a>.</p>';
+        ackEq(
+            renderBodyMarkdown(body),
+            `See [empty host](https://) and [relative](${new URL('/a/b', location.href).href}).`,
+            'falls back to the raw href instead of throwing',
+        );
     });
 
     ackTest('gatherFullPRContext fetches PR URL, title, description, commits, patch, comments', () => {
@@ -47449,6 +47980,17 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             host.remove();
         }
+    });
+
+    ackTest('embedded diff contents are collected once per page payload', () => {
+        const root = {
+            payload: { files: [{ path: 'src/a.cpp', diffLines: [] }, { nested: { path: 'b', diffLines: [] } }] },
+        };
+        const first = collectEmbeddedDiffContents(root);
+        ackEq(first.length, 2, 'finds nested diff contents');
+        ackEq(collectEmbeddedDiffContents(root), first, 'reuses the walk for the same payload');
+        ackEq(collectEmbeddedDiffContents(null).length, 0, 'handles pages without a payload');
+        ackEq(getEmbeddedDiffLineContext('', '', ''), '', 'skips the lookup without a file and line');
     });
 
     ackTest('embedded diff context recovers commented code for pending copies', () => {
@@ -48140,6 +48682,43 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes("'llm_infographic_'"), 'checks infographic cache prefix');
     });
 
+    ackTest('cache eviction keeps the cache toggle and drops orphaned timestamps', () => {
+        const originalList = GM_listValues;
+        const originalEnabled = GM_getValue('llm_cache_enabled', undefined);
+        const originalTimestamps = GM_getValue('llm_cache_timestamps', undefined);
+        const stale = 'llm_prompt_v2_pull_audit_evict_1_stale';
+        const fresh = 'llm_prompt_v2_pull_audit_evict_1_fresh';
+        const orphan = 'llm_prompt_v2_pull_audit_evict_1_orphan';
+        try {
+            GM_setValue('llm_cache_enabled', false);
+            GM_setValue(stale, 'old');
+            GM_setValue(fresh, 'new');
+            GM_setValue('llm_cache_timestamps', { [stale]: 1, [fresh]: Date.now(), [orphan]: Date.now() });
+            GM_listValues = () =>
+                ['llm_cache_enabled', 'llm_cache_timestamps', stale, fresh].filter(
+                    (key) => GM_getValue(key, undefined) !== undefined,
+                );
+            evictStaleCache();
+            ackEq(GM_getValue('llm_cache_enabled', true), false, 'keeps the disabled cache preference');
+            ackEq(GM_getValue(stale, null), null, 'removes stale entries');
+            ackEq(GM_getValue(fresh, null), 'new', 'keeps fresh entries');
+            ackDeepEq(Object.keys(GM_getValue('llm_cache_timestamps', {})), [fresh], 'drops orphaned timestamps');
+        } finally {
+            GM_listValues = originalList;
+            GM_deleteValue(stale);
+            GM_deleteValue(fresh);
+            if (originalEnabled === undefined) GM_deleteValue('llm_cache_enabled');
+            else GM_setValue('llm_cache_enabled', originalEnabled);
+            if (originalTimestamps === undefined) GM_deleteValue('llm_cache_timestamps');
+            else GM_setValue('llm_cache_timestamps', originalTimestamps);
+        }
+        const clearAll = sourceSection(_ackSource, 'function clearAllCaches', 'function resetInMemoryCaches');
+        ackAssert(
+            clearAll.includes("(k.startsWith('llm_cache_') && k !== 'llm_cache_enabled')"),
+            'clearing all caches keeps the cache preference',
+        );
+    });
+
     ackTest('clearCacheForPR clears all cache types including overview and autoopen', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function clearCacheForPR'), source.indexOf('function clearAllCaches'));
@@ -48264,6 +48843,43 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         } finally {
             ac.abort();
             host.textContent = '';
+        }
+    });
+
+    ackTest('existing toolbar re-arms its dropdown closer after a page lifetime reset', () => {
+        const previousGetById = document.getElementById;
+        const previousRefresh = refreshExistingConversationEnhancements;
+        const previousCloser = installAckToolbarDropdownCloser._ac;
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <div data-outside="true"></div>
+            <div data-wrapper="true">
+                <div data-toolbar="true">
+                    <div data-ack-toolbar-dropdown="hide" data-ack-toolbar-dropdown-id="sha-format" style="display:block"></div>
+                </div>
+            </div>
+        `;
+        const wrapper = host.querySelector('[data-wrapper]');
+        const toolbar = host.querySelector('[data-toolbar]');
+        const menu = toolbar.querySelector('[data-ack-toolbar-dropdown]');
+        document.body.appendChild(host);
+        try {
+            document.getElementById = (id) => id === BUTTON_CONTAINER_ID
+                ? wrapper : previousGetById.call(document, id);
+            refreshExistingConversationEnhancements = () => {};
+            installAckToolbarDropdownCloser(toolbar);
+            abortAckLifetime('test navigation');
+            ackEq(installAckToolbarDropdownCloser._ac.signal.aborted, true, 'lifetime reset aborts the closer');
+            inject();
+            ackEq(installAckToolbarDropdownCloser._ac.signal.aborted, false, 'surviving toolbar gets a live closer');
+            host.querySelector('[data-outside]').click();
+            ackEq(menu.style.display, 'none', 'outside clicks close toolbar dropdowns again');
+        } finally {
+            installAckToolbarDropdownCloser._ac?.abort();
+            installAckToolbarDropdownCloser._ac = previousCloser;
+            document.getElementById = previousGetById;
+            refreshExistingConversationEnhancements = previousRefresh;
+            host.remove();
         }
     });
 
@@ -48939,7 +49555,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('async function fetchPRFileCategories'),
             source.indexOf('async function fetchPRFileCategories') + 900,
         );
-        ackAssert(fileCatFn.includes('gmFetch('), 'fetchPRFileCategories uses shared gmFetch auth/rate-limit handling');
+        ackAssert(
+            fileCatFn.includes('fetchPagedGithubRows('),
+            'fetchPRFileCategories uses the shared paginated gmFetch reader',
+        );
         ackAssert(
             fileCatFn.includes('visibleDiffFileCategories(document, pr)'),
             'fetchPRFileCategories falls back to repository-aware visible file headers',
@@ -50346,7 +50965,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function findReactionOptionInPopup'),
             source.indexOf('async function applyReactionChoice('),
         );
-        ackAssert(fn.includes('isReactionVisible'), 'checks visibility');
+        ackAssert(fn.includes('isVisible'), 'checks visibility');
         ackAssert(fn.includes('details-menu'), 'searches details-menu');
         ackAssert(fn.includes('.Overlay'), 'searches Overlay');
         ackAssert(fn.includes('js-reaction-group-button'), 'excludes summary row buttons');
@@ -50827,6 +51446,13 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(result.includes('&amp;'), 'ampersand escaped in title');
         ackAssert(result.includes('&quot;'), 'quotes escaped in title');
         ackAssert(result.includes('class="ack-tip"'), 'span created despite special chars');
+    });
+
+    ackTest('expandTooltipMarkers does not double-escape rendered markdown explanations', () => {
+        const host = document.createElement('div');
+        host.innerHTML = expandTooltipMarkers(renderMarkdown('{{mapTx||keys a < b & "c"}}'));
+        ackEq(host.querySelector('.ack-tip')?.title, 'keys a < b & "c"', 'tooltip shows the plain explanation text');
+        ackEq(host.querySelector('.ack-tip')?.textContent, 'mapTx', 'term text is preserved');
     });
 
     ackTest('LLM pseudocode prompt includes inline annotation instructions', () => {
@@ -51963,6 +52589,23 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackEq(timelineFilterShouldShowItem(event, 'comments', true), true, 'hash-pinned items stay visible');
     });
 
+    ackTest('timeline filter pins the hash target and tolerates malformed hash encoding', () => {
+        const originalUrl = location.href;
+        const event = document.createElement('div');
+        event.className = 'js-timeline-item';
+        event.innerHTML = '<span id="ack-pin target"></span>';
+        document.body.appendChild(event);
+        try {
+            history.replaceState(history.state, '', '#ack-pin%20target');
+            ackEq(timelineFilterShouldShowItem(event, 'comments'), true, 'keeps the percent-decoded hash target visible');
+            history.replaceState(history.state, '', '#100%');
+            ackEq(timelineFilterShouldShowItem(event, 'comments'), false, 'malformed hash encoding does not throw');
+        } finally {
+            history.replaceState(history.state, '', originalUrl);
+            event.remove();
+        }
+    });
+
     ackTest('timeline filter stores the mode per path', () => {
         const path = '/owner/repo/pull/123';
         setTimelineFilterMode('all', path);
@@ -52463,6 +53106,45 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         }
     });
 
+    ackTest('context copy does not copy the next page after navigation interrupts its reveal', async () => {
+        const oldUrl = location.href;
+        const originalRevealState = getRevealAllState;
+        const originalReveal = revealAllContext;
+        const originalCopy = copyCommentsContext;
+        const originalKind = pageKind;
+        const originalMode = ackAlternateMode;
+        let group;
+        let copied = 0;
+        try {
+            history.replaceState(null, '', '/octo/demo/pull/1');
+            pageKind = () => 'pull';
+            setAckAlternateMode(false);
+            GM_setValue('contextCopyAction', 'comments');
+            getRevealAllState = () => ({ total: 1 });
+            revealAllContext = async () => history.replaceState(null, '', '/octo/demo/pull/2');
+            copyCommentsContext = async () => { copied++; };
+            group = buildContextCopyGroup();
+            document.body.appendChild(group);
+            group.firstElementChild.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(copied, 0, 'skips the copy once the page URL changed');
+
+            history.replaceState(null, '', '/octo/demo/pull/1');
+            revealAllContext = async () => {};
+            group.firstElementChild.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(copied, 1, 'still copies after a reveal on the same page');
+        } finally {
+            group?.remove();
+            history.replaceState(null, '', oldUrl);
+            getRevealAllState = originalRevealState;
+            revealAllContext = originalReveal;
+            copyCommentsContext = originalCopy;
+            pageKind = originalKind;
+            setAckAlternateMode(originalMode);
+        }
+    });
+
     ackTest('toolbar visibly marks alternate mode', () => {
         const inject = sourceSection(_ackSource, 'function inject()', '// Load ACK panel + force-push data async');
         ackAssert(
@@ -52816,6 +53498,31 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
+    ackTest('replaced floating commit nav does not swallow later Escape presses', async () => {
+        const oldUrl = location.href;
+        const originalFetchCommitList = fetchCommitList;
+        try {
+            history.replaceState(null, '', '/octo/demo/pull/1');
+            fetchCommitList = async () => [
+                { sha: 'a'.repeat(40), commit: { message: 'first' } },
+                { sha: 'b'.repeat(40), commit: { message: 'second' } },
+            ];
+            await _addFloatingCommitNavInner();
+            const bar = document.getElementById('ack-commit-nav');
+            ackAssert(bar, 'renders the floating commit nav');
+            bar.querySelector('button[aria-haspopup="listbox"]').click();
+            bar.remove();
+            const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+            document.body.dispatchEvent(escape);
+            ackEq(escape.defaultPrevented, false, 'the detached chooser leaves Escape to the page');
+        } finally {
+            fetchCommitList = originalFetchCommitList;
+            history.replaceState(null, '', oldUrl);
+            document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
+            hideNativeCommitNav(false);
+        }
+    });
+
     ackTest('floating commit nav jump dropdown searches commit diffs asynchronously', () => {
         const source = _ackSource;
         const fn = source.slice(
@@ -52929,6 +53636,25 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function getPendingReviewRevealTargets'),
         );
         ackAssert(sourceIncludesLoose(fn, ".closest('button')).filter(Boolean)"), 'filters null after closest()');
+    });
+
+    ackTest('loadDiffs lists a Primer Load diff button once', () => {
+        const host = document.createElement('div');
+        host.innerHTML = `
+            <button id="load-diff" type="button">
+                <span data-component="buttonContent" class="prc-Button-ButtonContent-HKbr-">
+                    <span data-component="text" class="prc-Button-Label-pTQ3x">Load diff</span>
+                </span>
+            </button>
+        `;
+        document.body.appendChild(host);
+        try {
+            const button = host.querySelector('#load-diff');
+            const matches = getLoadableElements().loadDiffs.filter((el) => el === button);
+            ackEq(matches.length, 1, 'nested content and label spans do not double-count or double-click the button');
+        } finally {
+            host.remove();
+        }
     });
 
     ackTest('commitListCache is cleared on PR-key teardown', () => {
@@ -53847,6 +54573,31 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(!fn.includes('location.href ='), 'does not assign location.href');
         ackAssert(fn.includes('pageSessionFallback: true'),
             'falls back to the page session if the centralized userscript request fails');
+    });
+
+    ackTest('refreshThreadAfterPendingComment swaps the live thread when React replaced it during the fetch', async () => {
+        const originalFetchPageText = gmFetchPageText;
+        const host = document.createElement('div');
+        host.innerHTML =
+            '<div class="js-resolvable-timeline-thread-container" id="ack-refresh-thread"><form><textarea></textarea></form></div>';
+        document.body.appendChild(host);
+        const form = host.querySelector('form');
+        try {
+            gmFetchPageText = async () => {
+                const rerendered = document.createElement('div');
+                rerendered.className = 'js-resolvable-timeline-thread-container';
+                rerendered.id = 'ack-refresh-thread';
+                rerendered.textContent = 'rerendered';
+                host.querySelector('#ack-refresh-thread').replaceWith(rerendered);
+                return '<div class="js-resolvable-timeline-thread-container" id="ack-refresh-thread">fresh</div>';
+            };
+            ackEq(await refreshThreadAfterPendingComment(form), true, 'reports the refresh');
+            ackEq(host.querySelectorAll('#ack-refresh-thread').length, 1, 'keeps a single thread');
+            ackEq(host.querySelector('#ack-refresh-thread').textContent, 'fresh', 'replaces the live thread');
+        } finally {
+            gmFetchPageText = originalFetchPageText;
+            host.remove();
+        }
     });
 
     ackTest('startReviewFromReplyForm clears draft before reload fallback', () => {
@@ -54917,10 +55668,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             resetCompareFileNav();
             _ackPendingReviewActive = isPRPage() ? detectPendingReview() && hasPendingReviewChanges() : false;
             tryInject();
-            if (isPRPage()) {
-                addFloatingCommitNav();
-                hideNativeCommitNav();
-            }
+            if (isPRPage()) addFloatingCommitNav();
         } catch (e) {
             console.warn('ACKtopus: post-test re-sync failed:', e?.message || e);
         }
