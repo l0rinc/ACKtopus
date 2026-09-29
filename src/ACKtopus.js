@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.289
+// @version      1.290
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -2863,8 +2863,6 @@
     let _rateLimitWarned = false;
     let _patInvalidWarned = '';
     let _githubBadPat = '';
-    let _githubAuthBucketPat = '';
-    let _githubAuthBucketId = 0;
     const _githubRateLimitedUntil = new Map();
     const _githubPatRepoAccess = new Map();
     const _githubPatRepoAccessRequests = new Map();
@@ -2905,6 +2903,7 @@
         if (!headers?.Authorization) return;
         const repoKey = githubApiRepoKey(url);
         const pat = githubPatValue();
+        if (headers.Authorization !== githubAuthHeaderValue(pat)) return;
         const key = githubPatRepoAccessKey(repoKey, pat);
         if (!key || repoKey.toLowerCase() !== currentGithubRepoKey().toLowerCase()) return;
         _githubPatRepoAccess.set(key, access);
@@ -2948,7 +2947,7 @@
             // A rejected PAT may have succeeded only through gmFetch's
             // anonymous public-repository fallback. Let the dependent read use
             // that same fallback without calling the PAT verified.
-            if (pat === _githubBadPat) {
+            if (pat !== githubPatValue() || pat === _githubBadPat) {
                 refreshGithubPatStatus();
                 return true;
             }
@@ -3063,13 +3062,7 @@
     }
 
     function githubAuthBucket(headers = {}) {
-        if (!headers.Authorization) return 'anonymous';
-        const pat = githubPatValue();
-        if (pat !== _githubAuthBucketPat) {
-            _githubAuthBucketPat = pat;
-            _githubAuthBucketId++;
-        }
-        return `auth:${_githubAuthBucketId}`;
+        return githubHttpCacheScope(headers);
     }
 
     function githubRateLimitUntil(response) {
@@ -3110,10 +3103,10 @@
         return err;
     }
 
-    function rememberGithubBadPat(response) {
+    function rememberGithubBadPat(response, headers) {
         if (!response || isGithubRateLimitResponse(response)) return;
         const pat = githubPatValue();
-        if (!pat) return;
+        if (!pat || headers?.Authorization !== githubAuthHeaderValue(pat)) return;
         _githubBadPat = pat;
         refreshGithubPatStatus();
         if (_patInvalidWarned !== pat) {
@@ -3443,7 +3436,7 @@
                             reject(githubHttpError(r, url));
                             return;
                         }
-                        rememberGithubBadPat(r);
+                        rememberGithubBadPat(r, headers);
                         const fallbackBaseHeaders = { Accept: 'application/vnd.github+json', ...baseHeaders };
                         delete fallbackBaseHeaders.Authorization;
                         const fallbackCached = readGithubHttpCache(url, fallbackBaseHeaders);
@@ -5811,6 +5804,8 @@
         if (!m) return;
         _compareActive = true;
         _compareJevFilter = null;
+        const lifetime = ensureAckLifetime('compare-filter');
+        const isCurrent = () => !lifetime.signal.aborted && compareLocationKey === `${location.pathname}${location.search}`;
         const [, owner, repo, baseSha, headSha] = m;
         const compareStartedAt = Date.now();
         const compareDiagnostics = {
@@ -5844,6 +5839,7 @@
         document.querySelectorAll('.ack-compare-status').forEach((el) => el.remove());
         const statusPopup = makeStatusPopup(`Compare: resolving PR for ${headSha.slice(0, 8)}...`);
         statusPopup.className = 'ack-compare-status';
+        lifetime.onAbort(() => statusPopup.remove());
         const setCompareStatus = (text) => {
             if (statusPopup?.isConnected) statusPopup.textContent = text;
         };
@@ -5920,17 +5916,21 @@
                 if (prNum) break;
                 try {
                     const prs = await withTimeout(fetchCommitPullRequests(owner, repo, sha), 10000);
+                    if (!isCurrent()) return;
                     if (prs.length > 0) {
                         prNum = prs[0].number;
                         compareDiagnostics.prSource = `commits/pulls ${sha.slice(0, 8)}`;
                     }
                 } catch (e) {
+                    if (!isCurrent()) return;
                     if (shouldWarnOptionalGitHubApiError(e)) {
                         noteCompareError(`resolve PR from ${sha.slice(0, 8)}`, e);
                     }
                 }
             }
         }
+
+        if (!isCurrent()) return;
 
         // Referrer fallback
         if (!prNum) {
@@ -6001,6 +6001,7 @@
                     10000,
                     { freshForMs: 0 },
                 );
+                if (!isCurrent()) return;
                 addFiles(batch);
                 page++;
             } while (batch.length === 100 && page <= 30); // up to 3000 files
@@ -6008,11 +6009,13 @@
             compareDiagnostics.fileSources.currentPr = prFileSet.size - before;
             compareDiagnostics.fileSources.currentPrPages = page - 1;
         } catch (e) {
+            if (!isCurrent()) return;
             currentPrFilesIncomplete = true;
             noteCompareApiError('current PR files', e);
         }
 
         if (currentPrFilesIncomplete || prFileSet.size === 0) await addPRPatchFallbackFiles();
+        if (!isCurrent()) return;
         if (prFileSet.size === 0) {
             finishCompareStatus(
                 compareApiRateLimited
@@ -6054,6 +6057,7 @@
         } catch (e) {
             noteCompareApiError('compare range files', e);
         }
+        if (!isCurrent()) return;
 
         // Auto-click "Files changed" tab if not already active
         const filesTab =
@@ -6101,6 +6105,7 @@
         let lastActivityAt = Date.now();
 
         function collapseNewFiles() {
+            if (!isCurrent()) return false;
             const fileEls = compareFileElements();
             if (fileEls.length === 0) return false;
 
@@ -6156,7 +6161,7 @@
         }
 
         function scrollToFirstKeptFile() {
-            if (scrolledToFirstKeptFile) return false;
+            if (!isCurrent() || scrolledToFirstKeptFile) return false;
             for (const file of compareFileElements()) {
                 const path = readDiffFilePath(file);
                 if (!path || collapsedPaths.has(path)) continue;
@@ -6173,6 +6178,7 @@
         collapseNewFiles();
         scrollToFirstKeptFile();
         finalLineCountsRequest.then((finalLineCounts) => {
+            if (!isCurrent()) return;
             if (finalLineCounts) {
                 finishCompareJevFilter(compareLocationKey, normalizedPrFileSet, finalLineCounts);
             } else {
@@ -7144,6 +7150,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     function clearCacheForPR() {
         const pr = parsePageContext();
         if (!pr) return 0;
+        _llmCacheEpoch++;
         const kind = pageKind() || 'pull';
         const prefix = `llm_cache_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_`;
         const promptPrefixV2 = `llm_prompt_v${LLM_PROMPT_CACHE_SCHEMA}_${kind}_${pr.owner}_${pr.repo}_${pr.pr}_`;
@@ -7232,6 +7239,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function resetInMemoryCaches() {
+        _llmCacheEpoch++;
+        _llmRequests.clear();
         Object.keys(_orgMemberCache).forEach((k) => delete _orgMemberCache[k]);
         _reviewCommitMap = null;
         _reviewCommitMapRequest = null;
@@ -7297,8 +7306,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     // --- Config Panel ---
 
     function validateKey(provider, key, statusEl, updateHelp) {
+        const validation = Symbol('key-validation');
+        statusEl._ackValidation = validation;
         if (!key.trim()) {
             statusEl.textContent = '';
+            statusEl.title = '';
             if (updateHelp) updateHelp('invalid');
             return;
         }
@@ -7337,7 +7349,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             if (provider === 'claude' && r.status === 529) {
                 return { ok: true, warn: true, state: 'valid', msg: 'API temporarily overloaded' };
             }
-            if (provider === 'claude' && r.status === 400) return { ok: true, state: 'valid', msg: 'Key accepted' };
             if (r.status === 400) return { ok: false, state: 'invalid', msg: `400: ${parseProviderError(r)}` };
             return { ok: false, state: 'invalid', msg: `HTTP ${r.status}` };
         };
@@ -7361,12 +7372,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
         const targets = getProviderValidationTargets(provider);
         Promise.all(targets.map(validateTarget)).then((results) => {
+            if (statusEl._ackValidation !== validation) return;
             const label = (r) => r.label || r.model;
             const failed = results.filter((r) => !r.ok);
             const warned = results.filter((r) => r.ok && r.warn);
             const primaryFailed = failed.find((r) => r.model === LLM_MODELS[provider]) || null;
             const checkedModels = results.map(label).join(', ');
-            const describeResults = (items) => items.map((r) => `${label(r)} (${r.msg})`).join('; ');
+            const describeResults = (items) => items.map((r) => `${label(r)} (${r.msg})`).join(', ');
             if (primaryFailed) {
                 onResult(
                     false,
@@ -8209,6 +8221,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     const LLM_PROMPT_CACHE_SCHEMA = 2;
+    const _llmRequests = new Map();
+    let _llmCacheEpoch = 0;
 
     // Every option that can change a successful response participates in the
     // key. Timeout and streaming only affect transport, not response semantics.
@@ -8486,6 +8500,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     ) {
         // Check prompt-level cache first (exact same prompt → cached response)
         const llmCfg = getLLMConfig();
+        const cacheEpoch = _llmCacheEpoch;
         const cfg = llmCfg[provider];
         const model = (modelOverride || cfg?.model || '').trim();
         const cacheEnabled = llmCfg.cacheEnabled;
@@ -8503,6 +8518,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         }
 
         if (!cfg?.key) return Promise.reject(new Error(`${provider} has no API key`));
+        const requestKey = promptKey ? `${cacheEpoch}:${promptKey}:${timeoutMs}` : '';
+        if (requestKey && _llmRequests.has(requestKey)) {
+            ackLogEvent('LLM request shared', { provider, model, requestLabel });
+            return _llmRequests.get(requestKey);
+        }
         const api = PROVIDER_API[provider];
         const label = PROVIDER_META[provider]?.label || provider;
         const requestUrl = providerRequestUrl(api, model, cfg.key);
@@ -8536,7 +8556,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             console.log('request_chars:', requestBody.length);
             console.groupEnd();
         }
-        return new Promise((resolve, reject) => {
+        const request = new Promise((resolve, reject) => {
             const startedAt = Date.now();
             const streamState = streaming ? createLLMStreamState(provider) : null;
             let settled = false;
@@ -8567,6 +8587,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     responseChars: responseText.length,
                     finishReason: String(finishReason || ''),
                 };
+                if (inputTokens || outputTokens) addUsage(provider, inputTokens, outputTokens, model);
                 if (isLLMTruncatedFinishReason(finishReason)) {
                     settled = true;
                     if (!_ackTesting) {
@@ -8579,14 +8600,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     return;
                 }
                 settled = true;
-                if (inputTokens) addUsage(provider, inputTokens, outputTokens, model);
                 if (!_ackTesting) {
                     console.groupCollapsed(`ACKtopus: LLM response ← ${label} (${inputTokens}→${outputTokens} tokens)`);
                     console.log('metadata:', meta);
                     console.log(responseText);
                     console.groupEnd();
                 }
-                if (promptKey) {
+                if (promptKey && cacheEpoch === _llmCacheEpoch && getLLMConfig().cacheEnabled) {
                     GM_setValue(promptKey, responseText);
                     recordCacheTimestamp(promptKey);
                 }
@@ -8648,6 +8668,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 ontimeout: (e) => rejectWithLoggedError('request timed out', formatTransportErrorDetails(e), e),
             });
         });
+        if (!requestKey) return request;
+        const tracked = request.finally(() => {
+            if (_llmRequests.get(requestKey) === tracked) _llmRequests.delete(requestKey);
+        });
+        _llmRequests.set(requestKey, tracked);
+        return tracked;
     }
 
     function parseProviderError(response) {
@@ -8862,7 +8888,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const key = prPatchCacheKey(pr, baseSha, headSha);
         if (!key) return Promise.resolve(request);
         const tracked = Promise.resolve(request).catch((error) => {
-            _prPatchCache.delete(key);
+            if (_prPatchCache.get(key) === tracked) _prPatchCache.delete(key);
             throw error;
         });
         _prPatchCache.delete(key);
@@ -8913,7 +8939,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     async function fetchPRPatchFilePaths(pr) {
-        return extractPatchFilePaths(await fetchPatch(pr));
+        // Only the aggregate diff identifies files still changed in the final PR
+        return extractPatchFilePaths(await gmFetchText(
+            `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.pr}.diff`, { freshForMs: 0 },
+        ));
     }
 
     function comparePatchUrl(path = location.pathname) {
@@ -8966,8 +8995,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 };
             }
             const linked = await fetchPRContext({ owner: pr.owner, repo: pr.repo, pr: pr.pr });
-            if (comparePatch) linked.diff = comparePatch;
-            return linked;
+            return comparePatch ? { ...linked, diff: comparePatch } : linked;
         }
         const generation = _prContextGeneration;
         let complete = false;
@@ -8975,7 +9003,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         try {
             const [patchResp, commitsResp, prResp] = await Promise.allSettled([
                 fetchPatch(pr),
-                gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=100`),
+                fetchPagedGithubRows((page) =>
+                    `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/commits?per_page=100&page=${page}`, 20),
                 gmFetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`),
             ]);
             if (patchResp.status === 'fulfilled') ctx.diff = patchResp.value;
@@ -9325,7 +9354,6 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         try {
             prInfo = await gmFetch(
                 `https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`,
-                { freshForMs: 0 },
             );
         } catch (_) {
             return null;
@@ -15105,7 +15133,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     }
                     if (resp.status < 200 || resp.status >= 300) {
                         if (isGithubRateLimitResponse(resp)) rememberGithubRateLimit(resp, headers);
-                        else if (resp.status === 401 || resp.status === 403) rememberGithubBadPat(resp);
+                        else if (resp.status === 401 || resp.status === 403) rememberGithubBadPat(resp, headers);
                         reject(githubHttpError(resp, url));
                         return;
                     }
@@ -17009,6 +17037,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: `https://keys.openpgp.org/vks/v1/by-keyid/${upper}`,
+                timeout: 15000,
                 onload: (r) => {
                     const key = r.status >= 200 && r.status < 300 ? r.responseText : null;
                     // Persist to GM storage
@@ -17022,13 +17051,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 onerror: () => {
                     resolve(null);
                 },
+                ontimeout: () => resolve(null),
             });
         });
         pgpKeyCache.set(upper, promise);
         // Evict failed lookups once settled (keeps in-flight dedup) so transient
         // keyserver errors don't poison the cache for the whole session.
         promise.then((key) => {
-            if (!key) pgpKeyCache.delete(upper);
+            if (!key && pgpKeyCache.get(upper) === promise) pgpKeyCache.delete(upper);
         });
         return promise;
     }
@@ -17962,9 +17992,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         waiting: jevJobs.length,
                     }, { key: kind, intervalMs: 2000 });
                     const result = await jevPost(kind, state, questions, 0, pageKey);
-                    if (epoch !== jevEpoch || location.pathname !== routePath || !jevEnabled()) return resolve(null);
-                    if (!readingEnabled()) return resolve(null);
+                    if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
+                    if (location.pathname !== routePath || !readingEnabled()) return resolve(null);
                     const completed = jevDiagnosticCount('completed', kind);
                     jevDiagnostic('request completed', {
                         kind,
@@ -17982,7 +18012,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     resolve(null);
                 } finally {
                     if (pageKey === jevPageKey) jevPageScheduled = Math.max(0, jevPageScheduled - 1);
-                    jevPending.delete(id);
+                    if (jevPending.get(id) === pending) jevPending.delete(id);
                 }
             };
             run.jevKind = kind;
@@ -17998,9 +18028,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 active: jevActive,
                 waiting: jevJobs.length,
             }, { key: kind, intervalMs: 1500 });
-            jevPump();
         });
         jevPending.set(id, pending);
+        jevPump();
         return pending;
     }
 
@@ -19280,7 +19310,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevChangedRow(row) {
-        const cells = [...row.querySelectorAll('td.blob-code, td.diff-text, td.diff-text-cell')];
+        const cells = [...row.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell')];
         if (!cells.length) cells.push(...row.querySelectorAll('[data-testid="diff-line-content"]'));
         const rowSignal = `${row.className || ''} ${row.getAttribute('data-diff-line-type') || ''}`;
         const kindFromSignal = (signal) => {
@@ -19301,7 +19331,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ].join(' ');
             const signaled = kindFromSignal(signal);
             if (signaled) return signaled;
-            const marker = line?.querySelector?.('.diff-text-marker')?.textContent?.trim();
+            const marker = cell.getAttribute?.('data-code-marker') || line?.getAttribute?.('data-code-marker') ||
+                line?.querySelector?.('.diff-text-marker')?.textContent?.trim();
             if (marker === '+') return 'addition';
             if (marker === '-') return 'deletion';
             return '';
@@ -24845,7 +24876,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const page = pages[index];
                 const rows = batches[index];
                 nextPage = page + 1;
-                if (!Array.isArray(rows) || rows.length === 0) {
+                if (!Array.isArray(rows)) throw new Error('GitHub paginated response was not an array');
+                if (rows.length === 0) {
                     rememberGithubPagedHint(urlForPage, page);
                     return out;
                 }
@@ -24859,7 +24891,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
         for (let page = nextPage; page <= maxPages; page++) {
             const rows = await fetchPage(urlForPage(page));
-            if (!Array.isArray(rows) || rows.length === 0) {
+            if (!Array.isArray(rows)) throw new Error('GitHub paginated response was not an array');
+            if (rows.length === 0) {
                 rememberGithubPagedHint(urlForPage, page);
                 return out;
             }
@@ -26207,14 +26240,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // Build a symbol → diff-anchor map from the commit diff visible on the page.
     // Scans added lines for function/class/variable/type definitions.
-    function buildDiffSymbolIndex() {
-        const index = {}; // { name: { anchor, line, file, context } }
-        const files = document.querySelectorAll('.js-file, [data-testid="diff-file"], .file');
+    function buildDiffSymbolIndex(root = document) {
+        const index = Object.create(null); // { name: { anchor, line, file, context } }
+        const files = qsa(root, DIFF_FILE_SELECTOR);
         for (const file of files) {
-            const fileName =
-                file
-                    .querySelector('.file-header [title], .file-info a, [data-testid="file-name"]')
-                    ?.textContent?.trim() || '';
+            const fileName = readDiffFilePath(file);
             const anchor =
                 file.querySelector('[data-diff-anchor]')?.getAttribute('data-diff-anchor') ||
                 file
@@ -26223,12 +26253,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     ?.match(/#(diff-\w+)/)?.[1] ||
                 '';
 
-            // Scan added lines (green lines in the diff)
-            const rows = file.querySelectorAll('td.blob-code-addition, td.blob-code-inner[data-code-marker="+"]');
-            for (const cell of rows) {
-                const text = cell.textContent?.trim() || '';
-                const lineNum =
-                    cell.closest('tr')?.querySelector('[data-line-number]')?.getAttribute('data-line-number') || '';
+            // Share changed-side detection with the reading guide
+            const additions = [...file.querySelectorAll('tr')].flatMap((row) =>
+                (jevChangedRow(row)?.parts || []).filter((part) => !part.deleted));
+            for (const { cell, fullText } of additions) {
+                const text = fullText.trim();
+                const meta = getDiffSelectionLineMeta(cell);
+                const lineNum = meta?.lineNum || '';
+                const lineAnchor = meta?.anchorId || cell.closest('[data-line-anchor]')?.getAttribute('data-line-anchor') ||
+                    (anchor && lineNum ? `${anchor}R${lineNum}` : anchor);
 
                 // C/C++: function/method definition patterns
                 // e.g. "void FuncName(", "bool CClass::Method(", "static int64_t GetSize("
@@ -26251,7 +26284,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 let cur = tr;
                 for (let i = 0; i < 2 && cur?.previousElementSibling; i++) cur = cur.previousElementSibling;
                 for (let i = 0; i < 5 && cur; i++) {
-                    const code = cur.querySelector('td.blob-code')?.textContent?.trim();
+                    const code = cur.querySelector('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell')?.textContent?.trim();
                     if (code) contextLines.push(code);
                     cur = cur.nextElementSibling;
                 }
@@ -26261,7 +26294,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         continue;
                     if (!index[name]) {
                         index[name] = {
-                            anchor: anchor && lineNum ? `${anchor}R${lineNum}` : anchor,
+                            anchor: lineAnchor,
                             line: lineNum,
                             file: fileName,
                             context: contextLines.join('\n'),
@@ -30894,6 +30927,346 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackSource && _ackSource.length > 0) return;
         _ackSource = stripSelfTestsFromSource(getSelfSource());
     }
+
+    ackTest('GitHub credential state belongs to the request token', () => {
+        const oldHeaders = { Authorization: 'Bearer old-token' };
+        const newHeaders = { Authorization: 'Bearer replacement-token' };
+        GM_setValue('github_pat', 'replacement-token');
+        rememberGithubBadPat({ status: 401 }, oldHeaders);
+        ackEq(_githubBadPat, '', 'a late rejection cannot disable the replacement token');
+        const repoKey = currentGithubRepoKey();
+        rememberGithubPatRepoAccess(`https://api.github.com/repos/${repoKey}`, oldHeaders, 'denied');
+        ackEq(githubPatRepoAccessState(repoKey), '', 'old permissions cannot be assigned to a new token');
+        const oldBucket = githubAuthBucket(oldHeaders);
+        rememberGithubRateLimit({ status: 429, responseText: 'rate limit exceeded' }, oldHeaders);
+        ackEq(githubRateLimitPreflightError('https://api.github.com/user', newHeaders), null,
+            'the replacement token keeps its independent rate limit');
+        ackAssert(!!githubRateLimitPreflightError('https://api.github.com/user', oldHeaders),
+            'the old request token remains rate limited');
+        GM_setValue('github_pat', 'old-token');
+        ackEq(githubAuthBucket(oldHeaders), oldBucket, 'switching back cannot reset the same token budget');
+    });
+
+    ackTest('PR context includes commits beyond the first API page', async () => {
+        const originalFetch = gmFetch;
+        const originalPatch = fetchPatch;
+        const rows = Array.from({ length: 101 }, (_, index) => ({
+            sha: index.toString(16).padStart(40, '0'), commit: { message: `Commit ${index}` },
+        }));
+        const pages = [];
+        try {
+            fetchPatch = async () => 'patch';
+            gmFetch = async (url) => {
+                if (!url.includes('/commits?')) return { title: 'Large PR' };
+                const page = Number(new URL(url).searchParams.get('page'));
+                pages.push(page);
+                return rows.slice((page - 1) * 100, page * 100);
+            };
+            const ctx = await fetchPRContext({ owner: 'audit', repo: 'context', pr: '1' });
+            ackAssert(ctx.commitMessages.includes('Commit 100'), 'the final commit is available to review prompts');
+            ackEq(ctx.commitMessages.split('\n').length, 101);
+            ackDeepEq(pages, [1, 2]);
+        } finally {
+            gmFetch = originalFetch;
+            fetchPatch = originalPatch;
+            invalidatePRContext();
+        }
+    });
+
+    ackTest('paged GitHub reads reject malformed pages instead of serving a partial list', async () => {
+        const url = (page) => `https://api.github.com/repos/audit/pages/issues/1/comments?per_page=100&page=${page}`;
+        for (const knownPages of [0, 2]) {
+            GM_deleteValue(GITHUB_PAGED_HINTS_KEY);
+            if (knownPages) rememberGithubPagedHint(url, knownPages);
+            let error;
+            try {
+                await fetchPagedGithubRows(url, 2, async (pageUrl) =>
+                    pageUrl.endsWith('page=1') ? Array(100).fill({ id: 1 }) : { message: 'not a list' });
+            } catch (e) { error = e; }
+            ackAssert(error?.message.includes('not an array'), 'both discovery and hinted pages reject invalid data');
+            ackEq(githubPagedHint(url), knownPages, 'the failure cannot establish a shorter complete list');
+        }
+    });
+
+    ackTest('comparison fallback uses final files after an intermediate change is reverted', async () => {
+        const originalText = gmFetchText;
+        const calls = [];
+        try {
+            gmFetchText = async (url) => {
+                calls.push(url);
+                return url.endsWith('.diff') ? 'diff --git a/kept.cpp b/kept.cpp\n' :
+                    'diff --git a/reverted.cpp b/reverted.cpp\ndiff --git a/kept.cpp b/kept.cpp\n';
+            };
+            ackDeepEq(await fetchPRPatchFilePaths({ owner: 'audit', repo: 'compare', pr: '1' }), ['kept.cpp'],
+                'the reverted intermediate file does not become relevant');
+            ackEq(calls.length, 1, 'one aggregate diff provides the final file set');
+        } finally { gmFetchText = originalText; }
+    });
+
+    ackTest('comparison loading cannot install its filter after navigation', async () => {
+        const oldUrl = location.href;
+        const oldFetch = gmFetch;
+        const oldActive = _compareActive;
+        const oldPath = _comparePath;
+        const oldFilter = _compareJevFilter;
+        const oldLifetime = ensureAckLifetime;
+        const beforeStyle = document.getElementById('ack-compare-collapse');
+        const lifetime = { signal: { aborted: false }, onAbort() {} };
+        let finish;
+        try {
+            history.replaceState(null, '', '/audit/compare/compare/' + 'a'.repeat(40) + '...' + 'b'.repeat(40) + '?pr=1');
+            ensureAckLifetime = () => lifetime;
+            _compareActive = false;
+            _comparePath = '';
+            gmFetch = () => new Promise((resolve) => { finish = resolve; });
+            const work = autoCollapseCompareFiles();
+            history.replaceState(null, '', '/audit/compare/pull/2');
+            lifetime.signal.aborted = true;
+            finish([{ filename: 'old.cpp' }]);
+            await work;
+            ackEq(document.getElementById('ack-compare-collapse'), beforeStyle,
+                'the old async pass adds no stylesheet to the new page');
+            ackEq(_compareJevFilter, null, 'the old pass does not mark the new comparison filter ready');
+        } finally {
+            history.replaceState(null, '', oldUrl);
+            gmFetch = oldFetch;
+            ensureAckLifetime = oldLifetime;
+            _compareActive = oldActive;
+            _comparePath = oldPath;
+            _compareJevFilter = oldFilter;
+            document.querySelectorAll('.ack-compare-status').forEach((element) => element.remove());
+        }
+    });
+
+    ackTest('an older patch failure cannot evict its replacement', async () => {
+        const pr = { owner: 'audit', repo: 'patch', pr: '1' };
+        const base = 'a'.repeat(40), head = 'b'.repeat(40);
+        let rejectOld;
+        const old = rememberExactPRPatch(pr, base, head, new Promise((_, reject) => { rejectOld = reject; }));
+        const replacement = rememberExactPRPatch(pr, base, head, 'new patch');
+        rejectOld(new Error('old request failed'));
+        await old.catch(() => {});
+        ackEq(await _prPatchCache.get(prPatchCacheKey(pr, base, head)), 'new patch',
+            'the replacement survives the old failure');
+        ackEq(await replacement, 'new patch');
+        _prPatchCache.delete(prPatchCacheKey(pr, base, head));
+    });
+
+    ackTest('identical in-flight LLM prompts share one paid request and retry failures', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPage = parsePageContext;
+        const callbacks = [];
+        try {
+            parsePageContext = () => ({ owner: 'audit', repo: 'llm', pr: '1' });
+            GM_setValue('llm_claude_key', 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            GM_xmlhttpRequest = (options) => { callbacks.push(options); };
+            const opts = { maxTokens: 100 };
+            const first = callLLM('claude', 'shared', 'prompt', opts);
+            const second = callLLM('claude', 'shared', 'prompt', opts);
+            ackEq(callbacks.length, 1, 'identical concurrent prompts make one request');
+            callbacks[0].onerror({ statusText: 'failure' });
+            const failed = await Promise.allSettled([first, second]);
+            ackAssert(failed.every((item) => item.status === 'rejected'), 'both callers receive the failure');
+            const retry = callLLM('claude', 'shared', 'prompt', opts);
+            const other = callLLM('claude', 'shared', 'different prompt', opts);
+            ackEq(callbacks.length, 3, 'failures retry and different prompts remain independent');
+            for (const callback of callbacks.slice(1)) callback.onload({ status: 200,
+                responseText: JSON.stringify({ content: [{ text: 'reply' }] }) });
+            ackDeepEq(await Promise.all([retry, other]), ['reply', 'reply']);
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            parsePageContext = originalPage;
+            if (typeof _llmRequests !== 'undefined') _llmRequests.clear();
+        }
+    });
+
+    ackTest('clearing PR caches prevents an older LLM reply from restoring its prompt cache', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalPage = parsePageContext;
+        let callback;
+        try {
+            parsePageContext = () => ({ owner: 'audit', repo: 'llm', pr: '2' });
+            GM_setValue('llm_claude_key', 'test-key');
+            GM_setValue('llm_cache_enabled', true);
+            GM_xmlhttpRequest = (options) => { callback = options; };
+            const request = callLLM('claude', 'clear', 'prompt', { maxTokens: 100 });
+            const key = buildPromptCacheKey('claude', LLM_MODELS.claude, 'clear', 'prompt', '', 100);
+            clearCacheForPR();
+            callback.onload({ status: 200, responseText: JSON.stringify({ content: [{ text: 'reply' }] }) });
+            ackEq(await request, 'reply', 'the active caller still receives its requested answer');
+            ackEq(GM_getValue(key, null), null, 'the cleared entry stays empty');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            parsePageContext = originalPage;
+        }
+    });
+
+    ackTest('Jev caches paid results completed after navigation and releases skipped jobs', async () => {
+        const originalEnabled = jevEnabled;
+        const originalPublic = jevPublicRepository;
+        const originalPost = jevPost;
+        const oldUrl = location.href;
+        const pr = { owner: 'audit', repo: 'jev', pr: '1' };
+        const state = { audit: 'late result' };
+        const id = jevCacheId('hunk', state);
+        const result = { model: 'fixture', answers: {} };
+        let finish;
+        try {
+            jevEnabled = () => false;
+            await jevEvaluate(pr, 'hunk', state);
+            ackEq(jevPending.has(id), false, 'a synchronously skipped job does not stay pending forever');
+            jevEnabled = () => true;
+            jevPublicRepository = async () => true;
+            jevPost = () => new Promise((resolve) => { finish = resolve; });
+            const request = jevEvaluate(pr, 'hunk', state);
+            await Promise.resolve();
+            history.replaceState(null, '', '/audit/jev/pull/2');
+            const replacement = Promise.resolve(result);
+            jevPending.set(id, replacement);
+            finish(result);
+            ackEq(await request, null, 'the old page does not receive an annotation');
+            ackDeepEq(jevReadCache(id), result, 'revisiting can reuse the already paid result');
+            ackEq(jevPending.get(id), replacement, 'an older completion cannot remove a replacement request');
+        } finally {
+            jevPending.delete(id);
+            history.replaceState(null, '', oldUrl);
+            jevEnabled = originalEnabled;
+            jevPublicRepository = originalPublic;
+            jevPost = originalPost;
+            jevDeleteCacheForPR('audit/jev#1');
+        }
+    });
+
+    ackTest('Jev commit metadata shares fresh GitHub reads but revalidates detected edits', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const originalResolve = resolveFullCommitSha;
+        const originalPatch = fetchFullCommitPatch;
+        const pr = { owner: 'audit', repo: 'jev-context', pr: '1' };
+        const sha = 'c'.repeat(40);
+        let calls = 0;
+        let description = 'Original description';
+        try {
+            GM_setValue('github_pat', '');
+            resolveFullCommitSha = async () => sha;
+            fetchFullCommitPatch = async () => `From ${sha} date\nSubject: [PATCH] Change\n\n\ndiff --git a/file b/file\n+changed\n`;
+            GM_xmlhttpRequest = (options) => {
+                calls++;
+                options.onload({ status: 200, responseHeaders: 'etag: "metadata"',
+                    responseText: JSON.stringify({ body: description }) });
+            };
+            clearJevCommitReviewContexts();
+            const first = await fetchJevCommitReviewContext(pr, sha);
+            const second = await fetchJevCommitReviewContext(pr, sha);
+            ackEq(calls, 1, 'successive annotations share the freshly fetched description');
+            ackEq(first, second, 'unchanged exact context is reused');
+            description = 'Edited description';
+            markGithubHttpCacheStaleForPR('audit/jev-context#1');
+            const edited = await fetchJevCommitReviewContext(pr, sha);
+            ackEq(calls, 2, 'a detected edit forces a new GitHub read');
+            ackEq(edited.description, description, 'changed description remains part of context identity');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
+            resolveFullCommitSha = originalResolve;
+            fetchFullCommitPatch = originalPatch;
+            clearJevCommitReviewContexts();
+        }
+    });
+
+    ackTest('model validation rejects schema errors and ignores an older key check', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        const status = document.createElement('span');
+        const requests = [];
+        try {
+            GM_xmlhttpRequest = (options) => { requests.push(options); };
+            validateKey('claude', 'old-key', status);
+            const oldRequests = requests.splice(0);
+            validateKey('claude', 'new-key', status);
+            for (const options of requests) options.onload({ status: 400,
+                responseText: JSON.stringify({ error: { message: 'request schema rejected' } }) });
+            await Promise.resolve();
+            await Promise.resolve();
+            ackEq(status.textContent, '❌', 'HTTP 400 does not prove a model is usable');
+            ackAssert(status.title.includes('request schema rejected'), 'validation exposes the rejection reason');
+            for (const options of oldRequests) options.onload({ status: 200, responseText: '{}' });
+            await Promise.resolve();
+            await Promise.resolve();
+            ackEq(status.textContent, '❌', 'older validation cannot make the replacement key appear valid');
+            validateKey('claude', '', status);
+            ackEq(status.title, '', 'clearing the key also clears the old diagnostic');
+        } finally { GM_xmlhttpRequest = originalRequest; }
+    });
+
+    ackTest('diff symbol links share current and classic changed-side detection', () => {
+        const root = document.createElement('div');
+        root.innerHTML = `<div data-testid="diff-file" data-path="src/new.cpp"><table data-diff-anchor="diff-modern"><tbody>
+            <tr data-line-anchor="diff-modernR42"><td data-line-number="12" data-diff-side="left"></td>
+                <td class="diff-text-cell"><code class="diff-text deletion"><span class="diff-text-inner">void OldFunction() {</span></code></td>
+                <td data-line-number="42" data-diff-side="right"></td>
+                <td class="diff-text-cell"><code class="diff-text addition"><span class="diff-text-inner">void NewFunction() {</span></code></td></tr>
+            </tbody></table></div>
+            <div class="js-file" data-path="src/classic.cpp"><table><tbody><tr>
+                <td id="diff-classicL7" data-line-number="7"></td><td class="blob-code blob-code-deletion">void RemovedFunction() {</td>
+                <td id="diff-classicR17" data-line-number="17"></td><td class="blob-code-inner" data-code-marker="+">void ClassicFunction() {</td>
+            </tr></tbody></table></div>`;
+        const index = buildDiffSymbolIndex(root);
+        ackEq(index.NewFunction?.anchor, 'diff-modernR42');
+        ackEq(index.NewFunction?.line, '42');
+        ackEq(index.NewFunction?.file, 'src/new.cpp');
+        ackEq(index.ClassicFunction?.anchor, 'diff-classicR17');
+        ackEq(index.ClassicFunction?.line, '17');
+        ackEq(index.ClassicFunction?.file, 'src/classic.cpp');
+        ackAssert(!index.OldFunction && !index.RemovedFunction, 'deleted definitions cannot take the added symbol link');
+    });
+
+    ackTest('PGP key lookups time out and remain retryable', async () => {
+        const request = GM_xmlhttpRequest;
+        const key = 'AUDIT-TIMEOUT';
+        const calls = [];
+        try {
+            GM_xmlhttpRequest = (options) => { calls.push(options); return { abort() {} }; };
+            const first = fetchPGPKey(key);
+            const shared = fetchPGPKey(key);
+            ackEq(calls.length, 1, 'in-flight key lookups are shared');
+            ackEq(calls[0].timeout, 15000, 'the spinner has a bounded wait');
+            calls[0].ontimeout();
+            ackEq(await first, null);
+            ackEq(await shared, null);
+            const retry = fetchPGPKey(key);
+            ackEq(calls.length, 2, 'timeout cannot poison the session cache');
+            pgpKeyCache.delete(key);
+            const replacement = fetchPGPKey(key);
+            calls[1].ontimeout();
+            ackEq(await retry, null);
+            ackAssert(pgpKeyCache.has(key), 'an older timeout cannot evict a replacement lookup');
+            calls[2].onload({ status: 200, responseText: 'public-key' });
+            ackEq(await replacement, 'public-key');
+        } finally {
+            GM_xmlhttpRequest = request;
+            pgpKeyCache.delete(key);
+        }
+    });
+
+    ackTest('comparison context cannot overwrite the cached final PR diff', async () => {
+        const originalFetch = gmFetch;
+        const originalPatch = fetchPatch;
+        const originalCompare = fetchComparePatch;
+        try {
+            gmFetch = async (url) => url.includes('/commits?') ? [] : { title: 'PR' };
+            fetchPatch = async () => 'final PR diff';
+            fetchComparePatch = async () => 'historical comparison diff';
+            const ctx = await fetchPRContext({ owner: 'audit', repo: 'context', pr: '1',
+                compare: true, compareBase: 'old', compareHead: 'new' });
+            ackEq(ctx.diff, 'historical comparison diff');
+            ackEq(_prContextCache.diff, 'final PR diff', 'synchronous PR consumers retain the final diff');
+            ackAssert(ctx !== _prContextCache, 'comparison context has its own value');
+        } finally {
+            gmFetch = originalFetch;
+            fetchPatch = originalPatch;
+            fetchComparePatch = originalCompare;
+            invalidatePRContext();
+        }
+    });
 
     // --- parsePR ---
 
@@ -44073,7 +44446,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         const fn = source.slice(source.indexOf('function gmFetch'), source.indexOf('function gmFetchText'));
         ackAssert(fn.includes('ghApiHeaders()'), 'captures request headers once');
         ackAssert(fn.includes('githubRateLimitPreflightError(url, headers)'), 'skips known rate-limited auth bucket');
-        ackAssert(fn.includes('rememberGithubBadPat(r)'), 'memoizes invalid PAT before retrying anonymously');
+        ackAssert(fn.includes('rememberGithubBadPat(r, headers)'), 'memoizes invalid PAT before retrying anonymously');
         ackAssert(fn.includes('fallbackPreflight'), 'checks anonymous rate limit before fallback request');
         ackAssert(fn.includes('rememberGithubRateLimit(r2, fallbackHeaders)'), 'memoizes anonymous fallback rate limit');
     });
@@ -48525,6 +48898,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             }
             ackAssert(err, 'truncated response should reject');
             ackAssert(err.message.includes('response truncated'), 'reports truncation clearly');
+            ackEq(getUsage('claude').output, 4096, 'provider-reported billed output includes truncated responses');
             ackEq(GM_getValue(promptKey, null), null, 'does not cache partial truncated response');
         } finally {
             if (promptKey && typeof GM_deleteValue === 'function') GM_deleteValue(promptKey);
@@ -51329,10 +51703,10 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function buildDiffSymbolIndex'),
             source.indexOf('function linkifyPseudocode'),
         );
-        ackAssert(fn.includes('.js-file'), 'scans diff files');
-        ackAssert(fn.includes('blob-code-addition'), 'targets added lines');
+        ackAssert(fn.includes('DIFF_FILE_SELECTOR'), 'shares supported diff file layouts');
+        ackAssert(fn.includes('!part.deleted'), 'targets added sides');
         ackAssert(fn.includes('data-diff-anchor'), 'reads diff anchors');
-        ackAssert(fn.includes('data-line-number'), 'reads line numbers');
+        ackAssert(fn.includes('getDiffSelectionLineMeta'), 'shares side-aware line numbers');
         ackAssert(fn.includes('def|class'), 'matches Python definitions');
         ackAssert(fn.includes('struct|class|enum'), 'matches C++ type definitions');
     });
@@ -53136,7 +53510,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(patFn.includes('GM_xmlhttpRequest'), 'uses GM_xmlhttpRequest (bypasses CORS)');
         ackAssert(patFn.includes('Authorization'), 'sends Authorization header');
         ackAssert(patFn.includes('resp.status < 200 || resp.status >= 300'), 'rejects non-success HTTP responses');
-        ackAssert(patFn.includes('rememberGithubBadPat(resp)'), 'disables a rejected PAT');
+        ackAssert(patFn.includes('rememberGithubBadPat(resp, headers)'), 'disables a rejected PAT');
         ackAssert(patFn.includes('rememberGithubRateLimit(resp, headers)'), 'records GraphQL rate limits');
         ackAssert(patFn.includes('githubHttpError(resp, url)'), 'reports HTTP status and response context');
 
@@ -54300,8 +54674,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             rateLimitWarned: _rateLimitWarned,
             patInvalidWarned: _patInvalidWarned,
             githubBadPat: _githubBadPat,
-            githubAuthBucketPat: _githubAuthBucketPat,
-            githubAuthBucketId: _githubAuthBucketId,
             githubRateLimitedUntil: new Map(_githubRateLimitedUntil),
             githubPatRepoAccess: new Map(_githubPatRepoAccess),
             githubPatRepoAccessWarned: new Set(_githubPatRepoAccessWarned),
@@ -54379,8 +54751,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             _rateLimitWarned = false;
             _patInvalidWarned = '';
             _githubBadPat = '';
-            _githubAuthBucketPat = '';
-            _githubAuthBucketId = 0;
             _githubRateLimitedUntil.clear();
             _githubPatRepoAccess.clear();
             _githubPatRepoAccessRequests.clear();
@@ -54446,8 +54816,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             _rateLimitWarned = stateSnapshot.rateLimitWarned;
             _patInvalidWarned = stateSnapshot.patInvalidWarned;
             _githubBadPat = stateSnapshot.githubBadPat;
-            _githubAuthBucketPat = stateSnapshot.githubAuthBucketPat;
-            _githubAuthBucketId = stateSnapshot.githubAuthBucketId;
             _githubRateLimitedUntil.clear();
             for (const [bucket, until] of stateSnapshot.githubRateLimitedUntil) {
                 _githubRateLimitedUntil.set(bucket, until);
