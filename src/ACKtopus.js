@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.293
+// @version      1.294
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -1888,16 +1888,15 @@
             if (!root || !document.body.contains(root)) continue;
             if (root.classList?.contains('ack-diff-dialog-overlay')) continue;
             if (isAckOwnedReviewControl(root)) continue;
-            // A fixed child is viewport-relative only in a real top-layer
-            // dialog/popover. GitHub also uses .Overlay and role=dialog on
-            // ordinary transformed containers, which can place the proofread
-            // dialog far above or below the current viewport on tall pages.
+            // Keep previews inside the native outside-click and focus boundary.
+            // Ordinary transformed hosts need the preview's own top-layer popover
+            // so its fixed positioning still uses the viewport.
             let topLayer = false;
             try { topLayer = root.matches(':modal'); } catch (_) {}
             if (!topLayer) {
                 try { topLayer = root.matches(':popover-open'); } catch (_) {}
             }
-            if (!topLayer) continue;
+            if (!topLayer && typeof HTMLElement.prototype.showPopover !== 'function') continue;
             return root;
         }
         return null;
@@ -14157,9 +14156,23 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (e.target === overlay) rejectDialog();
             });
             mount.appendChild(overlay);
+            if (mount !== document.body && typeof overlay.showPopover === 'function') {
+                // Manual popovers keep DOM ownership without dismissing GitHub's
+                // existing auto popover. Top-layer positioning avoids host transforms.
+                overlay.setAttribute('popover', 'manual');
+                Object.assign(overlay.style, {
+                    margin: '0', padding: '0', border: '0', boxSizing: 'border-box',
+                    width: '100vw', height: '100dvh', maxWidth: 'none', maxHeight: 'none',
+                });
+                overlay.showPopover();
+                ackLogEvent('proofread: preview kept inside native dialog', {
+                    nativeRoot: mount.tagName.toLowerCase(),
+                    preview: 'manual popover',
+                });
+            }
             focusDialogAtTop();
             ackRaf(() => {
-                if (!overlay.isConnected || overlay.parentElement === document.body) return;
+                if (!overlay.isConnected || overlay.parentElement === document.body || overlay.hasAttribute('popover')) return;
                 const rect = dialog.getBoundingClientRect();
                 if (!rect.width && !rect.height) return;
                 const viewportHeight = window.visualViewport?.height || window.innerHeight;
@@ -36668,6 +36681,80 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    ackTest('Submit review proofreading keeps the floating editor open on Accept and Reject', async () => {
+        const original = { fetchPRContext, callLLM, showDiffDialog };
+        const originalPopover = HTMLElement.prototype.showPopover;
+        const shown = [];
+        HTMLElement.prototype.showPopover = function () {
+            shown.push(this);
+            if (originalPopover) originalPopover.call(this);
+        };
+        GM_setValue('activeProvider', 'claude');
+        GM_setValue('llm_claude_key', 'fixture-key');
+        try {
+            fetchPRContext = async () => ({ description: '', commitMessages: '', diff: '' });
+            callLLM = async () => '<output><s1>This is clear.</s1></output>';
+            for (const choice of ['Accept', 'Reject']) {
+                const native = document.createElement('div');
+                native.className = 'Overlay';
+                native.setAttribute('role', 'dialog');
+                native.style.transform = 'translateY(4000px)';
+                native.innerHTML = '<form><fieldset data-testid="markdown-editor"><markdown-toolbar for="ack-review-proofread-fixture"><button type="button" class="ack-toolbar-proofread">Proofread</button></markdown-toolbar><textarea id="ack-review-proofread-fixture" name="pull_request_review[body]">Thsi is clear.</textarea></fieldset><button type="submit">Submit review</button></form>';
+                document.body.appendChild(native);
+                let dismissals = 0;
+                let submissions = 0;
+                const dismissOutside = (event) => {
+                    if (!native.contains(event.target)) { dismissals++; native.remove(); }
+                };
+                const events = ['pointerdown', 'mousedown', 'mouseup', 'click', 'focusin'];
+                events.forEach((name) => document.addEventListener(name, dismissOutside, true));
+                native.querySelector('form').addEventListener('submit', (event) => {
+                    event.preventDefault();
+                    submissions++;
+                });
+                let ready;
+                const previewReady = new Promise((resolve) => { ready = resolve; });
+                showDiffDialog = (...args) => {
+                    const promise = original.showDiffDialog(...args);
+                    ready();
+                    return promise;
+                };
+                let timer;
+                try {
+                    const textarea = native.querySelector('textarea');
+                    const request = runProofreadOnComment(native.querySelector('.ack-toolbar-proofread'));
+                    await Promise.race([previewReady, new Promise((_, reject) => {
+                        timer = setTimeout(() => reject(new Error('proofread preview did not open')), 2000);
+                    })]);
+                    clearTimeout(timer);
+                    const overlay = document.querySelector('.ack-diff-dialog-overlay');
+                    ackAssert(overlay, 'the actual proofread preview appears');
+                    const button = [...overlay.querySelectorAll('button')].find((el) => el.textContent === choice);
+                    for (const type of ['pointerdown', 'mousedown', 'mouseup']) {
+                        button.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+                    }
+                    button.click();
+                    await request;
+                    ackAssert(native.isConnected, 'accepting or rejecting does not dismiss Submit review');
+                    ackEq(dismissals, 0, 'native capture handlers see preview actions inside their dialog');
+                    ackEq(submissions, 0, 'proofreading never submits the review');
+                    ackEq(textarea.value, choice === 'Accept' ? 'This is clear.' : 'Thsi is clear.');
+                    ackAssert(shown.includes(overlay), 'the transformed floating host uses a top-layer preview');
+                    ackEq(overlay.getAttribute('popover'), 'manual', 'the preview does not dismiss native auto popovers');
+                } finally {
+                    clearTimeout(timer);
+                    events.forEach((name) => document.removeEventListener(name, dismissOutside, true));
+                    native.remove();
+                    document.querySelectorAll('.ack-diff-dialog-overlay').forEach((el) => el.remove());
+                }
+            }
+        } finally {
+            ({ fetchPRContext, callLLM, showDiffDialog } = original);
+            if (originalPopover) HTMLElement.prototype.showPopover = originalPopover;
+            else delete HTMLElement.prototype.showPopover;
+        }
+    });
+
     ackTest('showDiffDialog switches between readable diff modes', async () => {
         const promise = showDiffDialog('First old sentence.\n\nSecond paragraph.', 'First new sentence.\n\nSecond paragraph expanded.');
         await new Promise((resolve) => setTimeout(resolve, 0));
@@ -37019,13 +37106,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
     });
 
-    ackTest('proofread dialog mounts only in real top-layer UI and reanchors if off-screen', () => {
+    ackTest('proofread dialog keeps native ownership and viewport positioning', () => {
         const mountFn = sourceSection(_ackSource, 'function closestNativeDialogRoot', 'function waitForNextPaint');
         ackAssert(mountFn.includes("root.matches(':modal')"), 'recognizes modal dialogs in the top layer');
         ackAssert(mountFn.includes("root.matches(':popover-open')"), 'recognizes open popovers in the top layer');
-        ackAssert(mountFn.includes('if (!topLayer) continue'), 'rejects ordinary transformed overlay containers');
+        ackAssert(mountFn.includes('HTMLElement.prototype.showPopover'), 'ordinary hosts require top-layer preview support');
         const dialogFn = sourceSection(_ackSource, 'function showDiffDialog', 'async function runProofreadOnComment');
-        ackAssert(dialogFn.includes('outsideViewport'), 'checks final dialog geometry against the viewport');
+        ackAssert(dialogFn.includes('overlay.showPopover()'), 'uses the top layer inside ordinary native overlays');
+        ackAssert(dialogFn.includes('outsideViewport'), 'checks fallback dialog geometry against the viewport');
         ackAssert(dialogFn.includes('document.body.appendChild(overlay)'), 'reanchors an off-screen dialog to the body');
         ackAssert(dialogFn.includes("maxHeight: 'calc(100dvh - 32px)'"), 'keeps actions inside the visible viewport');
     });
