@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.295
+// @version      1.296
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -85,6 +85,8 @@
         '.ack-jev-line-anchor>.ack-jev-badges{position:absolute;top:1px;right:2px;z-index:2;margin:0;padding:0 2px;white-space:nowrap;background:var(--bgColor-default,Canvas);border-radius:3px}',
         '.ack-jev-reading-background,.ack-jev-reading-background *{color:var(--fgColor-muted,#8b949e)!important}',
         '.ack-jev-reading-background{opacity:.48}',
+        '.ack-jev-pr-list-title.ack-jev-reading-foreground{font-weight:400!important}',
+        '.ack-jev-pr-list-badges{display:inline-flex;gap:3px;margin-left:5px;vertical-align:middle}',
         '.ack-jev-reading-foreground{opacity:.76}',
         '.ack-jev-reading-essence,.ack-jev-reading-essence *{font-weight:900!important}',
         '.ack-jev-line-priority-anchor{padding-inline-start:20px!important}',
@@ -5474,6 +5476,7 @@
         const href = opts.href || location.href;
         if (!isPullRequestListPage(path)) return;
         addPullRequestListSizes(root, opts);
+        queueJevPullRequestList(root, opts);
         const login = getCurrentGitHubLogin(root);
         if (!login) return;
         const doc = root?.ownerDocument || document;
@@ -17283,7 +17286,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // These are review leads, not correctness verdicts. Only public GitHub
     // repository content is sent to TypeSafe, and only after opt-in.
     const JEV_MODEL = 'jev-latest';
-    const JEV_SCHEMA = { commit: 4, hunk: 4, line: 4, description: 4, comment: 5, stack: 3 };
+    const JEV_SCHEMA = { commit: 4, hunk: 4, line: 4, description: 4, comment: 5, stack: 3, pr_list: 1 };
     const JEV_CACHE_KEY = 'jev_annotations_v1';
     const JEV_CACHE_INDEX_KEY = 'jev_annotations_v2:index';
     const JEV_CACHE_ENTRY_PREFIX = 'jev_annotations_v2:entry:';
@@ -17299,6 +17302,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const JEV_STACK_MAX_STATE_CHARS = 80000;
     const JEV_SECRET_RE = /(?:apikey_[A-Za-z0-9_]{20,}|(?:github_pat|ghp)[_-][A-Za-z0-9_-]{20,}|(?:^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
     const JEV_QUESTIONS = {
+        pr_list: {
+            classification: { type: 'choice', instructions: 'Rank this Bitcoin Core PR for the viewer\'s review interests, using its title, description, file paths and size. Prefer validation, coins, UTXOs, benchmarks and optimizations. Also prefer genuinely very simple pure refactors, code moves, dead-code removal and modernization. Usually deprioritize build, IPC, mining, logs, mempool, wallet, P2P, backports, CI and PSBT. Tests-only work is usually background unless it covers a preferred area. A large or mixed refactor is not automatically simple. Decide from the actual described scope, not a keyword alone. Metadata cannot prove correctness. Unclear evidence should be foreground. Author and participation rules are enforced separately.', criteria: {
+                background: 'Outside the viewer\'s interests or routine tests in an unpreferred area',
+                foreground: 'Potentially useful but mixed, uncertain, or moderately interesting',
+                essence_validation: 'Primarily important validation work',
+                essence_state: 'Primarily coins or UTXO work',
+                essence_performance: 'Primarily benchmarks or meaningful optimization',
+                essence_refactor: 'A very simple pure refactor, code move, dead-code removal or modernization',
+            } },
+        },
         commit: {
             role: { type: 'choice', instructions: 'What is the primary role of this complete parent-relative commit patch within the pull request described by state.pr_description? Judge the patch together with the exact full commit message.', criteria: {
                 test: 'Adds or strengthens an executable test or characterization',
@@ -17621,6 +17634,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         GM_setValue(JEV_LINE_READING_KEY, !!enabled);
         clearJevLineAnnotations();
         clearJevDescriptionAnnotations();
+        clearJevPullRequestList();
         resetJevTrackers();
         updateGithubReviewOptions();
         if (enabled && (jevLineReadingEnabled() || jevDescriptionReadingEnabled())) {
@@ -17770,10 +17784,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         document.querySelectorAll('.ack-jev-badges, .ack-jev-stack-summary').forEach((element) => element.remove());
         clearJevLineAnnotations();
         clearJevDescriptionAnnotations();
+        clearJevPullRequestList();
         resetJevTrackers();
     }
 
     function jevRequeueEmptyAnnotations(root = document) {
+        if (isPullRequestListPage() && jevEnabled()) {
+            jevPullListRecords.clear();
+            queueJevPullRequestList(root);
+            return;
+        }
         if (!jevEnabled() || !jevReviewPageContext()) return;
         root.querySelectorAll('.ack-jev-badges:empty').forEach((slot) => slot.remove());
         resetJevTrackers();
@@ -17782,7 +17802,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevRetryPublicCheck(key, root = document) {
-        const current = jevReviewPageContext();
+        const current = isPullRequestListPage() ? parseGitHubRepoPath(location.pathname) : jevReviewPageContext();
         if (!current || `${current.owner}/${current.repo}`.toLowerCase() !== key || !jevEnabled()) return;
         jevPublicChecks.delete(key);
         jevRequeueEmptyAnnotations(root);
@@ -17945,9 +17965,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Callers that already derived the cache id pass it to avoid rehashing the state.
     function jevEvaluate(pr, kind, state, questions = JEV_QUESTIONS[kind], id = jevCacheId(kind, state, questions)) {
         const epoch = jevEpoch;
-        const readingRequest = kind === 'line' || kind === 'description';
+        const readingRequest = kind === 'line' || kind === 'description' || kind === 'pr_list';
         const readingEnabled = () => kind === 'line' ? jevLineReadingEnabled()
-            : kind === 'description' ? jevDescriptionReadingEnabled() : true;
+            : kind === 'description' ? jevDescriptionReadingEnabled()
+                : kind === 'pr_list' ? jevEnabled() && jevLineReadingPreferred() : true;
         if (!readingEnabled()) {
             jevDiagnostic('work skipped', { kind, reason: jevReadingUnavailableReason(kind) }, { key: kind, intervalMs: 2000 });
             return Promise.resolve(null);
@@ -17981,10 +18002,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
         jevPageScheduled++;
         const routePath = location.pathname;
+        const routeHref = location.href;
         const pending = new Promise((resolve) => {
             const run = async () => {
                 try {
-                    if (location.pathname !== routePath) return resolve(null);
+                    if (location.pathname !== routePath || (kind === 'pr_list' && location.href !== routeHref)) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
                     jevDiagnostic('work waiting for public check', {
                         kind,
@@ -17992,7 +18014,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         waiting: jevJobs.length,
                     }, { key: kind, intervalMs: 2000 });
                     if (!jevEnabled() || !(await jevPublicRepository(pr))) return resolve(null);
-                    if (location.pathname !== routePath) return resolve(null);
+                    if (location.pathname !== routePath || (kind === 'pr_list' && location.href !== routeHref)) return resolve(null);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
                     if (!readingEnabled()) return resolve(null);
                     if (jevPagePostAttempts >= JEV_MAX_REQUESTS_PER_PAGE) return resolve(null);
@@ -18006,7 +18028,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const result = await jevPost(kind, state, questions, 0, pageKey);
                     if (epoch !== jevEpoch || !jevEnabled()) return resolve(null);
                     jevWriteCache(id, result, `${pr.owner}/${pr.repo}#${pr.pr}`);
-                    if (location.pathname !== routePath || !readingEnabled()) return resolve(null);
+                    if (location.pathname !== routePath || (kind === 'pr_list' && location.href !== routeHref) || !readingEnabled()) return resolve(null);
                     const completed = jevDiagnosticCount('completed', kind);
                     jevDiagnostic('request completed', {
                         kind,
@@ -20510,6 +20532,301 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }, { key: path, intervalMs: 1500, level: changeSignals && !changed.length ? 'warn' : 'log' });
     }
 
+
+    // Subject classifications persist by exact inputs. Live action evidence only
+    // lasts one minute and is scoped to the viewer, PAT, route and row revision.
+    const jevPullListRecords = new Map();
+    let jevPullListRunning = false;
+    let jevPullListRescan = false;
+    let jevPullListScope = '';
+    let jevPullListGeneration = 0;
+
+    function clearJevPullRequestList(root = document) {
+        jevPullListGeneration++;
+        qsa(root, '.ack-jev-pr-list-title').forEach((link) => {
+            link.classList.remove('ack-jev-pr-list-title', 'ack-jev-reading-background',
+                'ack-jev-reading-foreground', 'ack-jev-reading-essence');
+        });
+        qsa(root, '.ack-jev-pr-list-badges').forEach((slot) => slot.remove());
+        jevPullListRecords.clear();
+        const toggle = document.querySelector('.ack-jev-pr-list-toggle');
+        if (toggle) toggle.textContent = `Jev priorities: ${jevLineReadingPreferred() ? 'on' : 'off'}`;
+    }
+
+    function jevPullListControls() {
+        if (document.querySelector('.ack-jev-pr-list-toggle')) return;
+        const control = findPullsAuthorFilterControl(document);
+        const anchor = control?.closest('details') || control;
+        if (!anchor?.parentElement) return;
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-sm ack-jev-pr-list-toggle';
+        toggle.style.marginLeft = '6px';
+        toggle.textContent = `Jev priorities: ${jevLineReadingPreferred() ? 'on' : 'off'}`;
+        toggle.title = 'Toggle the Jev reading guide for PRs, code and prose';
+        toggle.addEventListener('click', () => setJevLineReadingPreferred(!jevLineReadingPreferred()));
+        const refresh = document.createElement('button');
+        refresh.type = 'button';
+        refresh.className = 'btn btn-sm ack-jev-pr-list-refresh';
+        refresh.textContent = '↻';
+        refresh.title = 'Refresh PR action evidence. Exact subject classifications remain cached.';
+        refresh.addEventListener('click', () => {
+            jevPullListGeneration++;
+            jevPullListRecords.clear();
+            queueJevPullRequestList();
+        });
+        anchor.insertAdjacentElement('afterend', refresh);
+        anchor.insertAdjacentElement('afterend', toggle);
+    }
+
+    function jevPullListQuery(entries) {
+        const variables = { owner: entries[0].pr.owner, repo: entries[0].pr.repo };
+        const declarations = ['$owner:String!', '$repo:String!'];
+        const fields = entries.map((entry, index) => {
+            declarations.push(`$n${index}:Int!`);
+            variables[`n${index}`] = Number(entry.pr.pr);
+            return `p${index}:pullRequest(number:$n${index}) {
+                number title body author { login } authorAssociation headRefOid updatedAt
+                additions deletions changedFiles mergeable mergeStateStatus isDraft
+                labels(first:30) { nodes { name } }
+                files(first:100) { nodes { path } pageInfo { hasNextPage } }
+                statusCheckRollup { state }
+                comments(last:100) { nodes { author { login } body createdAt } pageInfo { hasPreviousPage } }
+                reviews(last:100,states:[APPROVED,COMMENTED,CHANGES_REQUESTED,DISMISSED]) {
+                    nodes { author { login } body state submittedAt commit { oid } }
+                    pageInfo { hasPreviousPage }
+                }
+                reviewThreads(last:100) { nodes { isResolved comments(last:100) {
+                    nodes { author { login } body createdAt state }
+                    pageInfo { hasPreviousPage }
+                } } pageInfo { hasPreviousPage } }
+            }`;
+        });
+        const revision = hashPrompt(JSON.stringify(entries.map((e) => [e.identity, e.pr.headSha, e.pr.updatedAt, e.link?.textContent, _githubHttpPrGenerations.get(e.identity) || 0, jevPullListGeneration])));
+        return { variables, query: `query(${declarations.join(',')}) { repository(owner:$owner,name:$repo) { ${fields.join('\n')} } }\n# row revision ${revision}` };
+    }
+
+    function jevPullListFacts(data, viewer) {
+        const login = String(viewer || '').toLowerCase();
+        const author = String(data.author?.login || data.user?.login || '').toLowerCase();
+        const own = !!login && login === author;
+        const comments = data.comments?.nodes || [];
+        const reviews = (data.reviews?.nodes || []).filter((r) => r.state !== 'PENDING' && r.submittedAt);
+        const threads = data.reviewThreads?.nodes || [];
+        const threadComments = threads.flatMap((t) => (t.comments?.nodes || []).filter((c) => c.state === 'SUBMITTED'));
+        const published = [...comments, ...reviews, ...threadComments];
+        const byViewer = published.filter((c) => login && String(c.author?.login || '').toLowerCase() === login);
+        const complete = !!data.reviewThreads && !!data.reviews && !!data.comments &&
+            !data.comments.pageInfo?.hasPreviousPage && !data.reviews.pageInfo?.hasPreviousPage &&
+            !data.reviewThreads.pageInfo?.hasPreviousPage && !threads.some((t) => t.comments?.pageInfo?.hasPreviousPage);
+        const head = data.headRefOid || data.head?.sha || '';
+        // Only an explicit revision-bound ACK can be declared stale. A newer
+        // current ACK or withdrawal supersedes an earlier ACK.
+        const ackEvents = byViewer.flatMap((c) => {
+            const prose = String(c.body || '').replace(/```[\s\S]*?```/g, '').split('\n')
+                .filter((line) => !/^\s*>/.test(line)).join('\n').replace(/[*_`]/g, '');
+            const ack = prose.match(/(?:^|\n)\s*(?:tACK|ACK)\b[^\n]*?\b([a-f0-9]{7,40})\b/i);
+            const withdrew = /(?:^|\n)\s*(?:NACK|withdraw(?:n|ing)?\s+(?:my\s+)?ACK)\b/i.test(prose);
+            if (!ack && !withdrew) return [];
+            return [{ sha: withdrew ? '' : ack[1].toLowerCase(), at: c.submittedAt || c.createdAt || '' }];
+        }).sort((a, b) => b.at.localeCompare(a.at));
+        const staleAck = !!head && !!ackEvents[0]?.sha && !head.toLowerCase().startsWith(ackEvents[0].sha);
+        const member = ['MEMBER', 'OWNER', 'COLLABORATOR'].includes(data.authorAssociation || data.author_association);
+        const actions = [];
+        if (staleAck) actions.push(['🔄', `Your latest revision-bound ACK is for ${ackEvents[0].sha}, not head ${head.slice(0, 12)}. Re-review may be needed.`]);
+        if (data.mergeable === 'CONFLICTING' || data.mergeable === false) actions.push(['🔀', 'GitHub reports merge conflicts. The branch needs updating.']);
+        else if (data.mergeStateStatus === 'BEHIND') actions.push(['⬆️', 'GitHub reports the branch is behind the base branch.']);
+        if (['FAILURE', 'ERROR'].includes(data.statusCheckRollup?.state)) actions.push(['❌', `Checks fail at head ${head.slice(0, 12)}.`]);
+        else if (data.statusCheckRollup?.state === 'PENDING') actions.push(['⏳', 'Head checks are still pending.']);
+        const unanswered = threads.filter((t) => {
+            const replies = (t.comments?.nodes || []).filter((c) => c.state === 'SUBMITTED');
+            const last = replies[replies.length - 1];
+            return !t.isResolved && last && String(last.author?.login || '').toLowerCase() !== author &&
+                !/\[bot\]$/i.test(last.author?.login || '');
+        }).length;
+        if (unanswered) actions.push(['💬', `${unanswered} unresolved review thread(s) end with another author's published comment.`]);
+        if (own) {
+            const conversation = [...comments, ...reviews].filter((c) => c.author?.login && !/\[bot\]$/i.test(c.author.login))
+                .sort((a, b) => String(b.submittedAt || b.createdAt).localeCompare(String(a.submittedAt || a.createdAt)));
+            if (conversation[0] && conversation[0].author.login.toLowerCase() !== author) {
+                actions.push(['📬', 'The latest fetched conversation comment or review is from someone else. Check whether it needs a reply.']);
+            }
+            if (!data.statusCheckRollup || !complete || data.mergeable === 'UNKNOWN' || data.mergeable == null) {
+                actions.push(['❔', 'Some action evidence is unavailable or truncated. This is not an all-clear. A repository-readable PAT enables batched review and check data.']);
+            }
+            if (!actions.length) actions.push(['👤', 'Your PR. No action signal found in the fetched snapshot.']);
+        }
+        return { own, member, participated: byViewer.length > 0, participationKnown: !!login && complete, staleAck, actions };
+    }
+
+    function jevPullListPriority(decision, facts) {
+        let level = decision?.level || 'foreground';
+        if (facts.own || facts.staleAck) return 'essence';
+        if (!facts.member && !facts.participated && level === 'essence') level = 'foreground';
+        if ((facts.participated || !facts.participationKnown) && level === 'background') level = 'foreground';
+        return level;
+    }
+
+    function jevPullListSubject(entry, data) {
+        return {
+            identity: entry.identity, head: data.headRefOid || data.head?.sha || '',
+            title: String(data.title || '').slice(0, 1000), description: String(data.body || '').slice(0, 12000),
+            description_truncated: String(data.body || '').length > 12000,
+            files: (data.files?.nodes || []).map((f) => f.path), files_truncated: !!data.files?.pageInfo?.hasNextPage || !data.files,
+            labels: (data.labels?.nodes || data.labels || []).map((l) => l.name),
+            additions: data.additions, deletions: data.deletions, changed_files: data.changedFiles ?? data.changed_files,
+        };
+    }
+
+    function renderJevPullList(entry, record) {
+        const { data, result, viewer } = record;
+        const facts = jevPullListFacts(data, viewer);
+        const decision = result ? jevReadingGuideDecision(result) : null;
+        const level = jevPullListPriority(decision, facts);
+        let slot = entry.row.querySelector('.ack-jev-pr-list-badges');
+        if (!slot) {
+            slot = document.createElement('span');
+            slot.className = 'ack-jev-pr-list-badges';
+            entry.link.insertAdjacentElement('afterend', slot);
+        }
+        const badges = [...facts.actions];
+        if (decision?.level === 'essence') {
+            const refactor = decision.classification.choice === 'essence_refactor';
+            badges.unshift([refactor ? '🧹' : decision.emoji,
+                `${refactor ? 'Very simple refactor or cleanup' : decision.meaning}\nJev confidence: ${Math.round(decision.classification.probability * 100)}%. Metadata-based advisory, not a code review.`]);
+        }
+        if (!result) badges.push(['❔', 'Subject classification is unavailable. Author and published action signals still apply.']);
+        if (!facts.participationKnown && !facts.participated && !facts.own) badges.push(['❔', 'Published participation could not be completely checked. No background priority is assigned.']);
+        const signature = JSON.stringify([level, badges, data.headRefOid || data.head?.sha, data.updatedAt || data.updated_at]);
+        if (slot.dataset.signature === signature && entry.link.classList.contains(`ack-jev-reading-${level}`)) return;
+        entry.link.classList.remove('ack-jev-reading-background', 'ack-jev-reading-foreground', 'ack-jev-reading-essence');
+        entry.link.classList.add('ack-jev-pr-list-title', `ack-jev-reading-${level}`);
+        slot.dataset.signature = signature;
+        slot.replaceChildren();
+        for (const [emoji, meaning] of badges) jevAppendBadge(slot, emoji,
+            `${meaning}\nGitHub snapshot: ${new Date(record.at).toISOString()}`);
+    }
+
+    function queueJevPullRequestList(root = document, opts = {}) {
+        if (_ackTesting || !isPullRequestListPage(opts.path || location.pathname)) return;
+        jevPullListControls();
+        if (!jevEnabled() || !jevLineReadingPreferred()) return;
+        if (jevPullListRunning) {
+            jevPullListRescan = true;
+            return;
+        }
+        const repo = parseGitHubRepoPath(opts.path || location.pathname);
+        const viewer = getCurrentGitHubLogin(document) || '';
+        const href = location.href;
+        const auth = hashPrompt(patAuthHeaderValue() || 'anonymous');
+        const scope = JSON.stringify([href, viewer, auth]);
+        if (jevPullListScope !== scope) {
+            jevPullListScope = scope;
+            jevPullListRecords.clear();
+        }
+        const entries = findPullRequestListEntries(document, repo);
+        const keyFor = (e) => JSON.stringify([href, viewer, auth, e.identity, e.pr.headSha, e.pr.updatedAt, e.link.textContent, _githubHttpPrGenerations.get(e.identity) || 0]);
+        const inputKeys = new Map(entries.map((entry) => [entry.identity, keyFor(entry)]));
+        const pending = [];
+        for (const entry of entries) {
+            const record = jevPullListRecords.get(inputKeys.get(entry.identity));
+            if (record && Date.now() - record.at < 60000) {
+                if (record.data) renderJevPullList(entry, record);
+            }
+            else {
+                const author = entry.row.querySelector('a[data-testid="author-link"], a.author, a[data-hovercard-type="user"]')?.textContent?.trim();
+                if (viewer && author?.toLowerCase() === viewer.toLowerCase()) {
+                    renderJevPullList(entry, { viewer, at: Date.now(), data: { author: { login: author } }, result: null });
+                }
+                pending.push(entry);
+            }
+        }
+        if (!pending.length) return;
+        jevPullListRunning = true;
+        const generation = jevPullListGeneration;
+        const current = () => generation === jevPullListGeneration && location.href === href &&
+            (getCurrentGitHubLogin(document) || '') === viewer && hashPrompt(patAuthHeaderValue() || 'anonymous') === auth &&
+            jevEnabled() && jevLineReadingPreferred();
+        const render = (entry, record) => {
+            if (!current() || !entry.link.isConnected) return;
+            const latest = findPullRequestListEntries(document, repo).find((e) => e.identity === entry.identity);
+            if (latest && keyFor(latest) === inputKeys.get(entry.identity)) renderJevPullList(latest, record);
+        };
+        jevDiagnostic('PR list started', { rows: pending.length, authenticated: !!patAuthHeaderValue(), viewer });
+        (async () => {
+            for (let offset = 0; offset < pending.length && current(); offset += 5) {
+                const batch = pending.slice(offset, offset + 5);
+                let dataRows;
+                try {
+                    if (patAuthHeaderValue()) {
+                        const { query, variables } = jevPullListQuery(batch);
+                        const data = await patGraphQL(query, variables);
+                        dataRows = batch.map((_, index) => data?.data?.repository?.[`p${index}`]);
+                    } else {
+                        // Without a PAT, never infer absence of participation from
+                        // missing lists or exhaust the anonymous limit on threads.
+                        dataRows = await Promise.all(batch.map((e) => gmFetch(
+                            `https://api.github.com/repos/${e.pr.owner}/${e.pr.repo}/pulls/${e.pr.pr}`, { freshForMs: 60000 },
+                        ).catch(() => null)));
+                    }
+                } catch (error) {
+                    jevDiagnostic('PR list metadata failed', { message: String(error.message || error), rows: batch.length }, { level: 'warn' });
+                    for (const entry of batch) jevPullListRecords.set(inputKeys.get(entry.identity), { at: Date.now() });
+                    continue;
+                }
+                if (!current()) break;
+                const uncached = [];
+                for (let index = 0; index < batch.length; index++) {
+                    const entry = batch[index];
+                    const data = dataRows[index];
+                    if (!data) {
+                        jevPullListRecords.set(inputKeys.get(entry.identity), { at: Date.now() });
+                        continue;
+                    }
+                    const head = data.headRefOid || data.head?.sha;
+                    const updated = data.updatedAt || data.updated_at;
+                    const title = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+                    if (keyFor(entry) !== inputKeys.get(entry.identity) ||
+                        (entry.pr.headSha && entry.pr.headSha !== head) ||
+                        (entry.pr.updatedAt && updated && updated < entry.pr.updatedAt) ||
+                        title(entry.link.textContent) !== title(data.title)) {
+                        jevDiagnostic('PR list revision mismatch', { pr: entry.identity, expected: entry.pr.headSha, received: head });
+                        jevPullListRecords.set(inputKeys.get(entry.identity), { at: Date.now() });
+                        continue;
+                    }
+                    const state = jevPullListSubject(entry, data);
+                    const id = jevCacheId('pr_list', state);
+                    const result = jevReadCache(id);
+                    const record = { data, viewer, result, at: Date.now() };
+                    jevPullListRecords.set(inputKeys.get(entry.identity), record);
+                    render(entry, record);
+                    if (!result) uncached.push({ entry, record, state, id });
+                }
+                if (uncached.length && current()) {
+                    const questions = jevReadingQuestions('pr_list', uncached.length);
+                    const result = await jevEvaluate({ owner: repo.owner, repo: repo.repo, pr: 'list' },
+                        'pr_list', { targets: uncached.map((item) => item.state) }, questions);
+                    for (let index = 0; index < uncached.length; index++) {
+                        const item = uncached[index];
+                        const classification = jevReadingTargetResult(result, index);
+                        if (!classification) continue;
+                        jevWriteCache(item.id, classification, item.entry.identity);
+                        item.record.result = classification;
+                        render(item.entry, item.record);
+                    }
+                }
+                jevDiagnostic('PR list batch completed', { rows: batch.length, uncached: uncached.length });
+            }
+        })().catch((error) => jevDiagnostic('PR list failed', { message: String(error.message || error) }))
+            .finally(() => {
+                jevPullListRunning = false;
+                if (jevPullListRescan) {
+                    jevPullListRescan = false;
+                    queueJevPullRequestList();
+                }
+            });
+    }
+
     function queueJevPageAnnotations() {
         if (_ackTesting) return;
         if (!jevEnabled()) {
@@ -20517,6 +20834,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 pathname: location.pathname,
                 ...jevAvailabilityDetails(),
             }, { key: 'page-disabled', intervalMs: 2000 });
+            return;
+        }
+        if (isPullRequestListPage()) {
+            queueJevPullRequestList();
             return;
         }
         const pr = jevReviewPageContext();
@@ -30741,11 +31062,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // forces a completely fresh inject() with fresh ACK API calls.
     document.addEventListener('turbo:before-cache', () => {
         abortAckLifetime('turbo:before-cache');
+        clearJevPullRequestList();
         teardownDiffSelectionUI();
         document
             .querySelectorAll(
                 `#${BUTTON_CONTAINER_ID}, #${ACK_PANEL_ID}, #${QUEUE_PANEL_ID}, #acktopus-analysis, ` +
-                    '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, ' +
+                    '#ack-commit-nav, .ack-quick-actions, .ack-details-btn, .ack-toolbar-item, .ack-start-review-btn, .ack-submit-review-wrap, .ack-pr-size, .ack-jev-pr-list-toggle, .ack-jev-pr-list-refresh, ' +
                     '.ack-reactor-avatars, .ack-pr-title-proofread, .ack-commit-explain, .ack-commit-proofread, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-actions, .ack-config-overlay, .ack-jev-badges, ' +
                     '.ack-commit-explain-panel, .ack-explain-panel, .ack-pgp-badge, .ack-changes-link, ' +
                     `#${DIFF_SELECTION_TOOLBAR_ID}`,
@@ -40179,8 +40501,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Keep this non-brittle: guard count can change as features evolve,
         // but should stay within a small expected band.
         ackAssert(
-            guards.length >= 4 && guards.length <= 6,
-            `expected 4-6 querySelector guards, found ${guards.length}: ${JSON.stringify(guards)}`,
+            guards.length >= 4 && guards.length <= 7,
+            `expected 4-7 querySelector guards, found ${guards.length}: ${JSON.stringify(guards)}`,
         );
         for (const g of guards) {
             ackNeq(
@@ -43005,6 +43327,191 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             host.querySelector('a').getAttribute('href'),
             '/octo/demo/compare/develop...topic/remove-foo?quick_pull=1',
         );
+    });
+
+
+    ackTest('Jev PR list enforces ownership, membership and participation priorities', () => {
+        const facts = { own: false, member: false, participated: false, participationKnown: true, staleAck: false };
+        ackEq(jevPullListPriority({ level: 'essence' }, facts), 'foreground', 'non-members without participation cannot be bold');
+        ackEq(jevPullListPriority({ level: 'background' }, facts), 'background', 'uninteresting non-member PR may be grey');
+        ackEq(jevPullListPriority({ level: 'background' }, { ...facts, participated: true }), 'foreground', 'participated PR cannot be grey');
+        ackEq(jevPullListPriority({ level: 'essence' }, { ...facts, participated: true }), 'essence', 'participated non-member PR can be bold');
+        ackEq(jevPullListPriority({ level: 'essence' }, { ...facts, member: true }), 'essence', 'interesting member PR can be bold');
+        ackEq(jevPullListPriority({ level: 'background' }, { ...facts, own: true }), 'essence', 'own PR always bold');
+        ackEq(jevPullListPriority({ level: 'background' }, { ...facts, staleAck: true }), 'essence', 'stale ACK needs re-review');
+        ackEq(jevPullListPriority({ level: 'background' }, { ...facts, participationKnown: false }), 'foreground', 'unknown participation is not treated as absent');
+    });
+
+    ackTest('Jev PR list ignores pending comments and superseded or quoted ACKs', () => {
+        const head = 'a'.repeat(40);
+        const comment = (body, at, state = 'SUBMITTED') => ({ author: { login: 'viewer' }, body, createdAt: at, state });
+        const data = {
+            author: { login: 'author' }, headRefOid: head, authorAssociation: 'MEMBER',
+            comments: { nodes: [], pageInfo: {} }, reviews: { nodes: [], pageInfo: {} },
+            reviewThreads: { nodes: [{ isResolved: false, comments: { nodes: [
+                comment('ACK bbbbbbb', '2026-09-01', 'PENDING'),
+            ], pageInfo: {} } }], pageInfo: {} },
+        };
+        ackEq(jevPullListFacts(data, 'viewer').participated, false, 'pending review does not count as participation');
+        data.comments.nodes = [comment('> ACK bbbbbbb', '2026-09-02')];
+        ackEq(jevPullListFacts(data, 'viewer').staleAck, false, 'quoted ACK is not the viewer verdict');
+        data.comments.nodes.push(comment('**ACK** bbbbbbb', '2026-09-03'));
+        ackEq(jevPullListFacts(data, 'viewer').staleAck, true, 'Markdown ACK for old revision is stale');
+        data.comments.nodes.push(comment('tACK aaaaaaa', '2026-09-04'));
+        ackEq(jevPullListFacts(data, 'viewer').staleAck, false, 'new current ACK supersedes old one');
+        data.comments.nodes.push(comment('ACK bbbbbbb', '2026-09-05'), comment('NACK', '2026-09-06'));
+        ackEq(jevPullListFacts(data, 'viewer').staleAck, false, 'withdrawn ACK no longer requests re-review');
+        data.comments.pageInfo.hasPreviousPage = true;
+        ackEq(jevPullListFacts(data, 'other').participationKnown, false, 'truncated histories do not prove absence');
+    });
+
+    ackTest('Jev PR list action evidence distinguishes conflicts, CI and unresolved replies', () => {
+        const data = {
+            author: { login: 'viewer' }, headRefOid: 'a'.repeat(40), mergeable: 'CONFLICTING',
+            statusCheckRollup: { state: 'FAILURE' }, comments: { nodes: [], pageInfo: {} },
+            reviews: { nodes: [], pageInfo: {} }, reviewThreads: { nodes: [
+                { isResolved: false, comments: { nodes: [{ author: { login: 'reviewer' }, state: 'SUBMITTED', body: 'Please change this' }], pageInfo: {} } },
+                { isResolved: true, comments: { nodes: [{ author: { login: 'reviewer' }, state: 'SUBMITTED' }], pageInfo: {} } },
+                { isResolved: false, comments: { nodes: [{ author: { login: 'viewer' }, state: 'SUBMITTED' }], pageInfo: {} } },
+            ], pageInfo: {} },
+        };
+        const facts = jevPullListFacts(data, 'viewer');
+        ackDeepEq(facts.actions.map((a) => a[0]), ['🔀', '❌', '💬']);
+        ackAssert(facts.actions[2][1].startsWith('1 unresolved'), 'resolved and author-replied threads are excluded');
+        ackEq(jevPullListFacts({ author: { login: 'viewer' } }, 'viewer').actions[0][0], '❔', 'missing evidence is not all-clear');
+    });
+
+    ackTest('Jev PR list batching keeps one question per PR and all subject inputs in cache keys', () => {
+        const entry = { identity: 'bitcoin/bitcoin#1', pr: { owner: 'bitcoin', repo: 'bitcoin', pr: '1', headSha: 'a'.repeat(40), updatedAt: '2026-09-30T00:00:00Z' } };
+        const { query, variables } = jevPullListQuery([entry, { ...entry, pr: { ...entry.pr, pr: '2' } }]);
+        ackEq(variables.n0, 1);
+        ackEq(variables.n1, 2);
+        ackAssert(query.includes('comments(last:100)') && query.includes('states:[APPROVED,COMMENTED,CHANGES_REQUESTED,DISMISSED]'), 'submitted review evidence is batched');
+        const changed = jevPullListQuery([{ ...entry, pr: { ...entry.pr, headSha: 'b'.repeat(40) } }]);
+        ackAssert(changed.query !== jevPullListQuery([entry]).query, 'row revisions affect shared GraphQL cache identity');
+        ackEq(Object.keys(jevReadingQuestions('pr_list', 5)).length, 5, 'one choice per PR');
+        const data = { title: 'coins cleanup', body: 'public description', headRefOid: 'a'.repeat(40), files: { nodes: [{ path: 'src/coins.cpp' }], pageInfo: {} }, comments: { nodes: [{ body: 'NOT FOR JEV' }] } };
+        const subject = jevPullListSubject(entry, data);
+        ackAssert(!JSON.stringify(subject).includes('NOT FOR JEV'), 'review bodies are never sent to the subject classifier');
+        for (const field of ['title', 'body', 'headRefOid', 'additions', 'deletions', 'changedFiles']) {
+            const altered = jevPullListSubject(entry, { ...data, [field]: field === 'additions' || field === 'deletions' || field === 'changedFiles' ? 123 : 'changed' });
+            ackAssert(jevCacheId('pr_list', altered) !== jevCacheId('pr_list', subject), `${field} participates in cache identity`);
+        }
+        ackAssert(jevCacheId('pr_list', jevPullListSubject(entry, { ...data, statusCheckRollup: { state: 'FAILURE' } })) === jevCacheId('pr_list', subject), 'CI does not cause another paid subject classification');
+    });
+
+    ackTest('Jev PR list rendering preserves titles and does not mutate unchanged rows', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-issue-row"><a id="issue_1_link" href="/bitcoin/bitcoin/pull/1">coins: cleanup</a></div>';
+        const entry = findPullRequestListEntries(host, { owner: 'bitcoin', repo: 'bitcoin', repoKey: 'bitcoin/bitcoin' })[0];
+        const record = { viewer: 'viewer', at: Date.now(), data: { author: { login: 'viewer' }, title: 'coins: cleanup' }, result: { model: 'jev-latest', answers: { classification: { choice: 'essence_refactor', probability: .9 } } } };
+        renderJevPullList(entry, record);
+        ackEq(entry.link.textContent, 'coins: cleanup', 'badges never contaminate native title');
+        ackAssert(entry.link.classList.contains('ack-jev-reading-essence'), 'own PR title is bold');
+        const slot = entry.row.querySelector('.ack-jev-pr-list-badges');
+        ackAssert(!entry.link.contains(slot), 'badge slot is outside the title link');
+        const observer = new MutationObserver(() => {});
+        observer.observe(host, { attributes: true, childList: true, subtree: true });
+        renderJevPullList(entry, record);
+        ackEq(observer.takeRecords().length, 0, 'repeated scans do not cause observer churn');
+        observer.disconnect();
+        clearJevPullRequestList(host);
+        ackEq(host.querySelector('.ack-jev-pr-list-badges'), null, 'off removes badges');
+        ackAssert(!entry.link.classList.contains('ack-jev-reading-essence'), 'off restores native title');
+    });
+
+    ackTest('Jev PR list uses GraphQL envelope and reuses exact classifications across repeated scans', async () => {
+        const old = { testing: _ackTesting, enabled: jevEnabled, auth: patAuthHeaderValue, graphql: patGraphQL,
+            login: getCurrentGitHubLogin, evaluate: jevEvaluate, read: jevReadCache, write: jevWriteCache };
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="js-issue-row"><a id="issue_981234_link" href="/bitcoin/bitcoin/pull/981234">coins cleanup</a></div>';
+        document.body.appendChild(host);
+        let fetches = 0;
+        let calls = 0;
+        try {
+            _ackTesting = false;
+            jevEnabled = () => true;
+            patAuthHeaderValue = () => 'synthetic-PAT';
+            getCurrentGitHubLogin = () => 'viewer';
+            jevReadCache = () => null;
+            jevWriteCache = () => {};
+            patGraphQL = async (_query, vars) => {
+                fetches++;
+                return { data: { repository: { p0: { number: vars.n0, title: 'coins cleanup', author: { login: 'viewer' }, headRefOid: 'a'.repeat(40) } } } };
+            };
+            jevEvaluate = async (_pr, kind, state, questions) => {
+                calls++;
+                ackEq(kind, 'pr_list');
+                ackEq(state.targets.length, 1);
+                ackEq(Object.keys(questions).length, 1);
+                return { model: 'jev-latest', answers: { target_1: { choice: 'essence_state', probability: .9 } } };
+            };
+            const options = { path: '/bitcoin/bitcoin/pulls' };
+            queueJevPullRequestList(document, options);
+            for (let n = 0; n < 15 && jevPullListRunning; n++) await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(fetches, 1, 'one metadata batch');
+            ackEq(calls, 1, 'one paid batch');
+            ackAssert(host.querySelector('.ack-jev-pr-list-badges'), 'GraphQL data envelope produces badges');
+            queueJevPullRequestList(document, options);
+            ackEq(fetches, 1, 'fresh metadata is reused');
+            ackEq(calls, 1, 'fresh subject result is reused');
+        } finally {
+            _ackTesting = old.testing;
+            jevEnabled = old.enabled;
+            patAuthHeaderValue = old.auth;
+            patGraphQL = old.graphql;
+            getCurrentGitHubLogin = old.login;
+            jevEvaluate = old.evaluate;
+            jevReadCache = old.read;
+            jevWriteCache = old.write;
+            clearJevPullRequestList(host);
+            host.remove();
+        }
+    });
+
+
+    ackTest('Jev PR list rejects edited rows before paid classification and stale rendering', async () => {
+        const old = { testing: _ackTesting, enabled: jevEnabled, auth: patAuthHeaderValue, graphql: patGraphQL,
+            login: getCurrentGitHubLogin, evaluate: jevEvaluate, read: jevReadCache };
+        const host = document.createElement('div');
+        host.innerHTML = '<li role="listitem"><a data-testid="listitem-title-link" href="/bitcoin/bitcoin/pull/981235">original title</a></li>';
+        document.body.appendChild(host);
+        let release;
+        let paid = 0;
+        try {
+            _ackTesting = false;
+            jevEnabled = () => true;
+            patAuthHeaderValue = () => 'synthetic-PAT';
+            getCurrentGitHubLogin = () => 'viewer';
+            jevReadCache = () => null;
+            patGraphQL = () => new Promise((resolve) => { release = resolve; });
+            jevEvaluate = async () => { paid++; return null; };
+            queueJevPullRequestList(document, { path: '/bitcoin/bitcoin/pulls' });
+            host.querySelector('a').textContent = 'edited title';
+            release({ data: { repository: { p0: { title: 'original title', author: { login: 'author' }, headRefOid: 'a'.repeat(40) } } } });
+            for (let n = 0; n < 15 && jevPullListRunning; n++) await new Promise((resolve) => setTimeout(resolve, 0));
+            ackEq(paid, 0, 'changed row does not classify the stale metadata');
+            ackEq(host.querySelector('.ack-jev-pr-list-badges'), null, 'changed row is not painted with old facts');
+            const query = jevPullListQuery([{ identity: 'bitcoin/bitcoin#981235', link: host.querySelector('a'), pr: { owner: 'bitcoin', repo: 'bitcoin', pr: '981235' } }]).query;
+            const prior = _githubHttpPrGenerations.get('bitcoin/bitcoin#981235');
+            try {
+                _githubHttpPrGenerations.set('bitcoin/bitcoin#981235', (prior || 0) + 1);
+                ackNeq(jevPullListQuery([{ identity: 'bitcoin/bitcoin#981235', link: host.querySelector('a'), pr: { owner: 'bitcoin', repo: 'bitcoin', pr: '981235' } }]).query, query, 'a detected PR write invalidates batched GraphQL reuse');
+            } finally {
+                if (prior === undefined) _githubHttpPrGenerations.delete('bitcoin/bitcoin#981235');
+                else _githubHttpPrGenerations.set('bitcoin/bitcoin#981235', prior);
+            }
+        } finally {
+            _ackTesting = old.testing;
+            jevEnabled = old.enabled;
+            patAuthHeaderValue = old.auth;
+            patGraphQL = old.graphql;
+            getCurrentGitHubLogin = old.login;
+            jevEvaluate = old.evaluate;
+            jevReadCache = old.read;
+            clearJevPullRequestList(host);
+            host.remove();
+        }
     });
 
     ackTest('pull request list URLs use recently-updated sort and current-user author filter', () => {
