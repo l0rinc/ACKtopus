@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.296
+// @version      1.297
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -24338,8 +24338,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (dd && !triggers.some((t) => t.el === dd)) triggers.push({ el: dd, type: 'details' });
         });
         // React UI: standalone button with reaction aria-label or smiley icon.
-        // Discover add selectors separately. Existing emoji chips open their
-        // selector on hover below and keep GitHub's native click behavior.
+        // Only the add selector opens on hover. Existing emoji chips keep
+        // GitHub's native selection and deselection behavior.
         qsa(root, 'button[aria-label*="reaction" i], button[aria-label*="react" i]').forEach((btn) => {
             if (btn.closest('details')) return;
             if (isExistingReactionButton(btn)) return;
@@ -24359,10 +24359,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (!isAddReactionTrigger(trigger, type)) continue;
             if (isOwnReactionTrigger(trigger)) continue;
             const openTarget = type === 'details' ? trigger.querySelector('summary') || trigger : trigger;
-            const container = getReactionContainer(trigger) || trigger.parentElement;
-            const hoverTargets = [openTarget, ...qsa(container, 'button').filter((button) =>
-                !trigger.contains(button) && isExistingReactionButton(button) &&
-                (getReactionContainer(button) || button.parentElement) === container)];
+            const hoverTargets = [openTarget];
             const existing = reactionHoverBindings.get(trigger);
             if (existing && !existing.lifetime.signal.aborted) {
                 hoverTargets.forEach(existing.bindHover);
@@ -39299,7 +39296,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(fn.includes('reacted with'), 'skips buttons whose aria-label describes an existing reaction');
     });
 
-    ackTest('autoOpenReactionPopup hovering an existing emoji opens the picker without toggling it', async () => {
+    ackTest('autoOpenReactionPopup hovering an existing emoji leaves the picker closed', async () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
         host.style.left = '-99999px';
@@ -39323,7 +39320,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             existing.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
             await new Promise((resolve) => setTimeout(resolve, 240));
             ackEq(existingClicks, 0, 'hovering an existing reaction never synthesizes a reaction click');
-            ackEq(triggerClicks, 1, 'hovering the add selector opens its native popup once');
+            ackEq(triggerClicks, 0, 'hovering an existing emoji does not open the picker');
             existing.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             ackEq(
                 existingClicks,
@@ -39335,7 +39332,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
-    ackTest('reaction hover binds newly rendered emoji chips and keeps an open picker open', async () => {
+    ackTest('reaction hover skips newly rendered emoji chips and keeps an open picker open', async () => {
         const host = document.createElement('div');
         host.className = 'comment-reactions';
         host.innerHTML = '<button aria-label="Add your reaction" aria-pressed="false" aria-expanded="false"><svg class="octicon-smiley"></svg></button>';
@@ -39354,12 +39351,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             autoOpenReactionPopup(chip);
             chip.dispatchEvent(new MouseEvent('mouseenter'));
             await new Promise((resolve) => setTimeout(resolve, 240));
-            ackEq(opens, 1, 'new chips open the existing add selector');
+            ackEq(opens, 0, 'new chips do not open the add selector');
             ackEq(reactions, 0, 'hover never adds or removes a reaction');
             chip.dispatchEvent(new MouseEvent('mouseleave'));
             trigger.dispatchEvent(new MouseEvent('mouseenter'));
             await new Promise((resolve) => setTimeout(resolve, 240));
-            ackEq(opens, 1, 'moving onto the smiley does not toggle the picker closed');
+            ackEq(opens, 1, 'hovering the smiley opens the picker');
+            trigger.dispatchEvent(new MouseEvent('mouseleave'));
+            trigger.dispatchEvent(new MouseEvent('mouseenter'));
+            await new Promise((resolve) => setTimeout(resolve, 240));
+            ackEq(opens, 1, 'hovering the smiley again does not toggle the picker closed');
         } finally { host.remove(); }
     });
 
