@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.297
+// @version      1.298
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -20708,8 +20708,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function queueJevPullRequestList(root = document, opts = {}) {
-        if (_ackTesting || !isPullRequestListPage(opts.path || location.pathname)) return;
-        jevPullListControls();
+        if ((_ackTesting && !opts.testRun) || !isPullRequestListPage(opts.path || location.pathname)) return;
+        const scanRoot = opts.scanRoot || document;
+        if (!opts.testRun) jevPullListControls();
         if (!jevEnabled() || !jevLineReadingPreferred()) return;
         if (jevPullListRunning) {
             jevPullListRescan = true;
@@ -20724,7 +20725,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevPullListScope = scope;
             jevPullListRecords.clear();
         }
-        const entries = findPullRequestListEntries(document, repo);
+        const entries = findPullRequestListEntries(scanRoot, repo);
         const keyFor = (e) => JSON.stringify([href, viewer, auth, e.identity, e.pr.headSha, e.pr.updatedAt, e.link.textContent, _githubHttpPrGenerations.get(e.identity) || 0]);
         const inputKeys = new Map(entries.map((entry) => [entry.identity, keyFor(entry)]));
         const pending = [];
@@ -20749,7 +20750,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevEnabled() && jevLineReadingPreferred();
         const render = (entry, record) => {
             if (!current() || !entry.link.isConnected) return;
-            const latest = findPullRequestListEntries(document, repo).find((e) => e.identity === entry.identity);
+            const latest = findPullRequestListEntries(scanRoot, repo).find((e) => e.identity === entry.identity);
             if (latest && keyFor(latest) === inputKeys.get(entry.identity)) renderJevPullList(latest, record);
         };
         jevDiagnostic('PR list started', { rows: pending.length, authenticated: !!patAuthHeaderValue(), viewer });
@@ -24088,6 +24089,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 kebab.getAttribute('aria-expanded') === 'true') kebab.click();
             if (deferVisualRestore) {
                 requestAnimationFrame(() => requestAnimationFrame(restoreNativeMenu));
+                // Background tabs can postpone animation frames indefinitely.
+                ackSetTimeout(restoreNativeMenu, 100);
             } else {
                 restoreNativeMenu();
             }
@@ -38617,7 +38620,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'the details trigger does not visibly enter its open state');
             ackEq(second.querySelector('.timeline-comment-actions').style.opacity, '',
                 'quick action does not permanently alter the action container');
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            for (let attempt = 0; attempt < 100 && document.documentElement.classList.contains('ack-native-comment-menu-hidden'); attempt++) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
             ackAssert(!document.documentElement.classList.contains('ack-native-comment-menu-hidden'),
                 'native menu concealment is removed after activation');
             ackEq(second.querySelector('details').style.opacity, '', 'native trigger visibility is restored');
@@ -43426,11 +43431,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             login: getCurrentGitHubLogin, evaluate: jevEvaluate, read: jevReadCache, write: jevWriteCache };
         const host = document.createElement('div');
         host.innerHTML = '<div class="js-issue-row"><a id="issue_981234_link" href="/bitcoin/bitcoin/pull/981234">coins cleanup</a></div>';
-        document.body.appendChild(host);
+        const unrelated = document.createElement('div');
+        unrelated.innerHTML = Array.from({ length: 6 }, (_, index) =>
+            `<div class="js-issue-row"><a id="issue_${982000 + index}_link" href="/bitcoin/bitcoin/pull/${982000 + index}">Unrelated page row</a></div>`).join('');
+        document.body.append(host, unrelated);
         let fetches = 0;
         let calls = 0;
         try {
-            _ackTesting = false;
+            _ackTesting = true;
             jevEnabled = () => true;
             patAuthHeaderValue = () => 'synthetic-PAT';
             getCurrentGitHubLogin = () => 'viewer';
@@ -43447,7 +43455,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ackEq(Object.keys(questions).length, 1);
                 return { model: 'jev-latest', answers: { target_1: { choice: 'essence_state', probability: .9 } } };
             };
-            const options = { path: '/bitcoin/bitcoin/pulls' };
+            const options = { path: '/bitcoin/bitcoin/pulls', scanRoot: host, testRun: true };
             queueJevPullRequestList(document, options);
             for (let n = 0; n < 15 && jevPullListRunning; n++) await new Promise((resolve) => setTimeout(resolve, 0));
             ackEq(fetches, 1, 'one metadata batch');
@@ -43456,6 +43464,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             queueJevPullRequestList(document, options);
             ackEq(fetches, 1, 'fresh metadata is reused');
             ackEq(calls, 1, 'fresh subject result is reused');
+            ackEq(unrelated.querySelector('.ack-jev-pr-list-badges'), null, 'page rows outside the fixture are untouched');
         } finally {
             _ackTesting = old.testing;
             jevEnabled = old.enabled;
@@ -43467,6 +43476,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             jevWriteCache = old.write;
             clearJevPullRequestList(host);
             host.remove();
+            unrelated.remove();
         }
     });
 
@@ -43480,14 +43490,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let release;
         let paid = 0;
         try {
-            _ackTesting = false;
+            _ackTesting = true;
             jevEnabled = () => true;
             patAuthHeaderValue = () => 'synthetic-PAT';
             getCurrentGitHubLogin = () => 'viewer';
             jevReadCache = () => null;
             patGraphQL = () => new Promise((resolve) => { release = resolve; });
             jevEvaluate = async () => { paid++; return null; };
-            queueJevPullRequestList(document, { path: '/bitcoin/bitcoin/pulls' });
+            queueJevPullRequestList(document, { path: '/bitcoin/bitcoin/pulls', scanRoot: host, testRun: true });
             host.querySelector('a').textContent = 'edited title';
             release({ data: { repository: { p0: { title: 'original title', author: { login: 'author' }, headRefOid: 'a'.repeat(40) } } } });
             for (let n = 0; n < 15 && jevPullListRunning; n++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -48032,7 +48042,9 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         try {
             scrollToAndHighlight(el, 10);
             scrollToAndHighlight(el, 10);
-            ackEq(el.style.outline, '2px solid #58a6ff', 'highlights while active');
+            const expected = document.createElement('div');
+            expected.style.outline = '2px solid #58a6ff';
+            ackEq(el.style.outline, expected.style.outline, 'highlights while active');
             await new Promise((resolve) => setTimeout(resolve, 40));
             ackEq(el.style.background, 'red', 'restores the pre-highlight background');
             ackEq(el.style.outline, '', 'clears the highlight outline');
