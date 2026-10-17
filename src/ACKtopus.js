@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.298
+// @version      1.299
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -23408,6 +23408,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return null;
     }
 
+    function getCommentMenuDetails(trigger) {
+        // A surrounding review-thread disclosure does not own a React button's menu
+        return trigger?.matches?.('details > summary') ? trigger.parentElement : null;
+    }
+
     function menuRootDistanceToTrigger(root, trigger) {
         const rr = root?.getBoundingClientRect?.();
         const tr = trigger?.getBoundingClientRect?.();
@@ -23445,7 +23450,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const menuControlsId = trigger?.getAttribute?.('aria-controls') || '';
         const popoverTargetId = trigger?.getAttribute?.('popovertarget') || '';
         const menuHost =
-            trigger?.closest?.('details, [data-target="action-menu.overlay"]')?.parentElement ||
+            (getCommentMenuDetails(trigger) || trigger?.closest?.('[data-target="action-menu.overlay"]'))?.parentElement ||
             trigger?.parentElement ||
             null;
 
@@ -23467,12 +23472,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function openMenuTrigger(trigger) {
         if (!trigger) return false;
-        const details = trigger.closest?.('details');
+        const details = getCommentMenuDetails(trigger);
         if (details) {
             if (!details.hasAttribute('open')) trigger.click();
             return true;
         }
-        trigger.click();
+        if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
         return true;
     }
 
@@ -23931,7 +23936,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return false;
             }
             menuHost =
-                kebab.closest('details, [data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement;
+                (getCommentMenuDetails(kebab) || kebab.closest('[data-target="action-menu.overlay"]'))?.parentElement || kebab.parentElement;
             origOpacity = menuHost.style.opacity;
             // Keep the menu practically invisible to avoid UI flash, but not fully
             // transparent — our `isVisible()` helper treats opacity:0 as invisible,
@@ -23945,7 +23950,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 () => {
                     // A swallowed user click (or GitHub itself) may have closed
                     // the kebab mid-attempt; re-open so Edit can render.
-                    const kebabDetails = kebab.closest('details');
+                    const kebabDetails = getCommentMenuDetails(kebab);
                     if (kebabDetails && !kebabDetails.hasAttribute('open')) openMenuTrigger(kebab);
                     for (const root of getCommentMenuRoots(kebab, container, {
                         includeDocument: false,
@@ -24013,7 +24018,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Never leave an invisibly-open kebab behind: Primer's open
             // details-overlay paints a full-viewport click-catcher that would
             // swallow every later click on the page.
-            if (!clickedEdit) kebab?.closest?.('details')?.removeAttribute('open');
+            if (!clickedEdit) getCommentMenuDetails(kebab)?.removeAttribute('open');
             if (container?.dataset?.ackEditOpening === attemptStamp) delete container.dataset.ackEditOpening;
         }
     }
@@ -24057,7 +24062,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!kebab) return;
         if (kebab.dataset.ackMenuActionBusy === '1') return;
         kebab.dataset.ackMenuActionBusy = '1';
-        const details = kebab.closest('details');
+        const details = getCommentMenuDetails(kebab);
         const restoreNativeMenu = concealNativeCommentMenu(kebab, details);
         const pageScrollX = window.scrollX ?? window.pageXOffset ?? 0;
         const pageScrollY = window.scrollY ?? window.pageYOffset ?? 0;
@@ -38551,7 +38556,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fn.includes('focusVisibleDeleteCommentConfirmButton'), 'does not visually select the destructive action');
     });
 
-    ackTest('triggerMenuAction coalesces repeated presses on one comment menu', async () => {
+    ackTest('triggerMenuAction coalesces repeated presses on one comment menu', () => {
         const host = document.createElement('div');
         host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
             '<details><summary class="timeline-comment-action">Actions</summary>' +
@@ -38574,12 +38579,54 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             pending.shift()();
             ackEq(deletes, 1, 'activates the native action once');
             ackAssert(!host.querySelector('summary').dataset.ackMenuActionBusy, 'releases the trigger after activation');
-            await new Promise((resolve) => setTimeout(resolve, 50));
         } finally {
+            while (pending.length) pending.shift()();
             ackSetTimeout = previousTimer;
             host.remove();
         }
     });
+
+    for (const wrapped of [false, true]) {
+        for (const open of [false, true]) {
+            ackTest(`pending-comment delete uses its React menu (thread disclosure: ${wrapped}, menu open: ${open})`, () => {
+                const host = document.createElement('div');
+                host.innerHTML = '<div class="timeline-comment current-user js-pending-review-comment">' +
+                    '<div class="timeline-comment-header"><button type="button" data-testid="comment-header-hamburger" ' +
+                    'aria-controls="ack-pending-delete-menu">Actions</button></div></div>';
+                if (wrapped) host.innerHTML = `<details open data-resolved="true"><summary>Review thread</summary>${host.innerHTML}</details>`;
+                const menu = document.createElement('div');
+                menu.id = 'ack-pending-delete-menu';
+                menu.setAttribute('role', 'menu');
+                menu.innerHTML = '<button type="button" role="menuitem">Delete</button>';
+                menu.hidden = !open;
+                const comment = host.querySelector('.timeline-comment');
+                const header = host.querySelector('.timeline-comment-header');
+                const trigger = header.querySelector('button');
+                trigger.setAttribute('aria-expanded', String(open));
+                trigger.addEventListener('click', () => {
+                    menu.hidden = trigger.getAttribute('aria-expanded') === 'true';
+                    trigger.setAttribute('aria-expanded', String(!menu.hidden));
+                });
+                let deletes = 0;
+                menu.querySelector('button').addEventListener('click', () => deletes++);
+                document.body.append(host, menu);
+                const previousTimer = ackSetTimeout;
+                try {
+                    ackSetTimeout = (fn) => { fn(); return 0; };
+                    ackAssert(!getCommentMenuRoots(trigger, comment, { includeDocument: false }).includes(host), 'menu lookup stays inside the comment');
+                    triggerMenuAction(comment, header, 'delete');
+                    ackEq(deletes, 1, 'activates the pending comment action exactly once');
+                    if (wrapped) ackAssert(host.querySelector('details').open, 'keeps the enclosing review thread open');
+                    ackAssert(!trigger.dataset.ackMenuActionBusy, 'releases the action guard');
+                    ackAssert(!document.documentElement.classList.contains('ack-native-comment-menu-hidden'), 'restores native menu visibility');
+                } finally {
+                    ackSetTimeout = previousTimer;
+                    host.remove();
+                    menu.remove();
+                }
+            });
+        }
+    }
 
     ackTest('delete actions stay bound to the chosen comment when nearby comments share text', async () => {
         const host = document.createElement('div');
