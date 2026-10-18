@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.299
+// @version      1.300
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -387,6 +387,12 @@
     const CLANG_TOOLING_CONFIGURE_CMD =
         'cmake -B build-ack-clang -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON';
 
+    const BITCOIN_TEST_CONFIGURE_CMD =
+        'cmake -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_FOR_FUZZING=OFF -DBUILD_TESTS=ON' +
+        ' -DENABLE_WALLET=ON -DENABLE_EXTERNAL_SIGNER=ON -DWITH_ZMQ=ON -DWITH_EMBEDDED_ASMAP=ON' +
+        ' -DBUILD_BITCOIN_BIN=ON -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_TX=ON -DBUILD_UTIL=ON' +
+        ' -DBUILD_WALLET_TOOL=ON -DBUILD_BENCH=ON -DBUILD_UTIL_CHAINSTATE=ON -DBUILD_KERNEL_LIB=ON';
+
     const SHA_FORMATS = [
         {
             key: 'ack',
@@ -512,9 +518,9 @@
                     if (!targets.length) return null;
                     const targetArgs = targets.map(shellQuoteIfNeeded).join(' ');
                     const runs = targets.map((target) => `build/bin/${target}`).join(' && ');
-                    return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DSECP256K1_BUILD_BENCHMARK=ON && cmake --build build -j --target ${targetArgs} && ${runs}`;
+                    return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DSECP256K1_BUILD_BENCHMARK=ON && cmake --build build -j10 --target ${targetArgs} && ${runs}`;
                 }
-                return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j --target bench_bitcoin && build/bin/bench_bitcoin --filter=${shellQuote(b.join('|'))} -min-time=1000`;
+                return `cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON && cmake --build build -j10 --target bench_bitcoin && build/bin/bench_bitcoin --filter=${shellQuote(b.join('|'))} -min-time=1000`;
             },
         },
         {
@@ -536,9 +542,9 @@
                     const ctimeRun = ctime
                         ? ' && command -v valgrind >/dev/null && valgrind --error-exitcode=42 build/bin/ctime_tests'
                         : '';
-                    return `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_TESTS=ON -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=ON${ctimeConfig} && cmake --build build -j && ctest --test-dir build --output-on-failure${ctimeRun}`;
+                    return `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_TESTS=ON -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=ON${ctimeConfig} && cmake --build build -j10 && ctest --test-dir build --output-on-failure${ctimeRun}`;
                 }
-                return `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j --target test_bitcoin && build/bin/test_bitcoin --run_test=${shellQuote(t.join(','))}`;
+                return `${BITCOIN_TEST_CONFIGURE_CMD} && cmake --build build -j10 --target test_bitcoin && build/bin/test_bitcoin --run_test=${shellQuote(t.join(','))}`;
             },
         },
         {
@@ -568,7 +574,7 @@
             fmt: () => {
                 const f = prFileCategories?.functional;
                 return f?.length
-                    ? `cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j && build/test/functional/test_runner.py ${f.map(shellQuote).join(' ')}`
+                    ? `${BITCOIN_TEST_CONFIGURE_CMD} && cmake --build build -j10 && build/test/functional/test_runner.py ${f.map(shellQuote).join(' ')}`
                     : null;
             },
         },
@@ -35044,6 +35050,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ackAssert(test.includes('-DSECP256K1_BUILD_BENCHMARK=OFF'), `${owner} skips benchmark builds`);
                 ackAssert(test.includes('ctest --test-dir build --output-on-failure'), `${owner} runs ctest`);
                 ackAssert(!test.includes('test_bitcoin'), `${owner} does not use Bitcoin Core test target`);
+                ackAssert(!test.includes('-DENABLE_WALLET'), `${owner} does not use Bitcoin Core configure options`);
             }
         } finally {
             prFileCategories = previous;
@@ -35376,10 +35383,25 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(benchFmt.includes('-min-time=1000'), 'bench has min-time flag');
     });
 
-    ackTest('test command uses Debug build and build/bin/test_bitcoin', () => {
-        const testFmt = _ackSource.slice(_ackSource.indexOf("key: 'test'"), _ackSource.indexOf("key: 'fuzz'"));
-        ackAssert(testFmt.includes('-DCMAKE_BUILD_TYPE=Debug'), 'test uses Debug');
-        ackAssert(testFmt.includes('build/bin/test_bitcoin'), 'test uses build/bin path');
+    ackTest('Bitcoin Core test commands explicitly enable test components', () => {
+        const previous = prFileCategories;
+        try {
+            prFileCategories = { test: ['wallet_tests'], functional: ['wallet_sendall.py'] };
+            for (const key of ['test', 'functional']) {
+                const command = SHA_FORMATS.find((format) => format.key === key).fmt();
+                ackAssert(command.startsWith('cmake -B build -DCMAKE_BUILD_TYPE=Debug '), `${key} uses Debug`);
+                ackAssert(command.includes('-DBUILD_FOR_FUZZING=OFF'), `${key} leaves fuzz-only configuration`);
+                for (const option of [
+                    'BUILD_TESTS', 'ENABLE_WALLET', 'ENABLE_EXTERNAL_SIGNER', 'WITH_ZMQ', 'WITH_EMBEDDED_ASMAP',
+                    'BUILD_BITCOIN_BIN', 'BUILD_DAEMON', 'BUILD_CLI', 'BUILD_TX', 'BUILD_UTIL',
+                    'BUILD_WALLET_TOOL', 'BUILD_BENCH', 'BUILD_UTIL_CHAINSTATE', 'BUILD_KERNEL_LIB',
+                ]) ackAssert(command.includes(`-D${option}=ON`), `${key} enables ${option}`);
+                ackAssert(command.includes('cmake --build build -j10'), `${key} caps build parallelism`);
+            }
+            ackAssert(SHA_FORMATS.find((format) => format.key === 'test').fmt().includes('build/bin/test_bitcoin'), 'unit tests use build/bin path');
+        } finally {
+            prFileCategories = previous;
+        }
     });
 
     ackTest('fuzz command uses --preset=libfuzzer, build_fuzz dir, no loop for single target, -runs=10000', () => {
@@ -35448,6 +35470,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(!fmtSection.includes('./build'), 'no ./ prefix in any build command');
         ackAssert(!fmtSection.includes('./contrib/'), 'no ./ prefix in tool paths');
+        ackAssert(!/cmake --build[^&\n]* -j(?=\s|$)/.test(fmtSection), 'no CMake build uses unbounded parallelism');
     });
 
     ackTest('shared constants COMMENT_TA_SELECTOR and NO_CHANGES_MSG are used (not inlined)', () => {
@@ -35475,13 +35498,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
     ackTest('functional command uses Debug build and build/test/functional/test_runner.py', () => {
-        const funcFmt = _ackSource.slice(
-            _ackSource.indexOf("key: 'functional'"),
-            _ackSource.indexOf("key: 'functional'") + 500,
-        );
-        ackAssert(funcFmt.includes('-DCMAKE_BUILD_TYPE=Debug'), 'functional uses Debug');
-        ackAssert(funcFmt.includes('build/test/functional/test_runner.py'), 'correct runner path');
-        ackAssert(funcFmt.includes('cmake --build build -j'), 'functional compiles first');
+        const previous = prFileCategories;
+        try {
+            const format = SHA_FORMATS.find((format) => format.key === 'functional');
+            prFileCategories = { functional: ['wallet_sendall.py'] };
+            const wallet = format.fmt();
+            ackAssert(wallet.endsWith("&& cmake --build build -j10 && build/test/functional/test_runner.py 'wallet_sendall.py'"), 'builds before running the wallet test');
+            prFileCategories.functional = ['p2p_ping.py'];
+            ackEq(format.fmt().split(' && ')[0], wallet.split(' && ')[0], 'non-wallet tests enable the same components');
+        } finally {
+            prFileCategories = previous;
+        }
     });
 
     // --- categorizePRFiles ---
