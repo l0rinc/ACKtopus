@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.300
+// @version      1.301
 // @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -780,6 +780,7 @@
     );
     window.addEventListener('blur', cancelAlternateModeShiftTap);
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
+    const COMMENT_HEADER_SELECTOR = '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header';
     const COMMENT_CONTAINER_BASE_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"]';
     const COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_BASE_SELECTOR + ', [class*="ReviewThreadContainer"]';
@@ -812,6 +813,9 @@
     const COMMENT_MENU_TRIGGER_SELECTOR =
         'button[data-testid="comment-header-hamburger"], ' +
         'button[aria-label*="action" i][data-component="IconButton"], ' +
+        'button[aria-label*="comment" i][aria-label*="action" i], ' +
+        'button[aria-haspopup][aria-label="Show options" i], button[aria-haspopup][aria-label="More options" i], ' +
+        'button[aria-haspopup][aria-label="Actions" i], ' +
         'summary.timeline-comment-action, .timeline-comment-actions details.details-overlay summary';
     const COMMENT_MENU_ROOT_SELECTOR =
         '[role="menu"], [role="dialog"], .Overlay, .ActionListWrap, details-menu, action-menu, action-list, [popover]';
@@ -1341,9 +1345,7 @@
             if (!isVisible(container)) continue;
             const header =
                 (container.matches?.('[data-testid="issue-body"]') ? container : null) ||
-                container.querySelector?.(
-                    '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header',
-                ) ||
+                container.querySelector?.(COMMENT_HEADER_SELECTOR) ||
                 container;
             const menuTrigger = findCommentMenuTrigger(header, container);
             const isPRBody =
@@ -23015,7 +23017,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         //   child of .timeline-comment-group.comment that contains .timeline-comment-actions
         //   (no .timeline-comment-header class).
         const headerSet = new Set(
-            qsa(root, '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header'),
+            qsa(root, COMMENT_HEADER_SELECTOR),
         );
         for (const issueBody of qsa(root, '[data-testid="issue-body"]')) {
             if (
@@ -23399,19 +23401,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ) {
             return false;
         }
-        if (trigger.closest?.('.timeline-comment-actions')) return true;
+        if (trigger.matches('button[data-testid="comment-header-hamburger"]')) return true;
         const text = commentMenuItemTextCandidates(trigger).join(' ');
         return !/\b(?:edited|created)\b|edit history|reaction/i.test(text);
     }
 
     function findCommentMenuTrigger(header, container) {
-        const roots = [header, container].filter((root, idx, arr) => root && arr.indexOf(root) === idx);
-        for (const root of roots) {
+        let fallback = null;
+        for (let root = header || container; root && (root === header || container?.contains(root)); root = root.parentElement) {
+            if (header && root !== header && qsa(root, COMMENT_HEADER_SELECTOR).some((other) =>
+                !other.contains(header) && !header.contains(other),
+            )) break;
             for (const trigger of root.querySelectorAll?.(COMMENT_MENU_TRIGGER_SELECTOR) || []) {
-                if (isCommentActionMenuTrigger(trigger)) return trigger;
+                if (!isCommentActionMenuTrigger(trigger)) continue;
+                if (isVisible(trigger)) return trigger;
+                fallback ||= trigger;
             }
         }
-        return null;
+        return fallback;
     }
 
     function getCommentMenuDetails(trigger) {
@@ -23441,6 +23448,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return roots.map((item) => item.root);
     }
 
+    function getLinkedCommentMenuRoots(trigger) {
+        const roots = new Set();
+        const controls = `${trigger?.getAttribute('aria-controls') || ''} ${trigger?.getAttribute('popovertarget') || ''}`;
+        for (const id of controls.split(/\s+/).filter(Boolean)) {
+            const root = document.getElementById(id);
+            if (root) roots.add(root);
+        }
+        const labels = [trigger?.id, ...(trigger?.getAttribute('aria-labelledby') || '').split(/\s+/)].filter(Boolean);
+        for (const id of new Set(labels)) {
+            // Primer can label the menu through its anchor's tooltip instead of the anchor itself
+            if (id !== trigger.id && qsa(document, COMMENT_MENU_TRIGGER_SELECTOR).some((other) =>
+                other !== trigger && (other.getAttribute('aria-labelledby') || '').split(/\s+/).includes(id) && isVisible(other),
+            )) continue;
+            for (const root of document.querySelectorAll(
+                `[role="menu"][aria-labelledby~="${cssEscape(id)}"], [popover][aria-labelledby~="${cssEscape(id)}"]`,
+            )) roots.add(root);
+        }
+        return [...roots];
+    }
+
     function getCommentMenuRoots(trigger, container, opts = {}) {
         const { includeDocument = true, includeNearby = false } = opts;
         const roots = [];
@@ -23452,20 +23479,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             for (const el of els || []) push(el);
         };
 
-        const triggerId = trigger?.id || '';
-        const menuControlsId = trigger?.getAttribute?.('aria-controls') || '';
-        const popoverTargetId = trigger?.getAttribute?.('popovertarget') || '';
         const menuHost =
             (getCommentMenuDetails(trigger) || trigger?.closest?.('[data-target="action-menu.overlay"]'))?.parentElement ||
             trigger?.parentElement ||
             null;
 
-        if (menuControlsId) push(document.getElementById(menuControlsId));
-        if (popoverTargetId) push(document.getElementById(popoverTargetId));
-        if (triggerId) {
-            const id = cssEscape(triggerId);
-            pushAll(document.querySelectorAll(`[role="menu"][aria-labelledby="${id}"], [popover][aria-labelledby="${id}"]`));
-        }
+        pushAll(getLinkedCommentMenuRoots(trigger));
 
         pushAll(container?.querySelectorAll?.(COMMENT_MENU_ROOT_SELECTOR) || []);
         pushAll(menuHost?.querySelectorAll?.(COMMENT_MENU_ROOT_SELECTOR) || []);
@@ -23513,6 +23532,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return false;
         const tokenAction = new RegExp(`(^|[\\s_-])${literal}([\\s_-]|$)`, 'i');
         return candidates.some((text) => tokenAction.test(text));
+    }
+
+    function isEnabledCommentMenuItem(item) {
+        // A delayed native menu must not resolve to the ACKtopus shortcut that opened it
+        return !item?.closest('.ack-quick-actions') && isVisible(item) &&
+            !item.matches(':disabled') && !item.closest('[aria-disabled="true"], [inert]');
     }
 
     function findVisibleEditTextarea(roots) {
@@ -23963,9 +23988,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         includeNearby: true,
                     })) {
                         const direct = root.querySelector?.('button.js-comment-edit-button');
-                        if (direct && isVisible(direct)) return direct;
+                        if (isEnabledCommentMenuItem(direct)) return direct;
                         for (const item of root.querySelectorAll?.(COMMENT_MENU_ITEM_SELECTOR) || []) {
-                            if (!isVisible(item)) continue;
+                            if (!isEnabledCommentMenuItem(item)) continue;
                             if (commentMenuItemMatchesAction(item, 'edit')) return item;
                         }
                     }
@@ -24062,10 +24087,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             return;
         }
         const lt = ensureAckLifetime('triggerMenuAction');
-        // React UI: kebab is often a sibling of the header, not a descendant.
-        // Search header first, then the full container.
+        // React menus can be siblings of the header, so stay within that header's branch
         const kebab = findCommentMenuTrigger(header, container);
-        if (!kebab) return;
+        if (!kebab) {
+            ackLogEvent(`${actionName} comment menu button not found`, {}, 'warn');
+            return;
+        }
         if (kebab.dataset.ackMenuActionBusy === '1') return;
         kebab.dataset.ackMenuActionBusy = '1';
         const details = getCommentMenuDetails(kebab);
@@ -24079,7 +24106,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             try { window.scrollTo(pageScrollX, pageScrollY); } catch (_) {}
         };
         const wasOpen = !!details?.hasAttribute('open');
-        const controlledMenuId = kebab.getAttribute('aria-controls') || kebab.getAttribute('popovertarget');
         const nearbyBeforeOpen = new Set(getNearbyCommentMenuRoots(kebab));
         const wasReactOpen = kebab.getAttribute('aria-expanded') === 'true';
         let sawReactMenuOpen = wasReactOpen;
@@ -24115,6 +24141,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return false;
             }
             if (expanded === 'false' && sawReactMenuOpen) return true;
+            const controlledMenuId = kebab.getAttribute('aria-controls') || kebab.getAttribute('popovertarget');
             if (controlledMenuId) {
                 const controlled = document.getElementById(controlledMenuId);
                 if (controlled) {
@@ -24133,13 +24160,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // These roots are tied to this trigger. The enclosing thread can
             // contain several comments, so never search all of its menus.
             if (details) add(details);
-            if (controlledMenuId) add(document.getElementById(controlledMenuId));
-            if (kebab.id) {
-                const id = cssEscape(kebab.id);
-                for (const root of document.querySelectorAll(
-                    `[role="menu"][aria-labelledby="${id}"], [popover][aria-labelledby="${id}"]`,
-                )) add(root);
-            }
+            for (const root of getLinkedCommentMenuRoots(kebab)) add(root);
             add(kebab.closest('[data-target="action-menu.overlay"]')?.parentElement || kebab.parentElement);
 
             // A React portal without an explicit control ID is safe to use only
@@ -24182,7 +24203,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     const searchRoots = actionMenuRoots();
                     for (const root of searchRoots) {
                         for (const item of root.querySelectorAll(COMMENT_MENU_ITEM_SELECTOR)) {
-                            if (!isVisible(item)) continue;
+                            if (!isEnabledCommentMenuItem(item)) continue;
                             if (commentMenuItemMatchesAction(item, actionName)) {
                                 clickedAction = true;
                                 item.click();
@@ -38807,19 +38828,24 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const host = document.createElement('div');
         host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
             '<button type="button" data-component="IconButton" aria-label="Open comment actions" ' +
-            'aria-expanded="false">Actions</button></div></div>';
+            'aria-expanded="false">Actions</button></div></div><span id="ack-shared-menu-label">Comment actions</span>';
         const otherMenu = document.createElement('div');
         otherMenu.setAttribute('role', 'menu');
         otherMenu.innerHTML = '<button type="button" role="menuitem">Delete comment</button>';
         const box = (top) => ({ left: 100, top, right: 180, bottom: top + 30, width: 80, height: 30 });
         const trigger = host.querySelector('button');
+        const otherTrigger = document.createElement('button');
+        otherTrigger.setAttribute('data-testid', 'comment-header-hamburger');
+        trigger.setAttribute('aria-labelledby', 'ack-shared-menu-label');
+        otherTrigger.setAttribute('aria-labelledby', 'ack-shared-menu-label');
+        otherMenu.setAttribute('aria-labelledby', 'ack-shared-menu-label');
         trigger.getBoundingClientRect = () => box(100);
         otherMenu.getBoundingClientRect = () => box(130);
         otherMenu.querySelector('button').getBoundingClientRect = () => box(135);
         trigger.addEventListener('click', () => {
             trigger.setAttribute('aria-expanded', trigger.getAttribute('aria-expanded') === 'true' ? 'false' : 'true');
         });
-        document.body.append(host, otherMenu);
+        document.body.append(host, otherTrigger, otherMenu);
         const previousTimer = ackSetTimeout;
         let otherDeletes = 0;
         otherMenu.querySelector('button').addEventListener('click', () => otherDeletes++);
@@ -38835,7 +38861,123 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         } finally {
             ackSetTimeout = previousTimer;
             host.remove();
+            otherTrigger.remove();
             otherMenu.remove();
+        }
+    });
+
+    for (const association of ['trigger label', 'label list', 'late controls', 'late popover']) {
+        ackTest(`delete follows the native menu relationship: ${association}`, () => {
+            const host = document.createElement('div');
+            host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
+                '<button type="button" id="ack-linked-trigger" data-testid="comment-header-hamburger">Actions</button>' +
+                '</div></div><span id="ack-menu-label">Comment actions</span><span id="ack-menu-heading">Comment menu</span>';
+            const trigger = host.querySelector('button');
+            const comment = host.querySelector('.timeline-comment');
+            const menu = document.createElement('div');
+            menu.id = 'ack-linked-menu';
+            menu.setAttribute('role', 'menu');
+            menu.style.cssText = 'position:absolute;left:1500px;top:1500px';
+            menu.innerHTML = '<button type="button" role="menuitem">Delete</button>';
+            const late = association.startsWith('late');
+            trigger.setAttribute('aria-expanded', String(!late));
+            menu.hidden = late;
+            if (association === 'trigger label') {
+                trigger.setAttribute('aria-labelledby', 'ack-menu-label');
+                menu.setAttribute('aria-labelledby', 'ack-menu-label');
+            } else if (association === 'label list') {
+                menu.setAttribute('aria-labelledby', `ack-menu-heading ${trigger.id}`);
+            }
+            trigger.addEventListener('click', () => {
+                trigger.setAttribute('aria-expanded', 'true');
+                trigger.setAttribute(association === 'late popover' ? 'popovertarget' : 'aria-controls', menu.id);
+                menu.hidden = false;
+            });
+            let deletes = 0;
+            menu.querySelector('button').addEventListener('click', () => deletes++);
+            document.body.append(host, menu);
+            const previousTimer = ackSetTimeout;
+            try {
+                ackSetTimeout = (fn) => { fn(); return 0; };
+                ackAssert(!getNearbyCommentMenuRoots(trigger).includes(menu), 'association does not depend on menu geometry');
+                triggerMenuAction(comment, host.querySelector('.timeline-comment-header'), 'delete');
+                ackEq(deletes, 1, 'activates only the linked native action');
+            } finally {
+                ackSetTimeout = previousTimer;
+                host.remove();
+                menu.remove();
+            }
+        });
+    }
+
+    ackTest('delete quick action waits for a delayed React menu instead of clicking itself', () => {
+        const comment = document.createElement('div');
+        comment.className = 'timeline-comment current-user';
+        comment.innerHTML = '<div data-testid="comment-header"><a class="author">reviewer</a>' +
+            '<button type="button" id="ack-delayed-trigger" data-testid="comment-header-hamburger" aria-expanded="false">Actions</button>' +
+            '</div><div class="markdown-body">Comment</div>';
+        const trigger = comment.querySelector('button');
+        trigger.addEventListener('click', () => trigger.setAttribute('aria-expanded', 'true'));
+        const menu = document.createElement('div');
+        menu.setAttribute('role', 'menu');
+        menu.setAttribute('aria-labelledby', trigger.id);
+        menu.innerHTML = '<button type="button" role="menuitem">Delete</button>';
+        let deletes = 0;
+        menu.querySelector('button').addEventListener('click', () => deletes++);
+        document.body.appendChild(comment);
+        const previousTimer = ackSetTimeout;
+        const pending = [];
+        const runNext = () => pending.sort((a, b) => a.delay - b.delay).shift().fn();
+        try {
+            addQuickCommentActions(comment);
+            const icon = comment.querySelector('.ack-quick-actions button[title="Delete comment"]');
+            ackAssert(icon, 'injects the Delete shortcut');
+            ackSetTimeout = (fn, delay = 0) => { pending.push({ fn, delay }); return pending.length; };
+            icon.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true }));
+            runNext();
+            ackEq(trigger.dataset.ackMenuActionBusy, '1', 'keeps waiting while only ACKtopus buttons are present');
+            ackEq(deletes, 0, 'no native action exists yet');
+            document.body.appendChild(menu);
+            runNext();
+            ackEq(deletes, 1, 'activates the delayed native Delete action exactly once');
+        } finally {
+            while (pending.length) runNext();
+            document.dispatchEvent(new Event('pointercancel'));
+            ackSetTimeout = previousTimer;
+            comment.remove();
+            menu.remove();
+        }
+    });
+
+    ackTest('delete waits for an enabled native menu action', () => {
+        const host = document.createElement('div');
+        host.innerHTML = '<div class="timeline-comment"><div class="timeline-comment-header">' +
+            '<details><summary class="timeline-comment-action">Actions</summary>' +
+            '<details-menu><button type="button" role="menuitem" disabled aria-disabled="true">Delete</button></details-menu>' +
+            '</details></div></div>';
+        document.body.appendChild(host);
+        const item = host.querySelector('button');
+        const trigger = host.querySelector('summary');
+        const pending = [];
+        const previousTimer = ackSetTimeout;
+        let deletes = 0;
+        item.addEventListener('click', () => deletes++);
+        try {
+            ackSetTimeout = (fn) => { pending.push(fn); return pending.length; };
+            triggerMenuAction(host.querySelector('.timeline-comment'), host.querySelector('.timeline-comment-header'), 'delete');
+            pending.shift()();
+            ackEq(deletes, 0, 'does not activate a disabled action');
+            ackEq(trigger.dataset.ackMenuActionBusy, '1', 'keeps waiting for the native action');
+            item.disabled = false;
+            pending.shift()();
+            ackEq(deletes, 0, 'also respects aria-disabled after the native disabled state clears');
+            item.removeAttribute('aria-disabled');
+            pending.shift()();
+            ackEq(deletes, 1, 'activates the action after GitHub enables it');
+        } finally {
+            while (pending.length) pending.shift()();
+            ackSetTimeout = previousTimer;
+            host.remove();
         }
     });
 
@@ -38958,6 +39100,53 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!history.matches(COMMENT_MENU_TRIGGER_SELECTOR), 'history summary does not match menu trigger selector');
         ackAssert(!isCommentActionMenuTrigger(history), 'history summary is rejected defensively');
         ackEq(findCommentMenuTrigger(header, container), actions, 'finds the real action menu after edit history');
+    });
+
+    ackTest('comment menu lookup stays in the selected header branch', () => {
+        const thread = document.createElement('div');
+        thread.innerHTML = '<div><div data-testid="comment-header">First comment</div>' +
+            '<button data-testid="comment-header-hamburger">First actions</button></div>' +
+            '<div><div data-testid="comment-header">Second comment</div>' +
+            '<button data-testid="comment-header-hamburger">Second actions</button></div>';
+        document.body.appendChild(thread);
+        try {
+            const header = thread.lastElementChild.querySelector('[data-testid="comment-header"]');
+            const trigger = thread.lastElementChild.querySelector('button');
+            ackEq(findCommentMenuTrigger(header, thread), trigger, 'finds the sibling control of the selected comment');
+            trigger.remove();
+            ackEq(findCommentMenuTrigger(header, thread), null, 'does not substitute another comment when the control is missing');
+        } finally {
+            thread.remove();
+        }
+    });
+
+    ackTest('comment menu discovery uses accessible labels without requiring Primer metadata', () => {
+        const header = document.createElement('div');
+        header.className = 'timeline-comment-actions';
+        header.innerHTML = '<button aria-haspopup="true" aria-label="Edit history">edited</button>' +
+            '<button data-component="IconButton" aria-haspopup="true" aria-label="Add reaction">React</button>';
+        document.body.appendChild(header);
+        try {
+            for (const label of ['Actions for reviewer\'s comment', 'Show options', 'More options', 'Actions']) {
+                const trigger = document.createElement('button');
+                trigger.setAttribute('aria-label', label);
+                trigger.setAttribute('aria-haspopup', 'menu');
+                trigger.textContent = '...';
+                header.appendChild(trigger);
+                ackEq(findCommentMenuTrigger(header, header), trigger, `recognizes ${label}`);
+                trigger.remove();
+            }
+            const hidden = document.createElement('button');
+            hidden.setAttribute('data-testid', 'comment-header-hamburger');
+            hidden.hidden = true;
+            const visible = hidden.cloneNode();
+            visible.hidden = false;
+            visible.textContent = 'Actions';
+            header.append(hidden, visible);
+            ackEq(findCommentMenuTrigger(header, header), visible, 'prefers the live control over a hidden clone');
+        } finally {
+            header.remove();
+        }
     });
 
     ackTest('comment menu roots can be scoped to the triggering kebab', () => {
