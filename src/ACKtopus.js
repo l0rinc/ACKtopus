@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.301
-// @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
+// @version      1.302
+// @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @match        https://github.com/*
+// @match        https://bitcoin-irc.chaincode.com/*
+// @grant        unsafeWindow
 // @grant        GM_setClipboard
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -29,6 +31,13 @@
 
 (function ACKtopusMain() {
     'use strict';
+
+    if (location.hostname === 'bitcoin-irc.chaincode.com') {
+        const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        if (typeof page.jQuery === 'function') page.jQuery(() => installIrcLogReader());
+        else installIrcLogReader();
+        return;
+    }
 
     // When running the built-in self-test suite, we temporarily sandbox some
     // global state. Background inject/observers should no-op during that time.
@@ -7259,6 +7268,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             k.startsWith('pr_context_') ||
             k.startsWith('commitlist_') ||
             k.startsWith('forcepush_sig_') ||
+            k.startsWith('ack_irc_page_v1:') ||
+            k === 'ack_irc_months_v1' ||
             k.startsWith(GITHUB_HTTP_CACHE_PREFIX) ||
             k.startsWith(JEV_CACHE_ENTRY_PREFIX) ||
             k === JEV_CACHE_KEY ||
@@ -31189,6 +31200,545 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
     });
 
+    function parseIrcLogUrl(value) {
+        let url;
+        try { url = new URL(value, 'https://bitcoin-irc.chaincode.com'); } catch (_) { return null; }
+        if (url.hostname !== 'bitcoin-irc.chaincode.com' || url.port || !/^https?:$/.test(url.protocol) || url.search) return null;
+        const match = url.pathname.match(/^\/([^/]+)\/(\d{4}-\d{2}-\d{2})\/?$/);
+        if (!match) return null;
+        let channel;
+        try { channel = decodeURIComponent(match[1]); } catch (_) { return null; }
+        if (!/^[#\w.-]+$/.test(channel)) return null;
+        const date = new Date(`${match[2]}T00:00:00Z`);
+        if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== match[2]) return null;
+        return { channel, day: match[2], month: match[2].slice(0, 7), path: `/${encodeURIComponent(channel)}/${match[2]}` };
+    }
+
+    function ircMonthPaths(doc, route) {
+        const paths = new Set([route.path]);
+        for (const link of doc.querySelectorAll('#calendar a[href]')) {
+            const day = parseIrcLogUrl(link.getAttribute('href'));
+            if (day?.channel === route.channel && day.month === route.month) paths.add(day.path);
+        }
+        return [...paths].sort();
+    }
+
+    function ircLogRow(row, botNicks) {
+        const nick = row.querySelector('.nick')?.textContent.trim() || '';
+        let kind = 'events';
+        if (row.matches('.op-msg, .op-action, .talk, .me-tell')) {
+            const login = nick.toLowerCase();
+            kind = botNicks.has(login) || /^bitcoin-git(?:[-_\d].*)?$/.test(login) ? 'bots' : 'human';
+        } else if (row.matches('.op-join, .op-leave, .op-quit, .op-part')) kind = 'joins';
+        else if (row.matches('.op-topic')) kind = 'topics';
+        else if (row.matches('.op-nick')) kind = 'nicks';
+        return { node: row, id: row.id, nick, kind, text: row.textContent.replace(/\s+/g, ' ').trim() };
+    }
+
+    function ircRowVisible(row, filters, query = '', author = '') {
+        return (row.kind === 'human' || !!filters[row.kind]) &&
+            (!query || row.text.toLowerCase().includes(query.toLowerCase())) &&
+            (!author || row.nick.toLowerCase().includes(author.toLowerCase()));
+    }
+
+    function ircPageRecord(doc, route) {
+        const log = doc.querySelector('#log[data-channel]');
+        const messages = log?.querySelector('.log-messages');
+        const calendar = doc.querySelector('#calendar');
+        if (!messages || !calendar || ![route.channel, `#${route.channel}`].includes(log.dataset.channel) || !doc.title.includes(route.day)) {
+            throw new Error('The server did not return the requested IRC day');
+        }
+        const copy = messages.cloneNode(true);
+        copy.querySelectorAll('[data-ack-irc-ui]').forEach((node) => node.remove());
+        for (const row of copy.children) {
+            row.removeAttribute('data-ack-irc-hidden');
+            row.classList.remove('highlight');
+            row.style.removeProperty('display');
+        }
+        return { ...route, title: doc.title, html: copy.innerHTML, calendar: calendar.innerHTML, savedAt: Date.now() };
+    }
+
+    function ircSafeFragment(html) {
+        const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+        doc.querySelectorAll('script, iframe, object, embed, base, meta, link, style, svg, math').forEach((node) => node.remove());
+        for (const node of doc.body.querySelectorAll('*')) {
+            for (const attr of [...node.attributes]) {
+                if (/^on/i.test(attr.name) || attr.name === 'srcdoc' || /^(?:href|xlink:href|src|action|formaction)$/i.test(attr.name) && /^(?:javascript|data):/i.test(attr.value.replace(/[\u0000-\u0020]/g, ''))) {
+                    node.removeAttribute(attr.name);
+                }
+            }
+        }
+        return document.createRange().createContextualFragment(doc.body.innerHTML);
+    }
+
+    function installIrcLogReader() {
+        const log = document.querySelector('#log[data-channel]');
+        const messages = log?.querySelector('.log-messages');
+        const panel = document.getElementById('log-panel');
+        let route = parseIrcLogUrl(location.href);
+        if (!route && /^\/[^/]+\/?$/.test(location.pathname)) {
+            route = parseIrcLogUrl(document.querySelector('#calendar a.current')?.getAttribute('href') || '');
+        }
+        if (!route || !messages || !panel || document.getElementById('acktopus-irc-toolbar')) return;
+
+        const prefix = 'ack_irc_page_v1:';
+        const settingsKey = 'ack_irc_filters_v1';
+        const monthsKey = 'ack_irc_months_v1';
+        const defaults = { joins: false, topics: false, nicks: false, events: false, bots: false,
+            botNicks: 'bitcoin-git,corebot,core-meetingbot,gribble', live: true };
+        const settings = { ...defaults, ...GM_getValue(settingsKey, {}) };
+        const memory = new Map();
+        const indexes = new Map();
+        const pending = new Map();
+        let months = GM_getValue(monthsKey, []);
+        if (!Array.isArray(months)) months = [];
+        let current = null;
+        let rows = [];
+        let paths = [];
+        let warm = null;
+        let navigation = 0;
+        let searchTimer = null;
+        let viewTimer = null;
+        let resultLimit = 200;
+        let monthMatches = 0;
+        let storageFailed = false;
+        let fetchError = '';
+        const today = () => new Date().toISOString().slice(0, 10);
+        const scope = (day) => `${encodeURIComponent(day.channel)}:${day.month}`;
+        const key = (day) => `${prefix}${encodeURIComponent(day.channel)}:${day.day}`;
+        const bots = () => new Set(String(settings.botNicks).split(/[,\s]+/).filter(Boolean).map((nick) => nick.toLowerCase()));
+        const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const stopNativeLive = () => { try { pageWindow.Live?.stop(); } catch (_) {} };
+        stopNativeLive();
+
+        function keepMonth(day) {
+            const selected = scope(day);
+            if (months[0] === selected && months.length <= 3) return;
+            months = [selected, ...months.filter((month) => typeof month === 'string' && month !== selected)];
+            for (const month of months.slice(3)) {
+                const oldPrefix = `${prefix}${month}-`;
+                for (const name of GM_listValues()) if (name.startsWith(oldPrefix)) GM_deleteValue(name);
+                for (const [path, value] of memory) if (value && scope(value) === month) { memory.delete(path); indexes.delete(path); }
+            }
+            months = months.slice(0, 3);
+            try { GM_setValue(monthsKey, months); } catch (_) { storageFailed = true; }
+        }
+
+        function cached(path) {
+            if (memory.has(path)) return memory.get(path);
+            const day = parseIrcLogUrl(path);
+            const value = day && GM_getValue(key(day), null);
+            const valid = value && value.path === day.path && value.channel === day.channel &&
+                value.day === day.day && value.month === day.month && typeof value.title === 'string' &&
+                typeof value.html === 'string' && typeof value.calendar === 'string' && Number.isFinite(value.savedAt);
+            memory.set(path, valid ? value : null);
+            return memory.get(path);
+        }
+
+        function remember(value) {
+            if (!months.includes(scope(value))) return;
+            memory.set(value.path, value);
+            indexes.delete(value.path);
+            try { GM_setValue(key(value), value); } catch (_) { storageFailed = true; }
+        }
+
+        async function fetchDay(path, { force = false, signal } = {}) {
+            const day = parseIrcLogUrl(path);
+            if (!day) throw new Error('Invalid IRC log URL');
+            const saved = cached(day.path);
+            const age = Date.now() - (saved?.savedAt || 0);
+            if (!force && saved && age >= 0 && age < (day.day === today() ? 60000 : 24 * 60 * 60 * 1000)) return saved;
+            if (pending.has(day.path)) return pending.get(day.path);
+            const request = (async () => {
+                const controller = new AbortController();
+                const abort = () => controller.abort();
+                signal?.addEventListener('abort', abort, { once: true });
+                const timer = setTimeout(abort, 30000);
+                try {
+                    if (signal?.aborted) controller.abort();
+                    const response = await fetch(`https://bitcoin-irc.chaincode.com${day.path}`, {
+                        credentials: 'omit', cache: 'no-store', signal: controller.signal,
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+                    if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+                    const value = ircPageRecord(doc, day);
+                    remember(value);
+                    return value;
+                } finally {
+                    clearTimeout(timer);
+                    signal?.removeEventListener('abort', abort);
+                }
+            })();
+            pending.set(day.path, request);
+            try { return await request; } finally { if (pending.get(day.path) === request) pending.delete(day.path); }
+        }
+
+        const css = document.createElement('style');
+        css.textContent = `
+            #log.ack-irc-managed .log-messages > [data-ack-irc-hidden="1"] { display:none!important }
+            #log.ack-irc-managed .log-messages > [data-ack-irc-hidden="0"] { display:block!important }
+            #log.ack-irc-managed .log-messages, #ack-irc-results { top:var(--ack-irc-top,80px)!important }
+            #acktopus-irc-toolbar { display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:7px;color:inherit }
+            #acktopus-irc-toolbar button, #acktopus-irc-toolbar input { font:inherit;box-sizing:border-box;height:25px;color:inherit;background:transparent;border:1px solid #888;border-radius:4px;padding:3px 6px }
+            #acktopus-irc-toolbar input[type=checkbox] { height:auto;width:auto;padding:0 }
+            #acktopus-irc-toolbar label { display:inline-flex;align-items:center;gap:4px }
+            #acktopus-irc-toolbar details { position:relative }
+            #acktopus-irc-toolbar details > div { position:absolute;top:25px;right:0;z-index:1000;background:Canvas;color:CanvasText;border:1px solid #888;border-radius:5px;padding:10px;width:240px;box-shadow:0 3px 12px #0003 }
+            #acktopus-irc-toolbar details label { display:flex;padding:4px 0 }
+            #acktopus-irc-toolbar details input[type=text] { width:100% }
+            #ack-irc-nick { width:130px }
+            #ack-irc-status { font-size:11px;opacity:.8 }
+            #ack-irc-results { position:absolute;left:175px;right:10px;bottom:10px;overflow:auto }
+            #ack-irc-results p { margin:0;padding:7px 4px;border-bottom:1px solid #8884 }
+            #ack-irc-results a { white-space:pre-wrap;overflow-wrap:anywhere;color:inherit }
+            #ack-irc-results[hidden], #log .log-messages[hidden] { display:none!important }
+            #log-panel [hidden] { display:none!important }
+        `;
+        document.head.appendChild(css);
+        log.classList.add('ack-irc-managed');
+        const toolbar = document.createElement('div');
+        toolbar.id = 'acktopus-irc-toolbar';
+        const brand = document.createElement('strong');
+        brand.textContent = '🐙 ACKtopus';
+        toolbar.appendChild(brand);
+        const button = (label, action) => {
+            const node = document.createElement('button');
+            node.type = 'button'; node.textContent = label; node.addEventListener('click', action); toolbar.appendChild(node);
+            return node;
+        };
+        const previous = button('◀', () => adjacent(-1));
+        previous.setAttribute('aria-label', 'Previous log day');
+        const date = document.createElement('input');
+        date.type = 'date'; date.value = route.day; date.max = today(); date.setAttribute('aria-label', 'Log date');
+        date.addEventListener('change', () => navigate(`/${encodeURIComponent(route.channel)}/${date.value}`));
+        toolbar.appendChild(date);
+        const next = button('▶', () => adjacent(1));
+        next.setAttribute('aria-label', 'Next log day');
+        const author = document.createElement('input');
+        author.id = 'ack-irc-nick'; author.placeholder = 'Filter by nick'; author.setAttribute('aria-label', 'Filter by nick');
+        author.setAttribute('list', 'ack-irc-authors');
+        const authors = document.createElement('datalist'); authors.id = 'ack-irc-authors';
+        toolbar.append(author, authors);
+        const monthLabel = document.createElement('label');
+        const monthSearch = document.createElement('input'); monthSearch.type = 'checkbox'; monthSearch.id = 'ack-irc-search-month';
+        monthLabel.append(monthSearch, 'Search month'); toolbar.appendChild(monthLabel);
+        const details = document.createElement('details');
+        const summary = document.createElement('summary'); summary.textContent = 'Show noise';
+        const options = document.createElement('div');
+        details.append(summary, options); toolbar.appendChild(details);
+        for (const [name, label] of [['bots', 'Bot messages'], ['topics', 'Topic changes'], ['nicks', 'Nickname changes'], ['events', 'Other server events']]) {
+            const wrap = document.createElement('label');
+            const input = document.createElement('input'); input.type = 'checkbox'; input.checked = !!settings[name];
+            input.dataset.ackIrcFilter = name;
+            wrap.append(input, label); options.appendChild(wrap);
+            input.addEventListener('change', () => { settings[name] = input.checked; saveFilters(); applyFilters(); });
+        }
+        const botLabel = document.createElement('label'); botLabel.textContent = 'Bot nicknames';
+        const botInput = document.createElement('input'); botInput.type = 'text'; botInput.value = settings.botNicks;
+        botInput.setAttribute('aria-label', 'Bot nicknames'); options.append(botLabel, botInput);
+        botInput.addEventListener('change', () => {
+            settings.botNicks = botInput.value; indexes.clear(); rebuildRows(); saveFilters(); applyFilters();
+        });
+        const refresh = button('Refresh month', () => cacheMonth(true));
+        const status = document.createElement('span'); status.id = 'ack-irc-status'; status.setAttribute('role', 'status');
+        toolbar.appendChild(status); panel.prepend(toolbar);
+        const replaceInput = (id) => {
+            const original = document.getElementById(id);
+            if (!original) return null;
+            const copy = original.cloneNode(true); original.replaceWith(copy); return copy;
+        };
+        const query = replaceInput('filter');
+        const clear = replaceInput('clear_filter');
+        const joins = replaceInput('show_noise');
+        if (joins) {
+            joins.checked = settings.joins;
+            joins.addEventListener('change', () => { settings.joins = joins.checked; saveFilters(); applyFilters(); });
+        }
+        let live = replaceInput('live_logging');
+        let liveGroup = live?.closest('.input-group');
+        if (!live) {
+            liveGroup = document.createElement('label'); liveGroup.className = 'input-group';
+            live = document.createElement('input'); live.type = 'checkbox'; live.id = 'live_logging';
+            liveGroup.append(live, ' Live'); panel.appendChild(liveGroup);
+        }
+        live.checked = settings.live; live.title = 'Refresh the current day every minute';
+        liveGroup.style.removeProperty('display');
+        live.addEventListener('change', () => { settings.live = live.checked; saveFilters(); });
+        const results = document.createElement('section'); results.id = 'ack-irc-results'; results.hidden = true;
+        log.appendChild(results);
+        const empty = document.createElement('p'); empty.dataset.ackIrcUi = '1';
+        const emptyText = document.createElement('span');
+        const browse = document.createElement('button'); browse.type = 'button'; browse.textContent = 'Browse month';
+        browse.addEventListener('click', () => { monthSearch.checked = true; applyFilters(); });
+        empty.append(emptyText, ' ', browse);
+        const resize = () => document.documentElement.style.setProperty('--ack-irc-top', `${Math.ceil(panel.getBoundingClientRect().bottom + 8)}px`);
+        new ResizeObserver(resize).observe(panel);
+        window.addEventListener('resize', resize);
+
+        function saveFilters() {
+            try { GM_setValue(settingsKey, settings); } catch (_) { storageFailed = true; }
+        }
+
+        function rebuildRows() {
+            if (!messages.contains(empty)) messages.appendChild(empty);
+            const knownBots = bots();
+            rows = [...messages.children].filter((row) => row.matches('div[data-timestamp]')).map((row) => ircLogRow(row, knownBots));
+            authors.replaceChildren(...[...new Set(rows.map((row) => row.nick).filter(Boolean))].sort().map((nick) => {
+                const option = document.createElement('option'); option.value = nick; return option;
+            }));
+        }
+
+        function pinnedRows() {
+            const selection = location.hash.slice(1).split(';')[0];
+            if (!/^\d+(?:-\d+)?$/.test(selection)) return new Set();
+            const [start, end] = selection.split('-').map(Number);
+            return new Set(rows.filter((row) => end === undefined
+                ? row.id === selection || Number(row.node.dataset.timestamp) === start
+                : Number(row.node.dataset.timestamp) >= Math.min(start, end) && Number(row.node.dataset.timestamp) <= Math.max(start, end)));
+        }
+
+        function applyFilters() {
+            const pins = pinnedRows();
+            let visible = 0;
+            for (const row of rows) {
+                const shown = pins.has(row) || ircRowVisible(row, settings, query?.value.trim(), author.value.trim());
+                row.node.dataset.ackIrcHidden = shown ? '0' : '1';
+                row.node.classList.toggle('highlight', pins.has(row));
+                visible += shown ? 1 : 0;
+            }
+            log.classList.toggle('highlight', pins.size > 0);
+            const searching = monthSearch.checked;
+            messages.hidden = searching; results.hidden = !searching;
+            empty.hidden = visible > 0;
+            emptyText.textContent = !query?.value && !author.value && !['joins', 'topics', 'nicks', 'events', 'bots'].some((name) => settings[name])
+                ? 'No human discussion on this day.' : 'No messages match these filters.';
+            if (clear) clear.style.display = query?.value ? 'inline-block' : 'none';
+            if (searching) renderResults();
+            updateStatus(visible);
+            clearTimeout(viewTimer);
+            viewTimer = setTimeout(() => {
+                if (parseIrcLogUrl(location.href)?.path === route.path) {
+                    history.replaceState({ ...history.state, ackIrcView: currentView() }, '', location.href);
+                }
+            }, 100);
+        }
+
+        function renderResults() {
+            const scrollTop = results.scrollTop;
+            results.replaceChildren();
+            let total = 0;
+            for (const path of paths) {
+                const record = cached(path);
+                if (!record) continue;
+                let index = indexes.get(path);
+                if (index?.record !== record) {
+                    const doc = new DOMParser().parseFromString(`<body>${record.html}</body>`, 'text/html');
+                    const knownBots = bots();
+                    index = { record, rows: [...doc.body.children].filter((row) => row.matches('div[data-timestamp]')).map((row) => {
+                        const { node, ...entry } = ircLogRow(row, knownBots);
+                        return entry;
+                    }) };
+                    indexes.set(path, index);
+                }
+                for (const row of index.rows) {
+                    if (!ircRowVisible(row, settings, query?.value.trim(), author.value.trim())) continue;
+                    total++;
+                    if (total > resultLimit) continue;
+                    const item = document.createElement('p');
+                    const link = document.createElement('a'); link.href = `${path}#${encodeURIComponent(row.id)}`;
+                    link.textContent = `${record.day} ${row.text}`; link.dataset.ackIrcResult = '1';
+                    item.appendChild(link); results.appendChild(item);
+                }
+            }
+            if (total > resultLimit) {
+                const more = document.createElement('button'); more.type = 'button'; more.textContent = `Show more (${total} matches)`;
+                more.addEventListener('click', () => { resultLimit += 200; renderResults(); }); results.appendChild(more);
+            } else if (!total) {
+                const empty = document.createElement('p'); empty.textContent = 'No matching messages in the cached days.'; results.appendChild(empty);
+            }
+            monthMatches = total;
+            results.scrollTop = scrollTop;
+        }
+
+        function updateStatus(visible) {
+            const count = paths.filter((path) => cached(path)).length;
+            const shown = visible === undefined ? rows.filter((row) => row.node.dataset.ackIrcHidden === '0').length : visible;
+            status.textContent = (monthSearch.checked ? `${monthMatches} month messages` : `${shown}/${rows.length} messages`) +
+                ` · ${count}/${paths.length} days cached` +
+                (storageFailed ? ' · storage unavailable' : fetchError ? ` · ${fetchError}` : '');
+            refresh.disabled = !!warm && !warm.controller.signal.aborted;
+        }
+
+        function currentView() {
+            return { query: query?.value || '', author: author.value, month: monthSearch.checked,
+                limit: resultLimit, scroll: (monthSearch.checked ? results : messages).scrollTop };
+        }
+
+        function render(record, { push = false, scroll = null, previousView = null } = {}) {
+            stopNativeLive();
+            const changedDay = route.path !== record.path;
+            const scrollTop = (monthSearch.checked ? results : messages).scrollTop;
+            if (push) {
+                history.replaceState({ ...history.state, ackIrcScroll: scrollTop, ackIrcView: previousView || currentView() }, '', location.href);
+                history.pushState({ ackIrcScroll: 0, ackIrcView: { ...currentView(), scroll: 0 } }, '', record.path);
+            }
+            route = parseIrcLogUrl(record.path);
+            keepMonth(route);
+            if (cached(record.path) !== record) remember(record);
+            if (current?.html !== record.html || changedDay) messages.replaceChildren(ircSafeFragment(record.html));
+            const calendar = document.getElementById('calendar');
+            const contents = ircSafeFragment(record.calendar);
+            const clock = calendar.querySelector('.clock');
+            if (clock && contents.querySelector('.clock')) contents.querySelector('.clock').replaceWith(clock);
+            calendar.replaceChildren(contents);
+            current = record; document.title = record.title; date.value = route.day;
+            liveGroup.hidden = route.day !== today();
+            paths = ircMonthPaths(document, route);
+            previous.disabled = paths.indexOf(route.path) <= 0;
+            next.disabled = paths.indexOf(route.path) === paths.length - 1;
+            rebuildRows(); applyFilters(); resize();
+            (monthSearch.checked ? results : messages).scrollTop = scroll === null ? changedDay ? 0 : scrollTop : scroll;
+            if (location.hash) hashChanged(true);
+        }
+
+        async function navigate(value, { push = true, openResult = false } = {}) {
+            const target = parseIrcLogUrl(value);
+            if (!target || target.channel !== route.channel) return;
+            const url = new URL(value, location.href);
+            const attempt = ++navigation;
+            const previousView = currentView();
+            const changedMonth = scope(target) !== scope(route);
+            if (changedMonth) warm?.controller.abort();
+            stopNativeLive(); fetchError = '';
+            let saved = cached(target.path);
+            if (!saved) { status.textContent = `Loading ${target.day}…`; date.value = target.day; }
+            try {
+                if (!saved) saved = await fetchDay(target.path);
+                if (attempt !== navigation) return;
+                const restore = !push && history.state?.ackIrcView;
+                if (restore) {
+                    if (query) query.value = restore.query || '';
+                    author.value = restore.author || ''; monthSearch.checked = !!restore.month;
+                    resultLimit = restore.limit || 200;
+                } else if (openResult) {
+                    monthSearch.checked = false; if (query) query.value = ''; author.value = '';
+                }
+                render(saved, { push, previousView, scroll: restore?.scroll || history.state?.ackIrcScroll || 0 });
+                if (url.hash) { history.replaceState(history.state, '', target.path + url.hash); hashChanged(true); }
+                cacheMonth();
+                const fresh = await fetchDay(target.path);
+                if (attempt === navigation && fresh !== saved && !window.getSelection()?.toString()) render(fresh);
+            } catch (error) {
+                if (attempt !== navigation) return;
+                fetchError = saved ? 'cached copy, refresh failed' : `Could not load ${target.day}`;
+                date.value = route.day;
+                if (!push) history.replaceState(history.state, '', route.path);
+                updateStatus();
+            }
+        }
+
+        function adjacent(direction) {
+            const path = paths[paths.indexOf(route.path) + direction];
+            if (path) navigate(path);
+        }
+
+        function cacheMonth(force = false) {
+            const selected = scope(route);
+            if (!force && warm?.scope === selected && !warm.controller.signal.aborted) return warm.promise;
+            warm?.controller.abort();
+            const job = { scope: selected, controller: new AbortController(), promise: null };
+            warm = job; fetchError = ''; updateStatus();
+            const queue = [...paths];
+            const queued = new Set(queue);
+            const worker = async () => {
+                while (queue.length && !job.controller.signal.aborted) {
+                    const path = queue.shift();
+                    try {
+                        const record = await fetchDay(path, { force, signal: job.controller.signal });
+                        if (job.controller.signal.aborted) return;
+                        if (route.path === path && current !== record && !window.getSelection()?.toString()) render(record);
+                        for (const added of paths) if (!queued.has(added)) { queued.add(added); queue.push(added); }
+                        if (monthSearch.checked) renderResults();
+                    } catch (error) {
+                        if (job.controller.signal.aborted) return;
+                        fetchError = 'some days could not be cached';
+                    }
+                    updateStatus();
+                }
+            };
+            job.promise = Promise.all([worker(), worker()]).finally(() => {
+                if (warm === job) { warm = null; updateStatus(); }
+            });
+            return job.promise;
+        }
+
+        function hashChanged(scroll = false) {
+            const hash = location.hash.slice(1);
+            if (query && hash.includes(';')) {
+                try { query.value = decodeURIComponent(hash.slice(hash.indexOf(';') + 1)); } catch (_) {}
+            }
+            applyFilters();
+            if (scroll) [...pinnedRows()][0]?.node.scrollIntoView({ block: 'center' });
+        }
+
+        const filterChanged = () => {
+            clearTimeout(searchTimer); resultLimit = 200;
+            results.scrollTop = 0;
+            searchTimer = setTimeout(applyFilters, 80);
+        };
+        query?.addEventListener('input', filterChanged);
+        author.addEventListener('input', filterChanged);
+        monthSearch.addEventListener('change', () => { resultLimit = 200; applyFilters(); });
+        clear?.addEventListener('click', () => { query.value = ''; applyFilters(); });
+        document.addEventListener('click', (event) => {
+            if (event.button || event.metaKey || event.ctrlKey || event.altKey) return;
+            const link = event.target.closest?.('a[href]');
+            if (!link || link.getAttribute('href') === '#' || link.target === '_blank' || link.hasAttribute('download')) return;
+            if (event.shiftKey && !link.matches('a.timestamp')) return;
+            const url = new URL(link.getAttribute('href'), location.href);
+            const target = parseIrcLogUrl(url.href);
+            if (!target || target.channel !== route.channel) return;
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (link.dataset.ackIrcResult) navigate(url.href, { openResult: true });
+            else if (target.path === route.path && url.hash) {
+                if (event.shiftKey) {
+                    const from = [...pinnedRows()][0]?.node.dataset.timestamp;
+                    const to = link.closest('[data-timestamp]')?.dataset.timestamp;
+                    if (from && to) url.hash = `${from}-${to}`;
+                }
+                history.pushState(history.state, '', url.pathname + url.hash); hashChanged(true);
+            } else navigate(url.href);
+        }, true);
+        window.addEventListener('popstate', () => {
+            const target = parseIrcLogUrl(location.href);
+            if (target) navigate(location.href, { push: false });
+            else hashChanged(true);
+        });
+        window.addEventListener('hashchange', () => hashChanged(true));
+        setInterval(async () => {
+            date.max = today(); liveGroup.hidden = route.day !== today();
+            if (document.hidden || !settings.live || route.day !== today()) return;
+            const path = route.path;
+            try {
+                const record = await fetchDay(path);
+                if (route.path === path && !window.getSelection()?.toString()) render(record);
+            } catch (_) { fetchError = 'cached copy, refresh failed'; updateStatus(); }
+        }, 60000);
+
+        keepMonth(route);
+        if (location.pathname !== route.path) history.replaceState(history.state, '', route.path + location.hash);
+        const initial = ircPageRecord(document, route);
+        remember(initial); render(initial); hashChanged(true);
+        history.replaceState({ ...history.state, ackIrcView: currentView() }, '', location.href);
+        cacheMonth();
+        if (shouldExposeTestExports()) globalThis.__ACKtopusIrcTest = {
+            parseIrcLogUrl, ircMonthPaths, ircLogRow, ircRowVisible, ircPageRecord, ircSafeFragment,
+            navigate, cacheMonth, applyFilters, fetchDay, cached,
+            get route() { return route; },
+        };
+    }
+
     // =========================================================================
     // In-browser test suite — ALL tests (functional + structural + DOM)
     // Runs when settings panel is opened. Tests validate internal logic,
@@ -31287,8 +31837,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
 // @version      ${ver}
-// @description  ACKtopus - Bitcoin Core and secp256k1 PR review toolkit with LLM integration
+// @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @match        https://github.com/*
+// @match        https://bitcoin-irc.chaincode.com/*
+// @grant        unsafeWindow
 // @grant        GM_setClipboard
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -31317,6 +31869,72 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (_ackSource && _ackSource.length > 0) return;
         _ackSource = stripSelfTestsFromSource(getSelfSource());
     }
+
+    ackTest('IRC routes validate dates and stay on the archive host', () => {
+        ackDeepEq(parseIrcLogUrl('/bitcoin-core-dev/2026-10-20#1267074'), {
+            channel: 'bitcoin-core-dev', day: '2026-10-20', month: '2026-10', path: '/bitcoin-core-dev/2026-10-20',
+        });
+        ackEq(parseIrcLogUrl('/%23miniscript/2024-02-29')?.channel, '#miniscript', 'supports escaped channel names and leap days');
+        for (const url of ['https://example.com/bitcoin-core-dev/2026-10-20', '/bitcoin-core-dev/2026-02-29',
+            '/bitcoin-core-dev/2026-10-32', '/bitcoin-core-dev/search', '/bitcoin-core-dev/2026-10-20?raw=1']) {
+            ackEq(parseIrcLogUrl(url), null, `rejects ${url}`);
+        }
+    });
+
+    ackTest('IRC month caching follows available calendar days only', () => {
+        const doc = document.implementation.createHTMLDocument();
+        doc.body.innerHTML = '<section id="calendar"><a href="/bitcoin-core-dev/2026-09-20">Previous</a>' +
+            '<a href="/bitcoin-core-dev/2026-10-01">1</a><a href="/bitcoin-core-dev/2026-10-22">22</a>' +
+            '<a href="/other/2026-10-02">Other channel</a><a href="https://example.com/bitcoin-core-dev/2026-10-03">Foreign</a></section>';
+        ackDeepEq(ircMonthPaths(doc, parseIrcLogUrl('/bitcoin-core-dev/2026-10-20')), [
+            '/bitcoin-core-dev/2026-10-01', '/bitcoin-core-dev/2026-10-20', '/bitcoin-core-dev/2026-10-22',
+        ], 'includes the active day, excludes other months/channels, and does not invent empty or future days');
+    });
+
+    ackTest('IRC default filters retain human messages and actions, with independent noise switches', () => {
+        const bots = new Set(['corebot']);
+        for (const [classes, nick, text, kind] of [
+            ['talk op-msg', 'reviewer', '#topic review meeting', 'human'],
+            ['talk op-msg', 'reviewer', 'A user has joined and changed the topic', 'human'],
+            ['info op-action', 'reviewer', 'reviews the patch', 'human'],
+            ['talk op-msg', 'bitcoin-git', 'pushed commits', 'bots'],
+            ['talk op-msg', 'bitcoin-git2', 'opened a pull request', 'bots'],
+            ['talk op-msg', 'corebot', 'Meeting started', 'bots'],
+            ['info op-topic', '', 'changed the topic', 'topics'],
+            ['info op-nick', '', 'is now known as', 'nicks'],
+            ['info op-quit', '', 'has quit', 'joins'],
+            ['info op-mode', '', 'sets mode', 'events'],
+        ]) {
+            const node = document.createElement('div'); node.className = classes;
+            node.innerHTML = '<span class="nick"></span>'; node.firstChild.textContent = nick;
+            node.append(text);
+            const row = ircLogRow(node, bots);
+            ackEq(row.kind, kind, `${classes}: ${nick}`);
+            ackEq(ircRowVisible(row, {}), kind === 'human', 'only humans are visible by default');
+            ackEq(ircRowVisible(row, { [kind]: true }), true, 'the matching switch restores the entry');
+        }
+        const row = { kind: 'human', nick: 'Reviewer', text: '16:00 Reviewer: discuss package relay' };
+        ackEq(ircRowVisible(row, {}, 'PACKAGE', 'review'), true, 'text and participant filters ignore case');
+        ackEq(ircRowVisible(row, {}, 'unrelated'), false, 'text filters reject unrelated messages');
+    });
+
+    ackTest('IRC snapshots retain noise, remove reader state, and reject incorrect server pages', () => {
+        const doc = document.implementation.createHTMLDocument('Log on 2026-10-20');
+        doc.body.innerHTML = '<section id="calendar"></section><section id="log" data-channel="#bitcoin-core-dev">' +
+            '<div class="log-messages"><div class="info op-nick highlight" data-timestamp="1" data-ack-irc-hidden="1" style="display:none">nick change</div>' +
+            '<p data-ack-irc-ui="1">Reader controls</p></div></section>';
+        const route = parseIrcLogUrl('/bitcoin-core-dev/2026-10-20');
+        const record = ircPageRecord(doc, route);
+        ackAssert(record.html.includes('nick change'), 'stores original noise for later revealing');
+        ackAssert(!/data-ack-irc|display|highlight/.test(record.html), 'does not persist filter state or reader controls');
+        let rejected = false;
+        try { ircPageRecord(doc, parseIrcLogUrl('/bitcoin-core-dev/2026-10-21')); } catch (_) { rejected = true; }
+        ackAssert(rejected, 'cannot cache another day as the requested page');
+        doc.querySelector('#log').dataset.channel = '##miniscript';
+        ackEq(ircPageRecord(doc, parseIrcLogUrl('/%23miniscript/2026-10-20')).channel, '#miniscript', 'preserves doubled IRC channel prefixes');
+        const fragment = ircSafeFragment('<div onclick="bad()"><script>bad()</script><a href="java&#9;script:bad()">message</a><svg><animate attributeName="href" values="javascript:bad()"></animate></svg></div>');
+        ackAssert(!fragment.querySelector('script, svg, [onclick], [href]'), 'removes active markup and encoded script URLs before rendering');
+    });
 
     ackTest('GitHub credential state belongs to the request token', () => {
         const oldHeaders = { Authorization: 'Bearer old-token' };

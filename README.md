@@ -1,6 +1,7 @@
 <h1><img src="screenshots/acktopus-logo.svg" alt="ACKtopus" width="28" height="28"> ACKtopus</h1>
 
-ACKtopus is a GitHub userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a floating review toolbar, context-copy tools, LLM review recipes, proofreading, pending-review helpers, and queue/navigation shortcuts on GitHub pull requests and issues (optimized for Bitcoin Core and libsecp256k1 review).
+ACKtopus is a userscript for [Tampermonkey](https://www.tampermonkey.net/) that adds a floating review toolbar, context-copy tools, LLM review recipes, proofreading, pending-review helpers, and queue/navigation shortcuts on GitHub pull requests and issues (optimized for Bitcoin Core and libsecp256k1 review).
+It also provides a cached discussion reader for [Chaincode's IRC logs](https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-10-20).
 
 ## Highlights
 
@@ -122,6 +123,23 @@ _Settings for tokens, providers, maintainer list, caches, and compact toolbar be
 - Proofreading comments, PR descriptions, and selected prose with a diff preview before applying changes
 - Starting pending GitHub reviews and opening the review dialog from the Conversation tab
 - Keeping a personal PR review queue
+
+## IRC discussion reader
+
+On `bitcoin-irc.chaincode.com`, ACKtopus shows human messages and actions by default.
+The **Show noise** menu independently reveals bot messages, topic changes, nickname changes, and other server events, alongside the original **Show join/leave messages** checkbox.
+Bot nicknames can be edited, and filter choices persist between visits.
+Direct timestamp links reveal their target without enabling all noise.
+
+After the initial site load, the date picker, previous/next buttons, and calendar use cached navigation within the page.
+ACKtopus automatically saves every available day in the active month, prefetching two days at a time, and retains the three most recently visited channel/month combinations.
+The toolbar shows cache progress, and **Refresh month** downloads fresh copies.
+Past days refresh after 24 hours, while **Live** checks the current day every minute.
+
+The existing text filter and the participant field work on the active day or, with **Search month**, across all cached days.
+Month results fill in as caching progresses and open the original day at the matching timestamp.
+Browser Back and Forward restore the view, and cached day navigation remains available when requests fail.
+Days without human discussion offer **Browse month**.
 
 ## Toolbar (top-right)
 
