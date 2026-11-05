@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.302
+// @version      1.303
 // @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -14564,8 +14564,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             let taContainer = container;
 
             if (isToolbarProofreadBtn) {
-                // Toolbar proofread for existing edit forms: use the textarea
-                // associated with this markdown toolbar.
+                // Toolbar proofread uses the textarea associated with this editor
                 const toolbar = commentEl.closest(
                     'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"], .ack-toolbar-actions',
                 );
@@ -24243,7 +24242,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function makeStickyEditToolbar(root = document) {
         const forms = qsa(root, '.js-previewable-comment-form, [data-testid="edit-comment-form"]');
         for (const form of forms) {
-            if (form.dataset.ackStickySetup) continue;
+            if (form.dataset.ackStickySetup || !isVisible(form)) continue;
             // Only target edit forms (not the main "new comment" form at the bottom)
             const isEditForm = form.closest(
                 '.is-comment-editing, .js-comment-update, [data-testid="edit-comment-form"]',
@@ -24270,12 +24269,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 if (headerH > 0) head.style.top = `${headerH}px`;
             }
 
-            // Walk up from form to the scrollable viewport and fix overflow clipping
+            // Unclip local wrappers while preserving native scroll containers
             const fixedAncestors = [];
             let el = form.parentElement;
             for (let i = 0; i < 10 && el && el !== document.body; i++) {
-                const ov = getComputedStyle(el).overflow;
-                if (ov === 'hidden' || ov === 'auto' || ov === 'scroll') {
+                const { overflowX, overflowY } = getComputedStyle(el);
+                if (/(auto|scroll)/.test(`${overflowX} ${overflowY}`)) break;
+                if (overflowX === 'hidden' || overflowY === 'hidden') {
                     el.classList.add('ack-overflow-fix');
                     fixedAncestors.push(el);
                 }
@@ -25968,7 +25968,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const fallbackScopes = new Set();
         const addFallbackScope = (el) => {
             let scope = findEditForm(el) || (isExistingPostEditForm(el) ? el : null);
-            if (!scope && el?.tagName === 'TEXTAREA' && isSuggestedReplyTextarea(el, path)) {
+            if (!scope && el?.tagName === 'TEXTAREA' && isProofreadableComposeTextarea(el, path)) {
                 scope = el.closest('form') || el.parentElement;
             }
             if (scope) fallbackScopes.add(scope);
@@ -38087,18 +38087,19 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(proofFn.includes('showDiffDialog'), 'shows diff dialog');
     });
 
-    ackTest('proofread ignores compose/new-post textareas', () => {
+    ackTest('toolbar proofreading accepts recognized compose editors', () => {
         const fn = _ackSource.slice(
             _ackSource.indexOf('async function runProofreadOnComment'),
             _ackSource.indexOf('// --- Start a review ---'),
         );
         ackAssert(
             fn.includes("logProofreadOutcome('ignored unsupported compose form')"),
-            'toolbar proofread exits on compose/new-post textareas',
+            'rejects unsupported editor contexts',
         );
         ackAssert(
-            fn.includes('!isExistingPostEditForm(ta.closest') && fn.includes("!ta.closest('.is-comment-editing')"),
-            'toolbar proofread allows only existing edit forms',
+            fn.includes('!isExistingPostEditForm(ta.closest') && fn.includes("!ta.closest('.is-comment-editing')") &&
+                fn.includes('!isProofreadableComposeTextarea(ta)'),
+            'allows existing edits and recognized compose forms',
         );
         ackAssert(!fn.includes('isDraftPRDescription'), 'does not special-case draft PR descriptions');
         ackAssert(!fn.includes('suggestDraftReplyForTextarea(ta'), 'does not generate new comments from proofread');
@@ -38106,7 +38107,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     ackTest('toolbar proofread resolves textarea via markdown-toolbar for attribute', () => {
         const section = _ackSource.slice(
-            _ackSource.indexOf('Toolbar proofread for existing edit forms'),
+            _ackSource.indexOf('Toolbar proofread uses the textarea'),
             _ackSource.indexOf('Quick-action proofread for existing comments is EDIT-MODE ONLY'),
         );
         ackAssert(section.includes("toolbar?.tagName === 'MARKDOWN-TOOLBAR'"), 'checks for markdown-toolbar element');
@@ -38141,7 +38142,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(dialogFn.includes("maxHeight: 'calc(100dvh - 32px)'"), 'keeps actions inside the visible viewport');
     });
 
-    ackTest('toolbar proofread remains edit-only instead of draft-generation mode', () => {
+    ackTest('toolbar proofreading corrects draft text without generating a reply', () => {
         const source = _ackSource;
         const toolbarFn = source.slice(
             source.indexOf('function updateToolbarProofreadButton'),
@@ -40687,6 +40688,90 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ta.selectionStart = ta.selectionEnd = 0;
         ackEq(indentTextareaSelection(ta, false), true, 'indent changed the caret line');
         ackEq(ta.value, '    \nbeta', 'indents the empty first line without duplicating its newline');
+    });
+
+    ackTest('sticky edit toolbars preserve native scroll viewports', () => {
+        const viewport = document.createElement('div');
+        viewport.style.cssText = 'height:200px;overflow:auto';
+        viewport.innerHTML = '<div style="overflow:hidden"><div style="height:4000px">Diff</div>' +
+            '<div class="is-comment-editing"><form class="js-previewable-comment-form">' +
+            '<div class="comment-form-head">Toolbar</div><textarea></textarea></form></div></div>';
+        document.body.appendChild(viewport);
+        try {
+            viewport.scrollTop = 1200;
+            makeStickyEditToolbar(viewport);
+            ackEq(getComputedStyle(viewport).overflowY, 'auto', 'preserves the native scroll container');
+            ackEq(viewport.scrollTop, 1200, 'keeps the reader at the same diff position');
+            ackAssert(viewport.firstElementChild.classList.contains('ack-overflow-fix'), 'still unclamps the local clipping wrapper');
+            ackAssert(!viewport.classList.contains('ack-overflow-fix'), 'never expands the scroll viewport into the document');
+        } finally {
+            viewport.remove();
+        }
+    });
+
+    ackTest('sticky toolbar setup waits for a visible edit form', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div class="is-comment-editing" hidden><form class="js-previewable-comment-form">' +
+            '<div class="comment-form-head">Toolbar</div><textarea></textarea></form></div>';
+        document.body.appendChild(root);
+        try {
+            const form = root.querySelector('form');
+            makeStickyEditToolbar(root);
+            ackAssert(!form.dataset.ackStickySetup, 'hidden GitHub editors do not change ancestor layout');
+            root.firstElementChild.hidden = false;
+            makeStickyEditToolbar(root);
+            ackEq(form.dataset.ackStickySetup, 'true', 'sets up the toolbar when editing becomes visible');
+        } finally {
+            root.remove();
+        }
+    });
+
+    ackTest('issue and PR reply editors without a formatting toolbar get manual proofreading', () => {
+        for (const [path, tag] of [['/owner/repo/issues/123', 'form'], ['/owner/repo/issues/123', 'div'], ['/owner/repo/pull/123', 'form']]) {
+            const root = document.createElement('div');
+            root.innerHTML = `<${tag} class="js-new-comment-form"><div data-testid="markdown-editor">` +
+                `<textarea name="comment[body]">Draft reply</textarea></div><button type="submit">Comment</button></${tag}>`;
+            document.body.appendChild(root);
+            try {
+                addDetailsButtons(root, path);
+                addDetailsButtons(root, path);
+                ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 1, `${path} (${tag}) gets one proofread control`);
+                ackAssert(root.querySelector('.ack-toolbar-proofread svg'), 'renders the proofread icon');
+                ackEq(getToolbarTextarea(root.querySelector('.ack-toolbar-actions')), root.querySelector('textarea'), 'targets the reply textarea');
+            } finally {
+                root.remove();
+            }
+        }
+    });
+
+    ackTest('issue reply proofreading updates the selected draft without posting', async () => {
+        const original = { callLLM, showDiffDialog, parsePR, isPRPage, isIssuePage };
+        const root = document.createElement('div');
+        root.innerHTML = '<form class="js-new-comment-form"><div data-testid="markdown-editor">' +
+            '<textarea name="comment[body]">Thsi is clear.</textarea></div><button type="submit">Comment</button></form>' +
+            '<textarea>Another draft</textarea>';
+        document.body.appendChild(root);
+        let submissions = 0;
+        root.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); submissions++; });
+        GM_setValue('activeProvider', 'claude');
+        GM_setValue('llm_claude_key', 'fixture-key');
+        try {
+            parsePR = () => null; isPRPage = () => false; isIssuePage = () => true;
+            callLLM = async () => '<output><s1>This is clear.</s1></output>';
+            showDiffDialog = async (before, after) => {
+                ackEq(before, 'Thsi is clear.', 'compares the reply text');
+                return { action: true, text: after };
+            };
+            addDetailsButtons(root, '/owner/repo/issues/123');
+            await runProofreadOnComment(root.querySelector('.ack-toolbar-proofread'));
+            ackEq(root.querySelector('textarea').value, 'This is clear.', 'applies the accepted correction');
+            ackEq(root.lastElementChild.value, 'Another draft', 'leaves other drafts alone');
+            ackEq(submissions, 0, 'manual proofreading never posts the reply');
+        } finally {
+            callLLM = original.callLLM; showDiffDialog = original.showDiffDialog; parsePR = original.parsePR;
+            isPRPage = original.isPRPage; isIssuePage = original.isIssuePage;
+            root.remove();
+        }
     });
 
     ackTest('installEditorErgonomics binds GitHub comment textareas', () => {

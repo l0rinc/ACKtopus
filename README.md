@@ -297,7 +297,9 @@ Inline review comments also get a quick link back to the Changes tab when ACKtop
 
 ### Compose forms
 
-ACKtopus does not activate proofreading while drafting a new PR, issue, or comment. Proofreading is limited to existing comments and PR descriptions that are already in edit mode, so compose forms are left to GitHub's native flow.
+Reply and comment editors offer manual proofreading, including issue replies without a formatting toolbar.
+Accepting a correction updates the draft without posting it.
+Existing comments and PR descriptions can be proofread while editing.
 
 Markdown textareas get small editor ergonomics: **Tab** indents selected lines, **Shift+Tab** unindents them, and comment boxes grow with their content up to a viewport-sized cap.
 
