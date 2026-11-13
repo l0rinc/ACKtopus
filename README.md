@@ -335,6 +335,8 @@ On repository pages, ACKtopus rewrites one-sided or cross-fork compare links so 
 
 ### GitHub layout compatibility
 
+Commit navigation reads both the original changes route and GitHub's newer `pullRequestsChangesWithRangeRoute`. A complete embedded commit list is reused for navigation only after its repository, PR, count, full SHAs and current head are checked. Partial timelines are not substituted for the complete list. Headline-only navigation data never populates the full-message commit cache. Derived commit-list caches include both base and head SHA. On commit diff pages, keyboard navigation uses the floating or native navigation links before considering commit rows.
+
 ACKtopus detects the classic UI, React views and the newer React overview from the current DOM. Shared selectors cover labelled descriptions, posted comment and review articles, timeline commits, header actions and native formatting toolbars. The detected layout is logged as `ACKtopus: GitHub layout detected: ...`, together with whether the header and description were found. Detection runs again when GitHub replaces the relevant page content. Review summaries remain eligible even when they contain inline threads. Inline diff previews also support the newer text-cell and line-number classes. Layout checks are local and do not trigger GitHub or AI requests.
 
 ## Development checks

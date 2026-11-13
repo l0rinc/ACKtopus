@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.304
+// @version      1.305
 // @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -306,10 +306,48 @@
         return data;
     }
 
+    function readPRChangesRoute(data = readPRSSRData()) {
+        return data?.payload?.pullRequestsChangesWithRangeRoute || data?.payload?.pullRequestsChangesRoute || null;
+    }
+
+    function embeddedPRCommitRows(data = readPRSSRData()) {
+        const changes = readPRChangesRoute(data);
+        if (Array.isArray(changes?.commits)) return changes.commits;
+        const groups = data?.payload?.pullRequestsCommitsRoute?.commitGroups;
+        return Array.isArray(groups) ? groups.flatMap((group) => group?.commits || []) : [];
+    }
+
+    // Headline-only entries are sufficient for navigation, not for AI context.
+    function embeddedNavigationCommits(data, pr, head, baseSha = '') {
+        const layout = data?.payload?.pullRequestsLayoutRoute;
+        const metadata = layout?.pullRequest;
+        const repository = layout?.repository;
+        const owner = repository?.ownerLogin || repository?.owner?.login || '';
+        if (!metadata || Number(metadata.number) !== Number(pr.pr) ||
+            String(owner).toLowerCase() !== String(pr.owner).toLowerCase() ||
+            String(repository?.name || '').toLowerCase() !== String(pr.repo).toLowerCase()) return null;
+        const expectedHead = metadata.headSha || metadata.headRefOid || '';
+        if (!/^[0-9a-f]{40}$/i.test(expectedHead) || head && !commitShaMatches(head, expectedHead) ||
+            baseSha && metadata.baseSha !== baseSha) return null;
+        const changes = readPRChangesRoute(data);
+        if (changes?.truncated || data?.payload?.pullRequestsCommitsRoute?.truncated) return null;
+        const rows = embeddedPRCommitRows(data);
+        if (!Number.isInteger(metadata.commitsCount) || metadata.commitsCount < 1 || rows.length !== metadata.commitsCount) return null;
+        const commits = rows.map((row) => ({
+            sha: row.oid || row.sha || '',
+            commit: { message: row.messageHeadline || row.shortMessage || row.commit?.message || '' },
+        }));
+        if (commits.some((commit) => !/^[0-9a-f]{40}$/i.test(commit.sha)) ||
+            new Set(commits.map((commit) => commit.sha.toLowerCase())).size !== commits.length) return null;
+        // Commit-list groups may be presented newest first.
+        if (commits.length > 1 && commitShaMatches(commits[0].sha, expectedHead)) commits.reverse();
+        return commitShaMatches(commits.at(-1).sha, expectedHead) ? commits : null;
+    }
+
     function readBaseBranchFromSSR() {
         const data = readPRSSRData();
         return (
-            data?.payload?.pullRequestsChangesRoute?.pullRequest?.baseBranch ||
+            readPRChangesRoute(data)?.pullRequest?.baseBranch ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.baseBranch ||
             ''
         );
@@ -318,7 +356,7 @@
     function readHeadBranchFromSSR() {
         const data = readPRSSRData();
         return (
-            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headBranch ||
+            readPRChangesRoute(data)?.pullRequest?.headBranch ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headBranch ||
             ''
         );
@@ -327,11 +365,11 @@
     function readHeadShaFromSSR() {
         const data = readPRSSRData();
         const sha =
-            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRefOid ||
+            readPRChangesRoute(data)?.pullRequest?.headRefOid ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid ||
-            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headRef?.target?.oid ||
+            readPRChangesRoute(data)?.pullRequest?.headRef?.target?.oid ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid ||
-            data?.payload?.pullRequestsChangesRoute?.pullRequest?.headSha ||
+            readPRChangesRoute(data)?.pullRequest?.headSha ||
             data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headSha ||
             data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha ||
             '';
@@ -837,11 +875,12 @@
     // React "Files changed" views use hashed CSS-module classes (see the
     // saved DOMs): container [class*="Diff-module__diff__"], header
     // [class*="DiffFileHeader-module__"]; classic selectors kept as fallback.
-    const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], [class*="Diff-module__diff__"], .file';
+    const DIFF_FILE_SELECTOR = '.js-file, [data-testid="diff-file"], [class*="Diff-module__diff__"], ' +
+        '[class^="diff__"], [class*=" diff__"], .file';
     const COMPARE_FILE_SELECTOR = `[data-tagsearch-path], ${DIFF_FILE_SELECTOR}`;
     const DIFF_FILE_HEADER_SELECTOR =
         '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header, ' +
-        '[class*="DiffFileHeader-module__diff-file-header"]';
+        '[class*="DiffFileHeader-module__diff-file-header"], [class^="diff-file-header__"], [class*=" diff-file-header__"]';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     const PR_DESCRIPTION_ROOT_SELECTOR =
@@ -5051,7 +5090,7 @@
             payload.repo,
             payload.repositoryOwner?.repository,
             payload.pullRequestsLayoutRoute?.repository,
-            payload.pullRequestsChangesRoute?.repository,
+            readPRChangesRoute(data)?.repository,
         ].forEach((repo) => addEmbeddedRepoInfo(infos, repo));
     }
 
@@ -9251,7 +9290,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             file.querySelector(DIFF_FILE_HEADER_SELECTOR) || outerFile?.querySelector(DIFF_FILE_HEADER_SELECTOR);
         if (!header) return normalize(outerFile?.getAttribute('data-path'));
         const named = header.querySelector(
-            '[data-testid="file-name"], [class*="DiffFileHeader-module__file-name"], .file-info a',
+            '[data-testid="file-name"], [class*="DiffFileHeader-module__file-name"], [class^="file-name__"], [class*=" file-name__"], .file-info a',
         ) || qsa(header, 'a[title], span[title], [data-path]').find((node) => !node.closest('button'));
         return normalize(header.getAttribute('data-path') || named?.getAttribute('data-path') ||
             named?.getAttribute('title') || named?.getAttribute('aria-label') || named?.textContent || '');
@@ -13364,10 +13403,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             });
         }
         if (commits.length === 0) {
-            const ssrCommits = readPRSSRData()?.payload?.pullRequestsChangesRoute?.commits || [];
+            const ssrCommits = embeddedPRCommitRows();
             for (const c of ssrCommits) {
                 const sha = c?.oid || c?.sha || '';
-                const msg = c?.messageHeadline || c?.commit?.message || '';
+                const msg = c?.messageHeadline || c?.shortMessage || c?.commit?.message || '';
                 if (sha) commits.push({ sha, msg, el: null });
             }
         }
@@ -13380,7 +13419,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     let currentCommitIdx = -1;
 
     function focusCommitEntry(target, idx = currentCommitIdx) {
-        if (!target?.el) return false;
+        if (!target?.el || !isVisible(target.el)) return false;
         document.querySelectorAll('.ack-commit-highlight').forEach((el) => {
             el.classList.remove('ack-commit-highlight');
             el.style.outline = '';
@@ -13396,7 +13435,17 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
-    function navigateCommit(dir) {
+    function navigateCommit(dir, root = document) {
+        const sel = dir > 0
+            ? 'a[aria-label*="next commit" i], a[data-testid="next-commit-link"]'
+            : 'a[aria-label*="previous commit" i], a[data-testid="prev-commit-link"]';
+        const navBtn = root.querySelector('#ack-commit-nav')?.querySelector(sel) || root.querySelector(sel);
+        // A commit diff can contain hidden commit-picker rows. Use navigation
+        // links here rather than scrolling to a row that is not on this page.
+        if (pathCommitSha() && navBtn) {
+            navBtn.click();
+            return;
+        }
         // Try commit list navigation first
         const commits = parseCommitsFromPage();
         if (commits.length > 0) {
@@ -13418,12 +13467,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 return;
             }
         }
-        // Fallback: click GitHub's native prev/next commit navigation buttons
-        const sel =
-            dir > 0
-                ? 'a[aria-label*="next commit" i], a[data-testid="next-commit-link"]'
-                : 'a[aria-label*="previous commit" i], a[data-testid="prev-commit-link"]';
-        const navBtn = document.querySelector(sel);
+        // Fallback: click the floating or native navigation link.
         if (navBtn) navBtn.click();
     }
 
@@ -30211,7 +30255,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // the async callback checks gen !== commitNavGeneration to discard stale calls.
     let commitNavGeneration = 0;
     let commitNavTimer = null;
-    const commitListCache = new Map(); // "owner/repo/pr:head" -> [{sha, message}]
+    const commitListCache = new Map(); // "owner/repo/pr:base:head" -> full-message API entries
 
     function runFloatingCommitNavBuild() {
         _addFloatingCommitNavInner().catch((e) => {
@@ -30220,6 +30264,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function addFloatingCommitNav(opts = {}) {
+        const pr = parsePR();
+        if (pr && embeddedNavigationCommits(readPRSSRData(), pr, getImmediatePRHeadSHA())) {
+            opts = { ...opts, immediate: true };
+        }
         // Remove ALL instances including turbo-cached ones
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
         hideNativeCommitNav(false);
@@ -30249,14 +30297,31 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }, 300);
     }
 
-    async function fetchCommitList(owner, repo, prNum) {
+    async function fetchCommitList(owner, repo, prNum, opts = {}) {
         const pagePR = parsePR();
         const head = pagePR && pagePR.owner === owner && pagePR.repo === repo && String(pagePR.pr) === String(prNum)
             ? getImmediatePRHeadSHA() : '';
         // Without a confirmed head, use the shared HTTP cache but do not create
         // a longer-lived derived entry whose revision cannot be identified.
-        const cacheKey = head ? `${owner}/${repo}/${prNum}:${head.toLowerCase()}` : '';
+        const data = readPRSSRData();
+        const contextKey = `${owner}/${repo}/${prNum}:`;
+        const layout = data?.payload?.pullRequestsLayoutRoute;
+        const sameEmbeddedPR = Number(layout?.pullRequest?.number) === Number(prNum) &&
+            String(layout?.repository?.ownerLogin || layout?.repository?.owner?.login || '').toLowerCase() === owner.toLowerCase() &&
+            String(layout?.repository?.name || '').toLowerCase() === repo.toLowerCase();
+        const baseSha = _prContextKey.startsWith(contextKey) && _prContextCache?.baseSha ||
+            (sameEmbeddedPR ? layout?.pullRequest?.baseSha || '' : '');
+        const cacheKey = head && /^[0-9a-f]{40}$/i.test(baseSha)
+            ? `${owner}/${repo}/${prNum}:${baseSha.toLowerCase()}:${head.toLowerCase()}` : '';
         if (cacheKey && commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
+
+        if (opts.navigationOnly) {
+            const embedded = embeddedNavigationCommits(data, { owner, repo, pr: prNum }, head, baseSha);
+            if (embedded) {
+                ackBackgroundLog('commit navigation reused embedded list', { commits: embedded.length }, 1000);
+                return embedded;
+            }
+        }
 
         // Try the validated, shared API path first.
         const apiResult = [];
@@ -30294,6 +30359,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 pageSessionFallback: true,
             });
             const doc = new DOMParser().parseFromString(html, 'text/html');
+            if (opts.navigationOnly) {
+                try {
+                    const embeddedData = JSON.parse(doc.querySelector(PR_SSR_SCRIPT_SELECTOR)?.textContent || 'null');
+                    const embedded = embeddedNavigationCommits(embeddedData, { owner, repo, pr: prNum }, head, baseSha);
+                    if (embedded) return embedded;
+                } catch (_) {}
+            }
             const commits = [];
             for (const a of doc.querySelectorAll('a.markdown-title, a[href*="/commits/"], a[href*="/changes/"]')) {
                 const href = a.getAttribute('href') || '';
@@ -30441,7 +30513,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const currentSha = shaMatch?.[1] || null;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
 
-        const commits = await fetchCommitList(owner, repo, prNum);
+        const commits = await fetchCommitList(owner, repo, prNum, { navigationOnly: true });
         if (gen !== commitNavGeneration) return;
         if (commits.length === 0) return;
 
@@ -32098,6 +32170,130 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(meta?.side, 'L', 'deleted preview lines stay on the old side');
             ackAssert(jevChangedRow(root.querySelector('tr')), 'changed preview row is recognized');
         } finally { root.remove(); }
+    });
+
+
+    ackTest('embedded navigation recognizes both changes routes and validates the entire PR revision', () => {
+        const a = 'a'.repeat(40), b = 'b'.repeat(40), head = 'c'.repeat(40), base = 'd'.repeat(40);
+        const pr = { owner: 'octo', repo: 'demo', pr: '7' };
+        const route = { commits: [{ oid: a, messageHeadline: 'first' }, { oid: b, messageHeadline: 'second' }, { oid: head, messageHeadline: 'third' }] };
+        const data = { payload: {
+            pullRequestsChangesWithRangeRoute: route,
+            pullRequestsLayoutRoute: { repository: { ownerLogin: 'octo', name: 'demo' },
+                pullRequest: { number: 7, headSha: head, baseSha: base, commitsCount: 3 } },
+        } };
+        ackEq(readPRChangesRoute(data), route);
+        ackDeepEq(embeddedNavigationCommits(data, pr, head, base).map((c) => c.sha), [a, b, head]);
+        const old = { payload: { ...data.payload, pullRequestsChangesWithRangeRoute: undefined, pullRequestsChangesRoute: route } };
+        ackEq(readPRChangesRoute(old), route, 'old route remains supported');
+        ackEq(embeddedNavigationCommits(old, pr, head, base).length, 3);
+        ackEq(embeddedNavigationCommits(data, { ...pr, pr: 8 }, head, base), null, 'wrong PR is rejected');
+        ackEq(embeddedNavigationCommits(data, { ...pr, repo: 'other' }, head, base), null, 'wrong repository is rejected');
+        ackEq(embeddedNavigationCommits(data, pr, a, base), null, 'old embedded head is rejected');
+        ackEq(embeddedNavigationCommits(data, pr, head, a), null, 'old base is rejected');
+        route.commits = [route.commits[0], route.commits[2]];
+        ackEq(embeddedNavigationCommits(data, pr, head, base), null, 'partial list with a matching head is rejected');
+        route.commits = [{ oid: a }, { oid: a }, { oid: head }];
+        ackEq(embeddedNavigationCommits(data, pr, head, base), null, 'duplicate rows cannot satisfy the count');
+        route.commits = [{ oid: a }, { oid: b }, { oid: head }];
+        route.truncated = true;
+        ackEq(embeddedNavigationCommits(data, pr, head, base), null, 'truncated lists are rejected');
+        const groups = { payload: { pullRequestsLayoutRoute: data.payload.pullRequestsLayoutRoute,
+            pullRequestsCommitsRoute: { truncated: false, commitGroups: [{ commits: [
+                { oid: head, shortMessage: 'third' }, { oid: b, shortMessage: 'second' }, { oid: a, shortMessage: 'first' },
+            ] }] } } };
+        ackDeepEq(embeddedNavigationCommits(groups, pr, head, base).map((c) => c.sha), [a, b, head], 'newest-first groups are normalized');
+    });
+
+    ackTest('embedded navigation avoids requests without replacing full commit messages or base-sensitive caches', async () => {
+        const original = { readPRSSRData, parsePR, getImmediatePRHeadSHA, gmFetch,
+            context: _prContextCache, contextKey: _prContextKey, cache: new Map(commitListCache) };
+        const a = 'a'.repeat(40), head = 'c'.repeat(40), base = 'd'.repeat(40);
+        const pr = { owner: 'octo', repo: 'demo', pr: '7' };
+        const data = { payload: {
+            pullRequestsChangesWithRangeRoute: { commits: [{ oid: a, messageHeadline: 'first' }, { oid: head, messageHeadline: 'second' }] },
+            pullRequestsLayoutRoute: { repository: { ownerLogin: 'octo', name: 'demo' },
+                pullRequest: { number: 7, headSha: head, baseSha: base, commitsCount: 2 } },
+        } };
+        let requests = 0;
+        try {
+            commitListCache.clear();
+            _prContextCache = null;
+            _prContextKey = '';
+            readPRSSRData = () => data;
+            parsePR = () => pr;
+            getImmediatePRHeadSHA = () => head;
+            gmFetch = async () => {
+                requests++;
+                return [{ sha: a, commit: { message: 'first\n\nFull message body.' } }, { sha: head, commit: { message: 'second\n\nAnother body.' } }];
+            };
+            ackEq((await fetchCommitList('octo', 'demo', '7', { navigationOnly: true })).length, 2);
+            ackEq(requests, 0, 'complete embedded navigation costs no GitHub request');
+            ackEq(commitListCache.size, 0, 'headline entries never populate the full-message cache');
+            const full = await fetchCommitList('octo', 'demo', '7');
+            ackEq(requests, 1, 'a full-context consumer still reads complete messages');
+            ackAssert(full[0].commit.message.includes('Full message body.'));
+            await fetchCommitList('octo', 'demo', '7');
+            ackEq(requests, 1, 'same base and head reuse the complete result');
+            data.payload.pullRequestsLayoutRoute.pullRequest.number = 8;
+            await fetchCommitList('octo', 'demo', '7');
+            ackEq(requests, 2, 'a departing page cannot supply a different PR cache revision');
+            data.payload.pullRequestsLayoutRoute.pullRequest.number = 7;
+            data.payload.pullRequestsLayoutRoute.pullRequest.baseSha = 'e'.repeat(40);
+            await fetchCommitList('octo', 'demo', '7');
+            ackEq(requests, 3, 'retargeting the base cannot reuse a head-only entry');
+        } finally {
+            ({ readPRSSRData, parsePR, getImmediatePRHeadSHA, gmFetch } = original);
+            _prContextCache = original.context;
+            _prContextKey = original.contextKey;
+            commitListCache.clear();
+            for (const [key, value] of original.cache) commitListCache.set(key, value);
+        }
+    });
+
+    ackTest('commit diff keyboard navigation prefers live navigation links over hidden picker rows', () => {
+        const old = { pathCommitSha, parseCommitsFromPage, index: currentCommitIdx };
+        const root = document.createElement('div');
+        root.innerHTML = '<a aria-label="Next commit" href="#native">Native</a>' +
+            '<div id="ack-commit-nav"><a aria-label="Previous commit" href="#previous">Previous</a><a aria-label="Next commit" href="#next">Next</a></div>' +
+            '<div hidden class="picker-row">Hidden commit</div>';
+        document.body.appendChild(root);
+        const chosen = [];
+        let scrolled = 0;
+        root.querySelector('.picker-row').scrollIntoView = () => scrolled++;
+        for (const a of root.querySelectorAll('a')) a.addEventListener('click', (event) => {
+            event.preventDefault(); chosen.push(a.getAttribute('href'));
+        });
+        try {
+            pathCommitSha = () => 'a'.repeat(40);
+            parseCommitsFromPage = () => [{ sha: 'a'.repeat(40), msg: 'hidden', el: root.querySelector('.picker-row') }];
+            navigateCommit(1, root);
+            navigateCommit(-1, root);
+            ackDeepEq(chosen, ['#next', '#previous'], 'floating navigation takes priority');
+            root.querySelector('#ack-commit-nav').remove();
+            navigateCommit(1, root);
+            ackEq(chosen.at(-1), '#native', 'native navigation remains a fallback');
+            ackEq(scrolled, 0, 'hidden picker rows never consume navigation');
+        } finally {
+            pathCommitSha = old.pathCommitSha;
+            parseCommitsFromPage = old.parseCommitsFromPage;
+            currentCommitIdx = old.index;
+            root.remove();
+        }
+    });
+
+    ackTest('new diff CSS modules resolve files headers and paths without hashed suffixes', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div class="diffTargetable__newHash diff__newHash"><div class="diff-file-header__newHash">' +
+            '<h3 class="file-name__newHash">src/httpserver.cpp</h3></div><table><tr><td data-line-number="42"></td>' +
+            '<td class="diff-text-cell"><code class="diff-text addition">new_code();</code></td></tr></table></div>';
+        const file = root.querySelector(DIFF_FILE_SELECTOR);
+        ackAssert(file, 'renamed file container is recognized');
+        ackAssert(file.querySelector(DIFF_FILE_HEADER_SELECTOR), 'renamed header is recognized');
+        ackEq(readDiffFilePath(file), 'src/httpserver.cpp');
+        ackEq(jevChangedRow(file.querySelector('tr')).parts[0].deleted, false, 'new cell is recognized as an addition');
+        root.innerHTML = '<div class="someUnrelateddiff__newHash"></div>';
+        ackEq(root.querySelector(DIFF_FILE_SELECTOR), null, 'class prefix does not capture unrelated names');
     });
 
     ackTest('GitHub credential state belongs to the request token', () => {
@@ -38472,7 +38668,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             _ackSource.indexOf('// Navigate to the next (+1) or previous (-1) commit in the list.'),
         );
         ackAssert(
-            fn.includes('pullRequestsChangesRoute?.commits'),
+            fn.includes('embeddedPRCommitRows()'),
             'reads compare-page commits from embedded SSR data',
         );
         ackAssert(fn.includes('messageHeadline'), 'uses commit message headline from SSR commits');
