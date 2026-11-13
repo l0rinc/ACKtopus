@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.303
+// @version      1.304
 // @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -340,8 +340,7 @@
 
     function readBaseBranchFromSummaryDom() {
         const summary =
-            document.querySelector('.PullRequestHeaderSummary-module__summaryContainer__dA7dP') ||
-            document.querySelector('#partial-discussion-header') ||
+            document.querySelector(PR_BRANCH_SUMMARY_SELECTOR) ||
             document;
         const branchLink = summary.querySelector?.('a[href*="/tree/"]');
         const href = branchLink?.getAttribute?.('href') || '';
@@ -355,7 +354,7 @@
 
     function normalizePRHeaderHeadBranch(root = document) {
         if (!isPRPage()) return false;
-        const summaries = qsa(root, '.PullRequestHeaderSummary-module__summaryContainer__dA7dP');
+        const summaries = qsa(root, PR_BRANCH_SUMMARY_SELECTOR);
         const summary = summaries.find(isVisible) || summaries[0];
         if (!summary) return false;
         const branchLinks = [...summary.querySelectorAll('a[href*="/tree/"]')];
@@ -791,7 +790,8 @@
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_HEADER_SELECTOR = '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header';
     const COMMENT_CONTAINER_BASE_SELECTOR =
-        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"]';
+        '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], ' +
+        'article[id^="issuecomment-"], article[id^="pullrequestreview-"]';
     const COMMENT_CONTAINER_SELECTOR = COMMENT_CONTAINER_BASE_SELECTOR + ', [class*="ReviewThreadContainer"]';
     const EDIT_FORM_SELECTOR =
         'form.js-comment-update, [data-testid="edit-comment-form"], form.js-issue-update, ' +
@@ -843,6 +843,56 @@
         '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header, ' +
         '[class*="DiffFileHeader-module__diff-file-header"]';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
+
+    const PR_DESCRIPTION_ROOT_SELECTOR =
+        '[data-testid="issue-body"], #issue-body, #issue-body-viewer, [data-testid="issue-body-viewer"], ' +
+        '.js-command-palette-pull-body, [id^="pullrequest-"], section[aria-label="Description"]';
+    const PR_HEADER_ROOT_SELECTOR =
+        '#partial-discussion-header, .gh-header, .gh-header-show, .js-discussion-header, ' +
+        '[data-testid*="issue-viewer-header" i], [data-testid*="pull-request-header" i], ' +
+        '[data-testid*="issue-header" i], [class*="prc-PageHeader-PageHeader-"]';
+    const PR_HEADER_ACTIONS_SELECTOR =
+        '[data-component="PH_Actions"], [class*="prc-PageHeader-Actions-"], .gh-header-actions';
+    const PR_BRANCH_SUMMARY_SELECTOR =
+        '[class*="PullRequestHeaderSummary-module__summaryContainer"], [class*="branches__"], #partial-discussion-header';
+    const REACT_EDITOR_TOOLBAR_SELECTOR = '[class*="Toolbar-module__toolbar"], [aria-label="Formatting tools"]';
+
+    function detectGitHubLayout(root = document) {
+        const find = (selector) => root.matches?.(selector) ? root : root.querySelector?.(selector);
+        const descriptionRoot = find(PR_DESCRIPTION_ROOT_SELECTOR);
+        const headerRoot = find(PR_HEADER_ROOT_SELECTOR);
+        const reactOverview = !!find('section[aria-label="Description"], article[id^="issuecomment-"], article[id^="pullrequestreview-"]');
+        const react = reactOverview || !!find('react-app[app-name="repo"], react-app[app-name="pull-requests"], react-app[app-name="issues-react"], [data-testid="comment-header"], [data-testid="diff-file"]');
+        return {
+            kind: reactOverview ? 'react-overview' : react ? 'react' :
+                find('#partial-discussion-header, .timeline-comment, .js-file') ? 'classic' : 'unknown',
+            headerRoot: headerRoot || null,
+            descriptionRoot: descriptionRoot || null,
+        };
+    }
+
+    function findPRDescriptionBody(root = document) {
+        for (const candidate of qsa(root, PR_DESCRIPTION_ROOT_SELECTOR)) {
+            if (candidate.matches('textarea, form, [contenteditable="true"]')) continue;
+            const body = candidate.matches(MARKDOWN_BODY_SELECTOR) ? candidate : candidate.querySelector(MARKDOWN_BODY_SELECTOR);
+            if (body && !body.closest(EDIT_FORM_SELECTOR)) return body;
+        }
+        return root.querySelector?.('.js-discussion [id^="issue-"] .comment-body') || null;
+    }
+
+    let lastGitHubLayoutDiagnostic = '';
+    function reportGitHubLayout() {
+        if (_ackTesting) return;
+        const layout = detectGitHubLayout();
+        const key = `${location.pathname}:${layout.kind}:${!!layout.headerRoot}:${!!layout.descriptionRoot}`;
+        if (key === lastGitHubLayoutDiagnostic) return;
+        lastGitHubLayoutDiagnostic = key;
+        ackLogEvent(`GitHub layout detected: ${layout.kind}`, {
+            headerFound: !!layout.headerRoot,
+            descriptionFound: !!layout.descriptionRoot,
+            commentContainers: document.querySelectorAll(COMMENT_CONTAINER_SELECTOR).length,
+        });
+    }
 
     function escapeHTML(s) {
         return String(s)
@@ -2447,8 +2497,8 @@
 
     const POSTED_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_BASE_SELECTOR + ', ' +
-        '[data-testid^="issue-comment"], div[id^="issuecomment-"], div[id^="discussion_r"], ' +
-        'div[id^="pullrequestreview-"]';
+        '[data-testid^="issue-comment"], :is(div, article)[id^="issuecomment-"], div[id^="discussion_r"], ' +
+        ':is(div, article)[id^="pullrequestreview-"]';
     const REVIEW_THREAD_SCOPE_SELECTOR =
         `${COMMENT_THREAD_SELECTOR}, [data-resolved="true"], ` +
         '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]';
@@ -3994,12 +4044,9 @@
     function findUserAcks(username) {
         // Find all comments by this user that look like ACKs
         const results = [];
-        const containerSel = '.timeline-comment, .js-comment, [class*="ActivityThread"]';
-        const authorSel =
-            '.author, a[data-testid="avatar-link"], a[data-hovercard-type="user"]:not([class*="avatar" i])';
+        const containerSel = `${COMMENT_CONTAINER_BASE_SELECTOR}, .js-comment`;
         document.querySelectorAll(containerSel).forEach((comment) => {
-            const authorEl = comment.querySelector(authorSel);
-            if (!authorEl || authorEl.textContent.trim() !== username) return;
+            if ((getCommentAuthor(comment) || '').toLowerCase() !== String(username || '').toLowerCase()) return;
             const body = comment.querySelector(MARKDOWN_BODY_SELECTOR + ', .comment-body, .js-comment-body');
             if (!body) return;
             const text = body.textContent.trim();
@@ -4550,10 +4597,10 @@
 
     function parseForcePushesFromPage() {
         const pushes = [];
-        document.querySelectorAll('.TimelineItem, .js-timeline-item').forEach((item) => {
+        document.querySelectorAll('.TimelineItem, .js-timeline-item, [data-testid="timeline-item"]').forEach((item) => {
             // Keep only innermost rows: outer .js-timeline-item wrappers duplicate the nested .TimelineItem
             // with polluted actor/timestamp metadata (first grouped event wins inside the wrapper).
-            if (item.querySelector('.TimelineItem, .js-timeline-item')) return;
+            if (item.querySelector('.TimelineItem, .js-timeline-item, [data-testid="timeline-item"]')) return;
             const text = item.textContent;
             if (!/force[- ]?pushed/i.test(text)) return;
             const actor = item.querySelector('.author')?.textContent?.trim() || '';
@@ -9551,8 +9598,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         if (prTitle) parts.push(`PR Title: ${prTitle}`);
 
         const prBodyEl =
-            document.querySelector('#issue-body, [data-testid="issue-body"]') ||
-            document.querySelector('.js-discussion [id^="issue-"] .comment-body'); // classic PR conversation pages
+            findPRDescriptionBody();
         const prBody = prBodyEl?.innerText?.trim();
         if (prBody) parts.push(`PR Description:\n${prBody.slice(0, 5000)}`);
 
@@ -9647,7 +9693,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             // A nested match (e.g. the .diff-table inside a .js-file) is already covered by its outer container.
             if (file.parentElement?.closest(diffFileSelector)) return;
             const fileName = readDiffFilePath(file);
-            file.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell').forEach((cell) => {
+            file.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])').forEach((cell) => {
                 const text = cell.textContent?.trim();
                 if (!text || text.length < 3) return;
                 const row = cell.closest('tr');
@@ -10994,7 +11040,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const permalink = getCommentPermalinkEl(container);
             if (permalink?.getAttribute('href')?.startsWith('#issue-')) continue;
             // Also skip by known PR body element IDs
-            if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
 
             // Skip "Nothing to preview" placeholder elements
             if (/^nothing to preview$/i.test(markdown)) continue;
@@ -11105,7 +11151,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         } catch (_) {
             // Fallback to page (title + rendered description)
             prTitle = getPRTitle();
-            const bodyEl = document.querySelector('#issue-body, [data-testid="markdown-body"], .comment-body');
+            const bodyEl = findPRDescriptionBody();
             description = bodyEl?.innerText?.trim() || '';
         }
         if (prTitle) parts.push(`## Title\n${prTitle}`);
@@ -11243,8 +11289,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             } catch (_) {
                 prTitle = getPRTitle();
                 const bodyEl =
-                    document.querySelector('#issue-body, [data-testid="issue-body"]') ||
-                    document.querySelector('.js-discussion [id^="issue-"] .comment-body'); // classic PR pages
+                    findPRDescriptionBody(); // classic PR pages
                 description = bodyEl?.innerText?.trim() || '';
             }
         }
@@ -13292,6 +13337,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const msg = titleLink?.textContent?.trim() || titleLink?.getAttribute('title') || '';
             if (sha) commits.push({ sha, msg, el });
         });
+        if (commits.length === 0) {
+            document.querySelectorAll('[data-testid="timeline-commit-row"]').forEach((el) => {
+                const link = el.querySelector('a[aria-label^="Commit:"], a[href*="/commit/"], a[href*="/commits/"], a[href*="/changes/"]');
+                const sha = link?.getAttribute('href')?.match(/\/(?:commits?|changes)\/([0-9a-f]{7,40})/)?.[1];
+                if (sha) commits.push({ sha, msg: textWithoutAcktopusDecorations(link).trim(), el });
+            });
+        }
         // Classic UI fallback
         if (commits.length === 0) {
             document.querySelectorAll('.js-commits-list-item, .TimelineItem--condensed').forEach((el) => {
@@ -14927,7 +14979,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function extractVisiblePRDescription(container) {
-        const issueBody = document.querySelector('[data-testid="issue-body"]');
+        const issueBody = detectGitHubLayout().descriptionRoot;
         const bodyEl =
             container?.querySelector?.(MARKDOWN_BODY_SELECTOR) || issueBody?.querySelector?.(MARKDOWN_BODY_SELECTOR);
         return String(bodyEl?.innerText || bodyEl?.textContent || '').trimEnd();
@@ -16569,9 +16621,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         '.review-thread-component',
         '[data-testid="issue-body"]',
         '[data-testid^="issue-comment"]',
-        'div[id^="issuecomment-"]',
+        ':is(div, article)[id^="issuecomment-"]',
         'div[id^="discussion_r"]',
-        'div[id^="pullrequestreview-"]',
+        ':is(div, article)[id^="pullrequestreview-"]',
     ].join(', ');
 
     function isTimelineFilterPage(path = location.pathname) {
@@ -16605,7 +16657,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             !!item?.matches?.(
                 '.timeline-comment, .review-comment, .timeline-comment-group, [data-testid="issue-body"], ' +
                     '[data-testid^="issue-comment"], [data-testid="review-thread"], .review-thread-component, ' +
-                    'div[id^="issuecomment-"], div[id^="discussion_r"], div[id^="pullrequestreview-"]',
+                    ':is(div, article)[id^="issuecomment-"], div[id^="discussion_r"], :is(div, article)[id^="pullrequestreview-"]',
             ) || !!item?.querySelector?.(MARKDOWN_BODY_SELECTOR);
         const resolved =
             !!item?.matches?.('details[data-resolved="true"]') ||
@@ -17016,6 +17068,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const container = el.closest(WIDE_COMMENT_CONTAINER_SELECTOR);
         if (!container) return null;
 
+        const authorScope = container.querySelector(COMMENT_HEADER_SELECTOR) || container;
         const parseLoginFrom = (node) => {
             if (!node) return '';
             const t = (node.textContent || '').trim();
@@ -17037,7 +17090,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Prefer explicit username links (classic `.author`, then hovercard user link),
         // but ignore anything inside the markdown body (mentions).
         const candidates = Array.from(
-            container.querySelectorAll('.author, a[data-hovercard-type="user"]:not([class*="avatar" i])'),
+            authorScope.querySelectorAll('.author, a[data-hovercard-type="user"]:not([class*="avatar" i])'),
         );
         for (const c of candidates) {
             if (isInMarkdownBody(c)) continue;
@@ -17046,12 +17099,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         }
 
         // React variants often have an avatar link with no text; parse from href/img alt.
-        const avatar = container.querySelector('[data-testid="avatar-link"]');
+        const avatar = authorScope.querySelector('[data-testid="avatar-link"]');
         const avatarLogin = parseLoginFrom(avatar);
         if (avatarLogin) return avatarLogin;
 
         // Last resort: any @alt avatar in the header area.
-        const anyAlt = container.querySelector('img[alt^="@"]')?.getAttribute('alt') || '';
+        const anyAlt = authorScope.querySelector('img[alt^="@"]')?.getAttribute('alt') || '';
         const mAny = anyAlt.match(/^@([^\s]+)$/);
         if (mAny) return mAny[1];
 
@@ -18811,7 +18864,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const bodies = [...(container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
         const stats = { bodiesFound: bodies.length, eligible: 0, queued: 0, pending: 0, reused: 0 };
         for (const body of bodies) {
-            if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
             const text = jevCommentText(body);
             stats.eligible++;
             const originalHash = hashPrompt(text);
@@ -18851,7 +18904,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const threadVersion = jevCommentThreadVersions.get(thread) || 0;
             const sharedThread = comment.querySelectorAll(MARKDOWN_BODY_SELECTOR).length > 1;
             const header = (specificComment || !sharedThread
-                ? comment.querySelector('.timeline-comment-header, [class*="__activityHeader"], .review-comment-header, .TimelineItem-header')
+                ? comment.querySelector(COMMENT_HEADER_SELECTOR + ', [class*="__activityHeader"], .TimelineItem-header')
                 : body.parentElement) || comment;
             jevCommentPendingBodies.add(body);
             jevCommentPendingHashes.set(body, originalHash);
@@ -19371,7 +19424,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevChangedRow(row) {
-        const cells = [...row.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell')];
+        const cells = [...row.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])')];
         if (!cells.length) cells.push(...row.querySelectorAll('[data-testid="diff-line-content"]'));
         const rowSignal = `${row.className || ''} ${row.getAttribute('data-diff-line-type') || ''}`;
         const kindFromSignal = (signal) => {
@@ -19383,7 +19436,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // GitHub's React diff puts the change class on a nested <code>
             // while the surrounding td only says diff-text-cell.
             const line = cell.matches?.('code.diff-text, [data-testid="diff-line-content"]')
-                ? cell : cell.querySelector?.('code.diff-text, [data-testid="diff-line-content"]');
+                ? cell : cell.querySelector?.('code.diff-text, [data-testid="diff-line-content"], code[class*="Line__"]');
             const signal = [
                 cell.className || '',
                 cell.getAttribute?.('data-diff-line-type') || '',
@@ -19561,7 +19614,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (let i = 0; i < 2 && row?.previousElementSibling; i++) row = row.previousElementSibling;
         for (let i = 0; i < 6 && row; i++, row = row.nextElementSibling) {
             const code = row.querySelector(
-                'td.blob-code, td.diff-text, td.diff-text-cell, code.diff-text, [data-testid="diff-line-content"]',
+                'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), code.diff-text, [data-testid="diff-line-content"]',
             )?.textContent;
             if (code?.trim()) nearby.push(code.replace(/\r\n/g, '\n'));
         }
@@ -19687,9 +19740,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return stats;
     }
 
-    const JEV_DESCRIPTION_ROOT_SELECTOR =
-        '[data-testid="issue-body"], #issue-body, #issue-body-viewer, [data-testid="issue-body-viewer"], ' +
-        '.js-command-palette-pull-body, [id^="pullrequest-"]';
+    const JEV_DESCRIPTION_ROOT_SELECTOR = PR_DESCRIPTION_ROOT_SELECTOR;
     const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
     let jevReadingQuickTooltip = null;
     let jevDescriptionDomRetryTimer = null;
@@ -20497,10 +20548,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const signaledCells = new Set(qsa(file,
             'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
-            .map((node) => node.closest?.('td.blob-code, td.diff-text, td.diff-text-cell') || node));
+            .map((node) => node.closest?.('td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])') || node));
         for (const marker of qsa(file, '.diff-text-marker')) {
             if (/^[+-]$/.test(marker.textContent?.trim() || '')) {
-                signaledCells.add(marker.closest?.('td.diff-text-cell') || marker);
+                signaledCells.add(marker.closest?.('td:is(.diff-text-cell, [class*="diffTextCell__"])') || marker);
             }
         }
         const changeSignals = signaledCells.size;
@@ -20900,7 +20951,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // Instead of processing all comments eagerly, observe containers and run
     // comment controls/decorations only when they scroll into view (200px margin).
     // Mutation-scoped editor refreshes still run immediately.
-    const LAZY_COMMENT_SEL = `${WIDE_COMMENT_CONTAINER_SELECTOR}, [data-testid="issue-body"]`;
+    const LAZY_COMMENT_SEL = `${WIDE_COMMENT_CONTAINER_SELECTOR}, ${PR_DESCRIPTION_ROOT_SELECTOR}`;
 
     function leafLazyCommentContainers(root = document) {
         const candidates = qsa(root, LAZY_COMMENT_SEL);
@@ -20913,7 +20964,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (ancestorStack.length) containersWithNestedCandidates.add(ancestorStack[ancestorStack.length - 1]);
             ancestorStack.push(candidate);
         }
-        return candidates.filter((candidate) => !containersWithNestedCandidates.has(candidate));
+        return candidates.filter((candidate) => !containersWithNestedCandidates.has(candidate) ||
+            candidate.matches('article[id^="issuecomment-"], article[id^="pullrequestreview-"]'));
     }
 
     function processVisibleComment(container) {
@@ -21045,6 +21097,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ];
 
     const DOC_INJECTORS = [
+        { name: 'githubLayout', when: (ctx) => ctx.onToolbar, fn: reportGitHubLayout },
         { name: 'hideNativeCommitNav', when: (ctx) => ctx.onPR, fn: hideNativeCommitNav },
         { name: 'normalizePRHeaderHeadBranch', when: (ctx) => ctx.onPR, fn: normalizePRHeaderHeadBranch },
         { name: 'commitExplainButtons', when: (ctx) => ctx.onPR, fn: addCommitExplainButtons },
@@ -21196,6 +21249,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         'a[data-testid="prev-commit-link"]',
         '.PullRequestHeaderSummary-module__summaryContainer__dA7dP',
         '[data-testid="commit-row-item"]',
+        '[data-testid="timeline-commit-row"]',
+        'section[aria-label="Description"]',
+        '[class*="prc-PageHeader-PageHeader-"]',
         '[data-listview-item-title-container]',
         '[class*="trailingBadgesContainer"]',
         '.commit-title',
@@ -22651,6 +22707,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     function rootMayAffectPRTitle(root) {
         if (!root || root === document) return true;
         if (root.nodeType !== 1) return false;
+        if (root.matches?.(PR_HEADER_ROOT_SELECTOR) || root.closest?.(PR_HEADER_ROOT_SELECTOR)) return true;
         return !!(
             root.matches?.(PR_TITLE_MUTATION_SELECTOR) ||
             root.closest?.(PR_TITLE_MUTATION_SELECTOR) ||
@@ -22681,7 +22738,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             document
                 .querySelector('[data-component="PH_Actions"]')
                 ?.closest?.('header, .gh-header, .gh-header-show, .js-discussion-header') ||
-            document.querySelector('.gh-header-show, .gh-header, .js-discussion-header') ||
+            detectGitHubLayout().headerRoot ||
             null;
         if (!headerRoot) return { headerRoot: null, titleHost: null, titleTextEl: null, titleInputEl: null };
 
@@ -22768,8 +22825,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Prefer the PR header actions area: avoids overflow clipping in title text and
         // stays visible on wide/narrow variants.
         const actions =
-            document.querySelector('[data-component="PH_Actions"]') ||
-            titleHost.closest('[class*="PageHeader"], header')?.querySelector?.('[data-component="PH_Actions"]') ||
+            document.querySelector(PR_HEADER_ACTIONS_SELECTOR) ||
+            titleHost.closest('[class*="PageHeader"], header')?.querySelector?.(PR_HEADER_ACTIONS_SELECTOR) ||
             document.querySelector('#partial-discussion-header .gh-header-actions, .gh-header-actions');
         const actionsGroup = actions?.querySelector?.('.d-flex.gap-1') || actions;
         const insertionRoot = titleInputEl?.parentElement || actionsGroup || titleHost;
@@ -22849,8 +22906,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 'button[title*="edit title" i], button[data-testid*="title-edit" i], ' +
                 'summary[aria-label*="edit title" i], summary[title*="edit title" i]';
             const actions =
-                document.querySelector('[data-component="PH_Actions"]') ||
-                host.closest('[class*="PageHeader"], header')?.querySelector?.('[data-component="PH_Actions"]');
+                document.querySelector(PR_HEADER_ACTIONS_SELECTOR) ||
+                host.closest('[class*="PageHeader"], header')?.querySelector?.(PR_HEADER_ACTIONS_SELECTOR);
             const actionEditBtn = actions
                 ? [...actions.querySelectorAll('button')].find((b) => /^edit$/i.test(b.textContent.trim()))
                 : null;
@@ -23029,6 +23086,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const headerSet = new Set(
             qsa(root, COMMENT_HEADER_SELECTOR),
         );
+        for (const description of qsa(root, 'section[aria-label="Description"]')) {
+            if (description.querySelector(MARKDOWN_BODY_SELECTOR)) headerSet.add(description);
+        }
         for (const issueBody of qsa(root, '[data-testid="issue-body"]')) {
             if (
                 issueBody.querySelector(
@@ -23064,7 +23124,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const visibleContainers = new Map();
         for (const header of headers) {
             const container =
-                (header.matches?.('[data-testid="issue-body"]') ? header : null) ||
+                (header.matches?.('[data-testid="issue-body"], section[aria-label="Description"]') ? header : null) ||
                 header.closest(COMMENT_CONTAINER_SELECTOR) ||
                 header.closest('[data-testid="issue-body"]') ||
                 header.parentElement ||
@@ -23096,6 +23156,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const alt = header.querySelector('img[alt^="@"]')?.getAttribute('alt') || '';
                 const m = alt.match(/^@([^\s]+)$/);
                 if (m) author = m[1];
+            }
+            if (!author && header.matches('section[aria-label="Description"]')) {
+                const prAuthor = readPRSSRData()?.payload?.pullRequestsLayoutRoute?.pullRequest?.author;
+                author = typeof prAuthor === 'string' ? prAuthor : prAuthor?.login || '';
             }
             return author;
         };
@@ -23222,7 +23286,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const permalink = header.querySelector(
                 'a[id$="-permalink"], [data-testid="issue-body-header-link"], a[href*="#issue-"]',
             );
-            const isPRBody = isPRBodyFromPermalink(permalink);
+            const isPRBody = header.matches('[data-testid="issue-body"], section[aria-label="Description"]') || isPRBodyFromPermalink(permalink);
             const container = headerContainer;
             const isPendingComment =
                 !isPRBody && editState === 'v' && commentHasOwnPendingReviewMarker(container, root);
@@ -23330,7 +23394,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                         );
                     }
                 }
-            } else if (author) {
+            } else if (author || isPRBody) {
                 // Other people's PR descriptions can be proofread in read-only mode.
                 if (isPRBody) {
                     actionContainer.appendChild(
@@ -24495,7 +24559,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // Prefer a tight reactions container (prevents cross-comment leakage)
         return (
             trigger?.closest?.(
-                '.js-reactions-container, .reactions-container, .comment-reactions, [data-testid*="reactions" i]',
+                '.js-reactions-container, .reactions-container, .comment-reactions, [data-testid*="reactions" i], [aria-label^="Reactions for "], [aria-label="Reactions for the description"]',
             ) ||
             trigger?.closest?.(COMMENT_CONTAINER_SELECTOR) ||
             trigger?.closest?.(
@@ -25791,7 +25855,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function addDetailsButtons(root = document, path = location.pathname) {
         const toolbarSelector =
-            'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, [class*="Toolbar-module__toolbar"]';
+            `markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, ${REACT_EDITOR_TOOLBAR_SELECTOR}`;
         const ackToolbarControlsSelector =
             '.ack-details-btn, .ack-toolbar-proofread, .ack-toolbar-suggest-reply, .ack-toolbar-item, .ack-toolbar-actions';
         const bindToolbarControlPress = (btn, handler) => {
@@ -25831,7 +25895,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     'fieldset, [data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"]',
                 );
                 const hasVisibleReactToolbar = !![
-                    ...(editorRoot?.querySelectorAll?.('[class*="Toolbar-module__toolbar"]') || []),
+                    ...(editorRoot?.querySelectorAll?.(REACT_EDITOR_TOOLBAR_SELECTOR) || []),
                 ].find(isVisible);
                 if (hasVisibleReactToolbar) {
                     // Clean up duplicates injected into the hidden toolbar.
@@ -25969,7 +26033,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const addFallbackScope = (el) => {
             let scope = findEditForm(el) || (isExistingPostEditForm(el) ? el : null);
             if (!scope && el?.tagName === 'TEXTAREA' && isProofreadableComposeTextarea(el, path)) {
-                scope = el.closest('form') || el.parentElement;
+                scope = el.closest('form') || el.closest(COMPOSE_EDITOR_ROOT_SELECTOR) || el.parentElement;
             }
             if (scope) fallbackScopes.add(scope);
         };
@@ -26143,7 +26207,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const postedContainerSelector =
             '.timeline-comment, .review-comment, ' +
             '[data-testid="issue-body"], [data-testid^="issue-comment"], ' +
-            'div[id^="issuecomment-"], div[id^="discussion_r"], div[id^="pullrequestreview-"], div[id^="r"]';
+            ':is(div, article)[id^="issuecomment-"], div[id^="discussion_r"], :is(div, article)[id^="pullrequestreview-"], div[id^="r"]';
         const findPostedCommentContainer = (body) => {
             let container = body.closest(postedContainerSelector);
             if (container?.id === 'issue-body-viewer') {
@@ -26492,7 +26556,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             seen.add(body);
 
             // Skip PR body
-            if (body.id === 'issue-body' || body.closest('#issue-body')) continue;
+            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
 
             // Skip if badge already added
             if (container.querySelector('.ack-commit-badge')) continue;
@@ -26540,7 +26604,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             // Find the comment header to insert the badge
             const header = container.querySelector(
-                '.timeline-comment-header, [data-morpheus-enabled], [class*="__activityHeader"], .review-comment-header, .TimelineItem-header',
+                COMMENT_HEADER_SELECTOR + ', [data-morpheus-enabled], [class*="__activityHeader"], .TimelineItem-header',
             );
             const target = header || container;
 
@@ -26664,7 +26728,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 let cur = tr;
                 for (let i = 0; i < 2 && cur?.previousElementSibling; i++) cur = cur.previousElementSibling;
                 for (let i = 0; i < 5 && cur; i++) {
-                    const code = cur.querySelector('td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell')?.textContent?.trim();
+                    const code = cur.querySelector('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])')?.textContent?.trim();
                     if (code) contextLines.push(code);
                     cur = cur.nextElementSibling;
                 }
@@ -27535,7 +27599,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 '.commit-desc pre, span.text-mono.ws-pre-wrap.f6, [data-testid="commit-title"], .markdown-title',
             ) ||
             rootEl.closest?.(
-                'td.blob-code, td.diff-text, td.diff-text-cell, .blob-code-inner, .diff-text-cell, code.diff-text',
+                'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), .blob-code-inner, .diff-text-cell, code.diff-text',
             ) ||
             null;
         const fallbackText = !parentTextEl && rootEl?.textContent ? rootEl.textContent : '';
@@ -27550,7 +27614,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!el) return null;
         // Only consider selections inside diff code areas.
         const codeCell = el.closest(
-            'td.blob-code, td.blob-code-inner, td.diff-text, td.diff-text-cell, ' +
+            'td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), ' +
                 '.blob-code-inner, .diff-text-cell, code.diff-text, ' +
                 '[data-testid="diff-line"], [data-testid="diff-line-content"], ' +
                 '[class*="DiffLine"], [class*="blobCode"]',
@@ -27574,7 +27638,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 lineEl = row.querySelector('[data-line-number]');
             }
         }
-        const lineNum = lineEl?.getAttribute?.('data-line-number') || '';
+        if (!lineEl) lineEl = row?.querySelector('td[class*="diffLineNumber__"]') || null;
+        const renderedLineNum = lineEl?.matches('td[class*="diffLineNumber__"]') ? lineEl.textContent.trim() : '';
+        const lineNum = lineEl?.getAttribute?.('data-line-number') || (/^\d+$/.test(renderedLineNum) ? renderedLineNum : '');
         const anchorId = lineEl?.id || '';
         // React diff cells carry no id; their R/L side lives in data-line-anchor (preferred:
         // GitHub anchors context lines as R<n>, matching permalink semantics) or data-diff-side.
@@ -27583,10 +27649,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             anchorId.match(/([RL])\d+$/)?.[1] ||
             lineAnchor.match(/diff-\w+([RL])\d+$/)?.[1] ||
             ({ left: 'L', right: 'R' })[(lineEl || codeCell).getAttribute?.('data-diff-side')] ||
-            '';
+            (codeCell.querySelector('code[class*="DeletionLine__"]') ? 'L' :
+                codeCell.querySelector('code[class*="AdditionLine__"]') ? 'R' : '');
 
-        const diffFile = codeCell.closest('[data-path], .diff-table, table[data-diff-anchor], ' + DIFF_FILE_SELECTOR);
-        const fileName = readDiffFilePath(diffFile);
+        const diffFile = codeCell.closest('[data-path], .diff-table, table[data-diff-anchor], table[aria-label^="Diff for:"], ' + DIFF_FILE_SELECTOR);
+        const inlineFileLink = codeCell.closest('[data-testid="review-thread"]')?.querySelector('a.file-name-overflow');
+        const fileName = readDiffFilePath(diffFile) || inlineFileLink?.getAttribute('title') || inlineFileLink?.textContent?.trim() || '';
 
         return { codeCell, row, fileName, lineNum, side, anchorId, lineEl };
     }
@@ -27612,9 +27680,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 ? range.commonAncestorContainer
                 : range.commonAncestorContainer?.parentElement;
         const commitSha = pathCommitSha() || pr?.compareHead || findCommitShaNearSelection(rootEl) || '';
-        const isPRDescription = !!rootEl?.closest?.(
-            '#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]',
-        );
+        const isPRDescription = !!rootEl?.closest?.(PR_DESCRIPTION_ROOT_SELECTOR);
 
         const file = startMeta?.fileName || endMeta?.fileName || '';
         const startLabel = ((startMeta?.side || '') + (startMeta?.lineNum || '')).trim();
@@ -27630,7 +27696,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             for (let i = 0; i < 2 && cur?.previousElementSibling; i++) cur = cur.previousElementSibling;
             for (let i = 0; i < 6 && cur; i++) {
                 const code = cur.querySelector(
-                    'td.blob-code, td.diff-text, td.diff-text-cell, code.diff-text',
+                    'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), code.diff-text',
                 )?.textContent;
                 if (code && code.trim()) contextLines.push(code.replace(/\r\n/g, '\n'));
                 cur = cur.nextElementSibling;
@@ -28233,7 +28299,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function addCommitListExplainButtons() {
-        const commits = parseCommitsFromPage();
+        const commits = parseCommitsFromPage().filter((commit) => commit.el);
         if (commits.length === 0) return;
 
         for (const c of commits) {
@@ -30256,7 +30322,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const COMMIT_SEARCH_JUMP_KEY = 'ack_commit_search_jump_v1';
     const COMMIT_SEARCH_JUMP_MAX_AGE_MS = 2 * 60 * 1000;
     const COMMIT_SEARCH_JUMP_LINE_SELECTOR =
-        'td.blob-code, td.diff-text, td.diff-text-cell, .blob-code-inner, .diff-text-cell, code.diff-text, ' +
+        'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), .blob-code-inner, .diff-text-cell, code.diff-text, ' +
         '[data-testid="diff-line-content"], [class*="blobCode"]';
     let commitSearchJumpTimer = null;
 
@@ -31934,6 +32000,104 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackEq(ircPageRecord(doc, parseIrcLogUrl('/%23miniscript/2026-10-20')).channel, '#miniscript', 'preserves doubled IRC channel prefixes');
         const fragment = ircSafeFragment('<div onclick="bad()"><script>bad()</script><a href="java&#9;script:bad()">message</a><svg><animate attributeName="href" values="javascript:bad()"></animate></svg></div>');
         ackAssert(!fragment.querySelector('script, svg, [onclick], [href]'), 'removes active markup and encoded script URLs before rendering');
+    });
+
+
+    ackTest('GitHub layout detection follows current DOM across classic React and overview views', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div id="partial-discussion-header"></div><div class="timeline-comment"></div>';
+        ackEq(detectGitHubLayout(root).kind, 'classic');
+        root.innerHTML = '<react-app app-name="repo"><div data-testid="comment-header"></div></react-app>';
+        ackEq(detectGitHubLayout(root).kind, 'react');
+        root.innerHTML = '<section aria-label="Description"><div class="markdown-body">Description.</div></section><article id="issuecomment-123"></article>';
+        ackEq(detectGitHubLayout(root).kind, 'react-overview');
+        ackEq(findPRDescriptionBody(root).textContent, 'Description.');
+        root.innerHTML = '<div class="timeline-comment"><div class="markdown-body">A reply, not a description.</div></div>';
+        ackEq(findPRDescriptionBody(root), null, 'does not use the first comment as the PR description');
+        ackEq(detectGitHubLayout(root).kind, 'classic', 'detection is refreshed after replacement');
+    });
+
+    ackTest('GitHub overview retains review summary containers with nested inline comments', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<section aria-label="Description"><div class="markdown-body">Description</div></section>' +
+            '<article id="pullrequestreview-123"><div data-testid="comment-header">Review</div><div class="markdown-body">ACK</div>' +
+            '<div class="ReviewThreadContainer__newHash"><div id="discussion_r456" class="ReviewThreadContainer__anotherHash">' +
+            '<div data-testid="comment-header">Inline comment</div><div class="markdown-body">Question</div></div></div></article>' +
+            '<article id="issuecomment-789"><div data-testid="comment-header">Reply</div><div class="markdown-body">Answer</div></article>';
+        const containers = leafLazyCommentContainers(root);
+        ackEq(containers.length, 4, 'description, review summary, inline comment and reply all get processed');
+        ackAssert(containers.includes(root.querySelector('article')), 'summary does not disappear when it owns an inline thread');
+        ackAssert(!containers.includes(root.querySelector('[class="ReviewThreadContainer__newHash"]')), 'thread wrapper is not processed twice');
+    });
+
+    ackTest('GitHub overview description and article actions stay with their own bodies', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<section aria-label="Description"><div class="markdown-body">A PR description.</div></section>' +
+            '<article id="issuecomment-982345"><div data-testid="comment-header"><a data-testid="avatar-link" href="/layout-reviewer"><img alt="@layout-reviewer"></a></div><div class="markdown-body">ACK abcdef0123</div></article>' +
+            '<article id="pullrequestreview-982346"><div data-testid="comment-header"><a class="author">reviewer</a></div><div class="markdown-body">Second body</div></article>';
+        document.body.appendChild(root);
+        try {
+            addQuickCommentActions(root);
+            addQuickCommentActions(root);
+            ackEq(root.querySelectorAll('.ack-quick-actions').length, 3, 'one action group per description or posted article');
+            ackAssert(findUserAcks('layout-reviewer').includes(root.querySelector('article')), 'ACK discovery resolves an avatar-only author link');
+            const description = root.querySelector('section');
+            ackEq(description.querySelector('.ack-suggest-reply-btn'), null, 'description is not treated as a comment reply');
+            ackAssert(description.querySelector('[title^="Explain this PR at a high level"]'), 'description gets the PR overview action');
+            for (const article of root.querySelectorAll('article')) {
+                const header = article.querySelector('[data-testid="comment-header"]');
+                ackEq(header.closest(COMMENT_CONTAINER_BASE_SELECTOR), article, 'comment tools resolve the whole posted article');
+                ackEq(article.querySelectorAll('.ack-quick-actions').length, 1);
+            }
+        } finally { root.remove(); }
+    });
+
+    ackTest('GitHub overview formatting controls use the native toolbar and shared fieldset', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<fieldset><div class="toolbar__futureHash"><div aria-label="Formatting tools"></div></div>' +
+            '<span class="textArea__futureHash"><textarea aria-label="Markdown value"></textarea></span></fieldset>';
+        document.body.appendChild(root);
+        try {
+            addDetailsButtons(root);
+            addDetailsButtons(root);
+            const toolbar = root.querySelector('[aria-label="Formatting tools"]');
+            ackEq(root.querySelectorAll('.ack-toolbar-proofread').length, 1);
+            ackAssert(toolbar.querySelector('.ack-toolbar-proofread'), 'proofread belongs in the formatting toolbar');
+            ackEq(getToolbarTextarea(toolbar), root.querySelector('textarea'));
+            ackEq(root.querySelector('span').querySelector('.ack-toolbar-actions'), null, 'controls do not replace the input wrapper');
+        } finally { root.remove(); }
+    });
+
+    ackTest('GitHub timeline commits and SSR-only commits do not break explain controls', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div data-testid="timeline-commit-row"><a aria-label="Commit: refactor: move helper" href="/bitcoin/bitcoin/pull/36451/commits/' + 'a'.repeat(40) + '">refactor: move helper</a></div>';
+        document.body.appendChild(root);
+        const oldParse = parseCommitsFromPage;
+        try {
+            const commit = parseCommitsFromPage().find((c) => c.el === root.firstElementChild);
+            ackAssert(commit, 'timeline commit is detected');
+            ackEq(commit.msg, 'refactor: move helper');
+            parseCommitsFromPage = () => [{ sha: 'b'.repeat(40), msg: 'SSR-only commit', el: null }, commit];
+            addCommitListExplainButtons();
+            addCommitListExplainButtons();
+            ackEq(root.querySelectorAll('.ack-commit-explain').length, 1, 'only the rendered row receives a control');
+        } finally { parseCommitsFromPage = oldParse; root.remove(); }
+    });
+
+    ackTest('GitHub overview inline diff previews support renamed text cell classes', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div data-testid="review-thread"><a class="file-name-overflow" title="src/miner.cpp">src/miner.cpp</a><table><tbody><tr>' +
+            '<td class="diffLineNumber__newHash"><code>42</code></td><td class="diffTextCell__newHash"><code class="syntaxHighlightedDeletionLine__newHash">- old();</code></td>' +
+            '</tr></tbody></table></div>';
+        document.body.appendChild(root);
+        try {
+            const cell = root.querySelector('td[class*="diffTextCell__"]');
+            const meta = getDiffSelectionLineMeta(cell);
+            ackEq(meta?.lineNum, '42', 'selection resolves the inline preview line');
+            ackEq(meta?.fileName, 'src/miner.cpp', 'preview file comes from its own thread header');
+            ackEq(meta?.side, 'L', 'deleted preview lines stay on the old side');
+            ackAssert(jevChangedRow(root.querySelector('tr')), 'changed preview row is recognized');
+        } finally { root.remove(); }
     });
 
     ackTest('GitHub credential state belongs to the request token', () => {
@@ -40834,7 +40998,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         ackAssert(fn.includes("toolbar.tagName === 'MARKDOWN-TOOLBAR'"), 'detects markdown-toolbar element');
         ackAssert(fn.includes('!isVisible(toolbar)'), 'checks hidden toolbar visibility');
-        ackAssert(fn.includes('[class*="Toolbar-module__toolbar"]'), 'detects React toolbar');
+        ackAssert(fn.includes('REACT_EDITOR_TOOLBAR_SELECTOR'), 'detects React toolbar');
         ackAssert(fn.includes('ackToolbarControlsSelector'), 'defines custom toolbar control selector');
         ackAssert(
             sourceIncludesLoose(fn, 'toolbar.querySelectorAll(ackToolbarControlsSelector).forEach((el) => el.remove())'),
@@ -44010,8 +44174,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('findUserAcks supports both classic and React UI selectors', () => {
         const source = _ackSource;
         const fn = source.slice(source.indexOf('function findUserAcks'), source.indexOf('const TYPE_META'));
-        ackAssert(fn.includes('ActivityThread'), 'includes React ActivityThread containers');
-        ackAssert(fn.includes('data-testid="avatar-link"'), 'includes React avatar-link author selector');
+        ackAssert(fn.includes('COMMENT_CONTAINER_BASE_SELECTOR') && COMMENT_CONTAINER_BASE_SELECTOR.includes('ActivityThread'), 'includes React ActivityThread containers');
+        ackAssert(fn.includes('getCommentAuthor(comment)'), 'uses shared React avatar and classic author resolution');
         ackAssert(fn.includes('MARKDOWN_BODY_SELECTOR'), 'uses shared MARKDOWN_BODY_SELECTOR for body');
     });
 
@@ -47491,7 +47655,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function getDiffSelectionLineMeta'),
             source.indexOf('function getDiffSelectionContext'),
         );
-        ackAssert(fn.includes('td.diff-text-cell'), 'supports React diff table cells');
+        ackAssert(fn.includes('.diff-text-cell') && fn.includes('diffTextCell__'), 'supports old and renamed React diff table cells');
         ackAssert(fn.includes('code.diff-text'), 'supports nested code.diff-text nodes');
         ackAssert(fn.includes('data-line-anchor'), 'derives R/L side from React line anchors');
         ackAssert(fn.includes('readDiffFilePath(diffFile)'), 'uses the shared classic and React file path resolver');

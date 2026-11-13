@@ -333,6 +333,10 @@ On compare-style views, ACKtopus collapses files that are absent from the latest
 After collapsing unrelated files, it also scrolls to the first remaining open file.
 On repository pages, ACKtopus rewrites one-sided or cross-fork compare links so new PRs target your fork’s base branch instead of GitHub’s upstream-parent default. An adjacent **Open upstream** button keeps the original upstream target available. In alternate toolbar mode, the main button targets upstream and the adjacent button becomes **Open fork**. ACKtopus reads the base branch from the compare URL or GitHub’s page metadata when available, and falls back to fetching and caching the repository default branch.
 
+### GitHub layout compatibility
+
+ACKtopus detects the classic UI, React views and the newer React overview from the current DOM. Shared selectors cover labelled descriptions, posted comment and review articles, timeline commits, header actions and native formatting toolbars. The detected layout is logged as `ACKtopus: GitHub layout detected: ...`, together with whether the header and description were found. Detection runs again when GitHub replaces the relevant page content. Review summaries remain eligible even when they contain inline threads. Inline diff previews also support the newer text-cell and line-number classes. Layout checks are local and do not trigger GitHub or AI requests.
+
 ## Development checks
 
 Local commits do not update an installed Tampermonkey copy: the userscript's update URL points to GitHub `master`. To try changes from this checkout, paste the contents of `src/ACKtopus.js` into the ACKtopus script in Tampermonkey, save, and reload the GitHub page. Jev badges also require the setting to be enabled and a TypeSafe key to be saved.
