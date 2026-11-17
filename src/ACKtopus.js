@@ -317,15 +317,19 @@
         return Array.isArray(groups) ? groups.flatMap((group) => group?.commits || []) : [];
     }
 
-    // Headline-only entries are sufficient for navigation, not for AI context.
-    function embeddedNavigationCommits(data, pr, head, baseSha = '') {
-        const layout = data?.payload?.pullRequestsLayoutRoute;
-        const metadata = layout?.pullRequest;
-        const repository = layout?.repository;
+    function embeddedPullRequestFor(data, pr) {
+        const { pullRequest, repository } = data?.payload?.pullRequestsLayoutRoute || {};
         const owner = repository?.ownerLogin || repository?.owner?.login || '';
-        if (!metadata || Number(metadata.number) !== Number(pr.pr) ||
+        if (!pullRequest || Number(pullRequest.number) !== Number(pr.pr) ||
             String(owner).toLowerCase() !== String(pr.owner).toLowerCase() ||
             String(repository?.name || '').toLowerCase() !== String(pr.repo).toLowerCase()) return null;
+        return pullRequest;
+    }
+
+    // Headline-only entries are sufficient for navigation, not for AI context.
+    function embeddedNavigationCommits(data, pr, head, baseSha = '') {
+        const metadata = embeddedPullRequestFor(data, pr);
+        if (!metadata) return null;
         const expectedHead = metadata.headSha || metadata.headRefOid || '';
         if (!/^[0-9a-f]{40}$/i.test(expectedHead) || head && !commitShaMatches(head, expectedHead) ||
             baseSha && metadata.baseSha !== baseSha) return null;
@@ -364,14 +368,16 @@
 
     function readHeadShaFromSSR() {
         const data = readPRSSRData();
+        const changesPR = readPRChangesRoute(data)?.pullRequest;
+        const layout = data?.payload?.pullRequestsLayoutRoute;
         const sha =
-            readPRChangesRoute(data)?.pullRequest?.headRefOid ||
-            data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRefOid ||
-            readPRChangesRoute(data)?.pullRequest?.headRef?.target?.oid ||
-            data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headRef?.target?.oid ||
-            readPRChangesRoute(data)?.pullRequest?.headSha ||
-            data?.payload?.pullRequestsLayoutRoute?.pullRequest?.headSha ||
-            data?.payload?.pullRequestsLayoutRoute?.mergeStatusButtonData?.headSha ||
+            changesPR?.headRefOid ||
+            layout?.pullRequest?.headRefOid ||
+            changesPR?.headRef?.target?.oid ||
+            layout?.pullRequest?.headRef?.target?.oid ||
+            changesPR?.headSha ||
+            layout?.pullRequest?.headSha ||
+            layout?.mergeStatusButtonData?.headSha ||
             '';
         return /^[0-9a-f]{40}$/i.test(sha) ? sha : '';
     }
@@ -885,6 +891,10 @@
     const DIFF_FILE_HEADER_SELECTOR =
         '.file-header, [data-testid="diff-file-header"], [data-testid="file-header"], .diff-file-header, ' +
         '[class*="DiffFileHeader-module__diff-file-header"], [class^="diff-file-header__"], [class*=" diff-file-header__"]';
+    const REACT_DIFF_TEXT_CELL_SELECTOR = 'td:is(.diff-text-cell, [class*="diffTextCell__"])';
+    const DIFF_CODE_CELL_SELECTOR = `td.blob-code, td.diff-text, ${REACT_DIFF_TEXT_CELL_SELECTOR}`;
+    const DIFF_CODE_CONTENT_SELECTOR = `${DIFF_CODE_CELL_SELECTOR}, .blob-code-inner, .diff-text-cell, code.diff-text`;
+    const PREVIEW_LINE_NUMBER_SELECTOR = 'td[class*="diffLineNumber__"]';
     const NO_CHANGES_MSG = 'No changes needed; text is already correct';
 
     const PR_DESCRIPTION_ROOT_SELECTOR =
@@ -915,13 +925,22 @@
         };
     }
 
-    function findPRDescriptionBody(root = document) {
+    function postedPRDescriptionBody(candidate) {
+        if (!candidate || candidate.matches('textarea, form, [contenteditable="true"]')) return null;
+        const body = candidate.matches(MARKDOWN_BODY_SELECTOR) ? candidate : candidate.querySelector(MARKDOWN_BODY_SELECTOR);
+        return body && !body.closest(EDIT_FORM_SELECTOR) ? body : null;
+    }
+
+    function findPostedPRDescriptionBody(root) {
         for (const candidate of qsa(root, PR_DESCRIPTION_ROOT_SELECTOR)) {
-            if (candidate.matches('textarea, form, [contenteditable="true"]')) continue;
-            const body = candidate.matches(MARKDOWN_BODY_SELECTOR) ? candidate : candidate.querySelector(MARKDOWN_BODY_SELECTOR);
-            if (body && !body.closest(EDIT_FORM_SELECTOR)) return body;
+            const body = postedPRDescriptionBody(candidate);
+            if (body) return body;
         }
-        return root.querySelector?.('.js-discussion [id^="issue-"] .comment-body') || null;
+        return null;
+    }
+
+    function findPRDescriptionBody(root = document) {
+        return findPostedPRDescriptionBody(root) || root.querySelector?.('.js-discussion [id^="issue-"] .comment-body') || null;
     }
 
     let lastGitHubLayoutDiagnostic = '';
@@ -9770,7 +9789,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             // A nested match (e.g. the .diff-table inside a .js-file) is already covered by its outer container.
             if (file.parentElement?.closest(diffFileSelector)) return;
             const fileName = readDiffFilePath(file);
-            file.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])').forEach((cell) => {
+            file.querySelectorAll(`td.blob-code-inner, ${DIFF_CODE_CELL_SELECTOR}`).forEach((cell) => {
                 const text = cell.textContent?.trim();
                 if (!text || text.length < 3) return;
                 const row = cell.closest('tr');
@@ -10140,6 +10159,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     function getCommentPermalinkEl(container) {
         if (!container) return null;
         const owner = container.closest(ANCHORED_COMMENT_SELECTOR);
+        const ownHash = owner?.id ? `#${owner.id}` : '';
+        const ownIdentity = /^#(?:discussion_r|r|issuecomment-|pullrequestreview-)\d+$/.test(ownHash)
+            ? commentPermalinkIdentity(ownHash) : '';
         const header = container?.matches?.(COMMENT_HEADER_SELECTOR)
             ? container : container?.querySelector?.(COMMENT_HEADER_SELECTOR);
         const ownLink = (link) => {
@@ -10151,14 +10173,12 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const legacy = qsa(scope, 'a[id$="-permalink"], a.js-timestamp, a.timestamp').find(ownLink);
             if (legacy) return legacy;
             const links = qsa(scope, 'a[href*="#"]').filter(ownLink);
-            const ownHash = owner?.id ? `#${owner.id}` : '';
             return links.find((link) => ownHash && link.hash === ownHash && hrefIsLocalComment(link)) ||
                 links.find((link) => /^#(?:discussion_r|r|issuecomment-|pullrequestreview-|issue-)\d+$/.test(link.hash) &&
-                    (!/^#(?:discussion_r|r|issuecomment-|pullrequestreview-)\d+$/.test(ownHash) ||
-                        commentPermalinkIdentity(link.hash) === commentPermalinkIdentity(ownHash)) &&
+                    (!ownIdentity || commentPermalinkIdentity(link.hash) === ownIdentity) &&
                     (link.getAttribute('href').startsWith('#') || hrefIsLocalComment(link))) || null;
         };
-        return (header && from(header)) || from(container);
+        return (header && header !== container && from(header)) || from(container);
     }
 
     function hrefIsLocalComment(link) {
@@ -10445,9 +10465,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         let codeRows = [];
         let targetRow = null;
 
-        const rowCodeSelector =
-            'td.blob-code, td.diff-text, .blob-code-inner, .diff-text-cell, code.diff-text, ' +
-            '[data-testid="diff-line-content"], [class*="blobCode"], td[class*="diffTextCell__"]';
+        const rowCodeSelector = `${DIFF_CODE_CONTENT_SELECTOR}, [data-testid="diff-line-content"], [class*="blobCode"]`;
 
         const getRowLineNumber = (row) => {
             const codeCell = row.querySelector(rowCodeSelector);
@@ -10464,7 +10482,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const nums = [...row.querySelectorAll('[data-line-number]')]
                 .map((el) => el.getAttribute('data-line-number') || '')
                 .filter(Boolean);
-            const previewLine = row.querySelector('td[class*="diffLineNumber__"]')?.textContent?.trim() || '';
+            const previewLine = row.querySelector(PREVIEW_LINE_NUMBER_SELECTOR)?.textContent?.trim() || '';
             return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || (/^\d+$/.test(previewLine) ? previewLine : '');
         };
 
@@ -11168,7 +11186,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const permalink = getCommentPermalinkEl(container);
             if (permalink?.getAttribute('href')?.startsWith('#issue-')) continue;
             // Also skip by known PR body element IDs
-            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
+            if (body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
 
             // Skip "Nothing to preview" placeholder elements
             if (/^nothing to preview$/i.test(markdown)) continue;
@@ -19015,7 +19033,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const bodies = [...(container?.querySelectorAll?.(MARKDOWN_BODY_SELECTOR) || [])];
         const stats = { bodiesFound: bodies.length, eligible: 0, queued: 0, pending: 0, reused: 0 };
         for (const body of bodies) {
-            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
+            if (body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
             const text = jevCommentText(body);
             stats.eligible++;
             const originalHash = hashPrompt(text);
@@ -19575,7 +19593,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevChangedRow(row) {
-        const cells = [...row.querySelectorAll('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])')];
+        const cells = [...row.querySelectorAll(`td.blob-code-inner, ${DIFF_CODE_CELL_SELECTOR}`)];
         if (!cells.length) cells.push(...row.querySelectorAll('[data-testid="diff-line-content"]'));
         const rowSignal = `${row.className || ''} ${row.getAttribute('data-diff-line-type') || ''}`;
         const kindFromSignal = (signal) => {
@@ -19765,7 +19783,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (let i = 0; i < 2 && row?.previousElementSibling; i++) row = row.previousElementSibling;
         for (let i = 0; i < 6 && row; i++, row = row.nextElementSibling) {
             const code = row.querySelector(
-                'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), code.diff-text, [data-testid="diff-line-content"]',
+                `${DIFF_CODE_CELL_SELECTOR}, code.diff-text, [data-testid="diff-line-content"]`,
             )?.textContent;
             if (code?.trim()) nearby.push(code.replace(/\r\n/g, '\n'));
         }
@@ -19891,7 +19909,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return stats;
     }
 
-    const JEV_DESCRIPTION_ROOT_SELECTOR = PR_DESCRIPTION_ROOT_SELECTOR;
     const JEV_DESCRIPTION_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, td, th, summary';
     let jevReadingQuickTooltip = null;
     let jevDescriptionDomRetryTimer = null;
@@ -19947,25 +19964,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function jevPRDescriptionBody(root = document) {
         if (!isPRConversationPage()) return null;
-        const roots = [];
-        const add = (candidate) => {
-            if (candidate && !roots.includes(candidate)) roots.push(candidate);
-        };
-        if (root?.nodeType === 1) {
-            add(root.matches?.(JEV_DESCRIPTION_ROOT_SELECTOR) ? root : null);
-            add(root.closest?.(JEV_DESCRIPTION_ROOT_SELECTOR));
-        }
-        for (const candidate of qsa(root, JEV_DESCRIPTION_ROOT_SELECTOR)) add(candidate);
-        if (root !== document) {
-            for (const candidate of qsa(document, JEV_DESCRIPTION_ROOT_SELECTOR)) add(candidate);
-        }
-        for (const issueBody of roots) {
-            if (issueBody.matches?.('textarea, form, [contenteditable="true"]')) continue;
-            const body = issueBody.matches?.(MARKDOWN_BODY_SELECTOR)
-                ? issueBody : issueBody.querySelector?.(MARKDOWN_BODY_SELECTOR);
-            if (body && !body.closest?.(EDIT_FORM_SELECTOR)) return body;
-        }
-        return null;
+        return postedPRDescriptionBody(root.closest?.(PR_DESCRIPTION_ROOT_SELECTOR)) ||
+            findPostedPRDescriptionBody(root) ||
+            (root === document ? null : findPostedPRDescriptionBody(document));
     }
 
     function jevDescriptionText(body) {
@@ -20318,7 +20319,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 pullRequestParsed: !!pr,
                 descriptionFound: !!body,
                 descriptionConnected: !!body?.isConnected,
-                pullBodyRootsInDOM: document.querySelectorAll(JEV_DESCRIPTION_ROOT_SELECTOR).length,
+                pullBodyRootsInDOM: document.querySelectorAll(PR_DESCRIPTION_ROOT_SELECTOR).length,
                 markdownBodiesInDOM: document.querySelectorAll(MARKDOWN_BODY_SELECTOR).length,
             }, { key: 'description-dom', intervalMs: 3000, level: 'warn' });
             scheduleJevDescriptionDomRetry();
@@ -20541,8 +20542,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     function queueJevDescriptionUpdates(root) {
         if (_ackTesting || !jevDescriptionReadingEnabled() || !isPRConversationPage() || root === document) return;
-        const relevant = root.matches?.(JEV_DESCRIPTION_ROOT_SELECTOR) ||
-            root.closest?.(JEV_DESCRIPTION_ROOT_SELECTOR) || root.querySelector?.(JEV_DESCRIPTION_ROOT_SELECTOR);
+        const relevant = root.closest?.(PR_DESCRIPTION_ROOT_SELECTOR) || root.querySelector?.(PR_DESCRIPTION_ROOT_SELECTOR);
         if (relevant) scheduleJevDescriptionReading();
     }
 
@@ -20699,10 +20699,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         );
         const signaledCells = new Set(qsa(file,
             'code.addition, code.deletion, .blob-code-addition, .blob-code-deletion, [data-diff-line-type="addition"], [data-diff-line-type="deletion"]')
-            .map((node) => node.closest?.('td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])') || node));
+            .map((node) => node.closest?.(DIFF_CODE_CELL_SELECTOR) || node));
         for (const marker of qsa(file, '.diff-text-marker')) {
             if (/^[+-]$/.test(marker.textContent?.trim() || '')) {
-                signaledCells.add(marker.closest?.('td:is(.diff-text-cell, [class*="diffTextCell__"])') || marker);
+                signaledCells.add(marker.closest?.(REACT_DIFF_TEXT_CELL_SELECTOR) || marker);
             }
         }
         const changeSignals = signaledCells.size;
@@ -26728,7 +26728,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             seen.add(body);
 
             // Skip PR body
-            if (body.matches('#issue-body') || body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
+            if (body.closest(PR_DESCRIPTION_ROOT_SELECTOR)) continue;
 
             // Skip if badge already added
             if (container.querySelector('.ack-commit-badge')) continue;
@@ -26900,7 +26900,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 let cur = tr;
                 for (let i = 0; i < 2 && cur?.previousElementSibling; i++) cur = cur.previousElementSibling;
                 for (let i = 0; i < 5 && cur; i++) {
-                    const code = cur.querySelector('td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"])')?.textContent?.trim();
+                    const code = cur.querySelector(`td.blob-code-inner, ${DIFF_CODE_CELL_SELECTOR}`)?.textContent?.trim();
                     if (code) contextLines.push(code);
                     cur = cur.nextElementSibling;
                 }
@@ -27770,9 +27770,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             rootEl.closest?.(
                 '.commit-desc pre, span.text-mono.ws-pre-wrap.f6, [data-testid="commit-title"], .markdown-title',
             ) ||
-            rootEl.closest?.(
-                'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), .blob-code-inner, .diff-text-cell, code.diff-text',
-            ) ||
+            rootEl.closest?.(DIFF_CODE_CONTENT_SELECTOR) ||
             null;
         const fallbackText = !parentTextEl && rootEl?.textContent ? rootEl.textContent : '';
         const text = parentTextEl?.innerText || parentTextEl?.textContent || fallbackText;
@@ -27786,8 +27784,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (!el) return null;
         // Only consider selections inside diff code areas.
         const codeCell = el.closest(
-            'td.blob-code, td.blob-code-inner, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), ' +
-                '.blob-code-inner, .diff-text-cell, code.diff-text, ' +
+            `${DIFF_CODE_CONTENT_SELECTOR}, ` +
                 '[data-testid="diff-line"], [data-testid="diff-line-content"], ' +
                 '[class*="DiffLine"], [class*="blobCode"]',
         );
@@ -27810,8 +27807,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 lineEl = row.querySelector('[data-line-number]');
             }
         }
-        if (!lineEl) lineEl = row?.querySelector('td[class*="diffLineNumber__"]') || null;
-        const renderedLineNum = lineEl?.matches('td[class*="diffLineNumber__"]') ? lineEl.textContent.trim() : '';
+        if (!lineEl) lineEl = row?.querySelector(PREVIEW_LINE_NUMBER_SELECTOR) || null;
+        const renderedLineNum = lineEl?.matches(PREVIEW_LINE_NUMBER_SELECTOR) ? lineEl.textContent.trim() : '';
         const lineNum = lineEl?.getAttribute?.('data-line-number') || (/^\d+$/.test(renderedLineNum) ? renderedLineNum : '');
         const anchorId = lineEl?.id || '';
         // React diff cells carry no id; their R/L side lives in data-line-anchor (preferred:
@@ -27870,7 +27867,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             for (let i = 0; i < 2 && cur?.previousElementSibling; i++) cur = cur.previousElementSibling;
             for (let i = 0; i < 6 && cur; i++) {
                 const code = cur.querySelector(
-                    'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), code.diff-text',
+                    `${DIFF_CODE_CELL_SELECTOR}, code.diff-text`,
                 )?.textContent;
                 if (code && code.trim()) contextLines.push(code.replace(/\r\n/g, '\n'));
                 cur = cur.nextElementSibling;
@@ -30400,10 +30397,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         });
     }
 
-    function addFloatingCommitNav(opts = {}) {
-        const pr = parsePR();
-        if (pr && embeddedNavigationCommits(readPRSSRData(), pr, getImmediatePRHeadSHA())) {
-            opts = { ...opts, immediate: true };
+    function addFloatingCommitNav({ immediate = false } = {}) {
+        if (!immediate) {
+            const pr = parsePR();
+            immediate = !!pr && !!embeddedNavigationCommits(readPRSSRData(), pr, getImmediatePRHeadSHA());
         }
         // Remove ALL instances including turbo-cached ones
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
@@ -30413,7 +30410,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackClearTimeout(commitNavTimer);
             commitNavTimer = null;
         }
-        if (opts.immediate) {
+        if (immediate) {
             const pendingJob = _ackBackgroundJobs.get('floating-commit-nav');
             if (pendingJob) {
                 clearAckBackgroundJobTimer(pendingJob);
@@ -30435,6 +30432,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     async function fetchCommitList(owner, repo, prNum, opts = {}) {
+        const pr = { owner, repo, pr: prNum };
         const pagePR = parsePR();
         const head = pagePR && pagePR.owner === owner && pagePR.repo === repo && String(pagePR.pr) === String(prNum)
             ? getImmediatePRHeadSHA() : '';
@@ -30442,18 +30440,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // a longer-lived derived entry whose revision cannot be identified.
         const data = readPRSSRData();
         const contextKey = `${owner}/${repo}/${prNum}:`;
-        const layout = data?.payload?.pullRequestsLayoutRoute;
-        const sameEmbeddedPR = Number(layout?.pullRequest?.number) === Number(prNum) &&
-            String(layout?.repository?.ownerLogin || layout?.repository?.owner?.login || '').toLowerCase() === owner.toLowerCase() &&
-            String(layout?.repository?.name || '').toLowerCase() === repo.toLowerCase();
         const baseSha = _prContextKey.startsWith(contextKey) && _prContextCache?.baseSha ||
-            (sameEmbeddedPR ? layout?.pullRequest?.baseSha || '' : '');
+            embeddedPullRequestFor(data, pr)?.baseSha || '';
         const cacheKey = head && /^[0-9a-f]{40}$/i.test(baseSha)
             ? `${owner}/${repo}/${prNum}:${baseSha.toLowerCase()}:${head.toLowerCase()}` : '';
         if (cacheKey && commitListCache.has(cacheKey)) return commitListCache.get(cacheKey);
 
         if (opts.navigationOnly) {
-            const embedded = embeddedNavigationCommits(data, { owner, repo, pr: prNum }, head, baseSha);
+            const embedded = embeddedNavigationCommits(data, pr, head, baseSha);
             if (embedded) {
                 ackBackgroundLog('commit navigation reused embedded list', { commits: embedded.length }, 1000);
                 return embedded;
@@ -30499,7 +30493,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             if (opts.navigationOnly) {
                 try {
                     const embeddedData = JSON.parse(doc.querySelector(PR_SSR_SCRIPT_SELECTOR)?.textContent || 'null');
-                    const embedded = embeddedNavigationCommits(embeddedData, { owner, repo, pr: prNum }, head, baseSha);
+                    const embedded = embeddedNavigationCommits(embeddedData, pr, head, baseSha);
                     if (embedded) return embedded;
                 } catch (_) {}
             }
@@ -30525,7 +30519,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     const COMMIT_SEARCH_JUMP_KEY = 'ack_commit_search_jump_v1';
     const COMMIT_SEARCH_JUMP_MAX_AGE_MS = 2 * 60 * 1000;
     const COMMIT_SEARCH_JUMP_LINE_SELECTOR =
-        'td.blob-code, td.diff-text, td:is(.diff-text-cell, [class*="diffTextCell__"]), .blob-code-inner, .diff-text-cell, code.diff-text, ' +
+        `${DIFF_CODE_CONTENT_SELECTOR}, ` +
         '[data-testid="diff-line-content"], [class*="blobCode"]';
     let commitSearchJumpTimer = null;
 
@@ -32409,20 +32403,32 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     });
 
 
-    ackTest('embedded navigation recognizes both changes routes and validates the entire PR revision', () => {
+    function embeddedNavigationFixture() {
         const a = 'a'.repeat(40), b = 'b'.repeat(40), head = 'c'.repeat(40), base = 'd'.repeat(40);
         const pr = { owner: 'octo', repo: 'demo', pr: '7' };
-        const route = { commits: [{ oid: a, messageHeadline: 'first' }, { oid: b, messageHeadline: 'second' }, { oid: head, messageHeadline: 'third' }] };
+        const route = { commits: [
+            { oid: a, messageHeadline: 'first' }, { oid: b, messageHeadline: 'second' }, { oid: head, messageHeadline: 'third' },
+        ] };
+        const metadata = { number: Number(pr.pr), headSha: head, baseSha: base, commitsCount: route.commits.length };
+        const layout = { repository: { ownerLogin: pr.owner, name: pr.repo }, pullRequest: metadata };
         const data = { payload: {
             pullRequestsChangesWithRangeRoute: route,
-            pullRequestsLayoutRoute: { repository: { ownerLogin: 'octo', name: 'demo' },
-                pullRequest: { number: 7, headSha: head, baseSha: base, commitsCount: 3 } },
+            pullRequestsLayoutRoute: layout,
         } };
-        ackEq(readPRChangesRoute(data), route);
+        return { shas: [a, b, head], pr, route, layout, data };
+    }
+
+    ackTest('embedded navigation recognizes both changes routes and validates the entire PR revision', () => {
+        const { shas, pr, route, layout, data } = embeddedNavigationFixture();
+        const [a, b, head] = shas;
+        const base = layout.pullRequest.baseSha;
         ackDeepEq(embeddedNavigationCommits(data, pr, head, base).map((c) => c.sha), [a, b, head]);
-        const old = { payload: { ...data.payload, pullRequestsChangesWithRangeRoute: undefined, pullRequestsChangesRoute: route } };
-        ackEq(readPRChangesRoute(old), route, 'old route remains supported');
-        ackEq(embeddedNavigationCommits(old, pr, head, base).length, 3);
+        const old = { payload: {
+            pullRequestsLayoutRoute: { ...layout, repository: { name: 'Demo', owner: { login: 'Octo' } } },
+            pullRequestsChangesRoute: route,
+        } };
+        ackDeepEq(embeddedNavigationCommits(old, pr, head, base).map((c) => c.sha), [a, b, head],
+            'classic changes route and case-insensitive nested owner are supported');
         ackEq(embeddedNavigationCommits(data, { ...pr, pr: 8 }, head, base), null, 'wrong PR is rejected');
         ackEq(embeddedNavigationCommits(data, { ...pr, repo: 'other' }, head, base), null, 'wrong repository is rejected');
         ackEq(embeddedNavigationCommits(data, pr, a, base), null, 'old embedded head is rejected');
@@ -32434,7 +32440,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         route.commits = [{ oid: a }, { oid: b }, { oid: head }];
         route.truncated = true;
         ackEq(embeddedNavigationCommits(data, pr, head, base), null, 'truncated lists are rejected');
-        const groups = { payload: { pullRequestsLayoutRoute: data.payload.pullRequestsLayoutRoute,
+        const groups = { payload: { pullRequestsLayoutRoute: layout,
             pullRequestsCommitsRoute: { truncated: false, commitGroups: [{ commits: [
                 { oid: head, shortMessage: 'third' }, { oid: b, shortMessage: 'second' }, { oid: a, shortMessage: 'first' },
             ] }] } } };
@@ -32444,13 +32450,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     ackTest('embedded navigation avoids requests without replacing full commit messages or base-sensitive caches', async () => {
         const original = { readPRSSRData, parsePR, getImmediatePRHeadSHA, gmFetch,
             context: _prContextCache, contextKey: _prContextKey, cache: new Map(commitListCache) };
-        const a = 'a'.repeat(40), head = 'c'.repeat(40), base = 'd'.repeat(40);
-        const pr = { owner: 'octo', repo: 'demo', pr: '7' };
-        const data = { payload: {
-            pullRequestsChangesWithRangeRoute: { commits: [{ oid: a, messageHeadline: 'first' }, { oid: head, messageHeadline: 'second' }] },
-            pullRequestsLayoutRoute: { repository: { ownerLogin: 'octo', name: 'demo' },
-                pullRequest: { number: 7, headSha: head, baseSha: base, commitsCount: 2 } },
-        } };
+        const { shas: [a, b, head], pr, layout, data } = embeddedNavigationFixture();
+        const metadata = layout.pullRequest;
+        const { owner, repo, pr: number } = pr;
         let requests = 0;
         try {
             commitListCache.clear();
@@ -32461,22 +32463,26 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             getImmediatePRHeadSHA = () => head;
             gmFetch = async () => {
                 requests++;
-                return [{ sha: a, commit: { message: 'first\n\nFull message body.' } }, { sha: head, commit: { message: 'second\n\nAnother body.' } }];
+                return [
+                    { sha: a, commit: { message: 'first\n\nFull message body.' } },
+                    { sha: b, commit: { message: 'second' } }, { sha: head, commit: { message: 'third' } },
+                ];
             };
-            ackEq((await fetchCommitList('octo', 'demo', '7', { navigationOnly: true })).length, 2);
+            const navigation = await fetchCommitList(owner, repo, number, { navigationOnly: true });
+            ackDeepEq(navigation.map((c) => c.sha), [a, b, head]);
             ackEq(requests, 0, 'complete embedded navigation costs no GitHub request');
             ackEq(commitListCache.size, 0, 'headline entries never populate the full-message cache');
-            const full = await fetchCommitList('octo', 'demo', '7');
+            const full = await fetchCommitList(owner, repo, number);
             ackEq(requests, 1, 'a full-context consumer still reads complete messages');
             ackAssert(full[0].commit.message.includes('Full message body.'));
-            await fetchCommitList('octo', 'demo', '7');
+            await fetchCommitList(owner, repo, number);
             ackEq(requests, 1, 'same base and head reuse the complete result');
-            data.payload.pullRequestsLayoutRoute.pullRequest.number = 8;
-            await fetchCommitList('octo', 'demo', '7');
+            metadata.number = 8;
+            await fetchCommitList(owner, repo, number);
             ackEq(requests, 2, 'a departing page cannot supply a different PR cache revision');
-            data.payload.pullRequestsLayoutRoute.pullRequest.number = 7;
-            data.payload.pullRequestsLayoutRoute.pullRequest.baseSha = 'e'.repeat(40);
-            await fetchCommitList('octo', 'demo', '7');
+            metadata.number = Number(number);
+            metadata.baseSha = 'e'.repeat(40);
+            await fetchCommitList(owner, repo, number);
             ackEq(requests, 3, 'retargeting the base cannot reuse a head-only entry');
         } finally {
             ({ readPRSSRData, parsePR, getImmediatePRHeadSHA, gmFetch } = original);
@@ -33047,8 +33053,12 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             const line = gatherPageIndex().find((item) => item.el === cell.closest('tr') && item.text === 'new_value');
             ackEq(line?.file, 'src/full/path.cpp');
             ackEq(line?.line, '15');
-            host.innerHTML = '<table data-diff-anchor="fixture" aria-label="Diff for: src/modern.cpp"><tbody><tr><td data-line-number="7"></td><td class="diff-text-cell"><code class="diff-text">value</code></td></tr></tbody></table>';
-            ackEq(getDiffSelectionLineMeta(host.querySelector('code')).fileName, 'src/modern.cpp');
+            host.innerHTML = '<table data-diff-anchor="fixture" aria-label="Diff for: src/modern.cpp"><tbody>' +
+                '<tr data-line-anchor="diff-fixtureR7"><td data-line-number="7" data-diff-side="left"></td>' +
+                '<td class="diff-text-cell"><code class="diff-text">value</code></td></tr></tbody></table>';
+            const modern = getDiffSelectionLineMeta(host.querySelector('code'));
+            ackDeepEq([modern.fileName, modern.lineNum, modern.side], ['src/modern.cpp', '7', 'R'],
+                'nested React code uses the file table and prefers the row anchor for the side');
         } finally { host.remove(); }
     });
 
@@ -35040,7 +35050,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         // issue-body id or data-testid to this server-rendered PR body.
         const oldConversation = isPRConversationPage;
         const host = document.createElement('div');
-        host.innerHTML = `<div class="TimelineItem js-comment-container js-command-palette-pull-body">
+        host.innerHTML = `<form class="js-issue-update">
+            <section aria-label="Description"><div class="markdown-body">Draft preview.</div></section>
+          </form>
+          <div class="TimelineItem js-comment-container js-command-palette-pull-body">
             <div id="pullrequest-2876629729" class="timeline-comment current-user">
               <div class="edit-comment-hide">
                 <div class="comment-body markdown-body js-comment-body"><p>Problem: exact-limit chunks are rejected.</p></div>
@@ -35054,10 +35067,9 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         try {
             isPRConversationPage = () => true;
             const description = host.querySelector('[id^="pullrequest-"] .markdown-body');
-            ackEq(jevPRDescriptionBody(host), description, 'finds the body within GitHub’s pull-body timeline item');
+            ackEq(findPRDescriptionBody(host), description, 'general review tools skip the draft preview');
+            ackEq(jevPRDescriptionBody(host), description, 'Jev skips the draft preview and finds the posted body');
             ackEq(jevPRDescriptionBody(description), description, 'a mutation inside the description resolves the same body');
-            ackAssert(jevPRDescriptionBody(host) !== host.querySelector('#issuecomment-1 .markdown-body'),
-                'does not mistake a later issue comment for the PR description');
         } finally {
             isPRConversationPage = oldConversation;
             host.remove();
@@ -48081,18 +48093,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
     });
 
-    ackTest('diff selection recognizes modern React diff text cells', () => {
-        const source = _ackSource;
-        const fn = source.slice(
-            source.indexOf('function getDiffSelectionLineMeta'),
-            source.indexOf('function getDiffSelectionContext'),
-        );
-        ackAssert(fn.includes('.diff-text-cell') && fn.includes('diffTextCell__'), 'supports old and renamed React diff table cells');
-        ackAssert(fn.includes('code.diff-text'), 'supports nested code.diff-text nodes');
-        ackAssert(fn.includes('data-line-anchor'), 'derives R/L side from React line anchors');
-        ackAssert(fn.includes('readDiffFilePath(diffFile)'), 'uses the shared classic and React file path resolver');
-    });
-
     ackTest('diff selection context works outside diff (commit messages/comments/etc)', () => {
         const host = document.createElement('div');
         host.style.position = 'absolute';
@@ -50140,7 +50140,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('seenCommentKeys'), 'deduplicates duplicate rendered copies by comment identity');
         ackAssert(fn.includes('getCommentIdentityKey(comment)'), 'uses logical comment identity after extraction');
         ackAssert(fn.includes('#issue-'), 'skips PR body by permalink');
-        ackAssert(fn.includes('issue-body'), 'skips PR body by ID');
+        ackAssert(fn.includes('body.closest(PR_DESCRIPTION_ROOT_SELECTOR)'), 'skips the PR description');
         ackAssert(fn.includes('nothing to preview'), 'skips preview placeholders');
         ackAssert(fn.includes('data-resolved'), 'checks resolved thread state');
         ackAssert(fn.includes("!resolvedDetails.hasAttribute('open')"), 'skips collapsed resolved threads');
@@ -50408,10 +50408,6 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(
             fn.includes("return nums[nums.length - 1] || row.getAttribute?.('data-line-number') ||"),
             'falls back to the last populated line number in the row',
-        );
-        ackAssert(
-            fn.includes('.blob-code-inner, .diff-text-cell, code.diff-text'),
-            'prefers the inner code node over the padded table cell wrapper',
         );
         ackAssert(
             fn.includes("const parts = rawCode.split('\\\\n')") || fn.includes("const parts = rawCode.split('\\n')"),
@@ -55672,7 +55668,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('/files/'), 'extracts SHA from file links');
         ackAssert(fn.includes('/commits/'), 'links to commit view');
         ackAssert(fn.includes("fontFamily: 'monospace'"), 'uses monospace font');
-        ackAssert(fn.includes('issue-body'), 'skips PR body');
+        ackAssert(fn.includes('body.closest(PR_DESCRIPTION_ROOT_SELECTOR)'), 'skips the PR description');
         ackAssert(fn.includes('_reviewCommitMap'), 'reads API commit map from module state');
         ackAssert(fn.includes('comment-id-'), 'looks up turbo-frame comment IDs');
         ackAssert(fn.includes('discussion_r'), 'looks up permalink discussion IDs');
@@ -55840,7 +55836,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             source.indexOf('function addFloatingCommitNav'),
             source.indexOf('async function fetchCommitList'),
         );
-        ackAssert(fn.includes('opts.immediate'), 'has an immediate navigation mode');
+        ackAssert(fn.includes('if (immediate)'), 'has an immediate navigation mode');
         ackAssert(fn.includes('runFloatingCommitNavBuild()'), 'immediate mode starts the build directly');
         ackAssert(fn.includes("_ackBackgroundJobs.delete('floating-commit-nav')"), 'immediate mode cancels stale background jobs');
         ackAssert(fn.includes('ackSetTimeout'), 'uses lifetime-aware debounce timer');
