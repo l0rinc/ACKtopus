@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ACKtopus
 // @namespace    http://tampermonkey.net/
-// @version      1.305
+// @version      1.306
 // @description  ACKtopus - Bitcoin Core and secp256k1 review toolkit with LLM integration and cached IRC discussions
 // @updateURL    https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
 // @downloadURL  https://raw.githubusercontent.com/l0rinc/ACKtopus/master/src/ACKtopus.js
@@ -827,6 +827,7 @@
     window.addEventListener('blur', cancelAlternateModeShiftTap);
     const COMMENT_TA_SELECTOR = 'textarea.js-comment-field, textarea[name="comment[body]"]';
     const COMMENT_HEADER_SELECTOR = '[data-testid="comment-header"], .timeline-comment-header, .review-comment-header';
+    const TIMELINE_EVENT_SELECTOR = '.TimelineItem, .js-timeline-item, [data-testid="timeline-item"]';
     const COMMENT_CONTAINER_BASE_SELECTOR =
         '.timeline-comment, .review-comment, .js-comment-container, [class*="ActivityThread"], ' +
         'article[id^="issuecomment-"], article[id^="pullrequestreview-"]';
@@ -852,6 +853,9 @@
         COMMENT_CONTAINER_SELECTOR + ', .js-comment, .js-line-comments, .inline-comment-form-container';
     const WIDE_COMMENT_CONTAINER_SELECTOR =
         COMMENT_CONTAINER_SELECTOR + ', .js-discussion, .timeline-comment-group, .js-timeline-item, [id^="issue-"]';
+    const ANCHORED_COMMENT_SELECTOR =
+        ':is(div, article, section, turbo-frame):is([id^="issuecomment-"], [id^="discussion_r"], ' +
+        '[id^="pullrequestreview-"], [id^="pullrequestreviewcomment-"]), div[id^="r"][class*="ReviewThreadContainer"]';
     const MARKDOWN_BODY_SELECTOR = '.markdown-body, .comment-body, .js-comment-body, [data-testid="markdown-body"]';
     const PENDING_REVIEW_MARKER_SELECTOR =
         '.js-pending-review-comment, .Label--warning, [title*="Pending" i], [aria-label*="Pending" i], [data-testid*="pending" i]';
@@ -901,10 +905,11 @@
         const descriptionRoot = find(PR_DESCRIPTION_ROOT_SELECTOR);
         const headerRoot = find(PR_HEADER_ROOT_SELECTOR);
         const reactOverview = !!find('section[aria-label="Description"], article[id^="issuecomment-"], article[id^="pullrequestreview-"]');
-        const react = reactOverview || !!find('react-app[app-name="repo"], react-app[app-name="pull-requests"], react-app[app-name="issues-react"], [data-testid="comment-header"], [data-testid="diff-file"]');
+        const react = !!find('[data-testid="comment-header"], [data-testid="diff-file"], [data-testid="commit-row-item"], [data-testid="diff-content"]');
+        const classic = !!find('#partial-discussion-header, .timeline-comment, .js-file, .js-issue-row');
+        const app = find('react-app[app-name="repo"], react-app[app-name="pull-requests"], react-app[app-name="issues-react"]');
         return {
-            kind: reactOverview ? 'react-overview' : react ? 'react' :
-                find('#partial-discussion-header, .timeline-comment, .js-file') ? 'classic' : 'unknown',
+            kind: reactOverview ? 'react-overview' : react ? 'react' : classic ? 'classic' : app ? 'react' : 'unknown',
             headerRoot: headerRoot || null,
             descriptionRoot: descriptionRoot || null,
         };
@@ -2541,9 +2546,25 @@
     const REVIEW_THREAD_SCOPE_SELECTOR =
         `${COMMENT_THREAD_SELECTOR}, [data-resolved="true"], ` +
         '[class*="ReviewThreadContainer"], [class*="ReviewThreadInnerContainer"]';
+    const OVERVIEW_THREAD_TOGGLE_SELECTOR =
+        'button[aria-label^="Open review comment in "], button[aria-label^="Close review comment in "]';
+    const OVERVIEW_THREAD_ARTICLE_SELECTOR = `article:has(> div > div > :is(${OVERVIEW_THREAD_TOGGLE_SELECTOR}))`;
     const REVIEW_THREAD_TOGGLE_SELECTOR =
         'button[data-is-first-collapse-button="true"], ' +
-        'button[data-target="review-thread-collapsible.button"]';
+        'button[data-target="review-thread-collapsible.button"], ' + OVERVIEW_THREAD_TOGGLE_SELECTOR;
+
+    function overviewThreadHeader(thread) {
+        const article = thread?.closest?.('article');
+        const toggle = article?.querySelector(OVERVIEW_THREAD_TOGGLE_SELECTOR);
+        if (!toggle || toggle.closest('article') !== article || toggle.closest(MARKDOWN_BODY_SELECTOR)) return null;
+        return toggle.parentElement;
+    }
+
+    function reviewThreadHasLabel(header, name) {
+        return !!header && qsa(header, '[data-component="Label"], .Label, [class*="Label-Label"]').some((label) =>
+            (label.getAttribute('title') || label.textContent || '').trim().toLowerCase().replace(/^label:\s*/, '') === name,
+        );
+    }
     const REVEAL_MINE_BATCH_SIZE = 6;
 
     function hasAttrContaining(el, name, needle) {
@@ -2655,12 +2676,15 @@
         }
 
         for (const button of qsa(root, REVIEW_THREAD_TOGGLE_SELECTOR)) {
-            const scope = button.closest?.(REVIEW_THREAD_SCOPE_SELECTOR);
+            if (button.closest(MARKDOWN_BODY_SELECTOR)) continue;
+            const overview = button.matches(OVERVIEW_THREAD_TOGGLE_SELECTOR);
+            const scope = button.closest(overview ? 'article' : REVIEW_THREAD_SCOPE_SELECTOR);
             if (!scope || (root !== document && !root.contains(scope))) continue;
             const body = scope.querySelector?.('[data-target="review-thread-collapsible.body"]');
             const isOpen = () => {
                 const expanded = button.getAttribute('aria-expanded');
                 if (expanded === 'true' || expanded === 'false') return expanded === 'true';
+                if (overview) return button.getAttribute('aria-label').startsWith('Close review comment in ');
                 if (button.querySelector('.octicon-chevron-down')) return true;
                 if (button.querySelector('.octicon-chevron-right')) return false;
                 return body ? !body.hasAttribute('hidden') : false;
@@ -2841,7 +2865,10 @@
     // --- Show Resolved ---
 
     function getCollapsedResolved() {
-        const items = [];
+        const items = getReviewThreadToggleItems().filter(({ control, isOpen }) =>
+            control.matches(OVERVIEW_THREAD_TOGGLE_SELECTOR) && !isOpen() &&
+            reviewThreadHasLabel(control.parentElement, 'resolved'),
+        ).map(({ scope, isOpen, setOpen }) => ({ el: scope, click: () => setOpen(true), isDone: isOpen }));
         // Conversation page: <details data-resolved="true">
         document.querySelectorAll('details[data-resolved="true"]:not([open])').forEach((d) => {
             const summary = d.querySelector('summary');
@@ -2905,13 +2932,11 @@
         // All variants must be included or DOM ACK parsing silently fails,
         // falling through to the slower API path.
         const bodies = document.querySelectorAll(
-            '.js-comment-body, .comment-body, [class*="comment-body"], [data-testid="comment-body"], [class*="CommentBody"]',
+            MARKDOWN_BODY_SELECTOR + ', [class*="comment-body"], [data-testid="comment-body"], [class*="CommentBody"]',
         );
         for (const body of bodies) {
             if (!body.textContent.includes('Reviews')) continue;
-            const table = body.querySelector('table');
-            if (!table) continue;
-            const rows = table.querySelectorAll('tr');
+            const rows = body.querySelectorAll('table tr');
             for (const row of rows) {
                 const cells = row.querySelectorAll('td');
                 if (cells.length < 2) continue;
@@ -3883,14 +3908,15 @@
             document.getElementById(`r${id}`) ||
             document.getElementById(`pullrequestreviewcomment-${id}`);
         if (target) return visibleReviewCommentHashTarget(target);
-        const anchor = document.querySelector(
+        const anchor = qsa(document,
             [
                 `a[href="#discussion_r${id}"]`,
                 `a[href$="#discussion_r${id}"]`,
                 `a[href="#r${id}"]`,
                 `a[href$="#r${id}"]`,
             ].join(','),
-        );
+        ).find((link) => !link.closest(MARKDOWN_BODY_SELECTOR) &&
+            !link.closest(OVERVIEW_THREAD_ARTICLE_SELECTOR));
         if (anchor) {
             return visibleReviewCommentHashTarget(anchor.closest(WIDE_COMMENT_CONTAINER_SELECTOR) || anchor);
         }
@@ -3915,6 +3941,19 @@
     }
 
     function getReviewCommentRevealState(id = '') {
+        if (id) {
+            const overview = getReviewThreadToggleItems().find(({ control, isOpen }) => {
+                if (!control.matches(OVERVIEW_THREAD_TOGGLE_SELECTOR) || isOpen()) return false;
+                const link = overviewThreadFileLink(control.parentElement);
+                return link?.hash === `#r${id}` && hrefIsLocalComment(link);
+            });
+            if (overview) {
+                return {
+                    paginationBtns: [], timelineLoadMore: [], minimized: [], outdated: [], loadDiffs: [],
+                    resolved: [{ el: overview.scope, click: () => overview.setOpen(true) }], total: 1,
+                };
+            }
+        }
         const { paginationBtns, timelineLoadMore } = getConversationLoaderElements();
         const targetLoaderIndex = id
             ? paginationBtns.findIndex((button) =>
@@ -4636,10 +4675,10 @@
 
     function parseForcePushesFromPage() {
         const pushes = [];
-        document.querySelectorAll('.TimelineItem, .js-timeline-item, [data-testid="timeline-item"]').forEach((item) => {
+        document.querySelectorAll(TIMELINE_EVENT_SELECTOR).forEach((item) => {
             // Keep only innermost rows: outer .js-timeline-item wrappers duplicate the nested .TimelineItem
             // with polluted actor/timestamp metadata (first grouped event wins inside the wrapper).
-            if (item.querySelector('.TimelineItem, .js-timeline-item, [data-testid="timeline-item"]')) return;
+            if (item.querySelector(TIMELINE_EVENT_SELECTOR)) return;
             const text = item.textContent;
             if (!/force[- ]?pushed/i.test(text)) return;
             const actor = item.querySelector('.author')?.textContent?.trim() || '';
@@ -6282,7 +6321,7 @@
             for (const file of compareFileElements()) {
                 const path = readDiffFilePath(file);
                 if (!path || collapsedPaths.has(path)) continue;
-                const anchor = file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info') || file;
+                const anchor = file.querySelector(`${DIFF_FILE_HEADER_SELECTOR}, .file-info`) || file;
                 anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 openCompareFileIfCollapsed(file);
                 scrolledToFirstKeptFile = true;
@@ -7115,8 +7154,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function getAnalysisMode(path = location.pathname) {
-        if (/\/pull\/\d+\/commits\/[0-9a-f]+/.test(path)) return ANALYSIS_MODES.commit;
-        if (/\/pull\/\d+\/changes\/[0-9a-f]+/.test(path)) return ANALYSIS_MODES.commit;
+        if (isPRPage(path) && pathCommitSha(path)) return ANALYSIS_MODES.commit;
         if (/\/commit\/[0-9a-f]{7,40}(?:[/?#]|$)/i.test(path)) return ANALYSIS_MODES.commit;
         if (/\/pull\/\d+\/commits\/?$/.test(path)) return ANALYSIS_MODES.commits;
         return ANALYSIS_MODES.pr;
@@ -10100,13 +10138,35 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     }
 
     function getCommentPermalinkEl(container) {
-        return (
-            container?.querySelector?.(
-                'a[id$="-permalink"], a.js-timestamp, a.timestamp, ' +
-                    'a[href^="#discussion_r"], a[href^="#issuecomment-"], ' +
-                    'a[href^="#pullrequestreview-"], a[href^="#issue-"]',
-            ) || null
-        );
+        if (!container) return null;
+        const owner = container.closest(ANCHORED_COMMENT_SELECTOR);
+        const header = container?.matches?.(COMMENT_HEADER_SELECTOR)
+            ? container : container?.querySelector?.(COMMENT_HEADER_SELECTOR);
+        const ownLink = (link) => {
+            if (link.closest(MARKDOWN_BODY_SELECTOR)) return false;
+            const linkOwner = link.closest(ANCHORED_COMMENT_SELECTOR);
+            return !owner || !linkOwner || linkOwner === owner;
+        };
+        const from = (scope) => {
+            const legacy = qsa(scope, 'a[id$="-permalink"], a.js-timestamp, a.timestamp').find(ownLink);
+            if (legacy) return legacy;
+            const links = qsa(scope, 'a[href*="#"]').filter(ownLink);
+            const ownHash = owner?.id ? `#${owner.id}` : '';
+            return links.find((link) => ownHash && link.hash === ownHash && hrefIsLocalComment(link)) ||
+                links.find((link) => /^#(?:discussion_r|r|issuecomment-|pullrequestreview-|issue-)\d+$/.test(link.hash) &&
+                    (!/^#(?:discussion_r|r|issuecomment-|pullrequestreview-)\d+$/.test(ownHash) ||
+                        commentPermalinkIdentity(link.hash) === commentPermalinkIdentity(ownHash)) &&
+                    (link.getAttribute('href').startsWith('#') || hrefIsLocalComment(link))) || null;
+        };
+        return (header && from(header)) || from(container);
+    }
+
+    function hrefIsLocalComment(link) {
+        const page = parsePageContext();
+        const linked = link.origin === location.origin && parsePageContext(link.pathname);
+        return page && linked && pageKind(link.pathname) === pageKind() &&
+            linked.owner.toLowerCase() === page.owner.toLowerCase() &&
+            linked.repo.toLowerCase() === page.repo.toLowerCase() && linked.pr === page.pr;
     }
 
     function getCommentPermalink(container) {
@@ -10143,12 +10203,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     function getCommentThreadFlags(container, threadRoot = null) {
         const threadEl = threadRoot || getCommentThreadRoot(container) || container;
+        const overview = overviewThreadHeader(threadEl);
         const labels = [...(threadEl?.querySelectorAll?.('.Label[title], .Label') || [])]
             .map((el) => (el.getAttribute('title') || el.textContent || '').trim().toLowerCase())
             .filter(Boolean);
         return {
-            isResolved: !!container.closest('details[data-resolved="true"]'),
-            isOutdated: labels.some((label) => /(^|: )outdated$/.test(label)),
+            isResolved: !!container.closest('[data-resolved="true"]') || reviewThreadHasLabel(overview, 'resolved'),
+            isOutdated: reviewThreadHasLabel(overview, 'outdated') || labels.some((label) => /(^|: )outdated$/.test(label)),
             isPending: labels.some((label) => /(^|: )pending$/.test(label)),
         };
     }
@@ -10199,18 +10260,39 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return flags.map((flag) => ` [${flag}]`).join('');
     }
 
+    function overviewThreadFileLink(header) {
+        return header?.querySelector('a[class*="file-name-overflow"]') || null;
+    }
+
+    function overviewThreadLocation(container) {
+        const header = overviewThreadHeader(container);
+        const link = overviewThreadFileLink(header);
+        if (!link) return null;
+        const label = header.querySelector(OVERVIEW_THREAD_TOGGLE_SELECTOR)?.getAttribute('aria-label') || '';
+        return {
+            file: (link.getAttribute('title') || link.textContent || '').replace(/[‎‏]/g, '').trim(),
+            line: label.match(/, line (\d+)$/)?.[1] || '',
+            commitSha: pathCommitSha(link.pathname).slice(0, 8),
+        };
+    }
+
     function getCommentLocationInfo(container, threadRoot = null) {
         let file = '';
         let line = '';
         let commitSha = '';
 
-        const diffFile = container.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
+        const diffFile = container.closest(`${DIFF_FILE_SELECTOR}, .diff-table`);
         if (diffFile) {
             file =
                 readDiffFilePath(diffFile);
         }
 
         let threadEl = threadRoot || getCommentThreadRoot(container) || container;
+        const overviewLocation = overviewThreadLocation(threadEl);
+        if (overviewLocation) return {
+            file: file || overviewLocation.file, line: overviewLocation.line,
+            commitSha: overviewLocation.commitSha || pathCommitSha().slice(0, 8), threadRoot: threadEl,
+        };
         if (!threadEl.querySelector?.('a.text-mono')) {
             const wider = threadEl.parentElement?.closest(
                 'details[data-resolved], .js-discussion, .timeline-comment-group, ' +
@@ -10365,7 +10447,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
         const rowCodeSelector =
             'td.blob-code, td.diff-text, .blob-code-inner, .diff-text-cell, code.diff-text, ' +
-            '[data-testid="diff-line-content"], [class*="blobCode"]';
+            '[data-testid="diff-line-content"], [class*="blobCode"], td[class*="diffTextCell__"]';
 
         const getRowLineNumber = (row) => {
             const codeCell = row.querySelector(rowCodeSelector);
@@ -10382,7 +10464,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const nums = [...row.querySelectorAll('[data-line-number]')]
                 .map((el) => el.getAttribute('data-line-number') || '')
                 .filter(Boolean);
-            return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || '';
+            const previewLine = row.querySelector('td[class*="diffLineNumber__"]')?.textContent?.trim() || '';
+            return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || (/^\d+$/.test(previewLine) ? previewLine : '');
         };
 
         const rowHasCode = (row) => !!row.querySelector?.(rowCodeSelector);
@@ -10429,7 +10512,9 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 '';
             if (marker === '+' || marker === '-') return marker;
             if (marker) return ' ';
-            const codeCell = row.querySelector('td.blob-code, td.diff-text');
+            const codeCell = row.querySelector(rowCodeSelector);
+            if (codeCell?.querySelector('code[class*="DeletionLine__"]')) return '-';
+            if (codeCell?.querySelector('code[class*="AdditionLine__"]')) return '+';
             const cls = `${codeCell?.className || ''} ${row.className || ''}`;
             if (/\b(?:blob-code|diff-text)-addition\b|\bdiff-line-added\b/i.test(cls)) return '+';
             if (/\b(?:blob-code|diff-text)-deletion\b|\bdiff-line-removed\b/i.test(cls)) return '-';
@@ -10445,7 +10530,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             const sign = getRowDiffSign(row);
             const codeEl =
                 row.querySelector('.blob-code-inner, .diff-text-cell, code.diff-text, [data-testid="diff-line-content"], [class*="blobCode"]') ||
-                row.querySelector('td.blob-code, td.diff-text');
+                row.querySelector(rowCodeSelector);
             const rawCode = String(codeEl?.innerText || codeEl?.textContent || '').replace(/\r\n/g, '\n');
             const parts = rawCode.split('\n');
             let pendingIndent = '';
@@ -10468,17 +10553,20 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
     function getCommentReactionSummary(container) {
         const buttons = [
             ...(container.querySelectorAll?.(
-                'button[data-reaction-content], button.js-reaction-group-button, .social-reaction-summary-item',
+                `button[data-reaction-content], button.js-reaction-group-button, .social-reaction-summary-item, ${REACT_REACTION_CHIP_SELECTOR}`,
             ) || []),
         ];
         const seen = new Set();
         const parts = [];
         for (const btn of buttons) {
             if (btn.closest('.dropdown-menu, [role="menu"]')) continue;
-            const content = btn.getAttribute('data-reaction-content') || btn.getAttribute('data-reaction-label') || '';
+            const owner = btn.closest(POSTED_COMMENT_CONTAINER_SELECTOR);
+            if (owner && owner !== container && container.contains(owner)) continue;
+            const chip = btn.matches(REACT_REACTION_CHIP_SELECTOR) ? readReactReactionChip(btn) : null;
+            const content = chip?.content || btn.getAttribute('data-reaction-content') || btn.getAttribute('data-reaction-label') || '';
             const key = content.toLowerCase();
             if (!key || seen.has(key)) continue;
-            const emoji = btn.querySelector('g-emoji')?.textContent?.trim() || content;
+            const emoji = chip?.emoji || btn.querySelector('g-emoji')?.textContent?.trim() || content;
             const countText =
                 btn
                     .querySelector(
@@ -10486,7 +10574,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                     )
                     ?.textContent?.trim() || '';
             const aria = btn.getAttribute('aria-label') || '';
-            const count = parseInt(countText, 10) || parseInt(aria.match(/\((\d+)\)/)?.[1] || '', 10) || 0;
+            const count = chip?.count || parseInt(countText, 10) || parseInt(aria.match(/\((\d+)\)/)?.[1] || '', 10) || 0;
             if (!count) continue;
             seen.add(key);
             parts.push(`${emoji}${count > 1 ? ` x${count}` : ''}`);
@@ -11068,10 +11156,11 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const seenBodies = new Set(); // deduplicate nested container matches
         const seenCommentKeys = new Set(); // deduplicate duplicate DOM renderings of the same comment
         const containers = document.querySelectorAll(COMMENT_CONTAINER_SELECTOR);
-        for (const container of containers) {
-            const body = container.querySelector(MARKDOWN_BODY_SELECTOR);
+        for (const candidate of containers) {
+            const body = candidate.querySelector(MARKDOWN_BODY_SELECTOR);
             if (!body || seenBodies.has(body)) continue;
             seenBodies.add(body);
+            const container = body.closest(ANCHORED_COMMENT_SELECTOR) || candidate;
             const markdown = renderBodyMarkdown(body);
             if (!markdown || markdown.length < 3) continue;
 
@@ -11116,7 +11205,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 codeContext,
                 reactions,
             };
-            const identityKey = getCommentIdentityKey(comment);
+            // GitHub can render a pending draft twice without a public permalink.
+            const localId = container.matches(ANCHORED_COMMENT_SELECTOR) ? container.id : '';
+            const identityKey = !comment.permalink && localId
+                ? `page-comment:${localId}:${markdown}` : getCommentIdentityKey(comment);
             if (identityKey && seenCommentKeys.has(identityKey)) continue;
             if (identityKey) seenCommentKeys.add(identityKey);
             comments.push(comment);
@@ -15602,6 +15694,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     'details[data-resolved], .js-resolvable-timeline-thread-container',
             ) || form;
 
+        const overviewPath = overviewThreadLocation(threadRoot)?.file;
+        if (overviewPath) return overviewPath;
         const monoLink = threadRoot?.querySelector?.('a.text-mono.Link--primary, a.text-mono[href*="/files/"]');
         const monoText = monoLink?.textContent?.trim?.() || '';
         if (monoText) return monoText;
@@ -15611,7 +15705,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         if (linkText) return linkText;
 
         // Files changed threads: use diff file header if available.
-        const diffFile = form?.closest?.('.js-file, .diff-table, [data-testid="diff-file"], .file');
+        const diffFile = form?.closest?.(`${DIFF_FILE_SELECTOR}, .diff-table`);
         const headerText =
             readDiffFilePath(diffFile);
         if (headerText) return headerText;
@@ -16654,14 +16748,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     const TIMELINE_FILTER_ITEM_SELECTOR = [
-        '.js-timeline-item',
-        '.TimelineItem',
+        TIMELINE_EVENT_SELECTOR,
+        OVERVIEW_THREAD_ARTICLE_SELECTOR,
+        '[data-testid="review-thread"]',
         '.timeline-comment-group',
         '.timeline-comment',
         '.review-comment',
         '.js-resolvable-timeline-thread-container',
         'details[data-resolved]',
-        '[data-testid="review-thread"]',
         '.review-thread-component',
         '[data-testid="issue-body"]',
         '[data-testid^="issue-comment"]',
@@ -16697,7 +16791,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function timelineFilterItemInfo(item) {
-        const hasComment =
+        const overview = item?.matches?.(OVERVIEW_THREAD_ARTICLE_SELECTOR) ? overviewThreadHeader(item) : null;
+        const hasComment = !!overview ||
             !!item?.matches?.(
                 '.timeline-comment, .review-comment, .timeline-comment-group, [data-testid="issue-body"], ' +
                     '[data-testid^="issue-comment"], [data-testid="review-thread"], .review-thread-component, ' +
@@ -16706,7 +16801,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const resolved =
             !!item?.matches?.('details[data-resolved="true"]') ||
             !!item?.closest?.('details[data-resolved="true"]') ||
-            !!item?.querySelector?.('details[data-resolved="true"]');
+            !!item?.querySelector?.('details[data-resolved="true"]') ||
+            reviewThreadHasLabel(overview, 'resolved');
         return { hasComment, resolved };
     }
 
@@ -16733,12 +16829,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         return true;
     }
 
-    function gatherTimelineFilterItems(root = document) {
+    function gatherTimelineFilterItems(root = document, mode = 'comments') {
         const items = qsa(root, TIMELINE_FILTER_ITEM_SELECTOR).filter(
             (item) => !item.closest?.(`#${BUTTON_CONTAINER_ID}, #acktopus-analysis, .ack-config-overlay`),
         );
         const itemSet = new Set(items);
         return items.filter((item) => {
+            // The overview keeps thread controls beside the body inside an article.
+            // Keep the enclosing review and filter each resolved thread separately.
+            if (mode === 'unresolved' && item.matches(OVERVIEW_THREAD_ARTICLE_SELECTOR)) return true;
             let parent = item.parentElement?.closest?.(TIMELINE_FILTER_ITEM_SELECTOR);
             while (parent) {
                 if (itemSet.has(parent)) return false;
@@ -16769,7 +16868,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let hidden = 0;
         if (mode !== 'all') {
             const pinnedTargets = timelineFilterPinnedTargets();
-            for (const item of gatherTimelineFilterItems(scope)) {
+            for (const item of gatherTimelineFilterItems(scope, mode)) {
                 if (timelineFilterShouldShowItem(item, mode, timelineFilterPinnedItem(item, pinnedTargets))) continue;
                 item.dataset.ackTimelineFilterHidden = '1';
                 item.dataset.ackTimelineFilterDisplay = item.style.display || '';
@@ -16846,15 +16945,16 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function findGithubReviewOptionsContainer(anchor = findGithubReviewOptionsAnchor(document)) {
-        return (
-            anchor?.parentElement ||
-            document.querySelector(
-                '#files_bucket .file-navigation, #files .file-navigation, .file-navigation, #files_bucket, #files, [data-testid*="diff" i]',
-            ) ||
-            document.querySelector(
-                '[data-component="PH_Actions"], .prc-PageHeader-Actions-wawWm, .gh-header-actions, .prc-PageHeader-Navigation--uLav, .tabnav, main',
-            )
-        );
+        if (anchor?.parentElement) return anchor.parentElement;
+        if (isDiffReviewPage()) {
+            const diffControls = document.querySelector(
+                '#files_bucket .file-navigation, #files .file-navigation, .file-navigation, ' +
+                '[data-testid="diff-comparison-viewer-sticky-header-bar"], [data-testid="diff-content"], #files_bucket, #files',
+            );
+            if (diffControls) return diffControls;
+        }
+        return document.querySelector(PR_HEADER_ACTIONS_SELECTOR) ||
+            document.querySelector('[class*="prc-PageHeader-Navigation-"], .tabnav, main');
     }
 
     function makeGithubReviewOption({ label, checked, onChange, title = '' }) {
@@ -18328,9 +18428,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function jevCommentOwnPermalink(body) {
-        const own = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [id^="discussion_r"], [data-testid="review-comment"]');
-        if (!own || own.querySelectorAll(MARKDOWN_BODY_SELECTOR).length !== 1) return '';
-        return getCommentPermalink(own);
+        const own = body.closest(ANCHORED_COMMENT_SELECTOR) ||
+            body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [data-testid="review-comment"]');
+        if (!own) return '';
+        const identitySelector = `${ANCHORED_COMMENT_SELECTOR}, ${POSTED_COMMENT_CONTAINER_SELECTOR}`;
+        const posted = body.closest(identitySelector);
+        const bodyCount = qsa(own, MARKDOWN_BODY_SELECTOR).filter((candidate) =>
+            candidate.closest(identitySelector) === posted,
+        ).length;
+        return bodyCount === 1 ? getCommentPermalink(own) : '';
     }
 
     function jevCommentPublicIdentity(pr, permalink) {
@@ -18339,9 +18445,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const prPath = `/${pr.owner}/${pr.repo}/pull/${pr.pr}`;
         if (url.origin !== location.origin ||
             (url.pathname !== prPath && !url.pathname.startsWith(`${prPath}/`))) return null;
-        const id = url.hash.match(/^#(discussion_r|issuecomment-|pullrequestreview-)(\d+)$/)?.[2];
+        const alias = /^\/(?:files|changes)(?:\/|$)/.test(url.pathname.slice(prPath.length)) && url.hash.match(/^#r(\d+)$/);
+        const id = alias?.[1] || url.hash.match(/^#(discussion_r|issuecomment-|pullrequestreview-)(\d+)$/)?.[2];
         if (!id) return null;
-        const kind = url.hash.startsWith('#discussion_r') ? 'review-comment'
+        const kind = alias || url.hash.startsWith('#discussion_r') ? 'review-comment'
             : url.hash.startsWith('#issuecomment-') ? 'issue-comment' : 'review';
         const base = `https://api.github.com/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
         const apiUrl = kind === 'review-comment' ? `${base}/pulls/comments/${id}`
@@ -18941,7 +19048,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 previous.slot?.remove();
                 jevCommentSeenBodies.delete(body);
             }
-            const candidate = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', [data-testid="review-comment"]');
+            const candidate = body.closest(COMMENT_CONTAINER_BASE_SELECTOR + ', div[id^="discussion_r"], [data-testid="review-comment"]');
             const specificComment = candidate?.querySelectorAll(MARKDOWN_BODY_SELECTOR).length === 1 ? candidate : null;
             const comment = specificComment || body.closest(COMMENT_CONTAINER_BASE_SELECTOR) || body.closest(COMMENT_CONTAINER_SELECTOR) || container;
             const thread = jevCommentThreadRoot(body, comment);
@@ -21197,7 +21304,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         `${EDIT_FORM_SELECTOR}, .is-comment-editing, .edit-comment-hide, ` +
         '[data-testid="markdown-editor"], [class*="MarkdownEditor-module__container"], ' +
         'markdown-toolbar, .toolbar-commenting, .js-previewable-comment-form md-header, ' +
-        '[class*="Toolbar-module__toolbar"], textarea';
+        `${REACT_EDITOR_TOOLBAR_SELECTOR}, textarea`;
     const FAST_EDITOR_INJECTORS = ['detailsButtons', 'trackEditForms', 'editorErgonomics', 'quickActions'];
     let fastEditorAffordanceTimer = null;
     const pendingFastEditorRoots = new Set();
@@ -21291,7 +21398,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         'a[aria-label*="previous commit" i]',
         'a[data-testid="next-commit-link"]',
         'a[data-testid="prev-commit-link"]',
-        '.PullRequestHeaderSummary-module__summaryContainer__dA7dP',
+        PR_BRANCH_SUMMARY_SELECTOR,
         '[data-testid="commit-row-item"]',
         '[data-testid="timeline-commit-row"]',
         'section[aria-label="Description"]',
@@ -21949,7 +22056,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const threadRoot = container.closest(
                     '.js-discussion, .js-line-comments, [data-testid="review-thread"], .review-thread-component, .inline-comments',
                 );
-                const diffFile = container.closest('.js-file, .diff-table, [data-testid="diff-file"], .file');
+                const diffFile = container.closest(`${DIFF_FILE_SELECTOR}, .diff-table`);
 
                 // Extract the SPECIFIC line this comment is attached to
                 let targetLine = '';
@@ -23327,9 +23434,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
             const editState = getEditState(headerContainer);
             const author = extractAuthorLogin(header);
-            const permalink = header.querySelector(
-                'a[id$="-permalink"], [data-testid="issue-body-header-link"], a[href*="#issue-"]',
-            );
+            const permalink = getCommentPermalinkEl(header) || header.querySelector('[data-testid="issue-body-header-link"]');
             const isPRBody = header.matches('[data-testid="issue-body"], section[aria-label="Description"]') || isPRBodyFromPermalink(permalink);
             const container = headerContainer;
             const isPendingComment =
@@ -23367,7 +23472,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                                 ? actions.querySelector('.ack-suggest-reply-btn')
                                 : actions.querySelector('button');
                     const hasPendingCopy = !!actions.querySelector('.ack-copy-comment-btn');
-                    if (hasExpected && hasPendingCopy === isPendingComment) continue;
+                    if (hasExpected && hasPendingCopy === isPendingComment) {
+                        ensureChangesLink(header, permalink);
+                        continue;
+                    }
                     delete header.dataset.ackQuickProcessed;
                 }
             }
@@ -24405,6 +24513,20 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     // Known native reaction keys we manage from the smiley trigger
     const REACTION_CYCLE = ['+1', 'heart', 'hooray', 'rocket', 'eyes'];
+    const REACT_REACTION_CHIP_SELECTOR = 'button[class*="reactionToggleButton__"]';
+    const REACTION_CONTENT_BY_EMOJI = {
+        '👍': '+1', '👎': '-1', '😄': 'laugh', '🎉': 'hooray',
+        '😕': 'confused', '❤': 'heart', '🚀': 'rocket', '👀': 'eyes',
+    };
+
+    function readReactReactionChip(button) {
+        const label = button.getAttribute('aria-label') || '';
+        const match = label.match(/^(\S+)\s+(\d+)\s+reactions?$/i);
+        if (!match) return null;
+        const emoji = match[1];
+        const content = REACTION_CONTENT_BY_EMOJI[emoji.replace(/️/g, '')];
+        return content ? { emoji, content, count: Number(match[2]) } : null;
+    }
 
     // Passthrough flag: when true, our click handler yields to native GitHub behavior.
     // Used when we programmatically click to open the reaction popup.
@@ -24628,6 +24750,13 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 out.push({ content, btn });
             }
         }
+        for (const btn of qsa(container, REACT_REACTION_CHIP_SELECTOR)) {
+            if (getReactionContainer(btn) !== container || !btn.className.includes('reactionToggleButtonReacted__')) continue;
+            const chip = readReactReactionChip(btn);
+            if (chip && REACTION_CYCLE.includes(chip.content) && !out.some((entry) => entry.content === chip.content)) {
+                out.push({ content: chip.content, btn });
+            }
+        }
         return out;
     }
 
@@ -24758,8 +24887,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         let node = el;
         for (let i = 0; i < 25 && node; i++) {
             const id = node.id || '';
-            const m = id.match(/^issuecomment-(\d+)$/) || id.match(/^discussion_r(\d+)$/);
-            if (m) return { type: id.startsWith('discussion') ? 'review' : 'issue', id: m[1] };
+            const issue = id.match(/^issuecomment-(\d+)$/);
+            if (issue) return { type: 'issue', id: issue[1] };
+            const review = id.match(/^(?:discussion_r|r)(\d+)$/);
+            if (review && node.matches(ANCHORED_COMMENT_SELECTOR)) return { type: 'review', id: review[1] };
             if (/^issue-\d+/.test(id)) return { type: 'pr_body' };
             node = node.parentElement;
         }
@@ -25414,8 +25545,8 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // page. Compare only the comment fragment so both forms deduplicate.
     function commentPermalinkIdentity(permalink) {
         const text = String(permalink || '');
-        const fragment = text.match(/#[A-Za-z0-9_-]+$/);
-        return fragment ? fragment[0] : text;
+        const fragment = text.match(/#[A-Za-z0-9_-]+$/)?.[0];
+        return fragment?.replace(/^#r(\d+)$/, '#discussion_r$1') || text;
     }
 
     function gatherVisiblePRReplyEntries(skipIdentities = null) {
@@ -26287,10 +26418,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             // Skip PR body
             if (
                 isPR &&
-                (body.id === 'issue-body' ||
-                    body.closest(
-                        '#issue-body, [data-testid="issue-body"], #issue-body-viewer, [data-testid="issue-body-viewer"]',
-                    ))
+                body.closest(PR_DESCRIPTION_ROOT_SELECTOR)
             )
                 continue;
 
@@ -26390,7 +26518,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         for (const file of compareFileElements()) {
             if (file.dataset.ackCompareHidden === '1' || file.style.display === 'none') continue;
             if (!isVisible(file)) continue;
-            const anchor = file.querySelector('.file-header, [data-testid="diff-file-header"], .file-info') || file;
+            const anchor = file.querySelector(`${DIFF_FILE_HEADER_SELECTOR}, .file-info`) || file;
             if (!isVisible(anchor)) continue;
             entries.push({ el: file, anchor });
         }
@@ -26436,7 +26564,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     }
 
     function isPullRequestBulkDiffPage(path = location.pathname) {
-        return /\/pull\/\d+\/(?:files|changes)\/?$/.test(path);
+        return /\/pull\/\d+\/(?:files|changes)(?:\/[0-9a-f]{7,40}\.{2,3}(?:[0-9a-f]{7,40}|HEAD))?\/?$/i.test(path);
     }
 
     function isDiffReviewPage(path = location.pathname) {
@@ -27697,8 +27825,10 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 codeCell.querySelector('code[class*="AdditionLine__"]') ? 'R' : '');
 
         const diffFile = codeCell.closest('[data-path], .diff-table, table[data-diff-anchor], table[aria-label^="Diff for:"], ' + DIFF_FILE_SELECTOR);
-        const inlineFileLink = codeCell.closest('[data-testid="review-thread"]')?.querySelector('a.file-name-overflow');
-        const fileName = readDiffFilePath(diffFile) || inlineFileLink?.getAttribute('title') || inlineFileLink?.textContent?.trim() || '';
+        const previewThread = codeCell.closest('[data-testid="review-thread"]');
+        const inlineFileLink = previewThread?.querySelector('a.file-name-overflow');
+        const fileName = readDiffFilePath(diffFile) || overviewThreadLocation(previewThread)?.file ||
+            inlineFileLink?.getAttribute('title') || inlineFileLink?.textContent?.trim() || '';
 
         return { codeCell, row, fileName, lineNum, side, anchorId, lineEl };
     }
@@ -30242,7 +30372,14 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 // Don't hide our own floating commit-nav buttons which intentionally
                 // use "Next/Previous commit" aria-labels for accessibility.
                 if (el.closest?.('#ack-commit-nav')) return;
-                el.style.display = hidden ? 'none' : '';
+                if (hidden && !('ackNativeCommitDisplay' in el.dataset)) {
+                    if (el.style.display === 'none') return;
+                    el.dataset.ackNativeCommitDisplay = el.style.display;
+                    el.style.display = 'none';
+                } else if (!hidden && 'ackNativeCommitDisplay' in el.dataset) {
+                    if (el.style.display === 'none') el.style.display = el.dataset.ackNativeCommitDisplay;
+                    delete el.dataset.ackNativeCommitDisplay;
+                }
             });
     }
 
@@ -30378,12 +30515,6 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                     commit: { message: a.textContent.trim() },
                 });
             }
-            if (
-                cacheKey &&
-                commits.some((commit) => String(commit?.sha || '').toLowerCase() === head.toLowerCase())
-            ) {
-                commitListCache.set(cacheKey, commits);
-            }
             return commits;
         } catch (e) {
             console.error('ACKtopus: commit list HTML scrape failed:', e);
@@ -30496,6 +30627,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
 
     async function _addFloatingCommitNavInner() {
         const gen = ++commitNavGeneration;
+        const route = getAckLifetimeKey();
         document.querySelectorAll('#ack-commit-nav').forEach((el) => el.remove());
 
         const pr = parsePR();
@@ -30504,17 +30636,15 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         const prNum = pr.pr;
 
         // Detect page type: individual commit diff or commit list
-        const shaMatch = location.pathname.match(/\/pull\/\d+\/(?:changes|commits)\/([0-9a-f]+)/);
+        const currentSha = pathCommitSha();
         const isCommitsList = /\/pull\/\d+\/commits\/?$/.test(location.pathname);
         const isConversation = isPRConversationPage(location.pathname);
         const isBulkDiff = isPullRequestBulkDiffPage(location.pathname);
-        if (!shaMatch && !isCommitsList && !isConversation && !isBulkDiff) return;
-
-        const currentSha = shaMatch?.[1] || null;
+        if (!currentSha && !isCommitsList && !isConversation && !isBulkDiff) return;
         const basePath = `/${owner}/${repo}/pull/${prNum}/changes`;
 
         const commits = await fetchCommitList(owner, repo, prNum, { navigationOnly: true });
-        if (gen !== commitNavGeneration) return;
+        if (gen !== commitNavGeneration || route !== getAckLifetimeKey()) return;
         if (commits.length === 0) return;
 
         let prevCommit = null,
@@ -31129,7 +31259,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
                 const compareLink =
                     (n.matches?.('a[href*="/compare/"]') && n) || n.querySelector?.('a[href*="/compare/"]');
                 if (!compareLink) continue;
-                const event = compareLink.closest?.('.TimelineItem, .js-timeline-item') || n;
+                const event = compareLink.closest?.(TIMELINE_EVENT_SELECTOR) || n;
                 if (/force[- ]?pushed/i.test(String(event.textContent || ''))) return true;
             }
         }
@@ -31243,7 +31373,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
     // forces a completely fresh inject() with fresh ACK API calls.
     document.addEventListener('turbo:before-cache', () => {
         abortAckLifetime('turbo:before-cache');
-        clearJevPullRequestList();
+        commitNavGeneration++;
+        hideNativeCommitNav(false);
+        removeGithubReviewOptions();
+        restoreTimelineFilterItems();
+        clearJevAnnotations();
         teardownDiffSelectionUI();
         document
             .querySelectorAll(
@@ -32074,6 +32208,108 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
         ackAssert(!fragment.querySelector('script, svg, [onclick], [href]'), 'removes active markup and encoded script URLs before rendering');
     });
 
+
+
+    ackTest('absolute overview permalinks stay with their own comments across nested review wrappers', () => {
+        const root = document.createElement('div');
+        const prPath = '/bitcoin/bitcoin/pull/990123';
+        const expected = location.origin + prPath;
+        const oldUrl = location.href;
+        root.innerHTML =
+            '<article id="pullrequestreview-8201"><div data-testid="comment-header">' +
+            '<a href="' + expected + '#pullrequestreview-8201">Review</a></div><div class="markdown-body">Summary</div>' +
+            '<div id="discussion_r8202"><div data-testid="comment-header">' +
+            '<a href="/bitcoin/bitcoin/pull/990124#discussion_r8202">Wrong PR</a>' +
+            '<a href="' + expected + '#discussion_r8202">Correct URL</a></div>' +
+            '<div class="markdown-body"><a href="#discussion_r9999">Quoted link</a></div></div></article>' +
+            '<div id="issuecomment-8203"><div class="timeline-comment"><div class="timeline-comment-header">' +
+            '<a id="issuecomment-8203-permalink" href="#issuecomment-8203">Classic timestamp</a>' +
+            '</div><div class="markdown-body">Classic comment</div></div></div>';
+        try {
+            history.replaceState(null, '', prPath);
+            const [summary, inline, classic] = root.querySelectorAll('.markdown-body');
+            ackEq(jevCommentOwnPermalink(summary), expected + '#pullrequestreview-8201', 'nested inline bodies do not disqualify the review summary');
+            ackEq(jevCommentOwnPermalink(inline), expected + '#discussion_r8202');
+            ackEq(jevCommentOwnPermalink(classic), expected + '#issuecomment-8203');
+            root.querySelector('#discussion_r8202 [data-testid="comment-header"] a:last-child').remove();
+            ackEq(jevCommentOwnPermalink(inline), '', 'quoted or cross-PR links cannot supply a missing permalink');
+        } finally {
+            history.replaceState(null, '', oldUrl);
+        }
+    });
+
+    ackTest('files view comment aliases identify the same public review comment', () => {
+        const root = document.createElement('div');
+        const path = '/bitcoin/bitcoin/pull/990123/changes';
+        const oldUrl = location.href;
+        root.innerHTML = '<div id="r8204" class="ReviewThreadContainer__hash"><a href="' + path +
+            '#r8204">Timestamp</a><div class="markdown-body">Comment with file context</div></div>';
+        try {
+            history.replaceState(null, '', path);
+            const pr = parsePR();
+            const url = jevCommentOwnPermalink(root.querySelector('.markdown-body'));
+            const identity = jevCommentPublicIdentity(pr, url);
+            ackEq(identity?.kind, 'review-comment');
+            ackEq(identity?.id, '8204');
+            ackEq(commentPermalinkIdentity(url), '#discussion_r8204');
+            ackEq(jevCommentPublicIdentity(pr, location.origin + '/bitcoin/bitcoin/pull/990123#r8204'), null,
+                'only the diff route identifies the short fragment as a review comment');
+        } finally {
+            history.replaceState(null, '', oldUrl);
+        }
+    });
+
+    ackTest('overview thread controls track their own state and preserve the enclosing review', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<div data-testid="timeline-item"><article id="pullrequestreview-8301">' +
+            '<div class="markdown-body">Review summary</div><article><div><div>' +
+            '<button aria-label="Close review comment in src/node.cpp, line 42"></button>' +
+            '<h2><a class="file-name-overflow__hash" href="/bitcoin/bitcoin/pull/990123/changes#r8302">‎src/node.cpp‎</a></h2>' +
+            '<span data-component="Label">Resolved</span></div></div><div data-testid="review-thread">' +
+            '<div id="discussion_r8302"><div class="markdown-body">Inline reply</div><form><textarea></textarea></form></div>' +
+            '</div></article></article></div>';
+        const reply = root.querySelector('#discussion_r8302');
+        const [item] = getReviewThreadToggleItems({ root });
+        let clicks = 0;
+        item.control.addEventListener('click', () => {
+            clicks++;
+            item.control.setAttribute('aria-label', 'Open review comment in src/node.cpp, line 42');
+        });
+        ackEq(item.isOpen(), true);
+        item.setOpen(true);
+        item.setOpen(false);
+        ackEq(clicks, 1, 'only a requested state change activates the control');
+        ackEq(item.isOpen(), false);
+        const loc = getCommentLocationInfo(reply);
+        ackDeepEq([loc.file, loc.line], ['src/node.cpp', '42']);
+        ackEq(findReviewThreadPathForReplyForm(reply.querySelector('form')), 'src/node.cpp');
+        ackEq(getCommentThreadFlags(reply).isResolved, true);
+        const [reviewEvent, thread] = gatherTimelineFilterItems(root, 'unresolved');
+        ackEq(timelineFilterShouldShowItem(reviewEvent, 'unresolved', false), true, 'enclosing review stays visible');
+        ackEq(thread, item.scope);
+        ackEq(timelineFilterShouldShowItem(thread, 'unresolved', false), false, 'resolved thread is filtered on its own');
+    });
+
+    ackTest('modern reaction summaries and shortcuts use chips owned by the selected comment', () => {
+        const root = document.createElement('div');
+        root.innerHTML = '<article id="issuecomment-8401"><div aria-label="Reactions for a comment">' +
+            '<button class="reactionToggleButton__hash reactionToggleButtonReacted__hash" aria-label="👍 2 reactions"></button>' +
+            '<button class="reactionToggleButton__hash" aria-label="❤️ 1 reaction"></button></div>' +
+            '<div id="discussion_r8402"><div aria-label="Reactions for a reply">' +
+            '<button class="reactionToggleButton__hash reactionToggleButtonReacted__hash" aria-label="🚀 1 reaction"></button>' +
+            '</div></div></article>';
+        const article = root.querySelector('article');
+        const own = findUserReactedButtons(article.firstElementChild);
+        ackDeepEq(own.map((reaction) => reaction.content), ['+1']);
+        ackEq(getCommentReactionSummary(article), '👍 x2 ❤️', 'does not copy the nested reply reaction');
+    });
+
+    ackTest('PR compare ranges get diff controls but no single-commit actions', () => {
+        const path = '/bitcoin/bitcoin/pull/990123/changes/abc1234..HEAD';
+        ackEq(isDiffReviewPage(path), true);
+        ackEq(pathCommitSha(path), '');
+        ackEq(getAnalysisMode(path), ANALYSIS_MODES.pr);
+    });
 
     ackTest('GitHub layout detection follows current DOM across classic React and overview views', () => {
         const root = document.createElement('div');
@@ -43053,7 +43289,7 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             source.indexOf('function isPRPage'),
         );
         // Must match both /changes/ and /commits/ URL patterns
-        ackAssert(fn.includes('changes|commits'), 'regex matches both changes and commits paths');
+        ackAssert(fn.includes('pathCommitSha()'), 'shares the matcher for changes and commits paths');
         ackAssert(fn.includes('isCommitsList'), 'handles commit list page separately');
         ackAssert(fn.includes('isPRConversationPage'), 'handles conversation page too');
     });
@@ -50170,7 +50406,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         ackAssert(fn.includes('let sibling = codeCell.previousElementSibling'), 'walks left from the code cell');
         ackAssert(fn.includes('if (val) return val'), 'prefers the nearest non-empty adjacent line number');
         ackAssert(
-            fn.includes("return nums[nums.length - 1] || row.getAttribute?.('data-line-number') || ''"),
+            fn.includes("return nums[nums.length - 1] || row.getAttribute?.('data-line-number') ||"),
             'falls back to the last populated line number in the row',
         );
         ackAssert(
@@ -55620,7 +55856,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
         );
         ackAssert(fn.includes('const isBulkDiff = isPullRequestBulkDiffPage(location.pathname)'), 'detects bulk diff pages');
         ackAssert(
-            fn.includes('!shaMatch && !isCommitsList && !isConversation && !isBulkDiff'),
+            fn.includes('!currentSha && !isCommitsList && !isConversation && !isBulkDiff'),
             'does not return early on bulk diff pages',
         );
         ackAssert(
@@ -56698,7 +56934,7 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
     // --- getAnalysisMode for /changes/ path ---
 
     ackTest('getAnalysisMode returns commit for /changes/sha path', () => {
-        ackEq(getAnalysisMode('/bitcoin/bitcoin/pull/123/changes/abc123'), 'commit');
+        ackEq(getAnalysisMode('/bitcoin/bitcoin/pull/123/changes/abc1234'), 'commit');
     });
 
     // --- test-export gating ---
