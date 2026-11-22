@@ -9575,7 +9575,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const url = comparePatchUrl(path);
         if (!url) return Promise.resolve('');
         const cmp = parseCompareReviewContext(path);
-        const apiUrl = cmp
+        // The REST endpoint accepts three-dot ranges. A two-dot range can have a different base tree.
+        const apiUrl = cmp?.compareSeparator === '...'
             ? `https://api.github.com/repos/${cmp.owner}/${cmp.repo}/compare/${encodeGitRefSegments(cmp.compareBase)}...${encodeGitRefSegments(cmp.compareHead)}`
             : '';
         return fetchGithubDiffOrPatchText(url, apiUrl, 'patch', { freshForMs: 0 }).then(
@@ -9621,7 +9622,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                 };
             }
             const linked = await fetchPRContext({ owner: pr.owner, repo: pr.repo, pr: pr.pr });
-            return comparePatch ? { ...linked, diff: comparePatch } : linked;
+            return { ...linked, diff: comparePatch };
         }
         const generation = _prContextGeneration;
         let complete = false;
@@ -33943,6 +33944,11 @@ Start from first principles, then go deeper. Use concise paragraphs and short bu
             ackEq(ctx.diff, 'historical comparison diff');
             ackEq(_prContextCache.diff, 'final PR diff', 'synchronous PR consumers retain the final diff');
             ackAssert(ctx !== _prContextCache, 'comparison context has its own value');
+            fetchComparePatch = async () => { throw new Error('comparison unavailable'); };
+            const unavailable = await fetchPRContext({ owner: 'audit', repo: 'context', pr: '1',
+                compare: true, compareBase: 'old', compareHead: 'new', compareSeparator: '..' });
+            ackEq(unavailable.title, 'PR', 'keeps metadata from the linked PR');
+            ackEq(unavailable.diff, '', 'omits diff evidence when the comparison could not be read');
         } finally {
             gmFetch = originalFetch;
             fetchPatch = originalPatch;
@@ -50849,6 +50855,27 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             'https://github.com/bitcoin/bitcoin/compare/base...owner:repo:topic/with/slashes.patch',
         );
         ackEq(comparePatchUrl('/bitcoin/bitcoin/pull/35208'), '');
+    });
+
+    ackTest('compare patch REST fallback is limited to three-dot ranges', async () => {
+        const original = { gmFetchText, gmFetchGithubText, patAuthHeaderValue };
+        const calls = [];
+        const unavailable = Object.assign(new Error('web comparison unavailable'), { status: 404 });
+        try {
+            patAuthHeaderValue = () => 'Bearer test-token';
+            gmFetchText = async (url) => { calls.push(url); throw unavailable; };
+            gmFetchGithubText = async (url) => { calls.push(url); return 'merge-base patch'; };
+            const twoDot = await fetchComparePatch('/octo/demo/compare/base..head').catch((error) => error);
+            ackEq(twoDot, unavailable, 'preserves the failed two-dot web request');
+            ackDeepEq(calls, ['https://github.com/octo/demo/compare/base..head.patch']);
+            ackEq(await fetchComparePatch('/octo/demo/compare/base...head'), 'merge-base patch');
+            ackDeepEq(calls.slice(1), [
+                'https://github.com/octo/demo/compare/base...head.patch',
+                'https://api.github.com/repos/octo/demo/compare/base...head',
+            ]);
+        } finally {
+            ({ gmFetchText, gmFetchGithubText, patAuthHeaderValue } = original);
+        }
     });
 
     ackTest('inject gates PR-only features behind isPRPage', () => {
