@@ -6733,7 +6733,7 @@
                 'gemini-3.5-flash': { input: 0.15, output: 0.6 },
                 'gemini-4-hydrogen': { input: 1.5, output: 7.5 },
                 'gemini-4-neon': { input: 3, output: 15 },
-                'gemini-3-pro-image': { input: 2, output: 120 },
+                'gemini-3-pro-image': { input: 2, output: 12, imageOutput: 120 },
             },
             icon: `<svg width="14" height="14" viewBox="0 0 16 16" fill="#8ab4f8" style="vertical-align:middle"><path d="M8 0 9.6 4.9 14.7 6.5 9.6 8.1 8 13 6.4 8.1 1.3 6.5 6.4 4.9z"/><path d="m12.5 10.2.6 1.7 1.7.6-1.7.6-.6 1.7-.6-1.7-1.7-.6 1.7-.6z"/></svg>`,
         },
@@ -7780,11 +7780,14 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         return String(n);
     }
 
-    function calculateUsageCost(provName, inputTokens, outputTokens, model = '') {
+    function calculateUsageCost(provName, inputTokens, outputTokens, model = '', imageOutputTokens = 0) {
         const m = PROVIDER_META[provName];
         if (!m) return null;
         const prices = m.modelPrices?.[model] || { input: m.inputPrice, output: m.outputPrice };
-        return ((inputTokens || 0) * prices.input + (outputTokens || 0) * prices.output) / 1_000_000;
+        const output = outputTokens || 0;
+        const imageTokens = Math.min(imageOutputTokens, output);
+        const outputCost = (output - imageTokens) * prices.output + imageTokens * (prices.imageOutput ?? prices.output);
+        return ((inputTokens || 0) * prices.input + outputCost) / 1_000_000;
     }
 
     function formatUsageCost(cost) {
@@ -8582,13 +8585,13 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
 
     // --- LLM API Callers ---
 
-    function addUsage(provider, inputTokens, outputTokens, model = '') {
+    function addUsage(provider, inputTokens, outputTokens, model = '', imageOutputTokens = 0) {
         const key = `llm_usage_${provider}`;
         const prev = GM_getValue(key, { input: 0, output: 0, calls: 0 });
         const previousCost = Number.isFinite(Number(prev.cost))
             ? Number(prev.cost)
             : calculateUsageCost(provider, prev.input || 0, prev.output || 0);
-        const requestCost = calculateUsageCost(provider, inputTokens, outputTokens, model);
+        const requestCost = calculateUsageCost(provider, inputTokens, outputTokens, model, imageOutputTokens);
         GM_setValue(key, {
             input: prev.input + (inputTokens || 0),
             output: prev.output + (outputTokens || 0),
@@ -9287,6 +9290,10 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
         const inline = imagePart?.inlineData || imagePart?.inline_data || null;
         const mimeType = inline?.mimeType || inline?.mime_type || imageFormatToMimeType(GEMINI_IMAGE_FORMAT);
         const [inputTokens, outputTokens] = PROVIDER_API.gemini.parseUsage(data || {});
+        const usage = data?.usageMetadata;
+        // The request asks for image output only. Thoughts have a separate token count.
+        const imageOutputTokens = usage?.candidatesTokensDetails?.find((detail) => detail.modality === 'IMAGE')?.tokenCount ??
+            (inline?.data ? usage?.candidatesTokenCount || 0 : 0);
         return {
             b64: inline?.data || '',
             mimeType,
@@ -9300,6 +9307,7 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
             finishReason: PROVIDER_API.gemini.parseFinishReason(data || {}),
             inputTokens,
             outputTokens,
+            imageOutputTokens,
         };
     }
 
@@ -9340,7 +9348,8 @@ Keep it concise and direct. Skip obvious observations. Use plain ASCII. No em da
                         }
                         const imagePayload = extractGeminiImagePayload(data);
                         if (imagePayload.inputTokens || imagePayload.outputTokens) {
-                            addUsage('gemini', imagePayload.inputTokens, imagePayload.outputTokens, GEMINI_IMAGE_MODEL);
+                            addUsage('gemini', imagePayload.inputTokens, imagePayload.outputTokens,
+                                GEMINI_IMAGE_MODEL, imagePayload.imageOutputTokens);
                         }
                         if (imagePayload.refused) {
                             reject(new Error(`Gemini Image response refused: ${imagePayload.finishReason || 'blocked'}`));
@@ -58706,6 +58715,25 @@ Co-authored-by: Pablo Martin &lt;pablomartin4btc@gmail.com&gt;</pre></div>
             ackEq(res.model, GEMINI_IMAGE_MODEL, 'reports Gemini image model');
         } finally {
             GM_xmlhttpRequest = origReq;
+        }
+    });
+
+    ackTest('Gemini image usage prices thinking and image output separately', async () => {
+        const originalRequest = GM_xmlhttpRequest;
+        try {
+            GM_xmlhttpRequest = (request) => request.onload({ status: 200, responseText: JSON.stringify({
+                candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } }] } }],
+                usageMetadata: {
+                    promptTokenCount: 100, thoughtsTokenCount: 400, candidatesTokenCount: 1120,
+                    candidatesTokensDetails: [{ modality: 'IMAGE', tokenCount: 1120 }],
+                },
+            }) });
+            await requestGeminiImage('fixture', 'test-key');
+            const usage = getUsage('gemini');
+            ackEq(usage.output, 1520, 'includes both output modalities in the token count');
+            ackEq(Math.round(usage.cost * 1_000_000), 139400, 'prices image and thinking tokens at their own rates');
+        } finally {
+            GM_xmlhttpRequest = originalRequest;
         }
     });
 
